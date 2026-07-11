@@ -1,0 +1,66 @@
+flowchart TD
+    Start(["Я как пользователь открыл Issue"]) --> PreFilter
+
+    subgraph PREFILTER["Zero-cost предфильтры (без LLM)"]
+        PreFilter["type == Bot?<br/>(job-level, раннер не поднимается)"] -->|да| BotSkip["Лейбл bot-authored<br/>обработка остановлена"]
+        PreFilter -->|нет| BotNet["Денайлист логинов +<br/>маркеры автогенерации"]
+        BotNet -->|бот| BotSkip
+        BotNet -->|не бот| SecCheck["Keyword/CVE фильтр"]
+        SecCheck -->|сработал| SecStop["Лейбл security-sensitive<br/>рекомендация Private Vuln Reporting"]
+    end
+
+    SecCheck -->|чисто| Gate
+
+    subgraph GATEBLOCK["Intake Gate (Haiku, дёшево)"]
+        Gate["Gate: SPAM / VAGUE / SUFFICIENT"]
+        Gate -->|SPAM| SpamStop["Комментарий с причиной<br/>лейбл spam, issue закрыт"]
+        Gate -->|VAGUE| Clarify["1-3 уточняющих вопроса<br/>лейбл needs-clarification"]
+        Gate -->|SUFFICIENT| Classify
+    end
+
+    Clarify --> WaitUser{"Пользователь отвечает<br/>в комментарии"}
+    WaitUser --> Recheck["clarification-recheck.yml:<br/>gate повторно с учётом ответа"]
+    Recheck -->|снова VAGUE, раунд < 2| Clarify
+    Recheck -->|снова VAGUE, раунд >= 2| Escalate["Лейбл needs-human-triage"]
+    Recheck -->|теперь SUFFICIENT| Classify
+
+    subgraph CLASSIFYBLOCK["Классификация (Sonnet)"]
+        Classify["4-way: EXISTING / CONSULTATION / BUG / FEATURE"]
+        Classify -->|EXISTING| AnsExisting["Ответ: как использовать"]
+        Classify -->|CONSULTATION| AnsConsult["Ответ: варианты решения"]
+        Classify -->|BUG| LabelBug["Лейбл advisor:bug"]
+        Classify -->|FEATURE| LabelFeature["Лейбл advisor:feature-request"]
+    end
+
+    AnsExisting --> End1(["Issue закрыт ответом"])
+    AnsConsult --> End2(["Issue закрыт ответом"])
+
+    LabelBug --> DupCheck
+    LabelFeature --> DupCheck
+
+    subgraph DUPBLOCK["Duplicate Check (Haiku, один вызов на всех кандидатов)"]
+        DupCheck["gh search open+closed issue/PR<br/>+ вероятность дубликата"]
+        DupCheck -->|>=85%| DupClose["Закрыт, ссылка на оригинал<br/>+ ссылка на ветку с готовым контекстом"]
+        DupCheck -->|50-85%| DupMaybe["Лейбл possible-duplicate"]
+        DupCheck -->|<50%| DupCache["Кандидаты сохранены —<br/>переиспользуются Repowise"]
+    end
+
+    DupMaybe --> Priority
+    DupCache --> Priority
+
+    subgraph PRIOBLOCK["Priority Scoring"]
+        Priority["Извлечение атрибутов (Haiku) +<br/>детерминированный расчёт (Python)"]
+        Priority --> PLabel["Лейбл priority:P0-P3<br/>+ разбивка расчёта"]
+    end
+
+    PLabel --> ToPart2(["→ продолжение в части 2:<br/>решение человека и пайплайны"])
+
+    classDef done fill:#1A1A1A,stroke:#A3FF2E,color:#ffffff,stroke-width:1.5px
+    classDef human fill:#141414,stroke:#2563EB,color:#ffffff,stroke-width:1.5px
+    classDef terminal fill:#0C0C0C,stroke:#666666,color:#cccccc
+    classDef stop fill:#1A1A1A,stroke:#FF3131,color:#ffffff,stroke-width:1.5px
+
+    class PreFilter,BotNet,SecCheck,Gate,Clarify,Recheck,Classify,DupCheck,Priority,PLabel,LabelBug,LabelFeature,AnsExisting,AnsConsult,DupMaybe,DupCache done
+    class WaitUser human
+    class Start,End1,End2,ToPart2 terminal
+    class BotSkip,SecStop,SpamStop,Escalate,DupClose stop

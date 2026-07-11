@@ -1,0 +1,50 @@
+flowchart TD
+    FromPart1(["← из части 1:<br/>issue получил приоритет P0-P3"]) --> HumanDecide
+
+    HumanDecide{"Человек:<br/>смотрит приоритет и ответ advisor"} -->|запускаем баг| BugMe["Лейбл bug-me"]
+    HumanDecide -->|запускаем фичу| ResearchMe["Лейбл research-me"]
+    HumanDecide -->|не сейчас| Backlog(["Остаётся в бэклоге с приоритетом"])
+
+    subgraph BUGPIPE["bug-pipeline.yml"]
+        BugGuard["Guard: advisor:bug?"] --> BugCtx["Поиск дублей/регрессии"]
+        BugCtx --> BugSA["SA-helper: диагноз + Definition of Done"]
+    end
+
+    BugMe --> BugGuard
+    BugSA --> BugDone["Лейбл bug:diagnosed"]
+
+    subgraph RESEARCHPIPE["research-pipeline.yml"]
+        FGuard["Guard: advisor:feature-request?"] --> PO["po-helper: критерии приёмки<br/>(UJM/интерфейсы/НФТ) → БФТ.docx"]
+        PO --> RelIssues["Поиск связанных issue"]
+        RelIssues --> RepowiseCtx["Repowise: стратегия / история / рынок"]
+        RepowiseCtx --> Blueprint["Repowise — Blueprint:<br/>Service Blueprint + IDEF0<br/>+ Несогласованности"]
+        Blueprint --> Debate["deb8flow: дебаты по обогащённому БФТ"]
+        Debate --> SAHelper["SA-helper: техспека"]
+    end
+
+    ResearchMe --> FGuard
+    SAHelper --> ResearchDone["Лейбл research:done"]
+
+    BugDone --> BuildDecide{"Человек:<br/>проверяет артефакты"}
+    ResearchDone --> BuildDecide
+
+    BuildDecide -->|готово| BuildMe["Лейбл build-me"]
+    BuildDecide -->|нужны правки| Backlog
+
+    BuildMe -.->|TODO| Dev["OpenHands resolver:<br/>анализ + код + draft PR"]
+    Dev -.-> PRAgent["pr-agent: независимый review"]
+    PRAgent -.-> HumanReview{"Человек: ревью PR"}
+    HumanReview -.->|правки| Dev
+    HumanReview -.->|approve| Merge["Merge → существующий CI/CD"]
+    Merge -.-> Cap["Обновление docs/capabilities.md"]
+    Cap -.-> End3(["Цикл замкнут"])
+
+    classDef done fill:#1A1A1A,stroke:#A3FF2E,color:#ffffff,stroke-width:1.5px
+    classDef human fill:#141414,stroke:#2563EB,color:#ffffff,stroke-width:1.5px
+    classDef todo fill:#0C0C0C,stroke:#FFB800,color:#FFB800,stroke-width:1px,stroke-dasharray: 4 3
+    classDef terminal fill:#0C0C0C,stroke:#666666,color:#cccccc
+
+    class BugMe,ResearchMe,BuildMe,BugGuard,BugCtx,BugSA,BugDone,FGuard,PO,RelIssues,RepowiseCtx,Blueprint,Debate,SAHelper,ResearchDone done
+    class HumanDecide,BuildDecide,HumanReview human
+    class Dev,PRAgent,Merge,Cap todo
+    class FromPart1,End3,Backlog terminal

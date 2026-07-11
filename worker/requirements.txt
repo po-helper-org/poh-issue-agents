@@ -1,0 +1,6 @@
+temporalio==1.9.0
+instructor==1.7.2
+openai==1.61.0
+pydantic==2.10.5
+requests==2.32.3
+pyjwt[crypto]==2.10.1

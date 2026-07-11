@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_USER: temporal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.24
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Веб-интерфейс Temporal — видно, на какой стадии каждый issue,
+  # без необходимости лезть в логи GitHub Actions.
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - temporal
+
+  # Принимает вебхуки GitHub, транслирует их в старт/сигналы Temporal-workflow.
+  webhook:
+    build:
+      context: .
+      dockerfile: webhook/Dockerfile
+    env_file: .env
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "3000:3000"
+    depends_on:
+      - temporal
+
+  # Исполняет сам workflow и все activities (LLM-вызовы через GLM,
+  # gh CLI, claude -p для po-helper/SA-helper, deb8flow).
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    volumes:
+      - ./prompts:/app/prompts:ro
+      - ./config:/app/config:ro
+      # Рабочая директория для git-веток research/issue-N — том, а не
+      # эфемерный контейнерный слой, чтобы артефакты переживали рестарт.
+      - worker_workspace:/app/workspace
+    depends_on:
+      - temporal
+
+volumes:
+  pgdata:
+  worker_workspace:
