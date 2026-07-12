@@ -25,11 +25,15 @@ _client: instructor.Instructor | None = None
 def get_client() -> instructor.Instructor:
     global _client
     if _client is None:
+        # z.ai GLM rejects OpenAI tool-calling (400 "Invalid API parameter" —
+        # instructor's default Mode.TOOLS). JSON mode works: the model returns
+        # a JSON object matching the Pydantic schema.
         _client = instructor.from_openai(
             OpenAI(
                 base_url=os.environ["ZAI_BASE_URL"],
                 api_key=os.environ["ZAI_API_KEY"],
-            )
+            ),
+            mode=instructor.Mode.JSON,
         )
     return _client
 

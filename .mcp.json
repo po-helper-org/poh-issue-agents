@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "context7": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
+      "env": {}
+    },
+    "temporal": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "temporal-mcp"
+      ],
+      "env": {
+        "TEMPORAL_MCP_CONFIG": "/Users/aleksishmanov/projects/po-helper-issues/temporal-mcp.config.json"
+      }
+    }
+  }
+}

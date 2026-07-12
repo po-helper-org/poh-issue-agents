@@ -9,6 +9,7 @@ class IssueInput:
     body: str
     author_login: str
     author_type: str  # "Bot" | "User" | ...
+    interactive: bool = True  # False in batch backfill: VAGUE escalates, no wait
 
 
 @dataclass
