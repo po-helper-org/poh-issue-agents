@@ -164,6 +164,7 @@ class IssueLifecycle:
                 activities.post_error_label,
                 issue,
                 start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=5),
             )
             return
 

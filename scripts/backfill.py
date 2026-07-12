@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from temporalio.client import Client
-from temporalio.service import RPCError  # noqa: F401  (kept for clarity)
+from temporalio.common import WorkflowIDReusePolicy
 
 from shared.workflow_types import IssueInput
 
@@ -72,7 +72,7 @@ async def main() -> None:
         raise SystemExit("set --repo or GITHUB_REPOSITORY")
 
     if args.issue is not None:
-        items = [i for i in list_open_issues(args.repo, 200) if i["number"] == args.issue]
+        items = [i for i in list_open_issues(args.repo, args.limit) if i["number"] == args.issue]
         if not items:
             raise SystemExit(f"issue #{args.issue} not found among open issues")
     else:
@@ -87,6 +87,7 @@ async def main() -> None:
         try:
             await client.start_workflow(
                 "IssueLifecycle", issue, id=wf_id, task_queue=TASK_QUEUE,
+                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
             )
             started += 1
             print(f"started {wf_id}")
