@@ -20,6 +20,7 @@ async def main() -> None:
             activities.post_clarifying_question,
             activities.close_as_spam,
             activities.escalate_to_human,
+            activities.post_error_label,
             activities.classify_issue,
             activities.duplicate_check,
             activities.score_priority,
