@@ -82,12 +82,12 @@ Create empty `tests/__init__.py`.
 
 - [ ] **Step 4: Create a Python 3.12 venv and install deps**
 
-Run:
+System Python is 3.14 (no 3.12 on PATH); `temporalio==1.9.0` has no 3.14 wheels. Use `uv` (installed at `~/.local/bin/uv`) to get a managed 3.12:
 ```bash
-python3.12 -m venv .venv
-.venv/bin/pip install -r worker/requirements.txt -r requirements-dev.txt
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r worker/requirements.txt -r requirements-dev.txt
 ```
-Expected: installs without error (temporalio 1.9.0 ships a prebuilt wheel for macOS arm64).
+Expected: uv fetches CPython 3.12 if absent, then installs all pinned deps (temporalio 1.9.0 has a 3.12 macOS arm64 wheel) without error.
 
 - [ ] **Step 5: Verify pytest collects nothing yet, cleanly**
 
@@ -401,13 +401,13 @@ def test_post_error_label_comments_and_labels(monkeypatch):
 
     issue = IssueInput(repo="o/r", issue_number=7, title="t", body="b",
                        author_login="u", author_type="User")
-    asyncio.run(activities.post_error_label.__wrapped__(issue))
+    asyncio.run(activities.post_error_label(issue))
 
     assert ("label", "o/r", 7, "advisor:error") in calls
     assert any(c[0] == "comment" and c[1] == "o/r" and c[2] == 7 for c in calls)
 ```
 
-(`.__wrapped__` calls the plain async function under the Temporal `@activity.defn` decorator.)
+(`@activity.defn` attaches metadata but returns the original coroutine function, so it is directly awaitable in tests.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
