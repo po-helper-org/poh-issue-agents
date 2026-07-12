@@ -822,7 +822,7 @@ ZAI_API_KEY=<owner-provided>
 GH_TOKEN=<fine-grained PAT: Issues r/w, Contents r on kibarik/po-helper>
 DRY_RUN=1
 ```
-Leave `GITHUB_APP_ID`/`GITHUB_INSTALLATION_ID`/`GITHUB_PRIVATE_KEY_PATH` empty — the PAT path (Task 2) makes them unnecessary for Layer A. `.env` is gitignored; confirm with `git check-ignore .env` (expected: prints `.env`). If not ignored, add `.env` to `.gitignore` and commit that.
+Leave `GITHUB_APP_ID`/`GITHUB_INSTALLATION_ID`/`GITHUB_PRIVATE_KEY_PATH` empty — the PAT path (Task 2) makes them unnecessary for Layer A. `.env` is already gitignored (repo `.gitignore` covers `.env`, `secrets/`, `*.pem`); confirm with `git check-ignore .env` (expected: prints `.env`). Never commit `.env`.
 
 - [ ] **Step 3: Verify compose config is valid**
 
