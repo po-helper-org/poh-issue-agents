@@ -51,7 +51,7 @@
 ```
 pytest==8.3.4
 pytest-asyncio==0.25.2
-pytest-timeout==2.3.0
+pytest-timeout==2.3.1
 ```
 
 - [ ] **Step 2: Create pytest config**
