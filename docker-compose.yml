@@ -63,12 +63,9 @@ services:
     volumes:
       - ./prompts:/app/prompts:ro
       - ./config:/app/config:ro
-      # Рабочая директория для git-веток research/issue-N — том, а не
-      # эфемерный контейнерный слой, чтобы артефакты переживали рестарт.
-      - worker_workspace:/app/workspace
+      - ./workspace:/app/workspace
     depends_on:
       - temporal
 
 volumes:
   pgdata:
-  worker_workspace:

@@ -132,6 +132,15 @@ async def escalate_to_human(issue: IssueInput) -> None:
     github_client.add_label(issue.repo, issue.issue_number, "needs-human-triage")
 
 
+@activity.defn
+async def post_error_label(issue: IssueInput) -> None:
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Автоматическая обработка не удалась. Ожидай ручного разбора.",
+    )
+    github_client.add_label(issue.repo, issue.issue_number, "advisor:error")
+
+
 # --- Классификация ---
 
 @activity.defn
