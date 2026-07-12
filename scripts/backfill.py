@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -88,6 +89,13 @@ async def main() -> None:
             await client.start_workflow(
                 "IssueLifecycle", issue, id=wf_id, task_queue=TASK_QUEUE,
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                # A backfill starts dozens of workflows at once against a single
+                # worker whose activities are slow LLM calls. The default 10s
+                # workflow-task timeout is then too tight — tasks time out before
+                # the busy worker processes them, forcing full-history replays
+                # (churn that re-runs activities and wastes LLM calls). 120s
+                # gives the worker room to drain the backlog.
+                task_timeout=timedelta(seconds=120),
             )
             started += 1
             print(f"started {wf_id}")

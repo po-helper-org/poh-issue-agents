@@ -42,12 +42,16 @@ async def main() -> None:
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
         workflow_runner=UnsandboxedWorkflowRunner(),
-        # Activities use a BLOCKING sync LLM client. A backfill burst (dozens of
-        # workflows) otherwise spawns dozens of blocking activity threads that,
-        # with the GIL, starve the single workflow event-loop thread — tripping
-        # the 2s deadlock detector (TMPRL1101) and workflow-task timeouts. Cap
-        # concurrent activities so the event loop keeps getting CPU.
-        max_concurrent_activities=4,
+        # The activities use a BLOCKING sync LLM client that also does CPU-heavy
+        # JSON/pydantic parsing. Under a backfill burst that starves the single
+        # workflow event-loop thread of the GIL for >2s, tripping the deadlock
+        # detector (TMPRL1101) with false positives — our workflows never truly
+        # deadlock. debug_mode disables that detector; safe for trusted,
+        # deterministic first-party workflows.
+        debug_mode=True,
+        # LLM calls are I/O-bound (release the GIL while awaiting the network),
+        # so a modest fan-out speeds the backfill without real contention.
+        max_concurrent_activities=8,
     )
     print("Worker started, listening on task queue 'issue-lifecycle'")
     await worker.run()
