@@ -41,28 +41,37 @@ def _installation_token_headers() -> dict:
     return {"Authorization": f"Bearer {_installation_token}", "Accept": "application/vnd.github+json"}
 
 
+def _auth_headers() -> dict:
+    """PAT path for the pilot: if GH_TOKEN/GITHUB_TOKEN is set, use it
+    directly and skip the GitHub App flow. Otherwise fall back to App auth."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    return _installation_token_headers()
+
+
 def post_comment(repo: str, issue_number: int, body: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
-    resp = requests.post(url, headers=_installation_token_headers(), json={"body": body}, timeout=30)
+    resp = requests.post(url, headers=_auth_headers(), json={"body": body}, timeout=30)
     resp.raise_for_status()
 
 
 def add_label(repo: str, issue_number: int, label: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
-    resp = requests.post(url, headers=_installation_token_headers(), json={"labels": [label]}, timeout=30)
+    resp = requests.post(url, headers=_auth_headers(), json={"labels": [label]}, timeout=30)
     resp.raise_for_status()
 
 
 def close_issue(repo: str, issue_number: int) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
-    resp = requests.patch(url, headers=_installation_token_headers(), json={"state": "closed"}, timeout=30)
+    resp = requests.patch(url, headers=_auth_headers(), json={"state": "closed"}, timeout=30)
     resp.raise_for_status()
 
 
 def search_candidates(repo: str, query: str, limit: int = 15) -> list[dict]:
     """Через gh CLI — тот же паттерн, что и в версии на Actions, но токен
     для gh нужно прокинуть через переменную окружения перед вызовом."""
-    env = {**os.environ, "GH_TOKEN": _installation_token_headers()["Authorization"].split(" ")[1]}
+    env = {**os.environ, "GH_TOKEN": _auth_headers()["Authorization"].split(" ")[1]}
     candidates = []
     for kind in ("issue", "pr"):
         fields = "number,title,body,url,state,labels" if kind == "issue" else "number,title,body,url,state"
@@ -79,5 +88,5 @@ def search_candidates(repo: str, query: str, limit: int = 15) -> list[dict]:
 
 def branch_exists(repo: str, branch: str) -> bool:
     url = f"https://api.github.com/repos/{repo}/branches/{branch}"
-    resp = requests.get(url, headers=_installation_token_headers(), timeout=30)
+    resp = requests.get(url, headers=_auth_headers(), timeout=30)
     return resp.status_code == 200
