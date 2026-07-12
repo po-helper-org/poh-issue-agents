@@ -97,10 +97,10 @@ fi
 [ -n "$ZAI_KEY" ] || die "ZAI_API_KEY is required (all LLM stages use it)."
 
 # defaults (kept from existing .env when present)
-ZAI_BASE_URL="$(cur ZAI_BASE_URL)";   ZAI_BASE_URL="${ZAI_BASE_URL:-https://api.z.ai/api/openai/v1}"
+ZAI_BASE_URL="$(cur ZAI_BASE_URL)";   ZAI_BASE_URL="${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
 ANTHROPIC_BASE_URL="$(cur ANTHROPIC_BASE_URL)"; ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}"
 MODEL_GATE="$(cur MODEL_GATE)";       MODEL_GATE="${MODEL_GATE:-glm-4.5-air}"
-MODEL_CLASSIFY="$(cur MODEL_CLASSIFY)"; MODEL_CLASSIFY="${MODEL_CLASSIFY:-glm-5.2}"
+MODEL_CLASSIFY="$(cur MODEL_CLASSIFY)"; MODEL_CLASSIFY="${MODEL_CLASSIFY:-glm-4.6}"
 echo
 
 # --- backup + write ---------------------------------------------------------

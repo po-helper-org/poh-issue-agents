@@ -60,6 +60,15 @@ services:
     env_file: .env
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
+      # Unbuffered stdio so [DRY_RUN] / INFO logs flush to `docker logs`
+      # immediately instead of sitting in a block buffer in the long-lived
+      # worker process.
+      - PYTHONUNBUFFERED=1
+    # Temporal auto-setup creates the `default` namespace a few seconds AFTER
+    # the temporal container starts; depends_on only waits for container start,
+    # so the worker can lose the race and exit with "Namespace default is not
+    # found". Restart until the namespace exists and the worker connects.
+    restart: unless-stopped
     volumes:
       - ./prompts:/app/prompts:ro
       - ./config:/app/config:ro

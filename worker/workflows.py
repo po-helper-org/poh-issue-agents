@@ -70,7 +70,7 @@ class IssueLifecycle:
             gate = await workflow.execute_activity(
                 activities.intake_gate,
                 args=[issue, []],  # [] — переписки уточнений ещё нет
-                start_to_close_timeout=timedelta(seconds=60),
+                start_to_close_timeout=timedelta(seconds=120),
                 retry_policy=default_retry,
             )
 
@@ -111,7 +111,7 @@ class IssueLifecycle:
                 gate = await workflow.execute_activity(
                     activities.intake_gate,
                     args=[issue, comment_thread],
-                    start_to_close_timeout=timedelta(seconds=60),
+                    start_to_close_timeout=timedelta(seconds=120),
                     retry_policy=default_retry,
                 )
 
@@ -127,7 +127,7 @@ class IssueLifecycle:
             classification = await workflow.execute_activity(
                 activities.classify_issue,
                 issue,
-                start_to_close_timeout=timedelta(seconds=90),
+                start_to_close_timeout=timedelta(seconds=180),
                 retry_policy=default_retry,
             )
 
@@ -141,7 +141,7 @@ class IssueLifecycle:
             dup = await workflow.execute_activity(
                 activities.duplicate_check,
                 issue,
-                start_to_close_timeout=timedelta(seconds=90),
+                start_to_close_timeout=timedelta(seconds=180),
                 retry_policy=default_retry,
             )
             if dup.decision == "duplicate":
@@ -151,7 +151,7 @@ class IssueLifecycle:
             priority = await workflow.execute_activity(
                 activities.score_priority,
                 args=[issue, classification, dup],
-                start_to_close_timeout=timedelta(seconds=60),
+                start_to_close_timeout=timedelta(seconds=180),
                 retry_policy=default_retry,
             )
             await workflow.execute_activity(
