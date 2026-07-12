@@ -38,13 +38,9 @@
 - Локальный запуск через `docker-compose` (postgres, temporal, temporal-ui,
   worker); сервис `webhook` в Слое A не требуется.
 
-**Вне объёма (последующие слои):**
-- Слой B: публичный webhook (cloudflared/reverse proxy) + вебхук репозитория
-  для автостарта на новых Issue.
-- Слой C: `run_research_pipeline` / `run_bug_pipeline` / `trigger_openhands_resolver`
-  (сейчас `NotImplementedError`), скиллы po-helper/SA-helper в контейнере,
-  deb8flow, MCP Confluence/Jira, генерация `.docx`.
-- Регистрация полноценного GitHub App с App-идентичностью комментариев.
+**Вне объёма:** всё, что после автономного триажа (Слой B — новые Issue авто,
+Слой C — аналитика по запросу, Layer A-hardening/калибровка), вынесено в
+[docs/roadmap-post-layer-a.md](../../roadmap-post-layer-a.md). Заполняется позже.
 
 ## Существующая архитектура (не меняется по сути)
 
@@ -195,11 +191,7 @@ scripts/backfill.py
 - Промпты написаны под старый парсинг маркеров `[[...]]` — с Instructor
   избыточно, упрощение косметическое, не блокирует.
 
-## Последующие слои (вне объёма)
+## Последующие слои
 
-- **Слой B:** публичный webhook + вебхук репозитория `po-helper` → автостарт
-  на `issues.opened`/`labeled`/`comment`. Даёт пункт 2 критерия.
-- **Слой C:** реализация research/bug-пайплайнов — стратегическая аналитика
-  (БФТ/Blueprint/дебаты/техспека в git-ветку). Основные блокеры: загрузка
-  скиллов po-helper/SA-helper в worker-контейнер, `claude -p` через z.ai с
-  tool-calling, deb8flow, MCP Confluence/Jira в headless, генерация `.docx`.
+Вынесены в [docs/roadmap-post-layer-a.md](../../roadmap-post-layer-a.md)
+(Слой B — новые Issue авто, Слой C — аналитика по запросу, A-hardening).
