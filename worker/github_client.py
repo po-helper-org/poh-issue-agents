@@ -5,12 +5,20 @@
 и обновлять самостоятельно (живёт ~1 час).
 """
 
+import logging
 import os
 import subprocess
 import time
 
 import jwt
 import requests
+
+_log = logging.getLogger("github_client")
+
+
+def _dry_run() -> bool:
+    return bool(os.environ.get("DRY_RUN"))
+
 
 _installation_token: str | None = None
 _token_expires_at: float = 0.0
@@ -51,18 +59,27 @@ def _auth_headers() -> dict:
 
 
 def post_comment(repo: str, issue_number: int, body: str) -> None:
+    if _dry_run():
+        _log.info("[DRY_RUN] comment %s#%s: %s", repo, issue_number, body[:200])
+        return
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
     resp = requests.post(url, headers=_auth_headers(), json={"body": body}, timeout=30)
     resp.raise_for_status()
 
 
 def add_label(repo: str, issue_number: int, label: str) -> None:
+    if _dry_run():
+        _log.info("[DRY_RUN] label %s#%s += %s", repo, issue_number, label)
+        return
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
     resp = requests.post(url, headers=_auth_headers(), json={"labels": [label]}, timeout=30)
     resp.raise_for_status()
 
 
 def close_issue(repo: str, issue_number: int) -> None:
+    if _dry_run():
+        _log.info("[DRY_RUN] close %s#%s", repo, issue_number)
+        return
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
     resp = requests.patch(url, headers=_auth_headers(), json={"state": "closed"}, timeout=30)
     resp.raise_for_status()
