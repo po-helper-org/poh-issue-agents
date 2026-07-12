@@ -12,3 +12,6 @@ __pycache__/
 # OS
 .DS_Store
 .env.bak.*
+
+# Serena MCP local cache
+.serena/
