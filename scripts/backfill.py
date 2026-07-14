@@ -90,10 +90,10 @@ async def main() -> None:
         try:
             await client.start_workflow(
                 "IssueLifecycle", issue, id=wf_id, task_queue=TASK_QUEUE,
-                # ALLOW_DUPLICATE so a fresh backfill re-runs issues whose prior
-                # (e.g. dry-run) workflow already closed. Terminate any still-
-                # running ones first; a RUNNING id still rejects the start.
-                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+                # REJECT_DUPLICATE keeps re-runs idempotent: a plain re-run skips
+                # already-processed issues (no double comments). To deliberately
+                # re-process, pass --suffix to mint fresh workflow ids instead.
+                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                 # A backfill starts dozens of workflows at once against a single
                 # worker whose activities are slow LLM calls. The default 10s
                 # workflow-task timeout is then too tight — tasks time out before
