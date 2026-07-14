@@ -21,17 +21,23 @@ class ConsolidationWorkflow:
         profiles = await asyncio.gather(*[
             workflow.execute_activity(
                 ca.extract_solution_profile, r,
-                start_to_close_timeout=timedelta(seconds=180), retry_policy=retry)
+                start_to_close_timeout=timedelta(seconds=240), retry_policy=retry)
             for r in refs])
 
+        # The reduce call clusters ALL profiles in one shot; over a ~50-issue
+        # backlog that is a large structured-output generation, and under the
+        # z.ai rate limit + Instructor retries it can run well past a few
+        # minutes. 900s per attempt (2 attempts) keeps it from a false
+        # StartToClose timeout (the 300s default failed a 50-issue run).
         clusterset = await workflow.execute_activity(
             ca.cluster_profiles, profiles,
-            start_to_close_timeout=timedelta(seconds=300), retry_policy=retry)
+            start_to_close_timeout=timedelta(seconds=900),
+            retry_policy=RetryPolicy(maximum_attempts=2))
 
         drafts = await asyncio.gather(*[
             workflow.execute_activity(
                 ca.synthesize_unifying_issue, args=[c, profiles],
-                start_to_close_timeout=timedelta(seconds=240),
+                start_to_close_timeout=timedelta(seconds=360),
                 retry_policy=RetryPolicy(maximum_attempts=2))
             for c in clusterset.clusters])
 
