@@ -29,6 +29,12 @@ make go-live   # выключить DRY_RUN, перезапустить worker, 
 Docker, [`uv`](https://astral.sh/uv), [`gh`](https://cli.github.com) (`gh auth login`).
 Детали и слои B/C — `docs/superpowers/`.
 
+## Consolidation (FNR-2)
+
+`make consolidate` clusters the open backlog by shared solution mechanism and
+opens a PR of unifying-Issue drafts (one per cluster). It proposes only — it
+never comments on, labels, or closes Issues. Honors `DRY_RUN`.
+
 ## Документация (начни отсюда)
 
 - **`docs/REQUIREMENTS.md`** — зафиксированный набор требований (FR/NFR),

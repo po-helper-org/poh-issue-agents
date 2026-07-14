@@ -1,5 +1,5 @@
 # Layer A operator commands. Run `make setup` once, then up → dry-run → go-live.
-.PHONY: help setup up logs ps dry-run backfill-one go-live dry-again down test
+.PHONY: help setup up logs ps dry-run backfill-one go-live dry-again down test consolidate
 
 # Services needed for Layer A (webhook is only needed later, for Layer B).
 CORE := postgres temporal temporal-ui worker
@@ -13,6 +13,7 @@ help:
 	@echo "make dry-run      triage ALL open issues (DRY_RUN — no mutations)"
 	@echo "make backfill-one issue=N   triage a single issue (smoke test)"
 	@echo "make go-live      turn DRY_RUN off, restart worker, run for real"
+	@echo "make consolidate  cluster open backlog & open PR (DRY_RUN-guarded)"
 	@echo "make down         stop everything"
 
 setup:
@@ -49,6 +50,10 @@ go-live:
 
 down:
 	docker compose down
+
+consolidate:
+	@test -n "$(REPO)" || { echo "no GITHUB_REPOSITORY in .env"; exit 1; }
+	GITHUB_REPOSITORY=$(REPO) $(PY) scripts/consolidate.py
 
 test:
 	.venv/bin/pytest -q
