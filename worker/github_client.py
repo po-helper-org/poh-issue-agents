@@ -5,6 +5,7 @@
 и обновлять самостоятельно (живёт ~1 час).
 """
 
+import base64
 import logging
 import os
 import subprocess
@@ -107,3 +108,29 @@ def branch_exists(repo: str, branch: str) -> bool:
     url = f"https://api.github.com/repos/{repo}/branches/{branch}"
     resp = requests.get(url, headers=_auth_headers(), timeout=30)
     return resp.status_code == 200
+
+
+def create_pr_with_files(repo: str, branch: str, base: str,
+                         files: dict, title: str, body: str):
+    if _dry_run():
+        _log.info("[DRY_RUN] PR %s <- %s: %d files, title=%s",
+                  repo, branch, len(files), title)
+        return None
+    h = _auth_headers()
+    api = f"https://api.github.com/repos/{repo}"
+    base_sha = requests.get(f"{api}/git/refs/heads/{base}", headers=h,
+                            timeout=30).json()["object"]["sha"]
+    requests.post(f"{api}/git/refs", headers=h,
+                  json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+                  timeout=30).raise_for_status()
+    for path, content in files.items():
+        requests.put(f"{api}/contents/{path}", headers=h, json={
+            "message": f"consolidation: {path}",
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": branch,
+        }, timeout=30).raise_for_status()
+    resp = requests.post(f"{api}/pulls", headers=h,
+                         json={"title": title, "head": branch, "base": base,
+                               "body": body}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["html_url"]
