@@ -16,6 +16,8 @@ logging.basicConfig(
 )
 
 import activities
+import consolidation_activities as ca
+from consolidation_workflow import ConsolidationWorkflow
 from workflows import IssueLifecycle
 
 
@@ -24,7 +26,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
-        workflows=[IssueLifecycle],
+        workflows=[IssueLifecycle, ConsolidationWorkflow],
         activities=[
             activities.prefilter_bot_and_security,
             activities.intake_gate,
@@ -39,6 +41,11 @@ async def main() -> None:
             activities.run_research_pipeline,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,
+            ca.fetch_open_issues,
+            ca.extract_solution_profile,
+            ca.cluster_profiles,
+            ca.synthesize_unifying_issue,
+            ca.write_consolidation_pr,
         ],
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
