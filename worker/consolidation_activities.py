@@ -79,3 +79,25 @@ def cluster_profiles(profiles: list[SolutionProfile]) -> ClusterSet:
             mechanism=co.mechanism, target=co.target,
             members=members, cross_links=co.cross_links))
     return ClusterSet(clusters=clusters, orphans=ext.orphans)
+
+
+class SynthOut(BaseModel):
+    title: str
+    body_markdown: str
+
+
+@activity.defn
+def synthesize_unifying_issue(cluster: Cluster,
+                              profiles: list[SolutionProfile]) -> UnifyingIssueDraft:
+    by_num = {p.issue_number: p for p in profiles}
+    members_block = "\n".join(
+        f"#{m.issue_number} [{m.role}] wants={m.contributed_requirement!r} "
+        f"anchors={by_num[m.issue_number].anchors if m.issue_number in by_num else []}"
+        for m in cluster.members)
+    user_message = (f"mechanism={cluster.mechanism!r} target={cluster.target!r}\n"
+                    f"members:\n{members_block}")
+    r = llm.extract(_load_prompt("system_unifying_issue.md"), user_message,
+                    SynthOut, model=llm.MODEL_CLASSIFY)
+    return UnifyingIssueDraft(
+        cluster_id=cluster.cluster_id, title=r.title, body_markdown=r.body_markdown,
+        source_issue_numbers=[m.issue_number for m in cluster.members])
