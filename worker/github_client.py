@@ -134,3 +134,16 @@ def create_pr_with_files(repo: str, branch: str, base: str,
                                "body": body}, timeout=30)
     resp.raise_for_status()
     return resp.json()["html_url"]
+
+
+def list_open_issues(repo: str, limit: int = 300) -> list:
+    import json
+    env = {**os.environ, "GH_TOKEN": _auth_headers()["Authorization"].split(" ")[1]}
+    cmd = ["gh", "issue", "list", "--repo", repo, "--state", "open",
+           "--limit", str(limit), "--json", "number,title,body,labels"]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    out = []
+    for it in json.loads(result.stdout or "[]"):
+        it["labels"] = [l["name"] for l in it.get("labels", [])]
+        out.append(it)
+    return out

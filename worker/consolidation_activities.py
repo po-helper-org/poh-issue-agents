@@ -101,3 +101,43 @@ def synthesize_unifying_issue(cluster: Cluster,
     return UnifyingIssueDraft(
         cluster_id=cluster.cluster_id, title=r.title, body_markdown=r.body_markdown,
         source_issue_numbers=[m.issue_number for m in cluster.members])
+
+
+@activity.defn
+def fetch_open_issues(cfg: ConsolidationInput) -> list:
+    issues = github_client.list_open_issues(cfg.repo, cfg.limit)
+    refs = []
+    for it in issues:
+        if any(lbl in cfg.exclude_labels for lbl in it.get("labels", [])):
+            continue
+        refs.append(IssueInput(repo=cfg.repo, issue_number=it["number"],
+                               title=it["title"], body=it.get("body") or "",
+                               author_login="", author_type="User"))
+    return refs
+
+
+def _render_overview(cs: ClusterSet) -> str:
+    lines = ["# Консолидация бэклога\n", "## Кластеры\n"]
+    for c in cs.clusters:
+        lines.append(f"### {c.cluster_id} — {c.mechanism} (target: {c.target})")
+        for m in c.members:
+            lines.append(f"- #{m.issue_number} [{m.role}] — {m.contributed_requirement}")
+        if c.cross_links:
+            lines.append(f"- cross-links: {', '.join(c.cross_links)}")
+        lines.append("")
+    lines.append(f"## Orphans\n{', '.join('#'+str(n) for n in cs.orphans) or '—'}")
+    return "\n".join(lines)
+
+
+@activity.defn
+def write_consolidation_pr(clusterset: ClusterSet,
+                           drafts: list, repo: str) -> str | None:
+    from datetime import date
+    files = {"docs/consolidation/overview.md": _render_overview(clusterset)}
+    for d in drafts:
+        files[f"docs/consolidation/unifying/{d.cluster_id}.md"] = d.body_markdown
+    branch = f"consolidation/{date.today().isoformat()}"
+    body = f"Автоконсолидация: {len(clusterset.clusters)} кластеров, " \
+           f"{len(drafts)} объединяющих Issue. Предлагает, не мутирует Issue."
+    return github_client.create_pr_with_files(
+        repo, branch, "main", files, "Консолидация бэклога", body)
