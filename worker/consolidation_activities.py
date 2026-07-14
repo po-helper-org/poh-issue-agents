@@ -57,20 +57,86 @@ class ClusterExtraction(BaseModel):
     orphans: list[int] = Field(default_factory=list)
 
 
+class MergeAssignment(BaseModel):
+    cluster_index: int
+    group_key: str  # identical key => same final cluster (same mechanism+target)
+
+
+class MergeExtraction(BaseModel):
+    assignments: list[MergeAssignment]
+
+
+# One reduce call over the whole backlog degenerates to near-singletons at ~50+
+# issues (the model cannot hold that many items). Cluster in batches, then merge
+# the batch-local clusters across batches. 12 keeps each map call small enough
+# for the model to group meaningfully.
+CLUSTER_BATCH_SIZE = 12
+
+
 def _slug(numbers: list[int]) -> str:
     return "cluster-" + "-".join(str(n) for n in sorted(numbers))
 
 
-@activity.defn
-def cluster_profiles(profiles: list[SolutionProfile]) -> ClusterSet:
+def _cluster_call(profiles: list[SolutionProfile]) -> ClusterExtraction:
     listing = "\n".join(
         f"#{p.issue_number} mechanism={p.proposed_mechanism!r} "
         f"target={p.target!r} domain={p.domain}"
-        for p in profiles if p.problem_essence != "[EXTRACTION_FAILED]")
-    ext = llm.extract(_load_prompt("system_cluster.md"), listing,
-                      ClusterExtraction, model=llm.MODEL_CLASSIFY)
+        for p in profiles)
+    return llm.extract(_load_prompt("system_cluster.md"), listing,
+                       ClusterExtraction, model=llm.MODEL_CLASSIFY)
+
+
+def _merge_local(local: list[ClusterOut]) -> list[ClusterOut]:
+    """Second pass: unify batch-local clusters that share a mechanism+target
+    across batches. The model assigns each local cluster a group_key; locals with
+    the same key are unioned (members deduped by issue_number). Divergent targets
+    get different keys (the #111 split is preserved into the merged set)."""
+    if len(local) <= 1:
+        return local
+    summary = "\n".join(
+        f"[{i}] mechanism={c.mechanism!r} target={c.target!r} "
+        f"members={[m.issue_number for m in c.members]}"
+        for i, c in enumerate(local))
+    merge = llm.extract(_load_prompt("system_cluster_merge.md"), summary,
+                        MergeExtraction, model=llm.MODEL_CLASSIFY)
+    key_by_idx = {a.cluster_index: a.group_key for a in merge.assignments}
+    groups: dict[str, list[int]] = {}
+    for i in range(len(local)):
+        # a local cluster the merge step never assigned stays on its own
+        key = key_by_idx.get(i, f"__ungrouped_{i}")
+        groups.setdefault(key, []).append(i)
+    merged: list[ClusterOut] = []
+    for idxs in groups.values():
+        seen: dict[int, MemberOut] = {}
+        for i in idxs:
+            for m in local[i].members:
+                seen.setdefault(m.issue_number, m)
+        rep = local[idxs[0]]
+        merged.append(ClusterOut(
+            mechanism=rep.mechanism, target=rep.target,
+            members=list(seen.values()),
+            cross_links=sorted({cl for i in idxs for cl in local[i].cross_links})))
+    return merged
+
+
+@activity.defn
+def cluster_profiles(profiles: list[SolutionProfile]) -> ClusterSet:
+    active = [p for p in profiles if p.problem_essence != "[EXTRACTION_FAILED]"]
+    orphans: list[int] = []
+    if len(active) <= CLUSTER_BATCH_SIZE:
+        ext = _cluster_call(active)
+        local = list(ext.clusters)
+        orphans = list(ext.orphans)
+    else:
+        local = []
+        for start in range(0, len(active), CLUSTER_BATCH_SIZE):
+            ext = _cluster_call(active[start:start + CLUSTER_BATCH_SIZE])
+            local.extend(ext.clusters)
+            orphans.extend(ext.orphans)
+        local = _merge_local(local)
+
     clusters = []
-    for co in ext.clusters:
+    for co in local:
         members = [ClusterMember(issue_number=m.issue_number, role=m.role,
                                  contributed_requirement=m.contributed_requirement)
                    for m in co.members]
@@ -78,7 +144,7 @@ def cluster_profiles(profiles: list[SolutionProfile]) -> ClusterSet:
             cluster_id=_slug([m.issue_number for m in co.members]),
             mechanism=co.mechanism, target=co.target,
             members=members, cross_links=co.cross_links))
-    return ClusterSet(clusters=clusters, orphans=ext.orphans)
+    return ClusterSet(clusters=clusters, orphans=sorted(set(orphans)))
 
 
 class SynthOut(BaseModel):
