@@ -1,5 +1,4 @@
 """Consolidation activities: profile extraction, clustering, synthesis, PR."""
-import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -12,14 +11,7 @@ from shared.workflow_types import (
     IssueInput, SolutionProfile, UnifyingIssueDraft,
 )
 
-# Use environment variable or default to Docker path; fall back to local path for tests
-_prompts_env = os.getenv("PROMPTS_DIR")
-if _prompts_env:
-    PROMPTS_DIR = Path(_prompts_env)
-else:
-    _docker_path = Path("/app/prompts")
-    _local_path = Path(__file__).resolve().parent.parent / "prompts"
-    PROMPTS_DIR = _docker_path if _docker_path.exists() else _local_path
+PROMPTS_DIR = Path("/app/prompts")
 
 
 def _load_prompt(name: str) -> str:

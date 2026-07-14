@@ -8,6 +8,7 @@ def test_extract_profile_maps_fields(monkeypatch):
                              proposed_mechanism="FTS engine", target="cut cost",
                              domain="memory-core", anchors=["grep/echo"])
     monkeypatch.setattr(ca.llm, "extract", lambda *a, **k: fake)
+    monkeypatch.setattr(ca, "_load_prompt", lambda name: "fake prompt")
     issue = IssueInput(repo="o/r", issue_number=59, title="Search layer",
                        body="replace grep with FTS", author_login="u",
                        author_type="User")
