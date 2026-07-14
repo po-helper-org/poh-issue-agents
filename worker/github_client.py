@@ -118,8 +118,9 @@ def create_pr_with_files(repo: str, branch: str, base: str,
         return None
     h = _auth_headers()
     api = f"https://api.github.com/repos/{repo}"
-    base_sha = requests.get(f"{api}/git/refs/heads/{base}", headers=h,
-                            timeout=30).json()["object"]["sha"]
+    base_resp = requests.get(f"{api}/git/refs/heads/{base}", headers=h, timeout=30)
+    base_resp.raise_for_status()
+    base_sha = base_resp.json()["object"]["sha"]
     requests.post(f"{api}/git/refs", headers=h,
                   json={"ref": f"refs/heads/{branch}", "sha": base_sha},
                   timeout=30).raise_for_status()

@@ -104,7 +104,7 @@ def synthesize_unifying_issue(cluster: Cluster,
 
 
 @activity.defn
-def fetch_open_issues(cfg: ConsolidationInput) -> list:
+def fetch_open_issues(cfg: ConsolidationInput) -> list[IssueInput]:
     issues = github_client.list_open_issues(cfg.repo, cfg.limit)
     refs = []
     for it in issues:
@@ -131,7 +131,7 @@ def _render_overview(cs: ClusterSet) -> str:
 
 @activity.defn
 def write_consolidation_pr(clusterset: ClusterSet,
-                           drafts: list, repo: str) -> str | None:
+                           drafts: list[UnifyingIssueDraft], repo: str) -> str | None:
     from datetime import date
     files = {"docs/consolidation/overview.md": _render_overview(clusterset)}
     for d in drafts:
