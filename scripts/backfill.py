@@ -58,8 +58,9 @@ def list_open_issues(repo: str, limit: int) -> list[dict]:
     return json.loads(out or "[]")
 
 
-def workflow_id_for(repo: str, n: int) -> str:
-    return f"issue-{repo}-{n}"
+def workflow_id_for(repo: str, n: int, suffix: str = "") -> str:
+    base = f"issue-{repo}-{n}"
+    return f"{base}-{suffix}" if suffix else base
 
 
 async def main() -> None:
@@ -67,6 +68,7 @@ async def main() -> None:
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--issue", type=int, default=None)
     parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--suffix", default="", help="append to workflow id (fresh run without terminating prior)")
     args = parser.parse_args()
 
     if not args.repo:
@@ -84,11 +86,14 @@ async def main() -> None:
     started, skipped = 0, 0
     for item in items:
         issue = build_issue_input(args.repo, item)
-        wf_id = workflow_id_for(args.repo, issue.issue_number)
+        wf_id = workflow_id_for(args.repo, issue.issue_number, args.suffix)
         try:
             await client.start_workflow(
                 "IssueLifecycle", issue, id=wf_id, task_queue=TASK_QUEUE,
-                id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+                # ALLOW_DUPLICATE so a fresh backfill re-runs issues whose prior
+                # (e.g. dry-run) workflow already closed. Terminate any still-
+                # running ones first; a RUNNING id still rejects the start.
+                id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
                 # A backfill starts dozens of workflows at once against a single
                 # worker whose activities are slow LLM calls. The default 10s
                 # workflow-task timeout is then too tight — tasks time out before

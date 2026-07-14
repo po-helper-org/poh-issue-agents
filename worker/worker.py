@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from temporalio.client import Client
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
@@ -42,16 +43,21 @@ async def main() -> None:
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
         workflow_runner=UnsandboxedWorkflowRunner(),
-        # The activities use a BLOCKING sync LLM client that also does CPU-heavy
-        # JSON/pydantic parsing. Under a backfill burst that starves the single
-        # workflow event-loop thread of the GIL for >2s, tripping the deadlock
-        # detector (TMPRL1101) with false positives — our workflows never truly
-        # deadlock. debug_mode disables that detector; safe for trusted,
-        # deterministic first-party workflows.
+        # The activities are now SYNC defs doing BLOCKING LLM/HTTP + CPU-heavy
+        # pydantic parsing. Running them in a ThreadPoolExecutor keeps the
+        # blocking work OFF the workflow event-loop thread, so under a backfill
+        # burst the loop stays free to process workflow tasks (no task-timeout
+        # churn) and up to `max_workers` activities run truly concurrently.
+        activity_executor=ThreadPoolExecutor(max_workers=3),
+        # debug_mode still disables the deadlock detector (TMPRL1101); with the
+        # blocking work offloaded it should rarely trigger, but it is safe for
+        # trusted, deterministic first-party workflows.
         debug_mode=True,
-        # LLM calls are I/O-bound (release the GIL while awaiting the network),
-        # so a modest fan-out speeds the backfill without real contention.
-        max_concurrent_activities=8,
+        # Capped at 3: the z.ai backend rate-limits (HTTP 429) under an 8-wide
+        # fan-out, and Instructor's own retries multiply the request rate. 3
+        # concurrent activities keeps the backfill under the limit while still
+        # draining meaningfully faster than serial.
+        max_concurrent_activities=3,
     )
     print("Worker started, listening on task queue 'issue-lifecycle'")
     await worker.run()

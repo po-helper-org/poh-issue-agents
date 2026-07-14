@@ -72,7 +72,7 @@ class PriorityExtraction(BaseModel):
 # --- Zero-cost предфильтры ---
 
 @activity.defn
-async def prefilter_bot_and_security(issue: IssueInput) -> str | None:
+def prefilter_bot_and_security(issue: IssueInput) -> str | None:
     """Возвращает причину пропуска, если стоит остановиться, иначе None."""
     if issue.author_type == "Bot":
         github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
@@ -83,10 +83,15 @@ async def prefilter_bot_and_security(issue: IssueInput) -> str | None:
         github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
         return "bot"
 
-    SECURITY_TERMS = ("vulnerability", "cve-", "exploit", "sql injection", "rce",
-                       "уязвимост", "эксплойт", "утечка данных")
+    # Latin terms must match whole words: the substring "rce" otherwise fires on
+    # "source"/"resource"/"ресурс" and false-flags most feature issues as
+    # security-sensitive. Cyrillic stems stay as substrings (morphology).
+    SECURITY_PATTERNS = (r"\bvulnerabilit\w*", r"\bcve-\d", r"\bexploit\w*",
+                          r"\bsql injection\b", r"\brce\b", r"\bremote code execution\b")
+    SECURITY_SUBSTRINGS = ("уязвимост", "эксплойт", "утечка данных")
     text = f"{issue.title} {issue.body}".lower()
-    if any(term in text for term in SECURITY_TERMS):
+    if any(re.search(p, text) for p in SECURITY_PATTERNS) or \
+       any(term in text for term in SECURITY_SUBSTRINGS):
         github_client.post_comment(
             issue.repo, issue.issue_number,
             "🔒 Похоже, это может касаться уязвимости безопасности. "
@@ -102,7 +107,7 @@ async def prefilter_bot_and_security(issue: IssueInput) -> str | None:
 # --- Intake Gate ---
 
 @activity.defn
-async def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResult:
+def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResult:
     thread_text = "\n\n".join(f"Пользователь: {c}" for c in comment_thread)
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\n{thread_text}"
     result = llm.extract(
@@ -112,20 +117,20 @@ async def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResul
 
 
 @activity.defn
-async def post_clarifying_question(issue: IssueInput, questions: str) -> None:
+def post_clarifying_question(issue: IssueInput, questions: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, questions)
     github_client.add_label(issue.repo, issue.issue_number, "needs-clarification")
 
 
 @activity.defn
-async def close_as_spam(issue: IssueInput, reason: str) -> None:
+def close_as_spam(issue: IssueInput, reason: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, f"🚫 Похоже на спам: {reason}")
     github_client.add_label(issue.repo, issue.issue_number, "spam")
     github_client.close_issue(issue.repo, issue.issue_number)
 
 
 @activity.defn
-async def escalate_to_human(issue: IssueInput) -> None:
+def escalate_to_human(issue: IssueInput) -> None:
     github_client.post_comment(
         issue.repo, issue.issue_number,
         "Не удалось сузить запрос за отведённое число уточнений. Передаю на ручной разбор.",
@@ -134,7 +139,7 @@ async def escalate_to_human(issue: IssueInput) -> None:
 
 
 @activity.defn
-async def post_error_label(issue: IssueInput) -> None:
+def post_error_label(issue: IssueInput) -> None:
     github_client.post_comment(
         issue.repo, issue.issue_number,
         "⚠️ Автоматическая обработка не удалась. Ожидай ручного разбора.",
@@ -145,7 +150,7 @@ async def post_error_label(issue: IssueInput) -> None:
 # --- Классификация ---
 
 @activity.defn
-async def classify_issue(issue: IssueInput) -> ClassificationResult:
+def classify_issue(issue: IssueInput) -> ClassificationResult:
     capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
         if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nИзвестный функционал:\n{capabilities}"
@@ -172,7 +177,7 @@ async def classify_issue(issue: IssueInput) -> ClassificationResult:
 # --- Duplicate Check ---
 
 @activity.defn
-async def duplicate_check(issue: IssueInput) -> DuplicateResult:
+def duplicate_check(issue: IssueInput) -> DuplicateResult:
     candidates = github_client.search_candidates(issue.repo, issue.title)
     candidates = [c for c in candidates if c["number"] != issue.issue_number]
     if not candidates:
@@ -204,10 +209,11 @@ async def duplicate_check(issue: IssueInput) -> DuplicateResult:
         reuse_note = f"\n\nВ ветке `{branch}` уже есть наработки." if branch else ""
         github_client.post_comment(
             issue.repo, issue.issue_number,
-            f"🔁 Дубликат #{best.number} (вероятность {best.probability:.0%}): {best.reason}{reuse_note}",
+            f"🔁 Вероятный дубликат #{best.number} ({best.probability:.0%}): {best.reason}{reuse_note}"
+            f"\n\n⚠️ Не закрыт автоматически — нужно решение человека "
+            f"(функциональный дубль ≠ целевой, см. #111).",
         )
         github_client.add_label(issue.repo, issue.issue_number, "duplicate")
-        github_client.close_issue(issue.repo, issue.issue_number)
         return DuplicateResult(decision="duplicate", best_match_number=best.number,
                                 probability=best.probability, reason=best.reason, context_branch=branch)
 
@@ -222,7 +228,7 @@ async def duplicate_check(issue: IssueInput) -> DuplicateResult:
 # --- Priority Scoring ---
 
 @activity.defn
-async def score_priority(issue: IssueInput, classification: ClassificationResult, dup: DuplicateResult) -> PriorityResult:
+def score_priority(issue: IssueInput, classification: ClassificationResult, dup: DuplicateResult) -> PriorityResult:
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nТип: {classification.label}"
     extracted = llm.extract(
         _load_prompt("system_priority_extract.md"), user_message, PriorityExtraction, model=llm.MODEL_GATE,
@@ -263,7 +269,7 @@ async def score_priority(issue: IssueInput, classification: ClassificationResult
 
 
 @activity.defn
-async def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: DuplicateResult) -> None:
+def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: DuplicateResult) -> None:
     body = priority.breakdown_markdown
     if dup.decision == "possible":
         body += (
@@ -277,7 +283,7 @@ async def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup
 # --- Тяжёлые стадии: TODO, те же незакрытые вопросы, что были на Actions ---
 
 @activity.defn
-async def run_research_pipeline(issue: IssueInput) -> None:
+def run_research_pipeline(issue: IssueInput) -> None:
     """TODO: перенести сюда содержимое research-pipeline.yml как
     последовательность subprocess-вызовов (claude -p с ANTHROPIC_BASE_URL=
     z.ai для po-helper/Repowise/SA-helper, deb8flow как CLI). Незакрытые
@@ -288,13 +294,13 @@ async def run_research_pipeline(issue: IssueInput) -> None:
 
 
 @activity.defn
-async def run_bug_pipeline(issue: IssueInput) -> None:
+def run_bug_pipeline(issue: IssueInput) -> None:
     """TODO: перенести содержимое bug-pipeline.yml аналогично."""
     raise NotImplementedError("bug-pipeline: перенести шаги из старого bug-pipeline.yml")
 
 
 @activity.defn
-async def trigger_openhands_resolver(issue: IssueInput) -> None:
+def trigger_openhands_resolver(issue: IssueInput) -> None:
     """TODO: вызов OpenHands resolver — остаётся отдельным сервисом со
     своим sandboxing (docker.sock), не частью этого docker-compose."""
     raise NotImplementedError("OpenHands resolver — интеграция ещё не спроектирована")
