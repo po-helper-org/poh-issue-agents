@@ -24,14 +24,14 @@ class ConsolidationWorkflow:
                 start_to_close_timeout=timedelta(seconds=240), retry_policy=retry)
             for r in refs])
 
-        # The reduce call clusters ALL profiles in one shot; over a ~50-issue
-        # backlog that is a large structured-output generation, and under the
-        # z.ai rate limit + Instructor retries it can run well past a few
-        # minutes. 900s per attempt (2 attempts) keeps it from a false
-        # StartToClose timeout (the 300s default failed a 50-issue run).
+        # cluster_profiles runs map-reduce INTERNALLY: it makes one LLM call per
+        # ~12-issue batch plus a merge call — ~7 sequential calls for a 60-issue
+        # backlog. Under the z.ai rate limit each call is slow, so the whole
+        # activity needs a generous budget: 900s was not enough (a 61-profile run
+        # timed out). 1800s per attempt covers ~7 calls with margin.
         clusterset = await workflow.execute_activity(
             ca.cluster_profiles, profiles,
-            start_to_close_timeout=timedelta(seconds=900),
+            start_to_close_timeout=timedelta(seconds=1800),
             retry_policy=RetryPolicy(maximum_attempts=2))
 
         drafts = await asyncio.gather(*[
