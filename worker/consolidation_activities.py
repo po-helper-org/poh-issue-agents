@@ -8,7 +8,8 @@ import github_client
 import llm
 from shared.workflow_types import (
     Cluster, ClusterMember, ClusterSet, ConsolidationInput,
-    IssueInput, SolutionProfile, UnifyingIssueDraft,
+    DeliveryZone, Increment, IssueInput, SolutionProfile, Taxonomy, UnifyingIssueDraft,
+    ZoneAssignment,
 )
 
 PROMPTS_DIR = Path("/app/prompts")
@@ -207,3 +208,28 @@ def write_consolidation_pr(clusterset: ClusterSet,
            f"{len(drafts)} объединяющих Issue. Предлагает, не мутирует Issue."
     return github_client.create_pr_with_files(
         repo, branch, "main", files, "Консолидация бэклога", body)
+
+
+class ZoneOut(BaseModel):
+    name: str
+    boundary: str
+    surface: str
+
+
+class TaxonomyExtraction(BaseModel):
+    zones: list[ZoneOut]
+
+
+@activity.defn
+def derive_taxonomy(profiles: list[SolutionProfile], prior: Taxonomy | None) -> Taxonomy:
+    listing = "\n".join(
+        f"#{p.issue_number} mechanism={p.proposed_mechanism!r} target={p.target!r} domain={p.domain}"
+        for p in profiles if p.problem_essence != "[EXTRACTION_FAILED]")
+    if prior and prior.zones:
+        listing = ("ПРОШЛЫЕ ЗОНЫ:\n" +
+                   "\n".join(f"- {z.name}: {z.boundary}" for z in prior.zones) +
+                   "\n\nISSUE:\n" + listing)
+    ext = llm.extract(_load_prompt("system_derive_taxonomy.md"), listing,
+                      TaxonomyExtraction, model=llm.MODEL_CLASSIFY)
+    return Taxonomy(zones=[DeliveryZone(name=z.name, boundary=z.boundary, surface=z.surface)
+                           for z in ext.zones])
