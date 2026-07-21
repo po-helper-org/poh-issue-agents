@@ -43,7 +43,6 @@ async def main() -> None:
             activities.trigger_openhands_resolver,
             ca.fetch_open_issues,
             ca.extract_solution_profile,
-            ca.cluster_profiles,
             ca.derive_taxonomy,
             ca.assign_zone,
             ca.slice_zone,
