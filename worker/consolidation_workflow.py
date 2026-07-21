@@ -19,28 +19,40 @@ class ConsolidationWorkflow:
             start_to_close_timeout=timedelta(seconds=120), retry_policy=retry)
 
         profiles = await asyncio.gather(*[
-            workflow.execute_activity(
-                ca.extract_solution_profile, r,
-                start_to_close_timeout=timedelta(seconds=240), retry_policy=retry)
-            for r in refs])
+            workflow.execute_activity(ca.extract_solution_profile, r,
+                                      start_to_close_timeout=timedelta(seconds=240),
+                                      retry_policy=retry) for r in refs])
 
-        # cluster_profiles runs map-reduce INTERNALLY: it makes one LLM call per
-        # ~12-issue batch plus a merge call — ~7 sequential calls for a 60-issue
-        # backlog. Under the z.ai rate limit each call is slow, so the whole
-        # activity needs a generous budget: 900s was not enough (a 61-profile run
-        # timed out). 1800s per attempt covers ~7 calls with margin.
-        clusterset = await workflow.execute_activity(
-            ca.cluster_profiles, profiles,
-            start_to_close_timeout=timedelta(seconds=1800),
-            retry_policy=RetryPolicy(maximum_attempts=2))
+        taxonomy = await workflow.execute_activity(
+            ca.derive_taxonomy, args=[profiles, None],
+            start_to_close_timeout=timedelta(seconds=300), retry_policy=retry)
 
-        drafts = await asyncio.gather(*[
-            workflow.execute_activity(
-                ca.synthesize_unifying_issue, args=[c, profiles],
+        assignments = await asyncio.gather(*[
+            workflow.execute_activity(ca.assign_zone, args=[p, taxonomy],
+                                      start_to_close_timeout=timedelta(seconds=180),
+                                      retry_policy=retry) for p in profiles])
+
+        by_zone: dict[str, list[int]] = {}
+        for a in assignments:
+            by_zone.setdefault(a.primary_zone, []).append(a.issue_number)
+
+        increments = []
+        for zone in taxonomy.zones:
+            members = by_zone.get(zone.name, [])
+            if not members:
+                continue
+            zi = await workflow.execute_activity(
+                ca.slice_zone, args=[zone, members, profiles],
                 start_to_close_timeout=timedelta(seconds=360),
                 retry_policy=RetryPolicy(maximum_attempts=2))
-            for c in clusterset.clusters])
+            increments.extend(zi)
+
+        drafts = await asyncio.gather(*[
+            workflow.execute_activity(ca.synthesize_unifying_issue, args=[inc, profiles],
+                                      start_to_close_timeout=timedelta(seconds=360),
+                                      retry_policy=RetryPolicy(maximum_attempts=2))
+            for inc in increments])
 
         return await workflow.execute_activity(
-            ca.write_consolidation_pr, args=[clusterset, drafts, cfg.repo],
+            ca.write_consolidation_pr, args=[taxonomy, increments, drafts, cfg.repo],
             start_to_close_timeout=timedelta(seconds=120), retry_policy=retry)
