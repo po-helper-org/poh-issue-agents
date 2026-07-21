@@ -233,3 +233,23 @@ def derive_taxonomy(profiles: list[SolutionProfile], prior: Taxonomy | None) -> 
                       TaxonomyExtraction, model=llm.MODEL_CLASSIFY)
     return Taxonomy(zones=[DeliveryZone(name=z.name, boundary=z.boundary, surface=z.surface)
                            for z in ext.zones])
+
+
+class AssignExtraction(BaseModel):
+    primary_zone: str
+    secondary_zones: list[str] = Field(default_factory=list)
+
+
+@activity.defn
+def assign_zone(profile: SolutionProfile, taxonomy: Taxonomy) -> ZoneAssignment:
+    names = {z.name for z in taxonomy.zones}
+    zones_block = "ЗОНЫ:\n" + "\n".join(f"- {z.name}: {z.boundary}" for z in taxonomy.zones)
+    user = (f"{zones_block}\n\nISSUE #{profile.issue_number}: {profile.title}\n"
+            f"mechanism={profile.proposed_mechanism!r} target={profile.target!r} "
+            f"domain={profile.domain}")
+    r = llm.extract(_load_prompt("system_assign_zone.md"), user, AssignExtraction,
+                    model=llm.MODEL_CLASSIFY)
+    primary = r.primary_zone if r.primary_zone in names else "other"
+    secondary = [s for s in r.secondary_zones if s in names]
+    return ZoneAssignment(issue_number=profile.issue_number,
+                          primary_zone=primary, secondary_zones=secondary)
