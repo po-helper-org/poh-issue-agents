@@ -19,7 +19,7 @@ def test_slice_big_zone(monkeypatch):
         IncrementOut(name="MVP+1", rationale="надстройка", issue_numbers=[4, 5, 6, 7])]))
     members = list(range(1, 8))
     incs = ca.slice_zone(ZONE, members, [_p(n) for n in members])
-    assert [i.name for i in incs] == ["MVP", "MVP+1"]
+    assert [i.name for i in incs] == ["jira-engine:MVP", "jira-engine:MVP+1"]
     assert sorted(n for i in incs for n in i.issue_numbers) == members
 
 

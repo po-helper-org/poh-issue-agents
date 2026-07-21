@@ -279,5 +279,5 @@ def slice_zone(zone: DeliveryZone, members: list[int],
     r = llm.extract(_load_prompt("system_slice_zone.md"),
                     f"Зона {zone.name} ({zone.boundary}):\n{listing}",
                     SliceExtraction, model=llm.MODEL_CLASSIFY)
-    return [Increment(name=i.name, rationale=i.rationale,
+    return [Increment(name=f"{zone.name}:{i.name}", rationale=i.rationale,
                       issue_numbers=sorted(i.issue_numbers)) for i in r.increments]
