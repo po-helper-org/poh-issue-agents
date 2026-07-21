@@ -87,3 +87,29 @@ class ConsolidationInput:
     exclude_labels: list[str] = field(
         default_factory=lambda: ["advisor:consultation", "advisor:existing-functionality"])
     limit: int = 300
+
+
+@dataclass
+class DeliveryZone:
+    name: str
+    boundary: str
+    surface: str
+
+
+@dataclass
+class Taxonomy:
+    zones: list[DeliveryZone]
+
+
+@dataclass
+class ZoneAssignment:
+    issue_number: int
+    primary_zone: str
+    secondary_zones: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Increment:
+    name: str
+    rationale: str
+    issue_numbers: list[int]
