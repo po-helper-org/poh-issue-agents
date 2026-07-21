@@ -253,3 +253,31 @@ def assign_zone(profile: SolutionProfile, taxonomy: Taxonomy) -> ZoneAssignment:
     secondary = [s for s in r.secondary_zones if s in names]
     return ZoneAssignment(issue_number=profile.issue_number,
                           primary_zone=primary, secondary_zones=secondary)
+
+
+SLICE_MIN = 6
+
+
+class IncrementOut(BaseModel):
+    name: str
+    rationale: str
+    issue_numbers: list[int]
+
+
+class SliceExtraction(BaseModel):
+    increments: list[IncrementOut]
+
+
+@activity.defn
+def slice_zone(zone: DeliveryZone, members: list[int],
+               profiles: list[SolutionProfile]) -> list[Increment]:
+    if len(members) <= SLICE_MIN:
+        return [Increment(name=zone.name, rationale="зона в пределах одной итерации",
+                          issue_numbers=sorted(members))]
+    by_num = {p.issue_number: p for p in profiles}
+    listing = "\n".join(f"#{n} {by_num[n].title}" for n in members if n in by_num)
+    r = llm.extract(_load_prompt("system_slice_zone.md"),
+                    f"Зона {zone.name} ({zone.boundary}):\n{listing}",
+                    SliceExtraction, model=llm.MODEL_CLASSIFY)
+    return [Increment(name=i.name, rationale=i.rationale,
+                      issue_numbers=sorted(i.issue_numbers)) for i in r.increments]
