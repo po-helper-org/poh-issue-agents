@@ -6,7 +6,7 @@ from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
     import consolidation_activities as ca
-    from shared.workflow_types import ConsolidationInput
+    from shared.workflow_types import ConsolidationInput, Increment
 
 
 @workflow.defn
@@ -46,6 +46,12 @@ class ConsolidationWorkflow:
                 start_to_close_timeout=timedelta(seconds=360),
                 retry_policy=RetryPolicy(maximum_attempts=2))
             increments.extend(zi)
+
+        other = by_zone.get("other", [])
+        if other:
+            increments.append(Increment(name="other:unassigned",
+                                        rationale="вне выведенных зон — требует ручного разбора",
+                                        issue_numbers=sorted(other)))
 
         drafts = await asyncio.gather(*[
             workflow.execute_activity(ca.synthesize_unifying_issue, args=[inc, profiles],
