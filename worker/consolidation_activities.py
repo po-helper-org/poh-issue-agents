@@ -29,7 +29,8 @@ class ProfileExtraction(BaseModel):
 
 @activity.defn
 def extract_solution_profile(issue: IssueInput) -> SolutionProfile:
-    user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}"
+    body = issue.body or github_client.get_issue_body(issue.repo, issue.issue_number)
+    user_message = f"Заголовок: {issue.title}\n\nОписание:\n{body}"
     r = llm.extract(_load_prompt("system_solution_profile.md"), user_message,
                     ProfileExtraction, model=llm.MODEL_CLASSIFY)
     return SolutionProfile(
@@ -178,7 +179,7 @@ def fetch_open_issues(cfg: ConsolidationInput) -> list[IssueInput]:
         if any(lbl in cfg.exclude_labels for lbl in it.get("labels", [])):
             continue
         refs.append(IssueInput(repo=cfg.repo, issue_number=it["number"],
-                               title=it["title"], body=it.get("body") or "",
+                               title=it["title"], body="",
                                author_login="", author_type="User"))
     return refs
 

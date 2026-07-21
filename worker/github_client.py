@@ -148,3 +148,10 @@ def list_open_issues(repo: str, limit: int = 300) -> list:
         it["labels"] = [l["name"] for l in it.get("labels", [])]
         out.append(it)
     return out
+
+
+def get_issue_body(repo: str, issue_number: int) -> str:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    resp = requests.get(url, headers=_auth_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("body") or ""
