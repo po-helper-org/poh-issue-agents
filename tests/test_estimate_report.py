@@ -53,6 +53,22 @@ def test_both_methods_are_shown_with_divergence(rules):
     assert "Расхождение" in text
 
 
+def test_pipe_in_unit_text_does_not_break_the_table(rules):
+    """Имена и обоснования модель берёт из текста Issue, где встречаются `|`
+    и переводы строк. Без экранирования таблица в комментарии разъезжается.
+    Поймано pr_agent на живом PR."""
+    units = [WorkUnit(name="колонка `status | error`", hours=4.0,
+                      rationale="две ветки:\nok и fail")]
+    given = facts(work_units=units, fp_count=2.0, fp_hours_per_point=4.0)
+    text = render(compute(given, rules), given, context())
+    row = next(line for line in text.splitlines() if "status" in line)
+    # Литеральный разделитель экранирован; перевод строки убран.
+    assert "\\|" in row
+    assert row.count("\n") == 0
+    # Ровно четыре неэкранированных разделителя — три колонки, таблица цела.
+    assert row.replace("\\|", "").count("|") == 4
+
+
 def test_every_work_unit_appears_with_its_rationale(rules):
     units = [
         WorkUnit(name="эндпоинт", hours=4.0, rationale="один маршрут"),

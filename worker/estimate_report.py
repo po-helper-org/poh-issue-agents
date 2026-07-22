@@ -37,6 +37,14 @@ def _number(value: float) -> str:
     return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
+def _cell(text: str) -> str:
+    """Текст, безопасный для ячейки markdown-таблицы. Имена единиц работы и
+    обоснования модель извлекает из текста Issue, а там встречаются и `|`
+    (схемы, CLI-флаги, pipe-форматы), и переводы строк — без экранирования
+    любой из них разваливает таблицу в комментарии."""
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").strip()
+
+
 def _days(value: float) -> str:
     return f"{_number(value)} дн"
 
@@ -148,7 +156,7 @@ def render(estimate: Estimate, facts: EstimationFacts,
     # Только положительные единицы — те же, что ушли в расчёт. Нулевые/
     # отрицательные, которые модель иногда возвращает, в таблице не показываем.
     for unit in positive_units(facts):
-        lines.append(f"| {unit.name} | {_number(unit.hours)} | {unit.rationale} |")
+        lines.append(f"| {_cell(unit.name)} | {_number(unit.hours)} | {_cell(unit.rationale)} |")
     lines.extend([
         f"| Интеграция | {_number(max(0.0, facts.integration_hours))} | сборка воедино |",
         f"| Тесты | {_number(estimate.tests_hours)} | доля от объёма работ |",
