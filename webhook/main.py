@@ -5,6 +5,9 @@ Webhook receiver: единственная точка входа для GitHub. 
 - issue_comment.created    -> сигнал уже идущему workflow (текст комментария —
                                используется циклом уточнений, если issue
                                в состоянии ожидания ответа)
+- issue_comment с /estimate -> старт отдельного workflow IssueEstimation
+                               (ID включает id комментария: повторная доставка
+                               вебхука не запускает вторую оценку)
 - issues.labeled           -> сигнал, если лейбл — одна из точек решения
                                человека (research-me / bug-me / build-me)
 
@@ -17,6 +20,9 @@ import os
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from temporalio.client import Client
+from temporalio.exceptions import WorkflowAlreadyStartedError
+
+from shared.commands import ESTIMATE, parse_command
 
 app = FastAPI()
 
@@ -43,6 +49,13 @@ def verify_signature(body: bytes, signature_header: str | None) -> None:
 
 def workflow_id_for(repo_full_name: str, issue_number: int) -> str:
     return f"issue-{repo_full_name}-{issue_number}"
+
+
+def estimate_workflow_id_for(repo_full_name: str, issue_number: int, comment_id: int) -> str:
+    """comment_id в ID даёт две вещи сразу: повторная доставка одного и того
+    же вебхука не запускает вторую оценку, а новая команда — это честно
+    новый прогон, а не сигнал в старый."""
+    return f"estimate-{repo_full_name}-{issue_number}-{comment_id}"
 
 
 @app.post("/webhook")
@@ -97,6 +110,27 @@ async def github_webhook(
 
         repo = payload["repository"]["full_name"]
         issue_number = payload["issue"]["number"]
+
+        if parse_command(payload["comment"].get("body") or "") == ESTIMATE:
+            from shared.workflow_types import EstimateRequest
+
+            comment_id = payload["comment"]["id"]
+            try:
+                await client.start_workflow(
+                    "IssueEstimation",
+                    EstimateRequest(
+                        repo=repo, issue_number=issue_number, comment_id=comment_id
+                    ),
+                    id=estimate_workflow_id_for(repo, issue_number, comment_id),
+                    task_queue="issue-lifecycle",
+                )
+            except WorkflowAlreadyStartedError:
+                # Тот же вебхук доставлен повторно — оценка уже идёт.
+                pass
+            # Команда — не ответ на уточняющий вопрос intake gate, поэтому
+            # сигнал user_comment по ней не шлётся.
+            return {"ok": True}
+
         wf_id = workflow_id_for(repo, issue_number)
         handle = client.get_workflow_handle(wf_id)
         try:
