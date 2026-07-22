@@ -1,0 +1,197 @@
+import pytest
+
+from estimation import (
+    EstimationError,
+    EstimationFacts,
+    WorkUnit,
+    compute,
+)
+
+
+def facts(**overrides) -> EstimationFacts:
+    """Базовые факты: новая разработка, всё описано, рисков нет.
+
+    Каркас 4 + единицы 6 + интеграция 2 = 12 ч; тесты 30% -> 15.6 ч;
+    коэффициент 1.0 -> декомпозиция 15.6 ч.
+    FP: 3 FP x 5 ч = 15 ч. Расхождение 4% — cross-check проходит.
+    """
+    base = dict(
+        work_type="new_development",
+        artifact_type="new_module",
+        scaffolding_hours=4.0,
+        work_units=[
+            WorkUnit(name="эндпоинт", hours=4.0, rationale="один маршрут"),
+            WorkUnit(name="валидация", hours=2.0, rationale="два правила"),
+        ],
+        integration_hours=2.0,
+        fp_count=3.0,
+        fp_hours_per_point=5.0,
+        data_sufficiency="complete",
+        has_acceptance_criteria=True,
+        has_dependencies_listed=True,
+        has_api_contract=True,
+        has_data_class=True,
+        risks=[],
+        open_questions=[],
+        reasoning="",
+    )
+    base.update(overrides)
+    return EstimationFacts(**base)
+
+
+def test_decomposition_is_base_plus_tests_times_coefficient(rules):
+    result = compute(facts(), rules)
+    assert result.base_hours == pytest.approx(12.0)
+    assert result.tests_hours == pytest.approx(3.6)
+    assert result.decomposition_hours == pytest.approx(15.6)
+
+
+def test_work_type_coefficient_discounts_copy_work(rules):
+    result = compute(facts(work_type="copy_existing", artifact_type="subtask"), rules)
+    assert result.work_type_coefficient == pytest.approx(0.35)
+    assert result.decomposition_hours == pytest.approx(15.6 * 0.35)
+    # Тот же коэффициент применяется и к cross-check, иначе методы
+    # разошлись бы искусственно.
+    assert result.fp_hours == pytest.approx(15.0 * 0.35)
+
+
+def test_pert_arithmetic_without_risks(rules):
+    result = compute(facts(), rules)
+    day = rules["day"]["hours"]
+    assert result.optimistic_days == pytest.approx(15.6 * 0.7 / day)
+    assert result.realistic_days == pytest.approx(15.6 / day)
+    assert result.pessimistic_days == pytest.approx(15.6 * 1.5 / day)
+    expected = (15.6 * 0.7 + 4 * 15.6 + 15.6 * 1.5) / 6
+    assert result.expected_days == pytest.approx(expected / day)
+
+
+def test_buffer_is_expectation_plus_k_standard_deviations(rules):
+    result = compute(facts(), rules)
+    sd = (result.pessimistic_days - result.optimistic_days) / 6
+    assert result.buffered_days == pytest.approx(result.expected_days + 2 * sd)
+
+
+def test_invariant_optimistic_below_realistic_below_pessimistic(rules):
+    result = compute(facts(), rules)
+    assert result.optimistic_days < result.realistic_days < result.pessimistic_days
+
+
+def test_risk_minimum_moves_realistic_maximum_moves_pessimistic(rules):
+    result = compute(facts(risks=["personal_data"]), rules)
+    assert result.realistic_days == pytest.approx(15.6 * 1.3 / rules["day"]["hours"])
+    assert result.pessimistic_days == pytest.approx(15.6 * 1.5 * 1.8 / rules["day"]["hours"])
+    assert [risk.key for risk in result.risks] == ["personal_data"]
+
+
+def test_unknown_risk_from_the_model_is_ignored(rules):
+    result = compute(facts(risks=["решил_что_рискованно"]), rules)
+    assert result.risks == []
+    assert result.pessimistic_days == pytest.approx(15.6 * 1.5 / rules["day"]["hours"])
+
+
+def test_missing_acceptance_criteria_only_inflates_pessimistic(rules):
+    result = compute(facts(has_acceptance_criteria=False), rules)
+    assert result.realistic_days == pytest.approx(15.6 / rules["day"]["hours"])
+    assert result.pessimistic_days == pytest.approx(15.6 * 1.5 * 1.2 / rules["day"]["hours"])
+    assert [penalty.key for penalty in result.penalties] == ["no_acceptance_criteria"]
+
+
+def test_all_four_penalties_accumulate(rules):
+    result = compute(
+        facts(
+            has_acceptance_criteria=False,
+            has_dependencies_listed=False,
+            has_api_contract=False,
+            has_data_class=False,
+        ),
+        rules,
+    )
+    assert len(result.penalties) == 4
+    total = 1 + 0.2 + 0.15 + 0.3 + 0.3
+    assert result.pessimistic_days == pytest.approx(
+        15.6 * 1.5 * total / rules["day"]["hours"]
+    )
+
+
+def test_cross_check_stops_when_methods_diverge_beyond_threshold(rules):
+    # 15.6 ч декомпозиции против 60 ч по FP — расхождение почти 3x.
+    result = compute(facts(fp_count=12.0, fp_hours_per_point=5.0), rules)
+    assert result.stopped is True
+    assert result.divergence > rules["cross_check"]["max_divergence"]
+    assert result.expected_days == 0.0
+    assert result.story_points == "—"
+
+
+def test_moderate_divergence_downgrades_confidence(rules):
+    # 15.6 ч против 25 ч — расхождение 60%: порог не превышен, но больше половины.
+    result = compute(facts(fp_count=5.0, fp_hours_per_point=5.0), rules)
+    assert result.stopped is False
+    assert result.confidence == "medium"
+
+
+def test_confidence_follows_data_sufficiency(rules):
+    assert compute(facts(data_sufficiency="complete"), rules).confidence == "high"
+    assert compute(facts(data_sufficiency="minimal"), rules).confidence == "medium"
+    assert compute(facts(data_sufficiency="insufficient"), rules).confidence == "low"
+
+
+def test_sanity_warning_when_above_corridor(rules):
+    big = [WorkUnit(name=f"модуль {i}", hours=20.0, rationale="крупный") for i in range(8)]
+    result = compute(
+        facts(work_units=big, fp_count=34.0, fp_hours_per_point=5.0),
+        rules,
+    )
+    assert result.sanity_warnings
+    assert "декомпозиция" in result.sanity_warnings[0]
+
+
+def test_no_sanity_warning_inside_corridor(rules):
+    assert compute(facts(), rules).sanity_warnings == []
+
+
+def test_story_points_snap_to_fibonacci(rules):
+    result = compute(facts(), rules)
+    # E = (10.92 + 4x15.6 + 23.4)/6 = 16.12 ч -> 4.03 SP -> ближайшее по шкале 5
+    assert result.story_points == "5"
+
+
+def test_story_points_above_scale_get_plus(rules):
+    huge = [WorkUnit(name=f"часть {i}", hours=40.0, rationale="крупная") for i in range(6)]
+    result = compute(
+        facts(work_units=huge, fp_count=50.0, fp_hours_per_point=5.5),
+        rules,
+    )
+    assert result.story_points == "20+"
+
+
+def test_grade_days_scale_the_realistic_scenario(rules):
+    result = compute(facts(), rules)
+    assert result.grade_days["middle"] == pytest.approx(result.realistic_days)
+    assert result.grade_days["senior"] == pytest.approx(result.realistic_days * 0.75)
+    assert result.grade_days["senior_ai"] == pytest.approx(result.realistic_days * 0.55)
+
+
+def test_empty_decomposition_is_an_error(rules):
+    with pytest.raises(EstimationError, match="декомпозиция пуста"):
+        compute(facts(work_units=[]), rules)
+
+
+def test_non_positive_unit_hours_are_an_error(rules):
+    bad = [WorkUnit(name="ничего", hours=0.0, rationale="")]
+    with pytest.raises(EstimationError, match="неположительными часами"):
+        compute(facts(work_units=bad), rules)
+
+
+def test_missing_function_points_are_an_error(rules):
+    with pytest.raises(EstimationError, match="Function Points"):
+        compute(facts(fp_count=0.0), rules)
+
+
+def test_unknown_work_type_is_an_error(rules):
+    with pytest.raises(EstimationError, match="тип работы"):
+        compute(facts(work_type="магия"), rules)
+
+
+def test_unknown_artifact_type_is_an_error(rules):
+    with pytest.raises(EstimationError, match="тип артефакта"):
+        compute(facts(artifact_type="нечто"), rules)
