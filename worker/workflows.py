@@ -187,16 +187,32 @@ class IssueLifecycle:
 
         if decision == "research-me" and classification.label == "advisor:feature-request":
             # Лейбл research-me — второй вход в ту же аналитику Слоя C, что и
-            # команда /analyze. Триггер не комментарий, поэтому comment_id=None
-            # (ack_command тогда пропускает реакцию, но комментарий всё равно шлёт).
-            await workflow.execute_activity(
-                activities.run_analysis_pipeline,
-                AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
-                             title=issue.title, body=issue.body),
-                start_to_close_timeout=timedelta(seconds=4500),
-                heartbeat_timeout=timedelta(seconds=300),
-                retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой прогон вслепую
-            )
+            # команда /analyze, но БЕЗ ack_command: триггер тут лейбл, а не
+            # комментарий, так что подтверждать нечего. Сам прогон и обработка
+            # сбоя — как в IssueAnalysis.run: пайплайн дорогой и недетерминиро-
+            # ванный, вслепую не ретраим, а падение обязано быть видно в
+            # GitHub через publish_analysis_error, а не просто уронить этот
+            # workflow молча.
+            analyze_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
+                                          title=issue.title, body=issue.body)
+            try:
+                await workflow.execute_activity(
+                    activities.run_analysis_pipeline,
+                    analyze_input,
+                    start_to_close_timeout=timedelta(seconds=4500),
+                    heartbeat_timeout=timedelta(seconds=300),
+                    retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой прогон вслепую
+                )
+            except Exception as exc:
+                # exc — ActivityError с общим текстом Temporal-core, настоящая
+                # причина лежит в exc.cause (см. тот же разбор в IssueAnalysis.run).
+                reason = str(getattr(exc, "cause", None) or exc)
+                await workflow.execute_activity(
+                    activities.publish_analysis_error,
+                    args=[analyze_input, reason[:500]],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
         elif decision == "bug-me" and classification.label == "advisor:bug":
             await workflow.execute_activity(
                 activities.run_bug_pipeline,

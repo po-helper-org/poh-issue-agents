@@ -286,6 +286,7 @@ ARTIFACT_FILES = ("task.md", "concept.md", "system_requirements.md", "validation
 CLAUDE_STAGE_TIMEOUT_SEC = 900
 REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
+HEARTBEAT_INTERVAL_SEC = 30.0
 
 
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
@@ -381,32 +382,56 @@ def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) ->
     )
 
 
+async def _run_with_heartbeat(fn, *args, label: str):
+    """Гоняет блокирующий fn в потоке и шлёт heartbeat каждые
+    HEARTBEAT_INTERVAL_SEC, пока он не завершится.
+
+    Heartbeat только между стадиями недостаточен: одна стадия claude -p идёт
+    до CLAUDE_STAGE_TIMEOUT_SEC (900с), а heartbeat_timeout воркфлоу — 300с;
+    без периодического сигнала внутри стадии сервер счёл бы activity мёртвой и
+    (при maximum_attempts=1) уронил бы весь прогон. to_thread освобождает event
+    loop, но сам по себе не бьёт — поэтому бьём здесь, пока поток занят.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SEC)
+        if task in done:
+            return task.result()  # переброс исключения из потока, если было
+        activity.heartbeat(label)
+
+
 @activity.defn
 async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
     """Полный прогон SA-helper одной activity.
 
     Одна activity, а не пять: клон, упаковка и стадии делят рабочий каталог на
     локальном диске одного процесса — разбиение по activity потребовало бы
-    общего тома. Heartbeat между стадиями держит таск живым (долгие стадии уже
-    приводили к ложным срабатываниям детектора дедлоков, worker/worker.py:44-51).
+    общего тома. Heartbeat идёт ВНУТРИ каждой долгой стадии через
+    _run_with_heartbeat, а не только между ними: одна стадия claude -p может
+    занять до CLAUDE_STAGE_TIMEOUT_SEC (900с) при heartbeat_timeout воркфлоу в
+    300с — без сигнала изнутри стадии сервер счёл бы activity мёртвой и (при
+    maximum_attempts=1) уронил бы весь прогон (та же причина, по которой
+    heartbeat вообще нужен — долгие стадии уже приводили к ложным срабатываниям
+    детектора дедлоков, worker/worker.py:44-51).
 
     Каждый блокирующий вызов (git/repomix/claude/REST) идёт через
-    asyncio.to_thread: воркер крутит один event loop с max_concurrent_activities,
-    и синхронный subprocess.run на 900с заблокировал бы поток целиком — другие
-    issue встали бы, а activity.heartbeat не смог бы уйти на сервер (ему нужен
-    тот же loop). Вынос в поток освобождает loop и делает heartbeat реальным.
+    asyncio.to_thread (напрямую или через _run_with_heartbeat): воркер крутит
+    один event loop с max_concurrent_activities, и синхронный subprocess.run
+    на 900с заблокировал бы поток целиком — другие issue встали бы, а
+    activity.heartbeat не смог бы уйти на сервер (ему нужен тот же loop).
+    Вынос в поток освобождает loop и делает heartbeat реальным.
     """
     workdir = tempfile.mkdtemp(prefix=f"analysis-{analyze.issue_number}-")
     clone_dir = str(Path(workdir) / "repo")
     try:
-        await asyncio.to_thread(_clone_repo, analyze.repo, clone_dir)
+        await _run_with_heartbeat(_clone_repo, analyze.repo, clone_dir, label="cloning")
         activity.heartbeat("cloned")
-        await asyncio.to_thread(_run_repomix, clone_dir)
+        await _run_with_heartbeat(_run_repomix, clone_dir, label="packing")
         activity.heartbeat("packed")
 
         description = f"{analyze.title}\n\n{analyze.body}"
         for name, prompt, expected in _fnr_stages(description):
-            await asyncio.to_thread(_run_claude, prompt, clone_dir)
+            await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=name)
             if expected and not (Path(clone_dir) / expected).exists():
                 raise RuntimeError(f"стадия {name}: артефакт {expected} не создан")
             activity.heartbeat(name)
@@ -451,12 +476,11 @@ async def trigger_openhands_resolver(issue: IssueInput) -> None:
 async def ack_command(analyze: AnalyzeInput) -> None:
     """Видимое подтверждение приёма команды ДО тяжёлой работы.
 
-    Реакция ставится на сам комментарий-триггер, комментарий объясняет
-    задержку: полный прогон FNR занимает минуты, без ack это выглядит как
-    молчание бота.
+    Комментарий — это и есть подтверждение, поэтому он идёт первым и ничем не
+    гейтится. Реакция на комментарий-триггер — чисто декоративная добавка;
+    если комментарий-триггер к этому моменту удалили (404) или сработал
+    rate limit, сбой реакции не должен утопить сам ack.
     """
-    if analyze.comment_id is not None:
-        github_client.add_reaction(analyze.repo, analyze.comment_id, "eyes")
     github_client.post_comment(
         analyze.repo,
         analyze.issue_number,
@@ -464,6 +488,11 @@ async def ack_command(analyze: AnalyzeInput) -> None:
         "Прогон занимает несколько минут: артефакты появятся в ветке "
         f"`research/issue-{analyze.issue_number}`, а сводка — следующим комментарием.",
     )
+    if analyze.comment_id is not None:
+        try:
+            github_client.add_reaction(analyze.repo, analyze.comment_id, "eyes")
+        except Exception:
+            pass  # best-effort: декорация не должна ронять ack или весь прогон
 
 
 @activity.defn

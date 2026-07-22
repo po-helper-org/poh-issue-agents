@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,28 @@ def test_heartbeats_at_least_once_per_stage(wired):
     asyncio.run(activities.run_analysis_pipeline(_analyze()))
     # clone + repomix + 5 стадий
     assert len(wired["beats"]) >= 7
+
+
+def test_heartbeat_fires_during_a_long_stage(monkeypatch, wired):
+    """Heartbeat обязан идти ВНУТРИ стадии, а не только между ними: одна
+    стадия claude -p может занять до CLAUDE_STAGE_TIMEOUT_SEC (900с) при
+    heartbeat_timeout воркфлоу в 300с — без периодического сигнала изнутри
+    сервер счёл бы activity мёртвой и (при maximum_attempts=1) уронил бы
+    весь прогон. Здесь клонирование намеренно длится дольше урезанного
+    HEARTBEAT_INTERVAL_SEC, и мы ловим лейбл "cloning" — его шлёт только
+    _run_with_heartbeat, пока поток занят (не путать с граничным "cloned"
+    после стадии)."""
+    monkeypatch.setattr(activities, "HEARTBEAT_INTERVAL_SEC", 0.01)
+
+    def slow_clone(repo, dest):
+        time.sleep(0.05)
+        Path(dest).mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(activities, "_clone_repo", slow_clone)
+
+    asyncio.run(activities.run_analysis_pipeline(_analyze()))
+
+    assert wired["beats"].count("cloning") >= 1
 
 
 def test_pushes_artifacts_to_research_branch(wired):
