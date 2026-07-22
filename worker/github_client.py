@@ -127,6 +127,9 @@ def add_reaction(repo: str, comment_id: int, content: str = "eyes") -> None:
 
 def ensure_branch(repo: str, branch: str) -> None:
     """Создаёт ветку от дефолтной, если её ещё нет."""
+    if _dry_run():
+        _log.info("[DRY_RUN] create branch %s in %s", branch, repo)
+        return
     if branch_exists(repo, branch):
         return
     meta = requests.get(f"https://api.github.com/repos/{repo}", headers=_auth_headers(), timeout=30)
@@ -155,6 +158,9 @@ def put_file(repo: str, branch: str, path: str, content: str, message: str) -> N
     Contents API, а не `git push`: клон делается shallow (--depth 1), а push из
     такого клона GitHub может отклонить. Здесь ремоут вообще не нужен.
     """
+    if _dry_run():
+        _log.info("[DRY_RUN] put file %s in %s:%s", path, repo, branch)
+        return
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     payload = {
         "message": message,

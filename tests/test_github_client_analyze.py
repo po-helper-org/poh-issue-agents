@@ -131,3 +131,27 @@ def test_put_file_includes_sha_when_file_already_exists(monkeypatch):
     gc.put_file("o/r", "research/issue-5", "docs/a.md", "new", "msg")
 
     assert captured["json"]["sha"] == "oldsha"
+
+
+def test_dry_run_ensure_branch_makes_no_http_call(monkeypatch):
+    # При DRY_RUN=1 ensure_branch должна просто залогировать и вернуться, не делая HTTP
+    gc = _fresh(monkeypatch, dry=True)
+
+    def boom(*a, **k):
+        raise AssertionError("HTTP called under DRY_RUN")
+
+    monkeypatch.setattr(gc.requests, "get", boom)
+    monkeypatch.setattr(gc.requests, "post", boom)
+    gc.ensure_branch("o/r", "research/issue-5")
+
+
+def test_dry_run_put_file_makes_no_http_call(monkeypatch):
+    # При DRY_RUN=1 put_file должна просто залогировать и вернуться, не делая HTTP
+    gc = _fresh(monkeypatch, dry=True)
+
+    def boom(*a, **k):
+        raise AssertionError("HTTP called under DRY_RUN")
+
+    monkeypatch.setattr(gc.requests, "get", boom)
+    monkeypatch.setattr(gc.requests, "put", boom)
+    gc.put_file("o/r", "research/issue-5", "docs/a.md", "content", "msg")
