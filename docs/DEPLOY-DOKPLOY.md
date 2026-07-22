@@ -43,12 +43,21 @@ GH_TOKEN=ghp_...
 GITHUB_WEBHOOK_SECRET=<openssl rand -hex 32>
 ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4
 ZAI_API_KEY=...
-ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
-ANTHROPIC_AUTH_TOKEN=...
 MODEL_GATE=glm-4.5-air
 MODEL_CLASSIFY=glm-4.6
 POSTGRES_PASSWORD=<openssl rand -hex 24>
 ```
+
+Один провайдер, одна модель GLM. `ZAI_*` — OpenAI-совместимый эндпоинт z.ai,
+через него идут все стадии, включая оценку. Второй пары `ANTHROPIC_*` из
+`.env.example` здесь нет намеренно: она нужна только пайплайнам research/bug
+(запускают CLI `claude -p`, который говорит по протоколу Anthropic), а те пока
+`NotImplementedError`. Для `/estimate` она не используется — не задавай.
+
+`POSTGRES_PASSWORD` — пароль к хранилищу Temporal, а не к какой-то нашей базе:
+приложение в Postgres не ходит. Там живёт история событий workflow, и именно
+она даёт durable execution — падение воркера продолжается с последнего
+завершённого шага, а issue месяцами ждёт сигнала как штатное состояние.
 
 `DRY_RUN=1` на первом развёртывании обязателен. В этом режиме комментарии,
 лейблы и реакции только пишутся в лог — сервис ничего не меняет в репозитории,
