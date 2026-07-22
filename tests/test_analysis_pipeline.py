@@ -1,4 +1,6 @@
 import asyncio
+import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,11 @@ from shared.workflow_types import AnalyzeInput
 
 def _analyze():
     return AnalyzeInput(repo="o/r", issue_number=5, title="Ревизия", body="текст", comment_id=1)
+
+
+# Заведомо отличимый токен: если он всплывёт хоть где-то в тексте исключения,
+# assert укажет ровно на него, а не на случайное совпадение подстроки.
+_SENTINEL_TOKEN = "ghs_SENTINELTOKENDONOTLEAK000000000000"
 
 
 @pytest.fixture
@@ -111,3 +118,83 @@ def test_workspace_is_removed_even_on_failure(monkeypatch, wired):
         asyncio.run(activities.run_analysis_pipeline(_analyze()))
 
     assert not Path(seen["dir"]).exists()
+
+
+# --- Regression: auth-токен не должен попадать в argv / текст исключения ---
+#
+# subprocess.CalledProcessError.__str__ и subprocess.TimeoutExpired.__str__
+# рендерят cmd целиком. Если токен подставлен прямо в URL как элемент argv,
+# ЛЮБОЙ сбой git clone (протухший токен, сетевой сбой, таймаут) унесёт живой
+# GitHub-токен в Temporal event history и логи воркера — именно туда, куда
+# человек полезет отлаживать сбой.
+
+def test_clone_failure_never_leaks_token_in_calledprocesserror(monkeypatch):
+    monkeypatch.setattr(activities.github_client, "auth_token", lambda: _SENTINEL_TOKEN)
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        # реалистичный провал git clone: неверные/протухшие учётные данные
+        raise subprocess.CalledProcessError(
+            128, cmd, output="", stderr="fatal: Authentication failed\n",
+        )
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        activities._clone_repo("o/r", "/tmp/does-not-matter")
+
+    exc = exc_info.value
+    assert _SENTINEL_TOKEN not in str(exc)
+    assert _SENTINEL_TOKEN not in repr(exc)
+    assert _SENTINEL_TOKEN not in " ".join(str(a) for a in captured["cmd"])
+    assert _SENTINEL_TOKEN not in (exc.output or "")
+    assert _SENTINEL_TOKEN not in (exc.stderr or "")
+
+
+def test_clone_timeout_never_leaks_token(monkeypatch):
+    monkeypatch.setattr(activities.github_client, "auth_token", lambda: _SENTINEL_TOKEN)
+
+    def fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", activities.CLONE_TIMEOUT_SEC))
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        activities._clone_repo("o/r", "/tmp/does-not-matter")
+
+    exc = exc_info.value
+    assert _SENTINEL_TOKEN not in str(exc)
+    assert _SENTINEL_TOKEN not in repr(exc)
+
+
+def test_blocking_stages_run_off_the_event_loop_thread(wired, monkeypatch):
+    """Блокирующие вызовы обязаны идти через asyncio.to_thread.
+
+    Воркер крутит один event loop; синхронный subprocess.run на 900с заблокировал
+    бы поток целиком — heartbeat не ушёл бы на сервер, другие issue встали бы.
+    asyncio.run() держит loop на главном потоке, поэтому исполнение стадии на
+    НЕ-главном потоке доказывает, что вынос в пул реально произошёл."""
+    threads = {}
+
+    def record(prompt, cwd):
+        threads["claude"] = threading.current_thread()
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        produced = {
+            "/fnr-new-task": "task.md",
+            "/fnr-concept": "concept.md",
+            "/fnr-system-requirements": "system_requirements.md",
+            "/validate-doc": "validation.md",
+        }.get(prompt.split()[0])
+        if produced:
+            (fnr / produced).write_text(f"# {produced}", encoding="utf-8")
+
+    # Переопределяем поверх фикстуры wired через monkeypatch: последний setattr
+    # выигрывает, и обе подмены откатятся чисто после теста.
+    monkeypatch.setattr(activities, "_run_claude", record)
+    asyncio.run(activities.run_analysis_pipeline(_analyze()))
+
+    assert threads["claude"] is not threading.main_thread()
