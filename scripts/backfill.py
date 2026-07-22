@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 
+from shared.workflow_ids import issue_workflow_id
 from shared.workflow_types import IssueInput
 
 try:
@@ -58,8 +59,7 @@ def list_open_issues(repo: str, limit: int) -> list[dict]:
     return json.loads(out or "[]")
 
 
-def workflow_id_for(repo: str, n: int) -> str:
-    return f"issue-{repo}-{n}"
+workflow_id_for = issue_workflow_id
 
 
 async def main() -> None:

@@ -23,6 +23,7 @@ from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.commands import ESTIMATE, parse_command
+from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
 
 app = FastAPI()
 
@@ -47,15 +48,10 @@ def verify_signature(body: bytes, signature_header: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 
-def workflow_id_for(repo_full_name: str, issue_number: int) -> str:
-    return f"issue-{repo_full_name}-{issue_number}"
-
-
-def estimate_workflow_id_for(repo_full_name: str, issue_number: int, comment_id: int) -> str:
-    """comment_id в ID даёт две вещи сразу: повторная доставка одного и того
-    же вебхука не запускает вторую оценку, а новая команда — это честно
-    новый прогон, а не сигнал в старый."""
-    return f"estimate-{repo_full_name}-{issue_number}-{comment_id}"
+# Формат ID живёт в shared/workflow_ids.py: его же собирают скрипты прямого
+# запуска, и разъехавшись, они потеряли бы идемпотентность.
+workflow_id_for = issue_workflow_id
+estimate_workflow_id_for = estimate_workflow_id
 
 
 @app.post("/webhook")
