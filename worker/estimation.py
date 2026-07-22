@@ -190,11 +190,26 @@ def _story_points(expected_hours: float, rules: dict) -> str:
 
 
 def _sanity_warnings(expected_days: float, artifact_type: str, rules: dict) -> list[str]:
+    """Коридор проверяется по ожиданию E, а не по реалистичному сценарию M:
+    E учитывает разброс, и задача с умеренным M, но огромным P — как раз тот
+    случай, ради которого коридор существует.
+
+    Но в шапке комментария итогом стоит M, поэтому текст обязан назвать
+    число, о котором говорит: иначе рядом окажутся «Итог 13.16 дн» и
+    «дольше пятнадцати дней», и это читается как ошибка расчёта.
+    """
     bounds = rules["sanity_bounds"][artifact_type]
+    label = ARTIFACT_TYPE_RU.get(artifact_type, artifact_type)
     if expected_days > bounds["max_days"]:
-        return [bounds["over"]]
+        return [
+            f"ожидание E = {round(expected_days, 2):g} дн выше коридора "
+            f"{bounds['max_days']:g} дн для типа «{label}»: {bounds['over']}"
+        ]
     if expected_days < bounds["min_days"]:
-        return [bounds["under"]]
+        return [
+            f"ожидание E = {round(expected_days, 2):g} дн ниже коридора "
+            f"{bounds['min_days']:g} дн для типа «{label}»: {bounds['under']}"
+        ]
     return []
 
 

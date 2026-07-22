@@ -145,6 +145,18 @@ def test_sanity_warning_when_above_corridor(rules):
     assert "декомпозиция" in result.sanity_warnings[0]
 
 
+def test_sanity_warning_names_the_number_it_is_about(rules):
+    """В шапке комментария итогом стоит M, а коридор проверяется по E. Без
+    явного числа в тексте читатель видит «Итог 13.16 дн» рядом с «дольше
+    пятнадцати дней» и считает это ошибкой расчёта."""
+    big = [WorkUnit(name=f"модуль {i}", hours=20.0, rationale="крупный") for i in range(8)]
+    result = compute(facts(work_units=big, fp_count=34.0, fp_hours_per_point=5.0), rules)
+    warning = result.sanity_warnings[0]
+    assert f"{round(result.expected_days, 2):g}" in warning
+    assert "15" in warning
+    assert "новый модуль с нуля" in warning
+
+
 def test_no_sanity_warning_inside_corridor(rules):
     assert compute(facts(), rules).sanity_warnings == []
 
