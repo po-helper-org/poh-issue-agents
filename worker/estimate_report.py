@@ -17,6 +17,7 @@ from estimation import (
     WORK_TYPE_RU,
     Estimate,
     EstimationFacts,
+    positive_units,
 )
 from shared.workflow_types import EstimationContext
 
@@ -142,12 +143,14 @@ def render(estimate: Estimate, facts: EstimationFacts,
         "",
         "| Единица работы | Часы | Почему столько |",
         "|----------------|------|----------------|",
-        f"| Каркас | {_number(facts.scaffolding_hours)} | базовая обвязка |",
+        f"| Каркас | {_number(max(0.0, facts.scaffolding_hours))} | базовая обвязка |",
     ]
-    for unit in facts.work_units:
+    # Только положительные единицы — те же, что ушли в расчёт. Нулевые/
+    # отрицательные, которые модель иногда возвращает, в таблице не показываем.
+    for unit in positive_units(facts):
         lines.append(f"| {unit.name} | {_number(unit.hours)} | {unit.rationale} |")
     lines.extend([
-        f"| Интеграция | {_number(facts.integration_hours)} | сборка воедино |",
+        f"| Интеграция | {_number(max(0.0, facts.integration_hours))} | сборка воедино |",
         f"| Тесты | {_number(estimate.tests_hours)} | доля от объёма работ |",
         "",
         f"Тип работы — {work_type}, коэффициент ×{coefficient}. "

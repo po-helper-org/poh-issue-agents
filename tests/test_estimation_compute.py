@@ -196,9 +196,37 @@ def test_empty_decomposition_is_an_error(rules):
         compute(facts(work_units=[]), rules)
 
 
-def test_non_positive_unit_hours_are_an_error(rules):
+def test_zero_hour_unit_is_dropped_not_fatal(rules):
+    """Модель регулярно возвращает единицу с 0 часов. Одна такая строка не
+    должна ронять всю оценку — её надо отбросить. Наблюдалось на живом
+    прогоне issue #149."""
+    units = [
+        WorkUnit(name="реальная", hours=6.0, rationale="есть работа"),
+        WorkUnit(name="пустышка", hours=0.0, rationale=""),
+    ]
+    result = compute(facts(work_units=units, fp_count=4.0, fp_hours_per_point=4.0), rules)
+    # Каркас 4 + единицы 6 (нулевая не в счёт) + интеграция 2 = 12.
+    assert result.base_hours == pytest.approx(12.0)
+
+
+def test_negative_unit_hours_are_dropped(rules):
+    units = [
+        WorkUnit(name="реальная", hours=6.0, rationale="есть работа"),
+        WorkUnit(name="кривая", hours=-3.0, rationale="шум модели"),
+    ]
+    result = compute(facts(work_units=units, fp_count=4.0, fp_hours_per_point=4.0), rules)
+    assert result.base_hours == pytest.approx(12.0)
+
+
+def test_negative_scaffolding_is_floored_to_zero(rules):
+    result = compute(facts(scaffolding_hours=-4.0, fp_count=2.0, fp_hours_per_point=4.0), rules)
+    # Каркас занулён, единицы 6 + интеграция 2 = 8.
+    assert result.base_hours == pytest.approx(8.0)
+
+
+def test_decomposition_of_only_non_positive_units_is_an_error(rules):
     bad = [WorkUnit(name="ничего", hours=0.0, rationale="")]
-    with pytest.raises(EstimationError, match="неположительными часами"):
+    with pytest.raises(EstimationError, match="декомпозиция пуста"):
         compute(facts(work_units=bad), rules)
 
 

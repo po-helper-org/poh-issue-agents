@@ -131,17 +131,22 @@ def load_rules(path: Path = RULES_PATH) -> dict:
         return tomllib.load(f)
 
 
+def positive_units(facts: EstimationFacts) -> list[WorkUnit]:
+    """Единицы работы с положительными часами. Модель регулярно возвращает
+    единицу с 0 (иногда отрицательными) часов — это шум, а не сломанная
+    декомпозиция: одну такую строку надо отбросить, а не ронять всю оценку.
+    Ноль в сумму и так не даёт вклада; отрицательное занизило бы её."""
+    return [unit for unit in facts.work_units if unit.hours > 0]
+
+
 def _validate(facts: EstimationFacts, rules: dict) -> None:
     if facts.work_type not in rules["work_type"]:
         raise EstimationError(f"неизвестный тип работы: {facts.work_type}")
     if facts.artifact_type not in rules["sanity_bounds"]:
         raise EstimationError(f"неизвестный тип артефакта: {facts.artifact_type}")
-    if not facts.work_units:
-        raise EstimationError("декомпозиция пуста — оценивать нечего")
-    if any(unit.hours <= 0 for unit in facts.work_units):
-        raise EstimationError("единица работы с неположительными часами")
-    if facts.scaffolding_hours < 0 or facts.integration_hours < 0:
-        raise EstimationError("отрицательные часы каркаса или интеграции")
+    if not positive_units(facts):
+        # Пусто и после отбрасывания нулевых — вот это уже нечего оценивать.
+        raise EstimationError("декомпозиция пуста — ни одной единицы работы с положительными часами")
     if facts.fp_count <= 0 or facts.fp_hours_per_point <= 0:
         raise EstimationError("Function Points не посчитаны — cross-check невозможен")
 
@@ -217,8 +222,10 @@ def compute(facts: EstimationFacts, rules: dict) -> Estimate:
     _validate(facts, rules)
 
     coefficient = rules["work_type"][facts.work_type]
-    units_hours = sum(unit.hours for unit in facts.work_units)
-    base = facts.scaffolding_hours + units_hours + facts.integration_hours
+    # Каркас и интеграцию тоже занижаем снизу нулём: модель иногда возвращает
+    # отрицательное, и одно такое число не должно рушить весь расчёт.
+    units_hours = sum(unit.hours for unit in positive_units(facts))
+    base = max(0.0, facts.scaffolding_hours) + units_hours + max(0.0, facts.integration_hours)
     tests = base * rules["test_share"]["ratio"]
     decomposition = (base + tests) * coefficient
     fp = facts.fp_count * facts.fp_hours_per_point * coefficient
