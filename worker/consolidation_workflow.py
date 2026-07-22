@@ -29,7 +29,7 @@ class ConsolidationWorkflow:
 
         assignments = await asyncio.gather(*[
             workflow.execute_activity(ca.assign_zone, args=[p, taxonomy],
-                                      start_to_close_timeout=timedelta(seconds=180),
+                                      start_to_close_timeout=timedelta(seconds=300),
                                       retry_policy=retry) for p in profiles])
 
         by_zone: dict[str, list[int]] = {}
