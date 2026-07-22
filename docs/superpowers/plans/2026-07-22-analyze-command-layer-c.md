@@ -1326,9 +1326,14 @@ class IssueAnalysis:
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
         except Exception as exc:
+            # Реальное сообщение (наш RuntimeError из пайплайна) лежит в
+            # exc.cause: temporalio оборачивает сбой activity в ActivityError,
+            # чей str() — generic «Activity task failed». Без разворачивания в
+            # Issue ушёл бы бесполезный комментарий вместо настоящего диагноза.
+            reason = str(getattr(exc, "cause", None) or exc)
             await workflow.execute_activity(
                 activities.publish_analysis_error,
-                args=[analyze, str(exc)[:500]],
+                args=[analyze, reason[:500]],
                 start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
