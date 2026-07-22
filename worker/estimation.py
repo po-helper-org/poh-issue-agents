@@ -274,7 +274,10 @@ def compute(facts: EstimationFacts, rules: dict) -> Estimate:
         pessimistic_days=pessimistic / hours_per_day,
         expected_days=expected_days,
         buffered_days=buffered / hours_per_day,
-        story_points=_story_points(expected, rules),
+        # Story Points считаются от реалистичного сценария, а не от E: именно
+        # M выводится в шапке комментария как итог, и два разных числа рядом
+        # («3.9 дн» и SP, соответствующие 5.6 дн) читались бы как ошибка.
+        story_points=_story_points(realistic, rules),
         confidence=confidence,
         grade_days={
             name: (realistic / hours_per_day) * factor

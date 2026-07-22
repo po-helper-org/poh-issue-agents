@@ -151,7 +151,15 @@ def test_no_sanity_warning_inside_corridor(rules):
 
 def test_story_points_snap_to_fibonacci(rules):
     result = compute(facts(), rules)
-    # E = (10.92 + 4x15.6 + 23.4)/6 = 16.12 ч -> 4.03 SP -> ближайшее по шкале 5
+    # M = 15.6 ч -> 3.9 SP -> ближайшее по шкале 3
+    assert result.story_points == "3"
+
+
+def test_story_points_follow_the_realistic_scenario_not_the_expectation(rules):
+    """Итог в шапке комментария — это M. Если SP считать от E, рядом окажутся
+    два числа про разный объём работы, и это читается как ошибка."""
+    result = compute(facts(risks=["personal_data"]), rules)
+    # M = 15.6 x 1.3 = 20.28 ч -> 5.07 SP -> 5; от E (30.68 ч) вышло бы 8.
     assert result.story_points == "5"
 
 
