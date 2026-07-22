@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 import activities
-from workflows import IssueLifecycle
+from workflows import IssueAnalysis, IssueLifecycle
 
 
 async def main() -> None:
@@ -23,7 +23,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
-        workflows=[IssueLifecycle],
+        workflows=[IssueLifecycle, IssueAnalysis],
         activities=[
             activities.prefilter_bot_and_security,
             activities.intake_gate,
@@ -35,7 +35,9 @@ async def main() -> None:
             activities.duplicate_check,
             activities.score_priority,
             activities.post_priority_comment,
-            activities.run_research_pipeline,
+            activities.run_analysis_pipeline,
+            activities.ack_command,
+            activities.publish_analysis_error,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,
         ],
