@@ -1,14 +1,30 @@
 # Issue Agent Service — self-hosted, docker-compose, GLM
 
-Полный цикл обработки Issue как один долгоживущий Temporal-workflow вместо
-семи отдельных GitHub Actions. Один `docker-compose up` — и сервис слушает
-вебхуки GitHub напрямую.
+Обработка GitHub Issue как долгоживущие Temporal-workflow вместо набора GitHub
+Actions. Два независимых сценария: **триаж каждого Issue** (Layer A) и
+**консолидация бэклога в зоны поставки** (consolidation).
 
-## 🚀 Быстрый старт (Layer A — автономный триаж)
+---
 
-Прогнать бизнес-процесс по **всем открытым Issue** репозитория (триаж:
-предфильтры → gate → классификация → дубликаты → приоритет → лейбл+коммент),
-не регистрируя GitHub App и без публичного webhook. Три команды:
+## Что умеет сейчас
+
+| Возможность | Статус | Точка входа |
+|-------------|--------|-------------|
+| **Layer A — автономный триаж Issue**: предфильтры → intake-gate (с циклом уточнений) → 4-way классификация + advisor-ответ → duplicate-check (только метка) → приоритет по формуле | ✅ Работает, прогнан вживую по реальному бэклогу (64/67 Issue размечено, 0 ошибочных закрытий) | `make dry-run` / `make backfill-one issue=N` |
+| **Consolidation — группировка бэклога в зоны поставки** (taxonomy-first): профиль на Issue → вывод 8–12 зон → классификация Issue в зону → нарезка зоны на инкременты (MVP/MVP+1) → объединяющий Issue на инкремент → **PR** | ✅ Работает, прогнан вживую (8 зон, 19 инкрементов, PR с 20 файлами). ⚠️ см. «Ограничения» | `make consolidate` |
+| **Layer B — webhook-автостарт** на новых Issue (GitHub App) | ⚙️ Код есть (`webhook/`), требует регистрации App + публичного URL | см. «Установка Layer B» |
+| **Тяжёлые стадии** `run_research_pipeline` / `run_bug_pipeline` (БФТ/Blueprint/SA-helper через `claude -p`) | ❌ `NotImplementedError` — не реализовано | — |
+| **Доставка скиллов po-helper/SA-helper в воркер**, установка `deb8flow` | ❌ Не решено (`worker/Dockerfile` — TODO) | — |
+| **OpenHands resolver** | ❌ `NotImplementedError`, намеренно вне этого compose | — |
+
+Тесты: `make test` — **32 теста**.
+
+---
+
+## Быстрый старт (Layer A — триаж)
+
+Прогнать триаж по всем открытым Issue репозитория, без GitHub App и публичного
+webhook:
 
 ```bash
 make setup     # preflight (docker/uv/gh) + venv + генерация .env (интерактивно)
@@ -16,125 +32,136 @@ make up        # поднять temporal + worker
 make dry-run   # прогнать ВСЕ открытые Issue в DRY_RUN — ничего не мутируется
 ```
 
-`make setup` спросит целевой репозиторий (по умолчанию `kibarik/po-helper`),
-возьмёт GitHub-токен из уже авторизованного `gh`, запросит `ZAI_API_KEY` и
-запишет `.env` с `DRY_RUN=1`. Проверь `[DRY_RUN]`-строки в `make logs`
-(Temporal UI — http://localhost:8080), затем:
+`make setup` спросит целевой репозиторий, возьмёт GitHub-токен из авторизованного
+`gh`, запросит `ZAI_API_KEY`, запишет `.env` с `DRY_RUN=1`. Смотри `[DRY_RUN]`-строки
+в `make logs` (Temporal UI — http://localhost:8080), затем:
 
 ```bash
 make go-live   # выключить DRY_RUN, перезапустить worker, прогнать по-настоящему
 ```
 
-`make backfill-one issue=<N>` — прогнать один Issue (смоук-тест). Требования:
-Docker, [`uv`](https://astral.sh/uv), [`gh`](https://cli.github.com) (`gh auth login`).
-Детали и слои B/C — `docs/superpowers/`.
+Точечно: `make backfill-one issue=<N>`. Повторный прогон идемпотентен
+(`REJECT_DUPLICATE` по workflow-id); осознанный перепрогон — `scripts/backfill.py --suffix <tag>`.
 
-## Документация (начни отсюда)
+Требования: Docker, [`uv`](https://astral.sh/uv), [`gh`](https://cli.github.com) (`gh auth login`).
 
-- **`docs/REQUIREMENTS.md`** — зафиксированный набор требований (FR/NFR),
-  технологические решения, границы. Источник правды.
-- **`docs/ARCHITECTURE.md`** — как устроена система, потоки, слои,
-  модель данных артефактов.
-- **`docs/ROADMAP.md`** — фазированный план реализации (Ф0-Ф6) с
-  чекпоинтами, открытыми вопросами и сводкой блокеров. **С этого начинать
-  разработку.**
-- **`docs/DECISIONS.md`** — журнал архитектурных решений (почему Temporal,
-  почему GLM, почему не KAgent/gh-aw) — чтобы не переоткрывать обсуждённое.
-- **`docs/diagrams/`** — Mermaid-диаграммы полного процесса (2 части).
+### Что триаж делает с Issue
 
-## С чего начать завтра
+- Бот/security-подозрение → метка, дальше не идёт.
+- Расплывчатый запрос → уточняющий вопрос (интерактивно) либо эскалация (batch).
+- Классификация: `advisor:feature-request` / `advisor:bug` / `advisor:consultation` /
+  `advisor:existing-functionality` + содержательный ответ комментарием.
+- Дубликат: **только метка** `duplicate` / `possible-duplicate` + комментарий.
+  **Issue НЕ закрывается автоматически** — решает человек (функциональный дубль ≠
+  целевой, см. #111).
+- Приоритет: LLM извлекает атрибуты → детерминированная формула из
+  `config/priority-weights.toml` → метка `priority:*` + комментарий с разбором.
+- Дальше workflow **паркуется** и ждёт сигнал `research-me` / `bug-me` (эти стадии
+  пока не реализованы — см. таблицу выше).
 
-1. Прочитать `docs/ROADMAP.md`, раздел "Фаза 0".
-2. Поднять инфраструктуру, зарегистрировать GitHub App, настроить публичный
-   webhook.
-3. Проверить, что тестовый Issue создаёт workflow в Temporal UI.
-4. Двигаться по фазам: сначала дешёвый сквозной путь (Ф1), потом
-   отказоустойчивость (Ф2), потом bug/research-пайплайны (Ф3-Ф4).
+---
+
+## Consolidation — бэклог в зоны поставки
+
+```bash
+make consolidate   # или: scripts/consolidate.py --repo <owner>/<repo>
+```
+
+Группирует открытые Issue по **оси поставки** — «что реализуется и релизится
+вместе одной технической итерацией», а не по похожести темы. Пайплайн:
+
+1. `fetch_open_issues` — список Issue **без тел** (тело тянет профиль — держит историю лёгкой).
+2. `extract_solution_profile` (fan-out) — на каждый Issue: суть проблемы, механизм, цель, домен, якоря-цитаты.
+3. `derive_taxonomy` — один вызов на весь бэклог → **8–12 зон поставки** (имя, граница «что закрывает одна итерация», имплементационная поверхность).
+4. `assign_zone` (fan-out, пер-Issue) — классификация в primary-зону (+ secondary для сквозных, `other` если не подходит ни одна).
+5. `slice_zone` — крупную зону режет на **инкременты** (MVP/MVP+1/…) по зависимостям и потолку размера (~3–6 Issue). Внутри зоны разводит по разным инкрементам одинаковый функционал с разной целью (#111).
+6. `synthesize_unifying_issue` — на инкремент: объединяющий Issue (синтез проблемы + механизм + агрегат требований, каждое подписано `— from #N`).
+7. `write_consolidation_pr` — ветка `consolidation/<дата>` + **PR**: `docs/consolidation/overview.md` (карта зон и инкрементов) + файл на каждый объединяющий Issue.
+
+**Consolidation НИКОГДА не трогает Issue** — не комментирует, не метит, не закрывает.
+Единственная запись — ветка+PR, и та под `DRY_RUN`. Предлагает — решает человек.
+
+Реальный прогон дал 8 зон (`memory-core`, `jira-connector`, `process-engine`,
+`llm-routing`, `router`, `po-helper`, `ui-shell`, `ops-core`) и 19 инкрементов по
+3–6 Issue.
+
+---
+
+## Ограничения (важно)
+
+- **Большой бэклог не дорабатывает до PR в самом workflow.** На ~75 Issue история
+  превышает ~990 событий, и реплей не укладывается в workflow-task timeout на
+  стадии synth. Нужен `continue-as-new` после `derive_taxonomy` (не реализовано).
+  Пока обход: снять посчитанные зоны/инкременты из истории Temporal и выполнить
+  synth+PR отдельно.
+- **Rate-limit z.ai** — главный потолок скорости. Воркер намеренно ограничен:
+  `max_concurrent_activities=3` + `ThreadPoolExecutor(3)`. Полный прогон по ~75
+  Issue занимает десятки минут.
+- **Таксономия не версионируется**: `derive_taxonomy` вызывается с `prior=None`,
+  temperature не фиксирована → зоны могут «плыть» между прогонами.
+- **Activity — синхронные `def`** (исполняются в ThreadPoolExecutor). Делать их
+  `async def` нельзя: блокирующий LLM-вызов на event-loop замораживает воркер.
+
+---
 
 ## Архитектура
 
 ```
-GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM/gh/claude -p)
+GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / claude -p)
                                   ↑
-                          Temporal UI (localhost:8080) — видно каждый issue
-                          на его текущей стадии
+                          Temporal UI (localhost:8080)
 ```
 
-Один workflow `IssueLifecycle` на issue (ID = `issue-<repo>-<n>`). Лейблы
-`research-me`/`bug-me`/`build-me` и ответы-уточнения — не отдельные
-GitHub Actions триггеры, а Temporal **signals**: workflow буквально спит
-и ждёт, пока не придёт сигнал. Это убирает гонку между duplicate-check и
-priority-scoring (были параллельными Actions — теперь последовательные шаги
-одного потока) и ручной парсинг HTML-маркеров для счётчика раундов
-уточнения (состояние просто живёт в переменных workflow).
+Два workflow-типа на одной очереди `issue-lifecycle`:
+
+- **`IssueLifecycle`** — один на Issue (id `issue-<repo>-<n>`). Лейблы
+  `research-me`/`bug-me` и ответы-уточнения — это Temporal **signals**: workflow
+  спит и ждёт сигнал сколько угодно долго.
+- **`ConsolidationWorkflow`** — один на прогон консолидации, fan-out по бэклогу.
 
 ## Модель — GLM через z.ai
 
-- Python-стадии (gate/classify/duplicate/priority) — Instructor поверх
-  OpenAI-совместимого эндпоинта z.ai (`worker/llm.py`). Дешёвая модель —
-  `glm-4.5-air`, для классификации — `glm-5.2`.
-- `claude -p` для po-helper/SA-helper skills (research/bug-pipeline) —
-  Anthropic-совместимый эндпоинт z.ai через `ANTHROPIC_BASE_URL`. Сами
-  скиллы не меняются, меняется только backend-модель.
+- Python-стадии (gate/classify/duplicate/priority/консолидация) — Instructor поверх
+  OpenAI-совместимого эндпоинта z.ai (`worker/llm.py`). Дешёвая модель `MODEL_GATE`
+  (по умолчанию `glm-4.5-air`), сильная `MODEL_CLASSIFY` (по умолчанию `glm-5.2`,
+  переопределяется через `.env`).
+- `claude -p` для скиллов po-helper/SA-helper — Anthropic-совместимый эндпоинт z.ai
+  (`ANTHROPIC_BASE_URL`). Используется только тяжёлыми стадиями, которые пока не
+  реализованы.
 
-## Установка (Layer B — webhook + GitHub App, для автостарта на новых Issue)
+---
 
-> Для Layer A это НЕ нужно — см. [Быстрый старт](#-быстрый-старт-layer-a--автономный-триаж)
-> выше. Регистрация App и публичный webhook требуются только чтобы новые Issue
-> обрабатывались автоматически при создании (Layer B).
+## Установка Layer B (webhook + GitHub App)
 
-1. Зарегистрировать GitHub App (Settings → Developer settings → GitHub Apps):
-   permissions Issues (read/write), Contents (read/write); webhook events
-   Issues + Issue comments; webhook URL — публичный адрес твоего `webhook`
-   сервиса (для локальной разработки — `cloudflared tunnel` или `ngrok`,
-   для прода — за твоим reverse proxy на реальном домене).
-2. Установить App на репозиторий, сохранить App ID, Installation ID,
-   приватный ключ (`.pem`).
-3. Скопировать `.env.example` → `.env`, заполнить GitHub App данные и
-   `ZAI_API_KEY`.
-4. Положить приватный ключ App по пути из `GITHUB_PRIVATE_KEY_PATH`
-   (по умолчанию монтируется как volume — добавь маунт в
-   `docker-compose.yml`, сейчас в шаблоне не прописан секрет-том явно).
-5. `docker-compose up --build`.
-6. Открой `localhost:8080` (Temporal UI) — там видно все workflow-инстансы
-   и на какой стадии застрял каждый issue.
+> Для Layer A и консолидации это НЕ нужно. App и публичный webhook требуются только
+> чтобы **новые** Issue обрабатывались автоматически при создании.
 
-## Что перенесено 1:1, что требует доработки
+1. Зарегистрировать GitHub App: permissions Issues (read/write), Contents
+   (read/write); events Issues + Issue comments; webhook URL — публичный адрес
+   сервиса `webhook` (локально — `cloudflared`/`ngrok`).
+2. Установить App на репозиторий; сохранить App ID, Installation ID, `.pem`.
+3. `.env.example` → `.env`, заполнить GitHub App + `ZAI_API_KEY`.
+4. Положить `.pem` по пути `GITHUB_PRIVATE_KEY_PATH` (том/secret в
+   `docker-compose.yml` явно не прописан — добавить под свою модель секретов).
+5. `docker compose up --build`.
 
-**Перенесено без изменений по смыслу:**
-- Zero-cost предфильтры (боты/security) — `activities.prefilter_bot_and_security`
-- Intake Gate с циклом уточнений — `intake_gate` + signal `user_comment`
-- 4-way классификация — `classify_issue`
-- Duplicate Check (один LLM-вызов на всех кандидатов, порог 85%/50%) —
-  `duplicate_check`
-- Priority Scoring (LLM извлекает атрибуты → детерминированная формула из
-  `config/priority-weights.toml`) — `score_priority`. Формула не изменилась.
+---
 
-**Требует доработки (те же TODO, что были на Actions, не появились заново):**
-- `run_research_pipeline` / `run_bug_pipeline` — сейчас `NotImplementedError`.
-  Нужно перенести содержимое старых `research-pipeline.yml`/`bug-pipeline.yml`
-  как subprocess-вызовы `claude -p`/`deb8flow`/`gh` внутри activity. Логика
-  та же (po-helper → Repowise контекст → Blueprint → deb8flow → SA-helper),
-  меняется только то, что это Python-функция, а не шаги YAML.
-- Механизм загрузки скиллов po-helper/SA-helper в контейнер воркера — не
-  решён (тот же открытый вопрос, что и раньше).
-- `deb8flow` — установка внутри `worker/Dockerfile` помечена TODO.
-- `trigger_openhands_resolver` — OpenHands намеренно остаётся ОТДЕЛЬНЫМ
-  сервисом со своим sandboxing (`docker.sock` = root-эквивалент на хосте),
-  не частью этого docker-compose. Activity здесь — просто вызов его API/CLI.
-- Промпты в `prompts/` были написаны под ручной парсинг маркеров
-  (`[[EXISTING]]`/`[[SPAM]]` и т.п.) для версии без Instructor. Сейчас
-  структура ответа задаётся Pydantic-схемой в `activities.py`, а не
-  парсингом текста — промпты работают (Instructor всё равно направит
-  LLM в нужную схему), но инструкцию "начни ответ с маркера" в них можно
-  убрать как избыточную, она больше ничего не делает.
-- `docker-compose.yml` не монтирует секрет с приватным ключом GitHub App —
-  добавь volume/secret под свою модель хранения секретов в MTS.
+## Почему Temporal
 
-## Почему Temporal, а не просто Python-скрипт с очередью
+Durable execution: воркер упал посреди долгого прогона — Temporal продолжит с
+последнего завершённого шага, а не начнёт заново. Тот же механизм даёт «ждать
+сигнал сколько угодно»: Issue может неделями висеть с приоритетом в ожидании
+`research-me` — это штатное состояние workflow, не хак.
 
-Durable execution — если worker упадёт посреди research-pipeline (60 минут
-исполнения), Temporal переживёт рестарт и продолжит с последнего
-завершённого шага, а не начнёт weit заново. Тот же механизм даёт "подожди
-сигнал сколько угодно долго" — issue может неделями висеть в бэклоге с
-приоритетом, ожидая `research-me`, это штатное состояние workflow, не хак.
+## Документация
+
+- `sa_documentation/FNR/` — постановки задач, концепты, дебаты и системные
+  требования (FNR-1 тяжёлые стадии, FNR-3 кластеризация под поставку).
+- `docs/consolidation-clustering-study.md` — почему группировка по «механизму»
+  вырождается в одиночки и какие практики группировки применимы (с экспериментом).
+- `docs/superpowers/specs/` и `docs/superpowers/plans/` — дизайн-спеки и планы
+  реализации.
+- `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ROADMAP.md`,
+  `docs/diagrams/` — архитектура, журнал решений, план, диаграммы.
+- `docs/demo-plan.md` — сценарий демонстрации с критериями приёмки.

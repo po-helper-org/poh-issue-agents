@@ -63,7 +63,7 @@ bold "3/3  Parameters → .env"
 cur() { [ -f .env ] && grep -E "^$1=" .env | head -1 | cut -d= -f2- || true; }
 
 # repo
-default_repo="$(cur GITHUB_REPOSITORY)"; default_repo="${default_repo:-kibarik/po-helper}"
+default_repo="$(cur GITHUB_REPOSITORY)"; default_repo="${default_repo:-po-helper-org/poh-helper}"
 read -r -p "  Target GitHub repo [owner/name] (${default_repo}): " REPO
 REPO="${REPO:-$default_repo}"
 
