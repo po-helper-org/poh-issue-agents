@@ -37,3 +37,12 @@ class DuplicateResult:
 class PriorityResult:
     tier: str  # "P0" | "P1" | "P2" | "P3"
     breakdown_markdown: str
+
+
+@dataclass
+class AnalyzeInput:
+    repo: str
+    issue_number: int
+    title: str
+    body: str
+    comment_id: int | None = None  # комментарий-триггер, на него ставится реакция
