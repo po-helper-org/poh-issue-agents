@@ -57,11 +57,16 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_CORS_ORIGINS=http://localhost:8080
-    # Слушает только петлевой интерфейс сервера. Снаружи недоступен; оператор
-    # ходит через SSH-туннель (docs/DEPLOY-DOKPLOY.md, раздел про Temporal UI).
-    # Не меняй на "8080:8080" — у этого интерфейса нет входа по паролю.
-    ports:
-      - "127.0.0.1:8080:8080"
+    # Хост-порт НЕ публикуется намеренно. На Dokploy-хосте порт 8080 обычно
+    # уже занят (Traefik/панель), а публиковать порты руками здесь и не нужно —
+    # наружу сервисы выводит Traefik. У интерфейса нет входа по паролю, поэтому
+    # снаружи он и не должен торчать. Как до него дойти — docs/DEPLOY-DOKPLOY.md,
+    # раздел «Temporal UI» (Dokploy-домен с basic-auth).
+    expose:
+      - "8080"
+    networks:
+      - default
+      - dokploy-network
     depends_on:
       - temporal
 
