@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 
+from shared.workflow_ids import issue_workflow_id
 from shared.workflow_types import IssueInput
 
 try:
@@ -58,9 +59,9 @@ def list_open_issues(repo: str, limit: int) -> list[dict]:
     return json.loads(out or "[]")
 
 
-def workflow_id_for(repo: str, n: int, suffix: str = "") -> str:
-    base = f"issue-{repo}-{n}"
-    return f"{base}-{suffix}" if suffix else base
+# Формат id (в т.ч. suffix для осознанного перепрогона) живёт в
+# shared/workflow_ids.py — его же собирают вебхук и scripts/estimate.py.
+workflow_id_for = issue_workflow_id
 
 
 async def main() -> None:

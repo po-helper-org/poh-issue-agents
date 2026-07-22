@@ -40,6 +40,30 @@ class PriorityResult:
 
 
 @dataclass
+class EstimateRequest:
+    repo: str
+    issue_number: int
+    comment_id: int  # комментарий с командой: на него ставится реакция
+
+
+@dataclass
+class EstimationContext:
+    title: str
+    body: str
+    labels: list[str]
+    thread: list[str]
+    branch: str | None  # research/issue-<n> или bug/issue-<n>, если есть
+    artifacts: dict[str, str]  # путь в ветке -> содержимое
+    truncated: bool  # часть контекста не влезла в лимиты
+
+
+@dataclass
+class EstimateResult:
+    markdown: str
+    stopped: bool  # cross-check развалился, итоговых чисел нет
+
+
+@dataclass
 class SolutionProfile:
     issue_number: int
     title: str

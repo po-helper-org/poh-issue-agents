@@ -22,7 +22,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared.workflow_types import IssueInput
+    from shared.workflow_types import EstimateRequest, EstimateResult, IssueInput
 
     import activities
 
@@ -197,4 +197,71 @@ class IssueLifecycle:
                 activities.trigger_openhands_resolver,
                 issue,
                 start_to_close_timeout=timedelta(seconds=30),
+            )
+
+
+@workflow.defn(name="IssueEstimation")
+class IssueEstimation:
+    """Оценка трудоёмкости по команде /estimate.
+
+    Отдельный workflow, а не сигнал в IssueLifecycle: тот завершается после
+    приоритизации (а на спаме и дубликате — раньше), и через неделю сигналить
+    было бы некуда. ID включает comment_id, поэтому повторная доставка того же
+    вебхука не запускает вторую оценку, а новая команда — это честно новый
+    прогон со своей историей в Temporal UI.
+    """
+
+    @workflow.run
+    async def run(self, req: EstimateRequest) -> None:
+        default_retry = RetryPolicy(maximum_attempts=3)
+        # Стадия нужна, чтобы человек в комментарии увидел, ЧТО именно
+        # сломалось, а не абстрактное «ошибка обработки».
+        stage = "подтверждение команды"
+        try:
+            await workflow.execute_activity(
+                activities.ack_estimate_command,
+                req,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+
+            stage = "сбор контекста"
+            context = await workflow.execute_activity(
+                activities.collect_estimation_context,
+                req,
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=default_retry,
+            )
+
+            stage = "извлечение фактов"
+            facts = await workflow.execute_activity(
+                activities.extract_estimation_facts,
+                context,
+                start_to_close_timeout=timedelta(seconds=180),
+                retry_policy=default_retry,
+            )
+
+            stage = "расчёт"
+            result: EstimateResult = await workflow.execute_activity(
+                activities.compute_estimate,
+                args=[facts, context],
+                start_to_close_timeout=timedelta(seconds=30),
+                # Расчёт детерминирован и не ходит в сеть: повтор дал бы
+                # ровно тот же результат, ретрай тут бессмыслен.
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+
+            stage = "публикация"
+            await workflow.execute_activity(
+                activities.post_estimate_comment,
+                args=[req, result],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+        except Exception:
+            await workflow.execute_activity(
+                activities.post_estimate_error,
+                args=[req, stage],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=5),
             )

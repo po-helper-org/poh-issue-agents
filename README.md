@@ -12,6 +12,7 @@ Actions. Два независимых сценария: **триаж каждо
 |-------------|--------|-------------|
 | **Layer A — автономный триаж Issue**: предфильтры → intake-gate (с циклом уточнений) → 4-way классификация + advisor-ответ → duplicate-check (только метка) → приоритет по формуле | ✅ Работает, прогнан вживую по реальному бэклогу (64/67 Issue размечено, 0 ошибочных закрытий) | `make dry-run` / `make backfill-one issue=N` |
 | **Consolidation — группировка бэклога в зоны поставки** (taxonomy-first): профиль на Issue → вывод 8–12 зон → классификация Issue в зону → нарезка зоны на инкременты (MVP/MVP+1) → объединяющий Issue на инкремент → **PR** | ✅ Работает, прогнан вживую (8 зон, 19 инкрементов, PR с 20 файлами). ⚠️ см. «Ограничения» | `make consolidate` |
+| **`/estimate` — оценка трудоёмкости Issue** по методологии (тип работы → декомпозиция → FP cross-check → PERT → риски/надбавки → sanity bounds → грейды → Story Points), обоснование комментарием | ✅ Работает, прогнано вживую через webhook | комментарий `/estimate` в Issue |
 | **Layer B — webhook-автостарт** на новых Issue (GitHub App) | ⚙️ Код есть (`webhook/`), требует регистрации App + публичного URL | см. «Установка Layer B» |
 | **Тяжёлые стадии** `run_research_pipeline` / `run_bug_pipeline` (БФТ/Blueprint/SA-helper через `claude -p`) | ❌ `NotImplementedError` — не реализовано | — |
 | **Доставка скиллов po-helper/SA-helper в воркер**, установка `deb8flow` | ❌ Не решено (`worker/Dockerfile` — TODO) | — |
@@ -129,6 +130,17 @@ GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / cla
   (`ANTHROPIC_BASE_URL`). Используется только тяжёлыми стадиями, которые пока не
   реализованы.
 
+## Развёртывание как постоянного сервиса
+
+`docs/DEPLOY-DOKPLOY.md` — self-hosted развёртывание на Dokploy: публичный
+адрес с TLS для вебхука, Temporal переживает перезагрузку сервера, туннели с
+ноутбука не нужны. Продакшн-compose — `docker-compose.dokploy.yml`; локальный
+`docker-compose.yml` для этого не годится, он публикует наружу gRPC-API
+Temporal и веб-интерфейс без аутентификации.
+
+Для команды `/estimate` регистрация GitHub App не нужна: хватает вебхука
+уровня репозитория и personal access token.
+
 ---
 
 ## Установка Layer B (webhook + GitHub App)
@@ -144,6 +156,28 @@ GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / cla
 4. Положить `.pem` по пути `GITHUB_PRIVATE_KEY_PATH` (том/secret в
    `docker-compose.yml` явно не прописан — добавить под свою модель секретов).
 5. `docker compose up --build`.
+
+> Для команды `/estimate` App не обязателен: хватает вебхука уровня
+> репозитория (событие `issue_comment`) и personal access token в `GH_TOKEN`.
+> См. `docs/DEPLOY-DOKPLOY.md`.
+
+---
+
+## Оценка трудоёмкости — команда `/estimate`
+
+Комментарий `/estimate` в любом Issue запускает оценку. Агент ставит 👀 на
+комментарий, собирает контекст (описание, обсуждение, артефакты ветки
+`research/issue-<n>` или `bug/issue-<n>`, если она есть) и публикует оценку
+с обоснованием: декомпозиция по единицам работы, Function Points как
+cross-check, PERT, разбивка по грейдам, каждый применённый риск и каждая
+надбавка отдельной строкой.
+
+Повторный `/estimate` — новая оценка с учётом контекста, появившегося с
+прошлого раза. Прошлые прогоны остаются в Temporal UI.
+
+Методология — `docs/methodology/task-estimation.md`. Все коэффициенты
+вынесены в `config/estimation-rules.toml`: меняя их, не трогаешь ни промпт,
+ни код расчёта. Модель извлекает только факты, все числа считает Python.
 
 ---
 
