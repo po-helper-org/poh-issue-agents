@@ -21,6 +21,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY worker/ .
 COPY shared/ /app/shared/
 
+# Промпты, коэффициенты расчёта и справочник функционала запекаются в образ,
+# а не приезжают монтированием. На Dokploy каталог репозитория очищается при
+# автодеплое, и bind-монтирование из него оставило бы воркер без файлов —
+# _load_prompt упал бы на FileNotFoundError уже на первой стадии.
+# Локальный docker-compose.yml всё ещё монтирует эти каталоги поверх, так что
+# правка промпта видна без пересборки образа.
+COPY prompts/ /app/prompts/
+COPY config/ /app/config/
+COPY workspace/ /app/workspace/
+
 ENV PYTHONPATH=/app
 
 CMD ["python", "worker.py"]
