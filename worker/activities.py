@@ -17,6 +17,7 @@ from temporalio import activity
 import github_client
 import llm
 from shared.workflow_types import (
+    AnalyzeInput,
     ClassificationResult,
     DuplicateResult,
     GateResult,
@@ -298,3 +299,37 @@ async def trigger_openhands_resolver(issue: IssueInput) -> None:
     """TODO: вызов OpenHands resolver — остаётся отдельным сервисом со
     своим sandboxing (docker.sock), не частью этого docker-compose."""
     raise NotImplementedError("OpenHands resolver — интеграция ещё не спроектирована")
+
+
+# --- Слой C: аналитика по запросу (команда /analyze) ---
+
+@activity.defn
+async def ack_command(analyze: AnalyzeInput) -> None:
+    """Видимое подтверждение приёма команды ДО тяжёлой работы.
+
+    Реакция ставится на сам комментарий-триггер, комментарий объясняет
+    задержку: полный прогон FNR занимает минуты, без ack это выглядит как
+    молчание бота.
+    """
+    if analyze.comment_id is not None:
+        github_client.add_reaction(analyze.repo, analyze.comment_id, "eyes")
+    github_client.post_comment(
+        analyze.repo,
+        analyze.issue_number,
+        "🔍 Взял `/analyze` в работу — запускаю автономный анализ через SA-helper.\n\n"
+        "Прогон занимает несколько минут: артефакты появятся в ветке "
+        f"`research/issue-{analyze.issue_number}`, а сводка — следующим комментарием.",
+    )
+
+
+@activity.defn
+async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
+    """Не молчать при провале: прогон дорогой и долгий, тихое падение
+    неотличимо от «ещё работает»."""
+    github_client.post_comment(
+        analyze.repo,
+        analyze.issue_number,
+        f"⚠️ Автономный анализ не удался: {reason}\n\n"
+        "Прогон не повторяется автоматически (он недетерминирован и дорог). "
+        "Запустить заново — командой `/analyze`.",
+    )
