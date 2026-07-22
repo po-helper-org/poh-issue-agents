@@ -31,6 +31,7 @@ async def main() -> None:
             activities.close_as_spam,
             activities.escalate_to_human,
             activities.post_error_label,
+            activities.mark_analyzing,
             activities.classify_issue,
             activities.duplicate_check,
             activities.score_priority,

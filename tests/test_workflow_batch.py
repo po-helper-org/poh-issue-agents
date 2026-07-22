@@ -130,3 +130,50 @@ async def test_research_me_label_surfaces_pipeline_failure():
 
     assert _research_state["attempts"] == [1], "дорогой прогон не должен ретраиться"
     assert "boom-research-me" in _research_state["reason"]
+
+
+# --- analyze_requested: лейбл ставится ровно один раз ---
+#
+# Хендлер сигнала теперь не просто пишет поле — он вызывает activity
+# mark_analyzing. Guard (self._analyze_labeled) обязан держаться даже если
+# /analyze прилетает дважды (повторная команда, дубль webhook-доставки):
+# лейбл должен появиться один раз, а не на каждый сигнал.
+
+_analyze_signal_state = {"count": 0}
+
+
+@activity.defn(name="mark_analyzing")
+async def stub_mark_analyzing(repo: str, issue_number: int) -> None:
+    _analyze_signal_state["count"] += 1
+
+
+@pytest.mark.timeout(30)
+async def test_analyze_requested_labels_only_once():
+    """Два сигнала analyze_requested подряд обязаны дать ровно один вызов
+    mark_analyzing: run() устанавливает self._issue первой же строкой (до
+    какого-либо await), так что к моменту, когда обработчики сигналов
+    получают своё исполнение, self._issue уже не None — guard проверяет
+    именно однократность лейбла, а не гонку за его инициализацию."""
+    _analyze_signal_state["count"] = 0
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client, task_queue="tq-analyze-once", workflows=[IssueLifecycle],
+            activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
+                        stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
+                        stub_mark_analyzing],
+        ):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run,
+                IssueInput(repo="o/r", issue_number=42, title="t", body="b",
+                           author_login="u", author_type="User", interactive=True),
+                id=f"wf-{uuid.uuid4()}", task_queue="tq-analyze-once",
+            )
+            await handle.signal(IssueLifecycle.analyze_requested, 111)
+            await handle.signal(IssueLifecycle.analyze_requested, 222)
+            # "no-match" не совпадает ни с research-me, ни с bug-me — run()
+            # уходит в ветку else: return, не запуская тяжёлый пайплайн, так
+            # что для завершения теста лишних стабов (пайплайна и т.п.) не нужно.
+            await handle.signal(IssueLifecycle.human_decision, "no-match")
+            await handle.result()
+
+    assert _analyze_signal_state["count"] == 1, "повторный /analyze не должен плодить лейблы"

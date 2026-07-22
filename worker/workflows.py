@@ -33,7 +33,8 @@ MAX_CLARIFICATION_ROUNDS = 2
 class IssueLifecycle:
     def __init__(self) -> None:
         self._signal_queue: asyncio.Queue[str] = asyncio.Queue()
-        self._analyze_requested_comment_id: int | None = None
+        self._analyze_labeled = False
+        self._issue: IssueInput | None = None
 
     @workflow.signal
     async def human_decision(self, label: str) -> None:
@@ -45,14 +46,24 @@ class IssueLifecycle:
 
     @workflow.signal
     async def analyze_requested(self, comment_id: int) -> None:
-        """Уведомление, что по Issue запрошен автономный анализ.
+        """По Issue запрошен автономный анализ командой /analyze.
 
-        Намеренно НЕ запускает пайплайн и не спавнит дочерний воркфлоу: run()
-        в этот момент обычно припаркован в _wait_for_signal(), и спавн из
-        хендлера сигнала гонялся бы с основным циклом. Тяжёлый прогон несёт
-        отдельный воркфлоу IssueAnalysis, стартующий из webhook.
+        Вешаем видимую метку `analyzing`, чтобы в ленте триажа было понятно, что
+        прогон идёт; сам анализ несёт отдельный воркфлоу IssueAnalysis (из
+        webhook), здесь — только метка, и ставим её один раз (повторный /analyze
+        не плодит лейблы). Тяжёлую работу из хендлера не запускаем: run() обычно
+        припаркован в _wait_for_signal(), спавн оттуда гонялся бы с основным
+        циклом; лёгкая activity add_label безопасна.
         """
-        self._analyze_requested_comment_id = comment_id
+        if self._analyze_labeled or self._issue is None:
+            return
+        self._analyze_labeled = True
+        await workflow.execute_activity(
+            activities.mark_analyzing,
+            args=[self._issue.repo, self._issue.issue_number],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
 
     async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | None:
         try:
@@ -66,6 +77,7 @@ class IssueLifecycle:
 
     @workflow.run
     async def run(self, issue: IssueInput) -> None:
+        self._issue = issue  # даёт analyze_requested доступ к repo/number
         default_retry = RetryPolicy(maximum_attempts=3)
 
         try:

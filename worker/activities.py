@@ -147,6 +147,13 @@ async def post_error_label(issue: IssueInput) -> None:
     github_client.add_label(issue.repo, issue.issue_number, "advisor:error")
 
 
+@activity.defn
+async def mark_analyzing(repo: str, issue_number: int) -> None:
+    """Видимая метка, что по Issue запущен автономный анализ (/analyze).
+    add_label соблюдает DRY_RUN, отдельного гарда не нужно."""
+    github_client.add_label(repo, issue_number, "analyzing")
+
+
 # --- Классификация ---
 
 @activity.defn
