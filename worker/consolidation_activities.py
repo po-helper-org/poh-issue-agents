@@ -1,4 +1,5 @@
 """Consolidation activities: profile extraction, taxonomy/increments, synthesis, PR."""
+import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -63,7 +64,10 @@ def synthesize_unifying_issue(increment: Increment,
 
 
 def _slug_file(name: str) -> str:
-    return name.replace(":", "-").replace("/", "-")
+    """Increment names become file paths, so collapse everything that is not a
+    word char / dot / dash — `:`, `/`, spaces and `&` all appear in real
+    increment names (e.g. `jira-bus:MVP: Discovery & Indexing`)."""
+    return re.sub(r"[^\w.-]+", "-", name, flags=re.UNICODE).strip("-") or "increment"
 
 
 @activity.defn

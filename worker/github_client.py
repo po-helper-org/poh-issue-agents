@@ -143,6 +143,12 @@ def list_open_issues(repo: str, limit: int = 300) -> list:
     cmd = ["gh", "issue", "list", "--repo", repo, "--state", "open",
            "--limit", str(limit), "--json", "number,title,body,labels"]
     result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    # Do NOT swallow a gh failure: an empty stdout would silently become an empty
+    # backlog, and consolidation would open a PR that consolidates nothing.
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh issue list failed for {repo} (exit {result.returncode}): "
+            f"{result.stderr.strip()[:300]}")
     out = []
     for it in json.loads(result.stdout or "[]"):
         it["labels"] = [l["name"] for l in it.get("labels", [])]
