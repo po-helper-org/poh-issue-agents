@@ -960,6 +960,8 @@ from pathlib import Path
 на:
 
 ```python
+import asyncio
+import os
 import re
 import shutil
 import subprocess
@@ -1000,11 +1002,24 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
 
 def _clone_repo(repo: str, dest: str) -> None:
     """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
-    реальный код (`файл:строка`), одного текста Issue недостаточно."""
-    url = f"https://x-access-token:{github_client.auth_token()}@github.com/{repo}.git"
+    реальный код (`файл:строка`), одного текста Issue недостаточно.
+
+    Токен идёт через credential.helper в env, а НЕ вклеен в URL: argv команды
+    целиком рендерится в текст subprocess.CalledProcessError/TimeoutExpired, и
+    без этого любой сбой клонирования унёс бы живой GitHub-токен в Temporal
+    event history и логи воркера. GIT_CONFIG_COUNT требует git ≥ 2.31 (в образе
+    2.47). Прецедент env-передачи токена — github_client.search_candidates."""
+    url = f"https://github.com/{repo}.git"
+    env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
+        "GH_CLONE_TOKEN": github_client.auth_token(),
+    }
     subprocess.run(
         ["git", "clone", "--depth", "1", url, dest],
-        check=True, capture_output=True, text=True, timeout=CLONE_TIMEOUT_SEC,
+        env=env, check=True, capture_output=True, text=True, timeout=CLONE_TIMEOUT_SEC,
     )
 
 
@@ -1073,28 +1088,34 @@ async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
     workdir = tempfile.mkdtemp(prefix=f"analysis-{analyze.issue_number}-")
     clone_dir = str(Path(workdir) / "repo")
     try:
-        _clone_repo(analyze.repo, clone_dir)
+        # Каждый блокирующий вызов через asyncio.to_thread: воркер крутит один
+        # event loop, синхронный subprocess.run на 900с заблокировал бы поток
+        # целиком — другие issue встали бы, а activity.heartbeat не ушёл бы на
+        # сервер (ему нужен тот же loop). Вынос в поток освобождает loop.
+        await asyncio.to_thread(_clone_repo, analyze.repo, clone_dir)
         activity.heartbeat("cloned")
-        _run_repomix(clone_dir)
+        await asyncio.to_thread(_run_repomix, clone_dir)
         activity.heartbeat("packed")
 
         description = f"{analyze.title}\n\n{analyze.body}"
         for name, prompt, expected in _fnr_stages(description):
-            _run_claude(prompt, clone_dir)
+            await asyncio.to_thread(_run_claude, prompt, clone_dir)
             if expected and not (Path(clone_dir) / expected).exists():
                 raise RuntimeError(f"стадия {name}: артефакт {expected} не создан")
             activity.heartbeat(name)
 
-        files = _collect_artifacts(clone_dir)
+        files = await asyncio.to_thread(_collect_artifacts, clone_dir)
         if not files:
             raise RuntimeError("пайплайн не произвёл ни одного артефакта")
 
         branch = f"research/issue-{analyze.issue_number}"
-        github_client.push_artifacts_to_branch(
+        await asyncio.to_thread(
+            github_client.push_artifacts_to_branch,
             analyze.repo, branch, files,
             f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
         )
-        github_client.post_comment(
+        await asyncio.to_thread(
+            github_client.post_comment,
             analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
         )
         return branch
@@ -1110,9 +1131,9 @@ Expected: PASS (6 passed)
 - [ ] **Step 6: Прогнать весь suite**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (39 passed)
+Expected: PASS (42 passed)
 
-> `run_research_pipeline` удалён — он ещё числится в регистрации воркера (`worker/worker.py:38`). Импорт `worker.py` пока не ломается на уровне тестов, но это чинится в Task 7, который обязателен сразу следом.
+> `run_research_pipeline` удалён — он ещё числится и в регистрации воркера (`worker/worker.py:38`), и в ветке `research-me` воркфлоу (`worker/workflows.py:178`). Импорт `worker.py` не ломается на уровне тестов, но обе ссылки обязан снять Task 7 (он идёт сразу следом).
 
 - [ ] **Step 7: Commit**
 
@@ -1121,12 +1142,25 @@ git add worker/activities.py tests/test_analysis_pipeline.py
 git commit -m "feat(activities): implement SA-helper FNR pipeline for /analyze"
 ```
 
+- [ ] **Step 8: Обязательный фикс-раунд (два дефекта из примера этого таска)**
+
+Ревью Task 6 находит два Important прямо в коде выше — оба надо закрыть отдельным коммитом:
+
+1. **Утечка токена.** `_clone_repo` (Step 4) в первичном виде вклеивал токен в URL как элемент argv; `subprocess.CalledProcessError`/`TimeoutExpired` печатают `cmd` целиком, а исключение никем не перехвачено — при любом сбое клонирования живой GitHub-токен уходит в Temporal event history и логи. Код `_clone_repo` в Step 4 УЖЕ приведён к безопасному виду (токен через `credential.helper` в `env`). Если исполняешь по старой ревизии — переключись на env-вариант.
+2. **Блокировка event loop.** `run_analysis_pipeline` — `async def` без единого `await`; синхронные вызовы блокируют единственный loop воркера (стадия до 900с), из-за чего `activity.heartbeat` не уходит на сервер. Код в Step 4 УЖЕ обёрнут в `asyncio.to_thread`.
+
+Регресс-тесты (в `tests/test_analysis_pipeline.py`, добавить к шести из Step 1):
+- `test_clone_failure_never_leaks_token_in_calledprocesserror` и `test_clone_timeout_never_leaks_token`: заведомый sentinel-токен не встречается в `str`/`repr`/`cmd`/`output`/`stderr` исключения.
+- `test_blocking_stages_run_off_the_event_loop_thread`: `_run_claude` исполняется на не-главном потоке (падает, если убрать `to_thread`).
+
+Итог: `tests/test_analysis_pipeline.py` содержит 9 тестов, весь suite — 42.
+
 ---
 
 ## Task 7: Воркфлоу `IssueAnalysis`, сигнал и регистрация
 
 **Files:**
-- Modify: `worker/workflows.py` (сигнал в `IssueLifecycle` рядом с `:37-43`; новый класс — в конец файла)
+- Modify: `worker/workflows.py` (сигнал в `IssueLifecycle` рядом с `:37-43`; перепроводка ветки `research-me` `:176-182`; новый класс — в конец файла)
 - Modify: `worker/worker.py:26-41`
 - Create: `tests/test_workflow_analysis.py`
 
@@ -1334,6 +1368,37 @@ from workflows import IssueAnalysis, IssueLifecycle
             activities.publish_analysis_error,
 ```
 
+- [ ] **Step 6b: Снять вторую висячую ссылку на удалённый `run_research_pipeline` в `worker/workflows.py`**
+
+Ветка `research-me` (`worker/workflows.py:176-182`) всё ещё зовёт удалённый Task 6 символ. Раньше это была отдельная заглушка (`NotImplementedError`); теперь лейбл `research-me` для feature-request перенаправляется на новый пайплайн через `AnalyzeInput` (та же аналитика, что и `/analyze`, но триггер — лейбл, поэтому `comment_id=None`). Заменить блок `:176-182`:
+
+```python
+        if decision == "research-me" and classification.label == "advisor:feature-request":
+            await workflow.execute_activity(
+                activities.run_research_pipeline,
+                issue,
+                start_to_close_timeout=timedelta(minutes=60),
+                retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой мультиагентный прогон вслепую
+            )
+```
+
+на:
+
+```python
+        if decision == "research-me" and classification.label == "advisor:feature-request":
+            # Лейбл research-me — второй вход в ту же аналитику Слоя C, что и
+            # команда /analyze. Триггер не комментарий, поэтому comment_id=None
+            # (ack_command тогда пропускает реакцию, но комментарий всё равно шлёт).
+            await workflow.execute_activity(
+                activities.run_analysis_pipeline,
+                AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
+                             title=issue.title, body=issue.body),
+                start_to_close_timeout=timedelta(seconds=4500),
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой прогон вслепую
+            )
+```
+
 - [ ] **Step 7: Прогнать тесты**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_workflow_analysis.py -q`
@@ -1354,7 +1419,7 @@ Expected: печатает `worker module imports OK` (ошибки `AttributeEr
 - [ ] **Step 9: Прогнать весь suite**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (41 passed)
+Expected: PASS (44 passed)
 
 - [ ] **Step 10: Commit**
 
@@ -1494,7 +1559,7 @@ _log = logging.getLogger("webhook")
 - [ ] **Step 4: Прогнать весь suite (регресса быть не должно)**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (41 passed)
+Expected: PASS (44 passed)
 
 - [ ] **Step 5: Поднять стек в DRY_RUN и проверить сквозной путь**
 

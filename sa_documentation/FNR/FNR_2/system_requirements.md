@@ -520,6 +520,8 @@ stop
 5. Каждый `claude -p` запускается неинтерактивно с `--permission-mode acceptEdits` (запись файлов без промптов). `--dangerously-skip-permissions` **неприменим**: контейнер воркера работает от root, а claude-code запрещает этот флаг под root (`cannot be used with root/sudo privileges`) — проверено спайком, `docs/spikes/2026-07-22-claude-p-zai-tool-calling.md`.
 6. Env субпроцесса: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL` (`.env.example:18-21`).
 7. Временный воркспейс удаляется по завершении (успех или сбой) — без утечки диска.
+8. **Токен клонирования не попадает в argv.** `subprocess.CalledProcessError`/`TimeoutExpired` рендерят `cmd` целиком, а исключение уходит в Temporal event history и логи; поэтому токен передаётся через `credential.helper` в `env` (git ≥ 2.31, `GIT_CONFIG_COUNT`), а не вклеивается в URL. Прецедент — `worker/github_client.py:92`.
+9. **Блокирующие вызовы — через `asyncio.to_thread`.** Воркер держит один event loop (`worker/worker.py:44-54`); синхронный `subprocess.run` на стадии до 900с заблокировал бы его целиком, и `activity.heartbeat` (п.2) не смог бы уйти на сервер. Каждый вызов (clone/repomix/claude/push/comment) выносится в поток, чтобы heartbeat из п.1-2 был реальным.
 
 ##### 4.3.2.5 Затрагиваемые компоненты
 
