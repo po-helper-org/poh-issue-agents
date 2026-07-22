@@ -5,6 +5,7 @@
 и обновлять самостоятельно (живёт ~1 час).
 """
 
+import base64
 import logging
 import os
 import subprocess
@@ -150,3 +151,56 @@ def get_file(repo: str, path: str, ref: str) -> str | None:
         return None
     resp.raise_for_status()
     return resp.text
+
+
+def create_pr_with_files(repo: str, branch: str, base: str,
+                         files: dict, title: str, body: str):
+    if _dry_run():
+        _log.info("[DRY_RUN] PR %s <- %s: %d files, title=%s",
+                  repo, branch, len(files), title)
+        return None
+    h = _auth_headers()
+    api = f"https://api.github.com/repos/{repo}"
+    base_resp = requests.get(f"{api}/git/refs/heads/{base}", headers=h, timeout=30)
+    base_resp.raise_for_status()
+    base_sha = base_resp.json()["object"]["sha"]
+    requests.post(f"{api}/git/refs", headers=h,
+                  json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+                  timeout=30).raise_for_status()
+    for path, content in files.items():
+        requests.put(f"{api}/contents/{path}", headers=h, json={
+            "message": f"consolidation: {path}",
+            "content": base64.b64encode(content.encode()).decode(),
+            "branch": branch,
+        }, timeout=30).raise_for_status()
+    resp = requests.post(f"{api}/pulls", headers=h,
+                         json={"title": title, "head": branch, "base": base,
+                               "body": body}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["html_url"]
+
+
+def list_open_issues(repo: str, limit: int = 300) -> list:
+    import json
+    env = {**os.environ, "GH_TOKEN": _auth_headers()["Authorization"].split(" ")[1]}
+    cmd = ["gh", "issue", "list", "--repo", repo, "--state", "open",
+           "--limit", str(limit), "--json", "number,title,body,labels"]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    # Do NOT swallow a gh failure: an empty stdout would silently become an empty
+    # backlog, and consolidation would open a PR that consolidates nothing.
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh issue list failed for {repo} (exit {result.returncode}): "
+            f"{result.stderr.strip()[:300]}")
+    out = []
+    for it in json.loads(result.stdout or "[]"):
+        it["labels"] = [l["name"] for l in it.get("labels", [])]
+        out.append(it)
+    return out
+
+
+def get_issue_body(repo: str, issue_number: int) -> str:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    resp = requests.get(url, headers=_auth_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("body") or ""

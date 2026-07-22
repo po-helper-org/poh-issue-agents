@@ -59,6 +59,8 @@ def list_open_issues(repo: str, limit: int) -> list[dict]:
     return json.loads(out or "[]")
 
 
+# Формат id (в т.ч. suffix для осознанного перепрогона) живёт в
+# shared/workflow_ids.py — его же собирают вебхук и scripts/estimate.py.
 workflow_id_for = issue_workflow_id
 
 
@@ -67,6 +69,7 @@ async def main() -> None:
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"))
     parser.add_argument("--issue", type=int, default=None)
     parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--suffix", default="", help="append to workflow id (fresh run without terminating prior)")
     args = parser.parse_args()
 
     if not args.repo:
@@ -84,10 +87,13 @@ async def main() -> None:
     started, skipped = 0, 0
     for item in items:
         issue = build_issue_input(args.repo, item)
-        wf_id = workflow_id_for(args.repo, issue.issue_number)
+        wf_id = workflow_id_for(args.repo, issue.issue_number, args.suffix)
         try:
             await client.start_workflow(
                 "IssueLifecycle", issue, id=wf_id, task_queue=TASK_QUEUE,
+                # REJECT_DUPLICATE keeps re-runs idempotent: a plain re-run skips
+                # already-processed issues (no double comments). To deliberately
+                # re-process, pass --suffix to mint fresh workflow ids instead.
                 id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
                 # A backfill starts dozens of workflows at once against a single
                 # worker whose activities are slow LLM calls. The default 10s

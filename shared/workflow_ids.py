@@ -9,8 +9,11 @@ ID несут смысл, а не только уникальность: `issue-
 """
 
 
-def issue_workflow_id(repo_full_name: str, issue_number: int) -> str:
-    return f"issue-{repo_full_name}-{issue_number}"
+def issue_workflow_id(repo_full_name: str, issue_number: int, suffix: str = "") -> str:
+    # suffix — осознанный перепрогон backfill: другой id, чтобы не упереться в
+    # REJECT_DUPLICATE уже обработанного Issue (scripts/backfill.py --suffix).
+    base = f"issue-{repo_full_name}-{issue_number}"
+    return f"{base}-{suffix}" if suffix else base
 
 
 def estimate_workflow_id(repo_full_name: str, issue_number: int, comment_id: int) -> str:

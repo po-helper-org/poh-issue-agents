@@ -1,5 +1,3 @@
-import asyncio
-
 import activities
 from shared.workflow_types import IssueInput
 
@@ -13,7 +11,9 @@ def test_post_error_label_comments_and_labels(monkeypatch):
 
     issue = IssueInput(repo="o/r", issue_number=7, title="t", body="b",
                        author_login="u", author_type="User")
-    asyncio.run(activities.post_error_label(issue))
+    # activities are now sync defs (run in the worker's ThreadPoolExecutor);
+    # call directly rather than via asyncio.run.
+    activities.post_error_label(issue)
 
     assert ("label", "o/r", 7, "advisor:error") in calls
     assert any(c[0] == "comment" and c[1] == "o/r" and c[2] == 7 for c in calls)

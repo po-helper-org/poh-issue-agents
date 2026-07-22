@@ -54,13 +54,13 @@ REQ = EstimateRequest(repo="o/r", issue_number=7, comment_id=555)
 
 
 async def test_ack_puts_eyes_on_the_command_comment(fake):
-    await activities.ack_estimate_command(REQ)
+    activities.ack_estimate_command(REQ)
     assert fake.reactions == [(555, "eyes")]
 
 
 async def test_context_carries_title_body_and_labels(fake):
     fake.issue = {"title": "Т", "body": "О", "labels": [{"name": "advisor:bug"}]}
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.title == "Т"
     assert context.body == "О"
     assert context.labels == ["advisor:bug"]
@@ -72,14 +72,14 @@ async def test_bot_comments_and_commands_are_excluded_from_the_thread(fake):
         comment("прошлая оценка", user_type="Bot"),
         comment("/estimate"),
     ]
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.thread == ["живой контекст"]
 
 
 async def test_thread_is_capped_by_character_budget(fake, monkeypatch):
     monkeypatch.setattr(activities, "MAX_THREAD_CHARS", 10)
     fake.comments = [comment("12345"), comment("67890"), comment("перебор")]
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.thread == ["12345", "67890"]
     assert context.truncated is True
 
@@ -87,7 +87,7 @@ async def test_thread_is_capped_by_character_budget(fake, monkeypatch):
 async def test_research_branch_artifacts_are_pulled(fake):
     fake.branches = {"research/issue-7"}
     fake.files = {"docs/bft/issue-7-blueprint.md": "план"}
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.branch == "research/issue-7"
     assert context.artifacts == {"docs/bft/issue-7-blueprint.md": "план"}
 
@@ -95,13 +95,13 @@ async def test_research_branch_artifacts_are_pulled(fake):
 async def test_bug_branch_is_used_when_there_is_no_research_branch(fake):
     fake.branches = {"bug/issue-7"}
     fake.files = {"docs/bugs/issue-7-diagnosis.md": "диагноз"}
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.branch == "bug/issue-7"
     assert "docs/bugs/issue-7-diagnosis.md" in context.artifacts
 
 
 async def test_no_branch_means_no_artifacts_and_is_not_an_error(fake):
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.branch is None
     assert context.artifacts == {}
 
@@ -110,7 +110,7 @@ async def test_oversized_artifact_is_truncated(fake, monkeypatch):
     monkeypatch.setattr(activities, "MAX_ARTIFACT_CHARS", 5)
     fake.branches = {"research/issue-7"}
     fake.files = {"docs/bft/issue-7-blueprint.md": "1234567890"}
-    context = await activities.collect_estimation_context(REQ)
+    context = activities.collect_estimation_context(REQ)
     assert context.artifacts["docs/bft/issue-7-blueprint.md"] == "12345"
     assert context.truncated is True
 
@@ -143,24 +143,24 @@ FACTS_PAYLOAD = {
 
 async def test_compute_activity_returns_rendered_markdown(fake, monkeypatch, rules):
     monkeypatch.setattr(activities.estimation, "load_rules", lambda *a, **k: rules)
-    result = await activities.compute_estimate(FACTS_PAYLOAD, _context())
+    result = activities.compute_estimate(FACTS_PAYLOAD, _context())
     assert result.stopped is False
     assert "## Оценка задачи" in result.markdown
 
 
 async def test_posting_adds_the_estimated_label(fake):
-    await activities.post_estimate_comment(REQ, EstimateResult(markdown="текст", stopped=False))
+    activities.post_estimate_comment(REQ, EstimateResult(markdown="текст", stopped=False))
     assert fake.posted == ["текст"]
     assert fake.labels == ["estimated"]
 
 
 async def test_stopped_estimate_is_posted_without_the_label(fake):
-    await activities.post_estimate_comment(REQ, EstimateResult(markdown="стоп", stopped=True))
+    activities.post_estimate_comment(REQ, EstimateResult(markdown="стоп", stopped=True))
     assert fake.posted == ["стоп"]
     assert fake.labels == []
 
 
 async def test_error_reports_the_stage_and_reacts(fake):
-    await activities.post_estimate_error(REQ, "сбор контекста")
+    activities.post_estimate_error(REQ, "сбор контекста")
     assert "сбор контекста" in fake.posted[0]
     assert fake.reactions == [(555, "confused")]
