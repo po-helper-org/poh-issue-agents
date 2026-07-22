@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 import activities
-from workflows import IssueLifecycle
+from workflows import IssueEstimation, IssueLifecycle
 
 
 async def main() -> None:
@@ -23,7 +23,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
-        workflows=[IssueLifecycle],
+        workflows=[IssueLifecycle, IssueEstimation],
         activities=[
             activities.prefilter_bot_and_security,
             activities.intake_gate,
@@ -38,6 +38,12 @@ async def main() -> None:
             activities.run_research_pipeline,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,
+            activities.ack_estimate_command,
+            activities.collect_estimation_context,
+            activities.extract_estimation_facts,
+            activities.compute_estimate,
+            activities.post_estimate_comment,
+            activities.post_estimate_error,
         ],
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
