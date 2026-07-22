@@ -419,6 +419,30 @@ def test_dry_run_makes_no_http_calls(monkeypatch):
     gc.push_artifacts_to_branch("o/r", "research/issue-5", {"a/b.md": "x"}, "msg")
 
 
+def test_dry_run_ensure_branch_makes_no_http_call(monkeypatch):
+    """Прямой вызов, в обход push_artifacts_to_branch: ensure_branch публична,
+    её может дёрнуть будущий код — гард обязан быть в ней самой."""
+    gc = _fresh(monkeypatch, dry=True)
+
+    def boom(*a, **k):
+        raise AssertionError("HTTP called under DRY_RUN")
+
+    monkeypatch.setattr(gc.requests, "get", boom)
+    monkeypatch.setattr(gc.requests, "post", boom)
+    gc.ensure_branch("o/r", "research/issue-5")
+
+
+def test_dry_run_put_file_makes_no_http_call(monkeypatch):
+    gc = _fresh(monkeypatch, dry=True)
+
+    def boom(*a, **k):
+        raise AssertionError("HTTP called under DRY_RUN")
+
+    monkeypatch.setattr(gc.requests, "get", boom)
+    monkeypatch.setattr(gc.requests, "put", boom)
+    gc.put_file("o/r", "research/issue-5", "docs/a.md", "x", "msg")
+
+
 def test_add_reaction_posts_to_comment_reactions_endpoint(monkeypatch):
     gc = _fresh(monkeypatch, dry=False)
     seen = {}
@@ -543,6 +567,9 @@ def add_reaction(repo: str, comment_id: int, content: str = "eyes") -> None:
 
 def ensure_branch(repo: str, branch: str) -> None:
     """Создаёт ветку от дефолтной, если её ещё нет."""
+    if _dry_run():
+        _log.info("[DRY_RUN] ensure branch %s#%s", repo, branch)
+        return
     if branch_exists(repo, branch):
         return
     meta = requests.get(f"https://api.github.com/repos/{repo}", headers=_auth_headers(), timeout=30)
@@ -571,6 +598,9 @@ def put_file(repo: str, branch: str, path: str, content: str, message: str) -> N
     Contents API, а не `git push`: клон делается shallow (--depth 1), а push из
     такого клона GitHub может отклонить. Здесь ремоут вообще не нужен.
     """
+    if _dry_run():
+        _log.info("[DRY_RUN] put file %s#%s: %s", repo, branch, path)
+        return
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
     payload = {
         "message": message,
@@ -613,12 +643,12 @@ def push_artifacts_to_branch(repo: str, branch: str, files: dict[str, str], mess
 - [ ] **Step 6: Прогнать тесты**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_analyze.py -q`
-Expected: PASS (7 passed)
+Expected: PASS (9 passed)
 
 - [ ] **Step 7: Прогнать весь suite (регресс существующих github_client-тестов)**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (28 passed)
+Expected: PASS (30 passed)
 
 - [ ] **Step 8: Commit**
 
@@ -758,7 +788,7 @@ Expected: PASS (3 passed)
 - [ ] **Step 6: Прогнать весь suite**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (31 passed)
+Expected: PASS (33 passed)
 
 - [ ] **Step 7: Commit**
 
@@ -1068,7 +1098,7 @@ Expected: PASS (6 passed)
 - [ ] **Step 6: Прогнать весь suite**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (37 passed)
+Expected: PASS (39 passed)
 
 > `run_research_pipeline` удалён — он ещё числится в регистрации воркера (`worker/worker.py:38`). Импорт `worker.py` пока не ломается на уровне тестов, но это чинится в Task 7, который обязателен сразу следом.
 
@@ -1312,7 +1342,7 @@ Expected: печатает `worker module imports OK` (ошибки `AttributeEr
 - [ ] **Step 9: Прогнать весь suite**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (39 passed)
+Expected: PASS (41 passed)
 
 - [ ] **Step 10: Commit**
 
@@ -1452,7 +1482,7 @@ _log = logging.getLogger("webhook")
 - [ ] **Step 4: Прогнать весь suite (регресса быть не должно)**
 
 Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
-Expected: PASS (39 passed)
+Expected: PASS (41 passed)
 
 - [ ] **Step 5: Поднять стек в DRY_RUN и проверить сквозной путь**
 
