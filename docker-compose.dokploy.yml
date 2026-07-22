@@ -1,110 +1,49 @@
 # Продакшн-вариант compose для self-hosted развёртывания (Dokploy).
 # Пошаговая инструкция — docs/DEPLOY-DOKPLOY.md.
 #
-# Отличия от docker-compose.yml (локальная разработка) не косметические,
-# каждое закрывает конкретную проблему публичного хоста:
+# Temporal НЕ поднимается здесь: сервис ходит в централизованный Temporal
+# в инфраструктуре по TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE из .env
+# (Dokploy → Environment). Postgres/temporal/temporal-ui выведены из этого
+# файла целиком — их держит централизованный кластер.
 #
-# 1. Наружу не публикуется ни один порт. В локальном файле открыты 7233
-#    (gRPC-API Temporal) и 8080 (Temporal UI, у которого нет никакой
-#    аутентификации). На сервере с публичным адресом это отдало бы постороннему
-#    право стартовать и терминировать workflow и читать тела всех Issue вместе
-#    с содержимым артефактов. Единственная публичная точка — webhook, и он
-#    попадает наружу через Traefik самого Dokploy, с TLS.
+# Отличия от docker-compose.yml (локальная разработка):
+#
+# 1. Наружу не публикуется ни один порт. Единственная публичная точка — webhook,
+#    и он попадает наружу через Traefik самого Dokploy, с TLS.
 #
 # 2. Нет bind-монтирования prompts/config/workspace из каталога репозитория:
 #    Dokploy очищает этот каталог при автодеплое. Файлы запечены в образ
 #    воркера (см. worker/Dockerfile).
 #
-# 3. Пароль Postgres приходит переменной. Деплой намеренно падает, если она
-#    не задана, — молчаливый дефолт здесь опаснее сломанного деплоя.
-#
-# 4. restart-политика у всех сервисов, а не только у воркера.
+# 3. restart-политика у всех сервисов.
 
 services:
-  postgres:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: temporal
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задай POSTGRES_PASSWORD в Environment}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U temporal"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  temporal:
-    image: temporalio/auto-setup:1.24
-    restart: unless-stopped
-    environment:
-      - DB=postgres12
-      - DB_PORT=5432
-      - POSTGRES_USER=temporal
-      - POSTGRES_PWD=${POSTGRES_PASSWORD:?задай POSTGRES_PASSWORD в Environment}
-      - POSTGRES_SEEDS=postgres
-    # expose, а не ports: порт доступен соседям по сети compose и никому больше.
-    expose:
-      - "7233"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  temporal-ui:
-    image: temporalio/ui:2.31.2
-    restart: unless-stopped
-    environment:
-      - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
-    # Хост-порт НЕ публикуется намеренно. На Dokploy-хосте порт 8080 обычно
-    # уже занят (Traefik/панель), а публиковать порты руками здесь и не нужно —
-    # наружу сервисы выводит Traefik. У интерфейса нет входа по паролю, поэтому
-    # снаружи он и не должен торчать. Как до него дойти — docs/DEPLOY-DOKPLOY.md,
-    # раздел «Temporal UI» (Dokploy-домен с basic-auth).
-    expose:
-      - "8080"
-    networks:
-      - default
-      - dokploy-network
-    depends_on:
-      - temporal
-
   webhook:
     build:
       context: .
       dockerfile: webhook/Dockerfile
     restart: unless-stopped
+    # TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE берутся из .env (централизованный Temporal).
     env_file: .env
-    environment:
-      - TEMPORAL_ADDRESS=temporal:7233
     expose:
       - "3000"
-    # default — чтобы видеть temporal; dokploy-network — чтобы Traefik видел
-    # этот контейнер. Указав сеть явно, compose перестаёт добавлять default
-    # сам, поэтому он перечислен здесь.
+    # dokploy-network — чтобы Traefik видел этот контейнер. Указав сеть явно,
+    # compose перестаёт добавлять default сам, поэтому он перечислен здесь.
     networks:
       - default
       - dokploy-network
-    depends_on:
-      - temporal
 
   worker:
     build:
       context: .
       dockerfile: worker/Dockerfile
     restart: unless-stopped
+    # TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE берутся из .env (централизованный Temporal).
     env_file: .env
     environment:
-      - TEMPORAL_ADDRESS=temporal:7233
       # Небуферизованный вывод: строки [DRY_RUN] и ошибки видны в логах
       # Dokploy сразу, а не через несколько минут блочным сбросом.
       - PYTHONUNBUFFERED=1
-    depends_on:
-      - temporal
-
-volumes:
-  pgdata:
 
 networks:
   dokploy-network:

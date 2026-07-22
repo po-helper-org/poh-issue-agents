@@ -13,6 +13,6 @@ def test_launcher_starts_workflow(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["consolidate", "--repo", "o/r"])
     mock_client = AsyncMock()
     mock_client.execute_workflow = AsyncMock(return_value="http://pr/1")
-    with patch("consolidate.Client.connect", AsyncMock(return_value=mock_client)):
+    with patch("consolidate.connect_temporal", AsyncMock(return_value=mock_client)):
         asyncio.run(consolidate.main())
     mock_client.execute_workflow.assert_awaited_once()

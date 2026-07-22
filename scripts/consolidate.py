@@ -10,8 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "worker"))
 
-from temporalio.client import Client
-
+from shared.temporal_client import connect_temporal
 from shared.workflow_types import ConsolidationInput
 
 TASK_QUEUE = "issue-lifecycle"
@@ -23,7 +22,7 @@ async def main() -> None:
     args = parser.parse_args()
     if not args.repo:
         raise SystemExit("set --repo or GITHUB_REPOSITORY")
-    client = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"))
+    client = await connect_temporal()
     url = await client.execute_workflow(
         "ConsolidationWorkflow", ConsolidationInput(repo=args.repo),
         id=f"consolidation-{args.repo}-{uuid.uuid4().hex[:8]}", task_queue=TASK_QUEUE,

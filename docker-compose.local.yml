@@ -1,0 +1,65 @@
+# Override для офлайн-разработки: поднимает ЛОКАЛЬНЫЙ Temporal-стек и
+# переключает приложение на него. Накладывается поверх базового файла:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# Базовый docker-compose.yml инфраструктуры не содержит (Temporal внешний) —
+# всё, что связано с локальным Temporal, живёт только здесь. Значения
+# TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE из .env тут перекрываются на локальные,
+# так что для офлайн-режима .env править не нужно.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_USER: temporal
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.24
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Веб-интерфейс Temporal — видно, на какой стадии каждый issue.
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - temporal
+
+  # Переключить приложение на локальный Temporal (перекрывает .env) и дождаться
+  # контейнера temporal.
+  webhook:
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+    depends_on:
+      - temporal
+
+  worker:
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+    depends_on:
+      - temporal
+
+volumes:
+  pgdata:

@@ -29,13 +29,20 @@ webhook:
 
 ```bash
 make setup     # preflight (docker/uv/gh) + venv + генерация .env (интерактивно)
-make up        # поднять temporal + worker
+make up        # поднять worker (Temporal — централизованный, TEMPORAL_ADDRESS в .env)
 make dry-run   # прогнать ВСЕ открытые Issue в DRY_RUN — ничего не мутируется
 ```
 
+Temporal — **внешний**: `docker-compose.yml` поднимает только `webhook`+`worker`,
+никаких `postgres`/`temporal`/`temporal-ui`. Адрес и namespace задаются через
+`TEMPORAL_ADDRESS` и `TEMPORAL_NAMESPACE` в `.env`. Нужен локальный Temporal для
+офлайн-разработки — `make up-local` наложит override `docker-compose.local.yml`
+(поднимет локальный стек, UI на http://localhost:8080, и сам переключит приложение
+на него; `.env` для этого править не нужно).
+
 `make setup` спросит целевой репозиторий, возьмёт GitHub-токен из авторизованного
 `gh`, запросит `ZAI_API_KEY`, запишет `.env` с `DRY_RUN=1`. Смотри `[DRY_RUN]`-строки
-в `make logs` (Temporal UI — http://localhost:8080), затем:
+в `make logs`, затем:
 
 ```bash
 make go-live   # выключить DRY_RUN, перезапустить worker, прогнать по-настоящему
@@ -109,8 +116,7 @@ make consolidate   # или: scripts/consolidate.py --repo <owner>/<repo>
 
 ```
 GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / claude -p)
-                                  ↑
-                          Temporal UI (localhost:8080)
+                          (централизованный, TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE)
 ```
 
 Два workflow-типа на одной очереди `issue-lifecycle`:
