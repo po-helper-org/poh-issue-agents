@@ -14,11 +14,17 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from temporalio import activity
 
+import estimate_report
+import estimation
 import github_client
 import llm
+from shared.commands import parse_command
 from shared.workflow_types import (
     ClassificationResult,
     DuplicateResult,
+    EstimateRequest,
+    EstimateResult,
+    EstimationContext,
     GateResult,
     IssueInput,
     PriorityResult,
@@ -298,3 +304,143 @@ async def trigger_openhands_resolver(issue: IssueInput) -> None:
     """TODO: вызов OpenHands resolver — остаётся отдельным сервисом со
     своим sandboxing (docker.sock), не частью этого docker-compose."""
     raise NotImplementedError("OpenHands resolver — интеграция ещё не спроектирована")
+
+
+# --- Оценка трудоёмкости по команде /estimate ---
+
+# Лимиты контекста: без них длинный тред или большой blueprint съедают
+# окно модели целиком и вытесняют само описание задачи.
+MAX_THREAD_COMMENTS = 50
+MAX_THREAD_CHARS = 20_000
+MAX_ARTIFACT_CHARS = 20_000
+MAX_ARTIFACTS_TOTAL_CHARS = 60_000
+
+# Пути артефактов из модели данных (docs/ARCHITECTURE.md). Отсутствующий
+# файл — штатная ситуация: research-пайплайн мог не дойти до этой стадии.
+ARTIFACT_PATHS = (
+    "docs/bft/issue-{n}-blueprint.md",
+    "docs/bft/issue-{n}-debate.md",
+    "docs/bft/issue-{n}-recommendations.md",
+    "docs/research/issue-{n}-sa-spec.md",
+    "docs/bugs/issue-{n}-diagnosis.md",
+)
+
+
+@activity.defn
+async def ack_estimate_command(req: EstimateRequest) -> None:
+    github_client.add_reaction(req.repo, req.comment_id, "eyes")
+
+
+def _collect_thread(req: EstimateRequest) -> tuple[list[str], bool]:
+    raw = github_client.list_comments(req.repo, req.issue_number, MAX_THREAD_COMMENTS)
+    truncated = len(raw) >= MAX_THREAD_COMMENTS
+    thread: list[str] = []
+    used = 0
+    for comment in raw:
+        # Прошлые оценки постит сам сервис, значит они уже отсеяны как Bot —
+        # иначе модель начала бы оценивать собственный предыдущий вывод.
+        if comment.get("user", {}).get("type") == "Bot":
+            continue
+        body = (comment.get("body") or "").strip()
+        if not body or parse_command(body):
+            continue
+        if used + len(body) > MAX_THREAD_CHARS:
+            truncated = True
+            break
+        thread.append(body)
+        used += len(body)
+    return thread, truncated
+
+
+def _collect_artifacts(req: EstimateRequest) -> tuple[str | None, dict[str, str], bool]:
+    branch = None
+    for prefix in ("research", "bug"):
+        candidate = f"{prefix}/issue-{req.issue_number}"
+        if github_client.branch_exists(req.repo, candidate):
+            branch = candidate
+            break
+    if branch is None:
+        return None, {}, False
+
+    artifacts: dict[str, str] = {}
+    truncated = False
+    total = 0
+    for template in ARTIFACT_PATHS:
+        path = template.format(n=req.issue_number)
+        content = github_client.get_file(req.repo, path, branch)
+        if content is None:
+            continue
+        if len(content) > MAX_ARTIFACT_CHARS:
+            content = content[:MAX_ARTIFACT_CHARS]
+            truncated = True
+        if total + len(content) > MAX_ARTIFACTS_TOTAL_CHARS:
+            truncated = True
+            break
+        artifacts[path] = content
+        total += len(content)
+    return branch, artifacts, truncated
+
+
+@activity.defn
+async def collect_estimation_context(req: EstimateRequest) -> EstimationContext:
+    issue = github_client.get_issue(req.repo, req.issue_number)
+    thread, thread_truncated = _collect_thread(req)
+    branch, artifacts, artifacts_truncated = _collect_artifacts(req)
+    return EstimationContext(
+        title=issue.get("title") or "",
+        body=issue.get("body") or "",
+        labels=[label["name"] for label in issue.get("labels", [])],
+        thread=thread,
+        branch=branch,
+        artifacts=artifacts,
+        truncated=thread_truncated or artifacts_truncated,
+    )
+
+
+@activity.defn
+async def extract_estimation_facts(context: EstimationContext) -> dict:
+    parts = [f"Заголовок: {context.title}", f"Описание:\n{context.body}"]
+    if context.labels:
+        parts.append("Лейблы: " + ", ".join(context.labels))
+    if context.thread:
+        parts.append("Обсуждение:\n" + "\n---\n".join(context.thread))
+    for path, content in context.artifacts.items():
+        parts.append(f"Артефакт {path}:\n{content}")
+
+    facts = llm.extract(
+        _load_prompt("system_estimate_extract.md"),
+        "\n\n".join(parts),
+        estimation.EstimationFacts,
+        model=llm.MODEL_CLASSIFY,
+    )
+    # Между activity ездит dict: штатный JSON-конвертер Temporal знает
+    # dataclass'ы, но не модели Pydantic. Схема при этом одна.
+    return facts.model_dump()
+
+
+@activity.defn
+async def compute_estimate(facts_payload: dict, context: EstimationContext) -> EstimateResult:
+    facts = estimation.EstimationFacts.model_validate(facts_payload)
+    estimate = estimation.compute(facts, estimation.load_rules())
+    return EstimateResult(
+        markdown=estimate_report.render(estimate, facts, context),
+        stopped=estimate.stopped,
+    )
+
+
+@activity.defn
+async def post_estimate_comment(req: EstimateRequest, result: EstimateResult) -> None:
+    github_client.post_comment(req.repo, req.issue_number, result.markdown)
+    if not result.stopped:
+        github_client.add_label(req.repo, req.issue_number, "estimated")
+
+
+@activity.defn
+async def post_estimate_error(req: EstimateRequest, stage: str) -> None:
+    github_client.post_comment(
+        req.repo,
+        req.issue_number,
+        f"⚠️ Оценка не удалась на стадии «{stage}». Повтори `/estimate` позже — "
+        f"подробности прогона видны в Temporal UI.",
+    )
+    github_client.add_reaction(req.repo, req.comment_id, "confused")
