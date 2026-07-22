@@ -107,3 +107,46 @@ def branch_exists(repo: str, branch: str) -> bool:
     url = f"https://api.github.com/repos/{repo}/branches/{branch}"
     resp = requests.get(url, headers=_auth_headers(), timeout=30)
     return resp.status_code == 200
+
+
+def add_reaction(repo: str, comment_id: int, content: str = "eyes") -> None:
+    """Реакция на комментарий — подтверждение, что команда увидена, до того
+    как начнётся долгий расчёт. GitHub отвечает 200 на уже поставленную
+    реакцию, поэтому повторный вызов безвреден."""
+    if _dry_run():
+        _log.info("[DRY_RUN] reaction %s on %s comment %s", content, repo, comment_id)
+        return
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}/reactions"
+    resp = requests.post(url, headers=_auth_headers(), json={"content": content}, timeout=30)
+    resp.raise_for_status()
+
+
+def get_issue(repo: str, issue_number: int) -> dict:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
+    resp = requests.get(url, headers=_auth_headers(), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def list_comments(repo: str, issue_number: int, limit: int = 50) -> list[dict]:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
+    resp = requests.get(
+        url, headers=_auth_headers(), params={"per_page": min(limit, 100)}, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()[:limit]
+
+
+def get_file(repo: str, path: str, ref: str) -> str | None:
+    """Содержимое файла из ветки. None — файла нет; для артефактов это
+    штатная ситуация, а не ошибка."""
+    resp = requests.get(
+        f"https://api.github.com/repos/{repo}/contents/{path}",
+        headers={**_auth_headers(), "Accept": "application/vnd.github.raw"},
+        params={"ref": ref},
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.text
