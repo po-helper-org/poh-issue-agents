@@ -701,13 +701,22 @@ def test_ack_reacts_and_comments(monkeypatch):
 
 
 def test_ack_skips_reaction_without_comment_id(monkeypatch):
+    posted = {}
+
     def boom(*a, **k):
         raise AssertionError("reaction attempted without comment_id")
 
     monkeypatch.setattr(activities.github_client, "add_reaction", boom)
-    monkeypatch.setattr(activities.github_client, "post_comment", lambda repo, n, body: None)
+    monkeypatch.setattr(activities.github_client, "post_comment",
+                        lambda repo, n, body: posted.update(repo=repo, n=n, body=body))
 
     asyncio.run(activities.ack_command(_analyze(comment_id=None)))
+
+    # Контракт двухчастный: реакция пропущена, НО подтверждение всё равно
+    # опубликовано. Без второго ассерта регрессия, загнавшая post_comment
+    # внутрь `if comment_id is not None`, прошла бы незамеченной.
+    assert posted, "подтверждающий комментарий не опубликован"
+    assert posted["n"] == 5
 
 
 def test_error_comment_mentions_reason_and_retry(monkeypatch):
