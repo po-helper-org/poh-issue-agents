@@ -26,10 +26,17 @@ def test_ack_skips_reaction_without_comment_id(monkeypatch):
     def boom(*a, **k):
         raise AssertionError("reaction attempted without comment_id")
 
+    posted = {}
     monkeypatch.setattr(activities.github_client, "add_reaction", boom)
-    monkeypatch.setattr(activities.github_client, "post_comment", lambda repo, n, body: None)
+    monkeypatch.setattr(activities.github_client, "post_comment",
+                        lambda repo, n, body: posted.update(repo=repo, n=n, body=body))
 
     asyncio.run(activities.ack_command(_analyze(comment_id=None)))
+
+    # Ensure acknowledgement comment was still posted even without comment_id
+    assert posted["repo"] == "o/r"
+    assert posted["n"] == 5
+    assert "/analyze" in posted["body"]
 
 
 def test_error_comment_mentions_reason_and_retry(monkeypatch):
