@@ -97,3 +97,43 @@ def test_degrades_when_prs_fetch_fails(monkeypatch):
 
     assert "живой контекст" in ctx
     assert "## Связанные PR" not in ctx
+
+
+def test_cap_respected_with_large_base_and_prs_no_comments(monkeypatch):
+    # base (title+body) в одиночку почти исчерпывает потолок; секция из 20 PR
+    # (без комментариев) не должна протолкнуть итог за CONTEXT_TOTAL_CHARS —
+    # раньше `budget` считался, но никогда не проверялся перед добавлением
+    # PR-секции, и она вклеивалась безусловно.
+    big_body = "B" * 15750
+    analyze = AnalyzeInput(repo="o/r", issue_number=1, title="Большой тред",
+                            body=big_body, comment_id=1)
+    prs = [{"number": i, "title": f"PR {i}", "state": "open",
+            "url": f"https://github.com/o/r/pull/{i}"} for i in range(1, 21)]
+    _wire(monkeypatch, comments=[], prs=prs)
+
+    ctx = activities._build_task_context(analyze)
+
+    assert len(ctx) <= activities.CONTEXT_TOTAL_CHARS
+    assert "Большой тред" in ctx
+    assert big_body in ctx
+
+
+def test_all_comments_filtered_degrades_to_floor(monkeypatch):
+    _wire(monkeypatch, comments=[
+        _comment("kibarik", "/analyze"),
+        _comment("dev", "/analyze"),
+    ])
+
+    ctx = activities._build_task_context(_analyze())
+
+    assert "## Обсуждение" not in ctx
+    assert "Ядро платформы." in ctx
+
+
+def test_both_fetches_raising_degrades_to_floor(monkeypatch):
+    _wire(monkeypatch, comments_exc=RuntimeError("boom"), prs_exc=RuntimeError("boom"))
+    analyze = _analyze()
+
+    ctx = activities._build_task_context(analyze)
+
+    assert ctx == f"# {analyze.title}\n\n{analyze.body}".strip()
