@@ -511,6 +511,13 @@ async def _run_with_heartbeat(fn, *args, label: str):
 
 
 @activity.defn
+async def prepare_workspace(analyze: AnalyzeInput) -> None:
+    """Стадия 0 пайплайна /analyze: свежий clone + repomix в детерминированный
+    каталог. Идемпотентна (сносит остаток и строит заново)."""
+    await _run_with_heartbeat(_build_workspace, analyze, label="preparing")
+
+
+@activity.defn
 async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
     """Полный прогон SA-helper одной activity.
 

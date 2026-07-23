@@ -347,3 +347,10 @@ def test_require_workspace_missing_input_fails_fast(stage_env):
     activities._build_workspace(_analyze())  # repomix есть, task.md нет
     with pytest.raises(RuntimeError, match="нет входа"):
         activities._require_workspace(_analyze(), f"{activities.FNR_DIR}/task.md")
+
+
+def test_prepare_workspace_builds_clone_and_repomix(stage_env):
+    asyncio.run(activities.prepare_workspace(_analyze()))
+    clone_dir = activities._clone_dir(_analyze())
+    assert Path(clone_dir).exists()
+    assert (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists()
