@@ -330,6 +330,27 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     ]
 
 
+FNR_STAGE_NAMES = ("task", "concept", "debate", "sysreq", "validate")
+
+# Входной артефакт каждой стадии — что уже должно лежать в рабочем каталоге,
+# чтобы стадия имела смысл (используется guard'ом _require_workspace).
+_FNR_STAGE_REQUIRES = {
+    "task": None,
+    "concept": f"{FNR_DIR}/task.md",
+    "debate": f"{FNR_DIR}/concept.md",
+    "sysreq": f"{FNR_DIR}/concept.md",
+    "validate": f"{FNR_DIR}/system_requirements.md",
+}
+
+
+def _fnr_stage(name: str, description: str) -> tuple[str, str | None, str | None]:
+    """(промпт, ожидаемый артефакт, требуемый вход) для стадии по имени."""
+    for n, prompt, expected in _fnr_stages(description):
+        if n == name:
+            return prompt, expected, _FNR_STAGE_REQUIRES[name]
+    raise ValueError(f"неизвестная стадия FNR: {name}")
+
+
 def _clone_repo(repo: str, dest: str) -> None:
     """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
     реальный код (`файл:строка`), одного текста Issue недостаточно.

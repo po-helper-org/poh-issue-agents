@@ -254,3 +254,24 @@ def test_claude_creds_empty_when_nothing_set(monkeypatch):
         monkeypatch.delenv(v, raising=False)
 
     assert activities._claude_anthropic_creds() == ("", "")
+
+
+def test_fnr_stage_names_are_the_five_stages():
+    assert activities.FNR_STAGE_NAMES == ("task", "concept", "debate", "sysreq", "validate")
+
+
+def test_fnr_stage_lookup_returns_prompt_expected_and_input():
+    prompt, expected, requires = activities._fnr_stage("concept", "Заголовок\n\nтело")
+    assert prompt == f"/fnr-concept {activities.FNR_DIR}/task.md"
+    assert expected == f"{activities.FNR_DIR}/concept.md"
+    assert requires == f"{activities.FNR_DIR}/task.md"
+
+
+def test_fnr_stage_task_has_no_required_input():
+    _, _, requires = activities._fnr_stage("task", "desc")
+    assert requires is None
+
+
+def test_fnr_stage_unknown_raises():
+    with pytest.raises(ValueError, match="неизвестная стадия"):
+        activities._fnr_stage("nope", "desc")
