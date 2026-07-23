@@ -7,6 +7,7 @@ GITHUB_EVENT_PATH и вызова через subprocess-CLI-скрипт — о�
 """
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,8 @@ from shared.workflow_types import (
     IssueInput,
     PriorityResult,
 )
+
+logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path("/app/prompts")
 CONFIG_DIR = Path("/app/config")
@@ -313,6 +316,12 @@ REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
 HEARTBEAT_INTERVAL_SEC = 30.0
 
+# Обогащение контекста /analyze (спека 2026-07-24). Двигаются без правки логики.
+CONTEXT_COMMENT_LIMIT = 20      # свежих комментариев в бриф
+CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментария
+CONTEXT_PR_LIMIT = 20           # связанных PR
+CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
+
 
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     """Стадии цепочки FNR: (имя, промпт, ожидаемый артефакт).
@@ -453,6 +462,85 @@ async def _run_with_heartbeat(fn, *args, label: str):
         if task in done:
             return task.result()  # переброс исключения из потока, если было
         activity.heartbeat(label)
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …[обрезано]"
+
+
+def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
+    """Свежие комментарии обсуждения (старые→свежие) без командного шума.
+
+    Командные комментарии (`/analyze`, `/estimate` и с хвостом) отсекаются
+    через parse_command — тот же разбор, что и в вебхуке. Сбой fetch → пустой
+    список: анализ продолжается на title+body.
+    """
+    try:
+        comments = github_client.list_comments(
+            analyze.repo, analyze.issue_number, limit=50
+        )
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for #%s: %s", analyze.issue_number, exc)
+        return []
+    kept = [c for c in comments if parse_command(c.get("body") or "") is None]
+    kept = kept[-CONTEXT_COMMENT_LIMIT:]
+    blocks: list[str] = []
+    for c in kept:
+        user = (c.get("user") or {}).get("login", "?")
+        date = (c.get("created_at") or "")[:10]
+        body = _truncate(c.get("body") or "", CONTEXT_COMMENT_CHARS)
+        blocks.append(f"**@{user} ({date}):**\n{body}")
+    return blocks
+
+
+def _fetch_prs_section(analyze: AnalyzeInput) -> str:
+    """Секция связанных PR. Сбой fetch → пустая строка (прогон не падает)."""
+    try:
+        prs = github_client.list_linked_prs(
+            analyze.repo, analyze.issue_number, limit=CONTEXT_PR_LIMIT
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("list_linked_prs failed for #%s: %s", analyze.issue_number, exc)
+        return ""
+    if not prs:
+        return ""
+    lines = ["## Связанные PR"]
+    for pr in prs:
+        lines.append(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['url']}")
+    return "\n".join(lines)
+
+
+def _build_task_context(analyze: AnalyzeInput) -> str:
+    """Обогащённый бриф задачи для /fnr-new-task.
+
+    Живое состояние issue (обсуждение, связанные PR) поверх title+body: тело
+    issue — статичный снимок, решения и прогресс живут в комментариях и PR.
+    Потолок CONTEXT_TOTAL_CHARS: title+body и компактная PR-секция
+    неприкосновенны, комментарии отбрасываются от самых старых к свежим, пока
+    бриф не влезает. Любой сбой fetch деградирует до title+body.
+    """
+    base = f"# {analyze.title}\n\n{analyze.body}".strip()
+    prs = _fetch_prs_section(analyze)
+    blocks = _fetch_comment_blocks(analyze)
+
+    reserved = len(base) + (len(prs) + 2 if prs else 0)
+    budget = CONTEXT_TOTAL_CHARS - reserved
+    while blocks:
+        section = "## Обсуждение\n" + "\n\n".join(blocks)
+        if len(section) <= budget:
+            break
+        blocks = blocks[1:]  # выкинуть старейший комментарий
+    comments = "## Обсуждение\n" + "\n\n".join(blocks) if blocks else ""
+
+    parts = [base]
+    if comments:
+        parts.append(comments)
+    if prs:
+        parts.append(prs)
+    return "\n\n".join(parts)
 
 
 @activity.defn
