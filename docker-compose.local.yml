@@ -1,17 +1,17 @@
-# Override для офлайн-разработки: поднимает ЛОКАЛЬНЫЙ Temporal-стек и
-# переключает приложение на него. Накладывается поверх базового файла:
-#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+# local — полный стек для локальной разработки. Самодостаточный:
+#   docker compose -f docker-compose.local.yml up -d   (или make up-local)
 #
-# Базовый docker-compose.yml инфраструктуры не содержит (Temporal внешний) —
-# всё, что связано с локальным Temporal, живёт только здесь. Значения
-# TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE из .env тут перекрываются на локальные,
-# так что для офлайн-режима .env править не нужно.
+# Поднимает ЛОКАЛЬНЫЙ Temporal (postgres + temporal + temporal-ui) и приложение,
+# настроенное на него. Порты Temporal (7233) и UI (8080) опубликованы наружу —
+# удобно для отладки. Промпты/config/workspace монтируются из репозитория, чтобы
+# правки были видны без пересборки образа. .env для Temporal править не нужно —
+# адрес/namespace заданы здесь.
 services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_PASSWORD: temporal
       POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +34,6 @@ services:
       postgres:
         condition: service_healthy
 
-  # Веб-интерфейс Temporal — видно, на какой стадии каждый issue.
   temporal-ui:
     image: temporalio/ui:2.31.2
     environment:
@@ -45,19 +44,36 @@ services:
     depends_on:
       - temporal
 
-  # Переключить приложение на локальный Temporal (перекрывает .env) и дождаться
-  # контейнера temporal.
   webhook:
+    build:
+      context: .
+      dockerfile: webhook/Dockerfile
+    env_file: .env
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_NAMESPACE=default
+    ports:
+      - "3000:3000"
     depends_on:
       - temporal
 
   worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_NAMESPACE=default
+      - PYTHONUNBUFFERED=1
+    # Temporal auto-setup создаёт namespace `default` через пару секунд ПОСЛЕ
+    # старта контейнера temporal; depends_on ждёт только запуск, не готовность.
+    # Перезапускаемся, пока namespace не появится и worker не подключится.
+    restart: unless-stopped
+    volumes:
+      - ./prompts:/app/prompts:ro
+      - ./config:/app/config:ro
+      - ./workspace:/app/workspace
     depends_on:
       - temporal
 
