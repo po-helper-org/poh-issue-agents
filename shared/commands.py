@@ -1,39 +1,40 @@
-"""Разбор команд из комментариев Issue и идентификаторы воркфлоу аналитики.
+"""Разбор slash-команд из комментариев Issue и сборка входа аналитики.
 
-Модуль намеренно не зависит ни от FastAPI, ни от temporalio: webhook — чистый
-транспортный слой, а эта логика должна оставаться юнит-тестируемой без
-установленного веб-стека (в dev-окружении fastapi отсутствует).
+Живёт в shared/, потому что команду распознаёт вебхук, а тот же разбор нужен
+воркеру — чтобы исключить сами команды из треда, уходящего в модель. Модуль
+намеренно не зависит ни от FastAPI, ни от temporalio: логика юнит-тестируема
+без веб-стека (в dev-окружении fastapi отсутствует). Оба Dockerfile копируют
+shared/ в образ.
 """
 
 from shared.workflow_types import AnalyzeInput
 
-ANALYZE_COMMAND = "/analyze"
+ESTIMATE = "estimate"
+ANALYZE = "analyze"
+
+_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE}
 
 
-def is_analyze_command(body: str | None) -> bool:
-    """True, если комментарий — команда `/analyze`.
+def parse_command(comment_body: str) -> str | None:
+    """Имя команды, если комментарий — вызов команды, иначе None.
 
-    Команда распознаётся только в начале комментария: упоминание `/analyze`
-    в середине текста (цитата, обсуждение) не должно запускать тяжёлый прогон.
+    Командой считается только комментарий, ПЕРВАЯ непустая строка которого
+    начинается с самого вызова. Цитата (строка с '>') командой не считается:
+    иначе ответ с процитированной командой запускал бы её повторно. Хвост
+    после имени команды игнорируется — аргументов в этой версии нет.
     """
-    if not body:
-        return False
-    tokens = body.strip().split()
-    return bool(tokens) and tokens[0].lower() == ANALYZE_COMMAND
-
-
-def analysis_workflow_id_for(repo_full_name: str, issue_number: int) -> str:
-    """Фиксированный id воркфлоу аналитики — источник идемпотентности.
-
-    Повторный `/analyze` при идущем прогоне упрётся в WorkflowAlreadyStarted
-    вместо запуска второго дорогого прогона. Namespace отличается от
-    `issue-<repo>-<n>`, чтобы не конфликтовать с воркфлоу триажа.
-    """
-    return f"analysis-{repo_full_name}-{issue_number}"
+    for raw_line in comment_body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            return None
+        return _COMMANDS.get(line.split()[0].lower())
+    return None
 
 
 def build_analyze_input(payload: dict) -> AnalyzeInput:
-    """Собирает вход воркфлоу из payload вебхука issue_comment."""
+    """Собирает вход воркфлоу IssueAnalysis из payload вебхука issue_comment."""
     issue = payload["issue"]
     return AnalyzeInput(
         repo=payload["repository"]["full_name"],

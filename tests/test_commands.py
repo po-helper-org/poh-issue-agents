@@ -1,38 +1,44 @@
-from shared.commands import (
-    analysis_workflow_id_for,
-    build_analyze_input,
-    is_analyze_command,
-)
+from shared.commands import ANALYZE, ESTIMATE, build_analyze_input, parse_command
+from shared.workflow_ids import analysis_workflow_id
 
 
 def test_recognises_bare_command():
-    assert is_analyze_command("/analyze") is True
+    assert parse_command("/analyze") == ANALYZE
 
 
 def test_recognises_command_with_trailing_text():
-    assert is_analyze_command("/analyze  спроектируй решение") is True
+    assert parse_command("/analyze  спроектируй решение") == ANALYZE
 
 
 def test_recognises_command_case_insensitively():
-    assert is_analyze_command("/ANALYZE") is True
+    assert parse_command("/ANALYZE") == ANALYZE
+
+
+def test_recognises_estimate_from_same_registry():
+    assert parse_command("/estimate") == ESTIMATE
 
 
 def test_ignores_command_not_at_start():
-    assert is_analyze_command("см. выше /analyze") is False
+    assert parse_command("см. выше /analyze") is None
+
+
+def test_ignores_quoted_command():
+    # Цитата (строка с '>') командой не считается: ответ с процитированной
+    # командой не должен запускать её повторно.
+    assert parse_command("> /analyze") is None
 
 
 def test_ignores_plain_comment():
-    assert is_analyze_command("это обычный ответ на уточнение") is False
+    assert parse_command("это обычный ответ на уточнение") is None
 
 
-def test_ignores_empty_and_none():
-    assert is_analyze_command("") is False
-    assert is_analyze_command(None) is False
-    assert is_analyze_command("   ") is False
+def test_ignores_empty_and_whitespace():
+    assert parse_command("") is None
+    assert parse_command("   ") is None
 
 
 def test_analysis_workflow_id_is_distinct_from_lifecycle_id():
-    wf_id = analysis_workflow_id_for("o/r", 5)
+    wf_id = analysis_workflow_id("o/r", 5)
     assert wf_id == "analysis-o/r-5"
     assert wf_id != "issue-o/r-5"
 

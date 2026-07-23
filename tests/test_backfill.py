@@ -42,7 +42,7 @@ def test_start_workflow_uses_reject_duplicate_id_reuse_policy(monkeypatch):
     mock_client = AsyncMock()
     mock_client.start_workflow = AsyncMock()
 
-    with patch("backfill.Client.connect", AsyncMock(return_value=mock_client)):
+    with patch("backfill.connect_temporal", AsyncMock(return_value=mock_client)):
         asyncio.run(backfill.main())
 
     mock_client.start_workflow.assert_awaited_once()

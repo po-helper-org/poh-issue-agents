@@ -22,11 +22,30 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared.workflow_types import AnalyzeInput, IssueInput
+    from shared.workflow_types import (
+        AnalyzeInput,
+        EstimateRequest,
+        EstimateResult,
+        IssueInput,
+    )
 
     import activities
 
 MAX_CLARIFICATION_ROUNDS = 2
+
+
+def _failure_reason(e: BaseException) -> str:
+    """"ExcType: message" из ПЕРВОПРИЧИНЫ для тегов/группировки Sentry.
+
+    catch-ветки ловят обёртку Temporal (ActivityError «Activity task failed»),
+    а не исходное исключение activity. Разворачиваем `.cause`: у ApplicationError
+    есть `.type` = имя исходного класса (RuntimeError/ValidationError/…), это и
+    даёт осмысленный fingerprint вместо единственного «ActivityError» на всё.
+    Чистые операции над атрибутами — детерминированы, безопасны в workflow-коде.
+    """
+    cause = getattr(e, "cause", None) or e
+    exc_type = getattr(cause, "type", None) or type(cause).__name__
+    return f"{exc_type}: {cause}"
 
 
 @workflow.defn(name="IssueLifecycle")
@@ -199,10 +218,10 @@ class IssueLifecycle:
                 args=[issue, priority, dup],
                 start_to_close_timeout=timedelta(seconds=30),
             )
-        except Exception:
+        except Exception as e:
             await workflow.execute_activity(
                 activities.post_error_label,
-                issue,
+                args=[issue, _failure_reason(e)],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=5),
             )
@@ -302,4 +321,71 @@ class IssueAnalysis:
                 args=[analyze, reason[:500]],
                 start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+
+
+@workflow.defn(name="IssueEstimation")
+class IssueEstimation:
+    """Оценка трудоёмкости по команде /estimate.
+
+    Отдельный workflow, а не сигнал в IssueLifecycle: тот завершается после
+    приоритизации (а на спаме и дубликате — раньше), и через неделю сигналить
+    было бы некуда. ID включает comment_id, поэтому повторная доставка того же
+    вебхука не запускает вторую оценку, а новая команда — это честно новый
+    прогон со своей историей в Temporal UI.
+    """
+
+    @workflow.run
+    async def run(self, req: EstimateRequest) -> None:
+        default_retry = RetryPolicy(maximum_attempts=3)
+        # Стадия нужна, чтобы человек в комментарии увидел, ЧТО именно
+        # сломалось, а не абстрактное «ошибка обработки».
+        stage = "подтверждение команды"
+        try:
+            await workflow.execute_activity(
+                activities.ack_estimate_command,
+                req,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+
+            stage = "сбор контекста"
+            context = await workflow.execute_activity(
+                activities.collect_estimation_context,
+                req,
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=default_retry,
+            )
+
+            stage = "извлечение фактов"
+            facts = await workflow.execute_activity(
+                activities.extract_estimation_facts,
+                context,
+                start_to_close_timeout=timedelta(seconds=180),
+                retry_policy=default_retry,
+            )
+
+            stage = "расчёт"
+            result: EstimateResult = await workflow.execute_activity(
+                activities.compute_estimate,
+                args=[facts, context],
+                start_to_close_timeout=timedelta(seconds=30),
+                # Расчёт детерминирован и не ходит в сеть: повтор дал бы
+                # ровно тот же результат, ретрай тут бессмыслен.
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+
+            stage = "публикация"
+            await workflow.execute_activity(
+                activities.post_estimate_comment,
+                args=[req, result],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+        except Exception as e:
+            await workflow.execute_activity(
+                activities.post_estimate_error,
+                args=[req, stage, _failure_reason(e)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=5),
             )

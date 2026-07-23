@@ -2,10 +2,10 @@
 Webhook receiver: единственная точка входа для GitHub. Проверяет подпись,
 транслирует событие в вызов Temporal:
 - issues.opened            -> старт нового workflow (ID = repo-issue-N)
-- issue_comment.created    -> `/analyze` запускает отдельный workflow
-                               IssueAnalysis (аналитика по запросу); любой
-                               другой комментарий — сигнал уже идущему
-                               workflow (используется циклом уточнений)
+- issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis,
+                               `/estimate` — IssueEstimation; любой другой
+                               комментарий — сигнал уже идущему workflow
+                               (используется циклом уточнений)
 - issues.labeled           -> сигнал, если лейбл — одна из точек решения
                                человека (research-me / bug-me / build-me)
 
@@ -21,11 +21,16 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared.commands import (
-    analysis_workflow_id_for,
-    build_analyze_input,
-    is_analyze_command,
+from shared import sentry_setup
+from shared.commands import ANALYZE, ESTIMATE, build_analyze_input, parse_command
+from shared.temporal_client import connect_temporal
+from shared.workflow_ids import (
+    analysis_workflow_id,
+    estimate_workflow_id,
+    issue_workflow_id,
 )
+
+sentry_setup.configure("webhook")  # no-op без SENTRY_DSN; FastAPI инструментируется автоматически
 
 _log = logging.getLogger("webhook")
 
@@ -39,7 +44,7 @@ _temporal_client: Client | None = None
 async def get_temporal_client() -> Client:
     global _temporal_client
     if _temporal_client is None:
-        _temporal_client = await Client.connect(os.environ["TEMPORAL_ADDRESS"])
+        _temporal_client = await connect_temporal()
     return _temporal_client
 
 
@@ -52,8 +57,10 @@ def verify_signature(body: bytes, signature_header: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 
-def workflow_id_for(repo_full_name: str, issue_number: int) -> str:
-    return f"issue-{repo_full_name}-{issue_number}"
+# Формат ID живёт в shared/workflow_ids.py: его же собирают скрипты прямого
+# запуска, и разъехавшись, они потеряли бы идемпотентность.
+workflow_id_for = issue_workflow_id
+estimate_workflow_id_for = estimate_workflow_id
 
 
 @app.post("/webhook")
@@ -109,15 +116,34 @@ async def github_webhook(
         repo = payload["repository"]["full_name"]
         issue_number = payload["issue"]["number"]
 
-        # Команда `/analyze` — отдельная ветка, и это ЕДИНСТВЕННАЯ точка
-        # ветвления «команда против обычного комментария». Если бы команда
-        # уходила в user_comment, её съел бы цикл уточнений intake gate как
-        # ответ на уточняющий вопрос.
-        if is_analyze_command(payload["comment"].get("body")):
+        # Единственная точка ветвления «команда против обычного комментария»:
+        # команда НЕ уходит в user_comment, иначе её съел бы цикл уточнений
+        # intake gate как ответ на уточняющий вопрос.
+        command = parse_command(payload["comment"].get("body") or "")
+
+        if command == ESTIMATE:
+            from shared.workflow_types import EstimateRequest
+
+            comment_id = payload["comment"]["id"]
+            try:
+                await client.start_workflow(
+                    "IssueEstimation",
+                    EstimateRequest(
+                        repo=repo, issue_number=issue_number, comment_id=comment_id
+                    ),
+                    id=estimate_workflow_id_for(repo, issue_number, comment_id),
+                    task_queue="issue-lifecycle",
+                )
+            except WorkflowAlreadyStartedError:
+                # Тот же вебхук доставлен повторно — оценка уже идёт.
+                pass
+            return {"ok": True}
+
+        if command == ANALYZE:
             analyze = build_analyze_input(payload)
 
-            # Живому воркфлоу триажа шлём только уведомление — исполнителем
-            # всегда остаётся выделенный IssueAnalysis.
+            # Живому воркфлоу триажа шлём только уведомление — оно повесит метку
+            # `analyzing`; исполнителем всегда остаётся выделенный IssueAnalysis.
             lifecycle = client.get_workflow_handle(workflow_id_for(repo, issue_number))
             try:
                 await lifecycle.signal("analyze_requested", analyze.comment_id)
@@ -128,13 +154,12 @@ async def github_webhook(
                 await client.start_workflow(
                     "IssueAnalysis",
                     analyze,
-                    id=analysis_workflow_id_for(repo, issue_number),
+                    id=analysis_workflow_id(repo, issue_number),
                     task_queue="issue-lifecycle",
                 )
             except WorkflowAlreadyStartedError:
                 # Прогон по этому Issue уже идёт: пользователь видел ack первого
-                # запуска, второй ack был бы шумом. Webhook — чистый транспорт,
-                # публиковать отсюда в GitHub не будем.
+                # запуска, второй ack был бы шумом. Webhook — чистый транспорт.
                 _log.info("analysis already running for %s#%s", repo, issue_number)
             return {"ok": True}
 

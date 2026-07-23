@@ -1,0 +1,107 @@
+# full — полный стек для прода (self-hosted, Dokploy) со ВСТРОЕННЫМ Temporal.
+# Приложение не зависит от внешнего Temporal-кластера: postgres + temporal
+# поднимаются рядом. Пошаговая инструкция — docs/DEPLOY-DOKPLOY.md.
+#
+# Отличия от docker-compose.local.yml (та же топология, но для прода):
+#
+# 1. Наружу не публикуется ни один порт. gRPC-API Temporal (7233) и UI (8080)
+#    доступны только соседям по сети compose. Единственная публичная точка —
+#    webhook, и он выходит наружу через Traefik самого Dokploy, с TLS.
+#
+# 2. Нет bind-монтирования prompts/config/workspace: Dokploy очищает каталог
+#    репозитория при автодеплое, файлы запечены в образ воркера.
+#
+# 3. Пароль Postgres приходит переменной — деплой падает, если она не задана.
+#
+# 4. restart-политика у всех сервисов.
+#
+# Альтернатива — docker-compose.yml (main): то же приложение, но против ВНЕШНЕГО
+# централизованного Temporal (TEMPORAL_ADDRESS в .env), без встроенной инфры.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задай POSTGRES_PASSWORD в Environment}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.24
+    restart: unless-stopped
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=${POSTGRES_PASSWORD:?задай POSTGRES_PASSWORD в Environment}
+      - POSTGRES_SEEDS=postgres
+    # expose, а не ports: порт доступен соседям по сети compose и никому больше.
+    expose:
+      - "7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    restart: unless-stopped
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+    # Хост-порт НЕ публикуется. Доступ — через Dokploy-домен с basic-auth,
+    # см. docs/DEPLOY-DOKPLOY.md, раздел «Temporal UI».
+    expose:
+      - "8080"
+    networks:
+      - default
+      - dokploy-network
+    depends_on:
+      - temporal
+
+  webhook:
+    build:
+      context: .
+      dockerfile: webhook/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+    expose:
+      - "3000"
+    # default — чтобы видеть temporal; dokploy-network — чтобы Traefik видел
+    # этот контейнер. Указав сеть явно, compose перестаёт добавлять default сам,
+    # поэтому он перечислен здесь.
+    networks:
+      - default
+      - dokploy-network
+    depends_on:
+      - temporal
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      # Небуферизованный вывод: строки [DRY_RUN] и ошибки видны в логах
+      # Dokploy сразу, а не через несколько минут блочным сбросом.
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - temporal
+
+volumes:
+  pgdata:
+
+networks:
+  dokploy-network:
+    external: true

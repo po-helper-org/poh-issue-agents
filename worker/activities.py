@@ -18,12 +18,19 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from temporalio import activity
 
+import estimate_report
+import estimation
 import github_client
 import llm
+from shared import sentry_setup
+from shared.commands import parse_command
 from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
     DuplicateResult,
+    EstimateRequest,
+    EstimateResult,
+    EstimationContext,
     GateResult,
     IssueInput,
     PriorityResult,
@@ -77,7 +84,7 @@ class PriorityExtraction(BaseModel):
 # --- Zero-cost предфильтры ---
 
 @activity.defn
-async def prefilter_bot_and_security(issue: IssueInput) -> str | None:
+def prefilter_bot_and_security(issue: IssueInput) -> str | None:
     """Возвращает причину пропуска, если стоит остановиться, иначе None."""
     if issue.author_type == "Bot":
         github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
@@ -88,10 +95,15 @@ async def prefilter_bot_and_security(issue: IssueInput) -> str | None:
         github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
         return "bot"
 
-    SECURITY_TERMS = ("vulnerability", "cve-", "exploit", "sql injection", "rce",
-                       "уязвимост", "эксплойт", "утечка данных")
+    # Latin terms must match whole words: the substring "rce" otherwise fires on
+    # "source"/"resource"/"ресурс" and false-flags most feature issues as
+    # security-sensitive. Cyrillic stems stay as substrings (morphology).
+    SECURITY_PATTERNS = (r"\bvulnerabilit\w*", r"\bcve-\d", r"\bexploit\w*",
+                          r"\bsql injection\b", r"\brce\b", r"\bremote code execution\b")
+    SECURITY_SUBSTRINGS = ("уязвимост", "эксплойт", "утечка данных")
     text = f"{issue.title} {issue.body}".lower()
-    if any(term in text for term in SECURITY_TERMS):
+    if any(re.search(p, text) for p in SECURITY_PATTERNS) or \
+       any(term in text for term in SECURITY_SUBSTRINGS):
         github_client.post_comment(
             issue.repo, issue.issue_number,
             "🔒 Похоже, это может касаться уязвимости безопасности. "
@@ -107,7 +119,7 @@ async def prefilter_bot_and_security(issue: IssueInput) -> str | None:
 # --- Intake Gate ---
 
 @activity.defn
-async def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResult:
+def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResult:
     thread_text = "\n\n".join(f"Пользователь: {c}" for c in comment_thread)
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\n{thread_text}"
     result = llm.extract(
@@ -117,20 +129,20 @@ async def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResul
 
 
 @activity.defn
-async def post_clarifying_question(issue: IssueInput, questions: str) -> None:
+def post_clarifying_question(issue: IssueInput, questions: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, questions)
     github_client.add_label(issue.repo, issue.issue_number, "needs-clarification")
 
 
 @activity.defn
-async def close_as_spam(issue: IssueInput, reason: str) -> None:
+def close_as_spam(issue: IssueInput, reason: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, f"🚫 Похоже на спам: {reason}")
     github_client.add_label(issue.repo, issue.issue_number, "spam")
     github_client.close_issue(issue.repo, issue.issue_number)
 
 
 @activity.defn
-async def escalate_to_human(issue: IssueInput) -> None:
+def escalate_to_human(issue: IssueInput) -> None:
     github_client.post_comment(
         issue.repo, issue.issue_number,
         "Не удалось сузить запрос за отведённое число уточнений. Передаю на ручной разбор.",
@@ -139,12 +151,17 @@ async def escalate_to_human(issue: IssueInput) -> None:
 
 
 @activity.defn
-async def post_error_label(issue: IssueInput) -> None:
+def post_error_label(issue: IssueInput, reason: str = "") -> None:
     github_client.post_comment(
         issue.repo, issue.issue_number,
         "⚠️ Автоматическая обработка не удалась. Ожидай ручного разбора.",
     )
     github_client.add_label(issue.repo, issue.issue_number, "advisor:error")
+    # `reason` = "ExcType: message" из catch-ветки workflow'а (workflows.py).
+    # Без него (прямой вызов/старые тесты) exc_type пуст — событие всё равно
+    # уходит, просто с менее точной группировкой.
+    exc_type, _, message = reason.partition(": ")
+    sentry_setup.capture_pipeline_failure(issue, exc_type or "unknown", message or reason)
 
 
 @activity.defn
@@ -157,7 +174,7 @@ async def mark_analyzing(repo: str, issue_number: int) -> None:
 # --- Классификация ---
 
 @activity.defn
-async def classify_issue(issue: IssueInput) -> ClassificationResult:
+def classify_issue(issue: IssueInput) -> ClassificationResult:
     capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
         if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nИзвестный функционал:\n{capabilities}"
@@ -184,7 +201,7 @@ async def classify_issue(issue: IssueInput) -> ClassificationResult:
 # --- Duplicate Check ---
 
 @activity.defn
-async def duplicate_check(issue: IssueInput) -> DuplicateResult:
+def duplicate_check(issue: IssueInput) -> DuplicateResult:
     candidates = github_client.search_candidates(issue.repo, issue.title)
     candidates = [c for c in candidates if c["number"] != issue.issue_number]
     if not candidates:
@@ -216,10 +233,11 @@ async def duplicate_check(issue: IssueInput) -> DuplicateResult:
         reuse_note = f"\n\nВ ветке `{branch}` уже есть наработки." if branch else ""
         github_client.post_comment(
             issue.repo, issue.issue_number,
-            f"🔁 Дубликат #{best.number} (вероятность {best.probability:.0%}): {best.reason}{reuse_note}",
+            f"🔁 Вероятный дубликат #{best.number} ({best.probability:.0%}): {best.reason}{reuse_note}"
+            f"\n\n⚠️ Не закрыт автоматически — нужно решение человека "
+            f"(функциональный дубль ≠ целевой, см. #111).",
         )
         github_client.add_label(issue.repo, issue.issue_number, "duplicate")
-        github_client.close_issue(issue.repo, issue.issue_number)
         return DuplicateResult(decision="duplicate", best_match_number=best.number,
                                 probability=best.probability, reason=best.reason, context_branch=branch)
 
@@ -234,7 +252,7 @@ async def duplicate_check(issue: IssueInput) -> DuplicateResult:
 # --- Priority Scoring ---
 
 @activity.defn
-async def score_priority(issue: IssueInput, classification: ClassificationResult, dup: DuplicateResult) -> PriorityResult:
+def score_priority(issue: IssueInput, classification: ClassificationResult, dup: DuplicateResult) -> PriorityResult:
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nТип: {classification.label}"
     extracted = llm.extract(
         _load_prompt("system_priority_extract.md"), user_message, PriorityExtraction, model=llm.MODEL_GATE,
@@ -275,7 +293,7 @@ async def score_priority(issue: IssueInput, classification: ClassificationResult
 
 
 @activity.defn
-async def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: DuplicateResult) -> None:
+def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: DuplicateResult) -> None:
     body = priority.breakdown_markdown
     if dup.decision == "possible":
         body += (
@@ -366,7 +384,7 @@ def _run_claude(prompt: str, cwd: str) -> None:
         raise RuntimeError(f"claude -p exit {result.returncode}: {result.stderr[-1000:]}")
 
 
-def _collect_artifacts(clone_dir: str) -> dict[str, str]:
+def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
     files: dict[str, str] = {}
     for name in ARTIFACT_FILES:
         path = Path(clone_dir) / FNR_DIR / name
@@ -443,7 +461,7 @@ async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
                 raise RuntimeError(f"стадия {name}: артефакт {expected} не создан")
             activity.heartbeat(name)
 
-        files = await asyncio.to_thread(_collect_artifacts, clone_dir)
+        files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
         if not files:
             raise RuntimeError("пайплайн не произвёл ни одного артефакта")
 
@@ -465,13 +483,13 @@ async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
 # --- Тяжёлые стадии: TODO, те же незакрытые вопросы, что были на Actions ---
 
 @activity.defn
-async def run_bug_pipeline(issue: IssueInput) -> None:
+def run_bug_pipeline(issue: IssueInput) -> None:
     """TODO: перенести содержимое bug-pipeline.yml аналогично."""
     raise NotImplementedError("bug-pipeline: перенести шаги из старого bug-pipeline.yml")
 
 
 @activity.defn
-async def trigger_openhands_resolver(issue: IssueInput) -> None:
+def trigger_openhands_resolver(issue: IssueInput) -> None:
     """TODO: вызов OpenHands resolver — остаётся отдельным сервисом со
     своим sandboxing (docker.sock), не частью этого docker-compose."""
     raise NotImplementedError("OpenHands resolver — интеграция ещё не спроектирована")
@@ -513,3 +531,145 @@ async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
         "Прогон не повторяется автоматически (он недетерминирован и дорог). "
         "Запустить заново — командой `/analyze`.",
     )
+
+
+# --- Оценка трудоёмкости по команде /estimate ---
+
+# Лимиты контекста: без них длинный тред или большой blueprint съедают
+# окно модели целиком и вытесняют само описание задачи.
+MAX_THREAD_COMMENTS = 50
+MAX_THREAD_CHARS = 20_000
+MAX_ARTIFACT_CHARS = 20_000
+MAX_ARTIFACTS_TOTAL_CHARS = 60_000
+
+# Пути артефактов из модели данных (docs/ARCHITECTURE.md). Отсутствующий
+# файл — штатная ситуация: research-пайплайн мог не дойти до этой стадии.
+ARTIFACT_PATHS = (
+    "docs/bft/issue-{n}-blueprint.md",
+    "docs/bft/issue-{n}-debate.md",
+    "docs/bft/issue-{n}-recommendations.md",
+    "docs/research/issue-{n}-sa-spec.md",
+    "docs/bugs/issue-{n}-diagnosis.md",
+)
+
+
+@activity.defn
+def ack_estimate_command(req: EstimateRequest) -> None:
+    github_client.add_reaction(req.repo, req.comment_id, "eyes")
+
+
+def _collect_thread(req: EstimateRequest) -> tuple[list[str], bool]:
+    raw = github_client.list_comments(req.repo, req.issue_number, MAX_THREAD_COMMENTS)
+    truncated = len(raw) >= MAX_THREAD_COMMENTS
+    thread: list[str] = []
+    used = 0
+    for comment in raw:
+        # Прошлые оценки постит сам сервис, значит они уже отсеяны как Bot —
+        # иначе модель начала бы оценивать собственный предыдущий вывод.
+        if comment.get("user", {}).get("type") == "Bot":
+            continue
+        body = (comment.get("body") or "").strip()
+        if not body or parse_command(body):
+            continue
+        if used + len(body) > MAX_THREAD_CHARS:
+            truncated = True
+            break
+        thread.append(body)
+        used += len(body)
+    return thread, truncated
+
+
+def _collect_artifacts(req: EstimateRequest) -> tuple[str | None, dict[str, str], bool]:
+    branch = None
+    for prefix in ("research", "bug"):
+        candidate = f"{prefix}/issue-{req.issue_number}"
+        if github_client.branch_exists(req.repo, candidate):
+            branch = candidate
+            break
+    if branch is None:
+        return None, {}, False
+
+    artifacts: dict[str, str] = {}
+    truncated = False
+    total = 0
+    for template in ARTIFACT_PATHS:
+        path = template.format(n=req.issue_number)
+        content = github_client.get_file(req.repo, path, branch)
+        if content is None:
+            continue
+        if len(content) > MAX_ARTIFACT_CHARS:
+            content = content[:MAX_ARTIFACT_CHARS]
+            truncated = True
+        if total + len(content) > MAX_ARTIFACTS_TOTAL_CHARS:
+            truncated = True
+            break
+        artifacts[path] = content
+        total += len(content)
+    return branch, artifacts, truncated
+
+
+@activity.defn
+def collect_estimation_context(req: EstimateRequest) -> EstimationContext:
+    issue = github_client.get_issue(req.repo, req.issue_number)
+    thread, thread_truncated = _collect_thread(req)
+    branch, artifacts, artifacts_truncated = _collect_artifacts(req)
+    return EstimationContext(
+        title=issue.get("title") or "",
+        body=issue.get("body") or "",
+        labels=[label["name"] for label in issue.get("labels", [])],
+        thread=thread,
+        branch=branch,
+        artifacts=artifacts,
+        truncated=thread_truncated or artifacts_truncated,
+    )
+
+
+@activity.defn
+def extract_estimation_facts(context: EstimationContext) -> dict:
+    parts = [f"Заголовок: {context.title}", f"Описание:\n{context.body}"]
+    if context.labels:
+        parts.append("Лейблы: " + ", ".join(context.labels))
+    if context.thread:
+        parts.append("Обсуждение:\n" + "\n---\n".join(context.thread))
+    for path, content in context.artifacts.items():
+        parts.append(f"Артефакт {path}:\n{content}")
+
+    facts = llm.extract(
+        _load_prompt("system_estimate_extract.md"),
+        "\n\n".join(parts),
+        estimation.EstimationFacts,
+        model=llm.MODEL_CLASSIFY,
+    )
+    # Между activity ездит dict: штатный JSON-конвертер Temporal знает
+    # dataclass'ы, но не модели Pydantic. Схема при этом одна.
+    return facts.model_dump()
+
+
+@activity.defn
+def compute_estimate(facts_payload: dict, context: EstimationContext) -> EstimateResult:
+    facts = estimation.EstimationFacts.model_validate(facts_payload)
+    estimate = estimation.compute(facts, estimation.load_rules())
+    return EstimateResult(
+        markdown=estimate_report.render(estimate, facts, context),
+        stopped=estimate.stopped,
+    )
+
+
+@activity.defn
+def post_estimate_comment(req: EstimateRequest, result: EstimateResult) -> None:
+    github_client.post_comment(req.repo, req.issue_number, result.markdown)
+    if not result.stopped:
+        github_client.add_label(req.repo, req.issue_number, "estimated")
+
+
+@activity.defn
+def post_estimate_error(req: EstimateRequest, stage: str, reason: str = "") -> None:
+    github_client.post_comment(
+        req.repo,
+        req.issue_number,
+        f"⚠️ Оценка не удалась на стадии «{stage}». Повтори `/estimate` позже — "
+        f"подробности прогона видны в Temporal UI.",
+    )
+    github_client.add_reaction(req.repo, req.comment_id, "confused")
+    exc_type, _, message = reason.partition(": ")
+    sentry_setup.capture_estimate_failure(req, stage, exc_type or "unknown", message or reason)
