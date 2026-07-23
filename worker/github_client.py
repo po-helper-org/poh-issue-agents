@@ -203,6 +203,45 @@ def list_comments(repo: str, issue_number: int, limit: int = 50) -> list[dict]:
     return resp.json()[:limit]
 
 
+def list_linked_prs(repo: str, issue_number: int, limit: int = 20) -> list[dict]:
+    """PR, кросс-ссылающиеся на issue (Timeline API).
+
+    Трекинг-issue связан с PR событиями cross-referenced; тело issue их не
+    содержит. Оставляем только ссылки на PR (source.issue с ключом
+    pull_request), не на другие issue, и убираем дубли.
+    """
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/timeline"
+    resp = requests.get(
+        url,
+        headers={**_auth_headers(),
+                 "Accept": "application/vnd.github.mockingbird-preview+json"},
+        params={"per_page": 100},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    seen: set[int] = set()
+    prs: list[dict] = []
+    for event in resp.json():
+        if event.get("event") != "cross-referenced":
+            continue
+        src = (event.get("source") or {}).get("issue") or {}
+        if "pull_request" not in src:
+            continue
+        number = src.get("number")
+        if number is None or number in seen:
+            continue
+        seen.add(number)
+        prs.append({
+            "number": number,
+            "title": src.get("title", ""),
+            "state": src.get("state", ""),
+            "url": src.get("html_url", ""),
+        })
+        if len(prs) >= limit:
+            break
+    return prs
+
+
 def get_file(repo: str, path: str, ref: str) -> str | None:
     """Содержимое файла из ветки. None — файла нет; для артефактов это
     штатная ситуация, а не ошибка."""
