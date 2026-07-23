@@ -89,7 +89,7 @@ def close_issue(repo: str, issue_number: int) -> None:
 def search_candidates(repo: str, query: str, limit: int = 15) -> list[dict]:
     """Через gh CLI — тот же паттерн, что и в версии на Actions, но токен
     для gh нужно прокинуть через переменную окружения перед вызовом."""
-    env = {**os.environ, "GH_TOKEN": _auth_headers()["Authorization"].split(" ")[1]}
+    env = {**os.environ, "GH_TOKEN": auth_token()}
     candidates = []
     for kind in ("issue", "pr"):
         fields = "number,title,body,url,state,labels" if kind == "issue" else "number,title,body,url,state"
@@ -110,16 +110,81 @@ def branch_exists(repo: str, branch: str) -> bool:
     return resp.status_code == 200
 
 
+def auth_token() -> str:
+    """Голый токен для внешних процессов (git clone, gh CLI)."""
+    return _auth_headers()["Authorization"].split(" ", 1)[1]
+
+
 def add_reaction(repo: str, comment_id: int, content: str = "eyes") -> None:
-    """Реакция на комментарий — подтверждение, что команда увидена, до того
-    как начнётся долгий расчёт. GitHub отвечает 200 на уже поставленную
-    реакцию, поэтому повторный вызов безвреден."""
+    """Реакция на комментарий — видимое «команда принята» до тяжёлой работы.
+    GitHub отвечает 200 на уже поставленную реакцию, повторный вызов безвреден."""
     if _dry_run():
-        _log.info("[DRY_RUN] reaction %s on %s comment %s", content, repo, comment_id)
+        _log.info("[DRY_RUN] reaction %s comment %s: %s", repo, comment_id, content)
         return
     url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}/reactions"
     resp = requests.post(url, headers=_auth_headers(), json={"content": content}, timeout=30)
     resp.raise_for_status()
+
+
+def ensure_branch(repo: str, branch: str) -> None:
+    """Создаёт ветку от дефолтной, если её ещё нет."""
+    if _dry_run():
+        _log.info("[DRY_RUN] create branch %s in %s", branch, repo)
+        return
+    if branch_exists(repo, branch):
+        return
+    meta = requests.get(f"https://api.github.com/repos/{repo}", headers=_auth_headers(), timeout=30)
+    meta.raise_for_status()
+    base = meta.json()["default_branch"]
+
+    ref = requests.get(
+        f"https://api.github.com/repos/{repo}/git/ref/heads/{base}",
+        headers=_auth_headers(), timeout=30,
+    )
+    ref.raise_for_status()
+    sha = ref.json()["object"]["sha"]
+
+    resp = requests.post(
+        f"https://api.github.com/repos/{repo}/git/refs",
+        headers=_auth_headers(),
+        json={"ref": f"refs/heads/{branch}", "sha": sha},
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def put_file(repo: str, branch: str, path: str, content: str, message: str) -> None:
+    """Создаёт или обновляет файл в ветке через Contents API.
+
+    Contents API, а не `git push`: клон делается shallow (--depth 1), а push из
+    такого клона GitHub может отклонить. Здесь ремоут вообще не нужен.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] put file %s in %s:%s", path, repo, branch)
+        return
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    existing = requests.get(url, headers=_auth_headers(), params={"ref": branch}, timeout=30)
+    if existing.status_code == 200:
+        payload["sha"] = existing.json()["sha"]  # перезапись требует sha текущей версии
+
+    resp = requests.put(url, headers=_auth_headers(), json=payload, timeout=30)
+    resp.raise_for_status()
+
+
+def push_artifacts_to_branch(repo: str, branch: str, files: dict[str, str], message: str) -> None:
+    """Публикует артефакты (путь -> содержимое) в ветку одним проходом."""
+    if _dry_run():
+        _log.info("[DRY_RUN] push %s files to %s#%s: %s",
+                  len(files), repo, branch, sorted(files))
+        return
+    ensure_branch(repo, branch)
+    for path, content in files.items():
+        put_file(repo, branch, path, content, message)
 
 
 def get_issue(repo: str, issue_number: int) -> dict:

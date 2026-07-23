@@ -2,12 +2,10 @@
 Webhook receiver: единственная точка входа для GitHub. Проверяет подпись,
 транслирует событие в вызов Temporal:
 - issues.opened            -> старт нового workflow (ID = repo-issue-N)
-- issue_comment.created    -> сигнал уже идущему workflow (текст комментария —
-                               используется циклом уточнений, если issue
-                               в состоянии ожидания ответа)
-- issue_comment с /estimate -> старт отдельного workflow IssueEstimation
-                               (ID включает id комментария: повторная доставка
-                               вебхука не запускает вторую оценку)
+- issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis,
+                               `/estimate` — IssueEstimation; любой другой
+                               комментарий — сигнал уже идущему workflow
+                               (используется циклом уточнений)
 - issues.labeled           -> сигнал, если лейбл — одна из точек решения
                                человека (research-me / bug-me / build-me)
 
@@ -16,6 +14,7 @@ Webhook receiver: единственная точка входа для GitHub. 
 
 import hashlib
 import hmac
+import logging
 import os
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -23,11 +22,17 @@ from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared import sentry_setup
-from shared.commands import ESTIMATE, parse_command
+from shared.commands import ANALYZE, ESTIMATE, build_analyze_input, parse_command
 from shared.temporal_client import connect_temporal
-from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
+from shared.workflow_ids import (
+    analysis_workflow_id,
+    estimate_workflow_id,
+    issue_workflow_id,
+)
 
 sentry_setup.configure("webhook")  # no-op без SENTRY_DSN; FastAPI инструментируется автоматически
+
+_log = logging.getLogger("webhook")
 
 app = FastAPI()
 
@@ -111,7 +116,12 @@ async def github_webhook(
         repo = payload["repository"]["full_name"]
         issue_number = payload["issue"]["number"]
 
-        if parse_command(payload["comment"].get("body") or "") == ESTIMATE:
+        # Единственная точка ветвления «команда против обычного комментария»:
+        # команда НЕ уходит в user_comment, иначе её съел бы цикл уточнений
+        # intake gate как ответ на уточняющий вопрос.
+        command = parse_command(payload["comment"].get("body") or "")
+
+        if command == ESTIMATE:
             from shared.workflow_types import EstimateRequest
 
             comment_id = payload["comment"]["id"]
@@ -127,8 +137,30 @@ async def github_webhook(
             except WorkflowAlreadyStartedError:
                 # Тот же вебхук доставлен повторно — оценка уже идёт.
                 pass
-            # Команда — не ответ на уточняющий вопрос intake gate, поэтому
-            # сигнал user_comment по ней не шлётся.
+            return {"ok": True}
+
+        if command == ANALYZE:
+            analyze = build_analyze_input(payload)
+
+            # Живому воркфлоу триажа шлём только уведомление — оно повесит метку
+            # `analyzing`; исполнителем всегда остаётся выделенный IssueAnalysis.
+            lifecycle = client.get_workflow_handle(workflow_id_for(repo, issue_number))
+            try:
+                await lifecycle.signal("analyze_requested", analyze.comment_id)
+            except Exception:
+                pass  # триаж уже завершён — уведомлять некого, это не ошибка
+
+            try:
+                await client.start_workflow(
+                    "IssueAnalysis",
+                    analyze,
+                    id=analysis_workflow_id(repo, issue_number),
+                    task_queue="issue-lifecycle",
+                )
+            except WorkflowAlreadyStartedError:
+                # Прогон по этому Issue уже идёт: пользователь видел ack первого
+                # запуска, второй ack был бы шумом. Webhook — чистый транспорт.
+                _log.info("analysis already running for %s#%s", repo, issue_number)
             return {"ok": True}
 
         wf_id = workflow_id_for(repo, issue_number)

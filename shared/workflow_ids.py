@@ -18,3 +18,9 @@ def issue_workflow_id(repo_full_name: str, issue_number: int, suffix: str = "") 
 
 def estimate_workflow_id(repo_full_name: str, issue_number: int, comment_id: int) -> str:
     return f"estimate-{repo_full_name}-{issue_number}-{comment_id}"
+
+
+def analysis_workflow_id(repo_full_name: str, issue_number: int) -> str:
+    # Фиксированный id (без comment_id): повторный /analyze при идущем прогоне
+    # упирается в WorkflowAlreadyStarted вместо второго дорогого прогона.
+    return f"analysis-{repo_full_name}-{issue_number}"
