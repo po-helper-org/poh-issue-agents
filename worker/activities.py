@@ -587,7 +587,7 @@ async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
         await _run_with_heartbeat(_run_repomix, clone_dir, label="packing")
         activity.heartbeat("packed")
 
-        description = f"{analyze.title}\n\n{analyze.body}"
+        description = await asyncio.to_thread(_build_task_context, analyze)
         for name, prompt, expected in _fnr_stages(description):
             await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=name)
             if expected and not (Path(clone_dir) / expected).exists():
