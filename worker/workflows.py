@@ -214,6 +214,26 @@ class IssueLifecycle:
             )
 
 
+@workflow.defn(name="IssueAnalysis")
+class IssueAnalysisTombstone:
+    """Tombstone shim for the removed IssueAnalysis workflow class.
+
+    IssueAnalysis was renamed/replaced but in-flight Temporal runs still carry
+    that workflow type name. Without this registration the worker raises
+    ApplicationError (class not registered) on every activation, which then
+    evicts the run from cache and causes a secondary RuntimeError (missing
+    initialize workflow).
+
+    This shim lets orphaned runs drain: any activation is accepted and the
+    workflow exits immediately. Remove this class once the Temporal namespace
+    shows zero open IssueAnalysis workflow runs.
+    """
+
+    @workflow.run
+    async def run(self, *args, **kwargs) -> None:  # noqa: ANN002,ANN003
+        return  # graceful no-op — lets the orphaned run complete cleanly
+
+
 @workflow.defn(name="IssueEstimation")
 class IssueEstimation:
     """Оценка трудоёмкости по команде /estimate.

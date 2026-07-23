@@ -18,7 +18,7 @@ import consolidation_activities as ca
 from consolidation_workflow import ConsolidationWorkflow
 from shared import sentry_setup
 from shared.temporal_client import connect_temporal
-from workflows import IssueEstimation, IssueLifecycle
+from workflows import IssueAnalysisTombstone, IssueEstimation, IssueLifecycle
 
 sentry_setup.configure("worker")  # no-op без SENTRY_DSN
 
@@ -28,7 +28,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
-        workflows=[IssueLifecycle, IssueEstimation, ConsolidationWorkflow],
+        workflows=[IssueLifecycle, IssueEstimation, ConsolidationWorkflow, IssueAnalysisTombstone],
         activities=[
             activities.prefilter_bot_and_security,
             activities.intake_gate,
