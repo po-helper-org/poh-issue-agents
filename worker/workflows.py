@@ -29,6 +29,20 @@ with workflow.unsafe.imports_passed_through():
 MAX_CLARIFICATION_ROUNDS = 2
 
 
+def _failure_reason(e: BaseException) -> str:
+    """"ExcType: message" из ПЕРВОПРИЧИНЫ для тегов/группировки Sentry.
+
+    catch-ветки ловят обёртку Temporal (ActivityError «Activity task failed»),
+    а не исходное исключение activity. Разворачиваем `.cause`: у ApplicationError
+    есть `.type` = имя исходного класса (RuntimeError/ValidationError/…), это и
+    даёт осмысленный fingerprint вместо единственного «ActivityError» на всё.
+    Чистые операции над атрибутами — детерминированы, безопасны в workflow-коде.
+    """
+    cause = getattr(e, "cause", None) or e
+    exc_type = getattr(cause, "type", None) or type(cause).__name__
+    return f"{exc_type}: {cause}"
+
+
 @workflow.defn(name="IssueLifecycle")
 class IssueLifecycle:
     def __init__(self) -> None:
@@ -159,10 +173,10 @@ class IssueLifecycle:
                 args=[issue, priority, dup],
                 start_to_close_timeout=timedelta(seconds=30),
             )
-        except Exception:
+        except Exception as e:
             await workflow.execute_activity(
                 activities.post_error_label,
-                issue,
+                args=[issue, _failure_reason(e)],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=5),
             )
@@ -258,10 +272,10 @@ class IssueEstimation:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
-        except Exception:
+        except Exception as e:
             await workflow.execute_activity(
                 activities.post_estimate_error,
-                args=[req, stage],
+                args=[req, stage, _failure_reason(e)],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=5),
             )

@@ -45,8 +45,9 @@ async def stub_post(req: EstimateRequest, result: EstimateResult):
 
 
 @activity.defn(name="post_estimate_error")
-async def stub_error(req: EstimateRequest, stage: str):
+async def stub_error(req: EstimateRequest, stage: str, reason: str = ""):
     _state["error_stage"] = stage
+    _state["error_reason"] = reason
 
 
 @activity.defn(name="collect_estimation_context")
@@ -86,4 +87,6 @@ async def test_failure_reports_the_stage_it_broke_on():
     _state.clear()
     await _run([stub_ack, stub_context_boom, stub_facts, stub_compute, stub_post, stub_error])
     assert _state["error_stage"] == "сбор контекста"
+    # reason "ExcType: message" пробрасывается в activity (для тегов Sentry).
+    assert "GitHub недоступен" in _state["error_reason"]
     assert "posted" not in _state
