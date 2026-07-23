@@ -22,9 +22,12 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
+from shared import sentry_setup
 from shared.commands import ESTIMATE, parse_command
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
+
+sentry_setup.configure("webhook")  # no-op без SENTRY_DSN; FastAPI инструментируется автоматически
 
 app = FastAPI()
 

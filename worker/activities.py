@@ -18,6 +18,7 @@ import estimate_report
 import estimation
 import github_client
 import llm
+from shared import sentry_setup
 from shared.commands import parse_command
 from shared.workflow_types import (
     ClassificationResult,
@@ -145,12 +146,17 @@ def escalate_to_human(issue: IssueInput) -> None:
 
 
 @activity.defn
-def post_error_label(issue: IssueInput) -> None:
+def post_error_label(issue: IssueInput, reason: str = "") -> None:
     github_client.post_comment(
         issue.repo, issue.issue_number,
         "⚠️ Автоматическая обработка не удалась. Ожидай ручного разбора.",
     )
     github_client.add_label(issue.repo, issue.issue_number, "advisor:error")
+    # `reason` = "ExcType: message" из catch-ветки workflow'а (workflows.py).
+    # Без него (прямой вызов/старые тесты) exc_type пуст — событие всё равно
+    # уходит, просто с менее точной группировкой.
+    exc_type, _, message = reason.partition(": ")
+    sentry_setup.capture_pipeline_failure(issue, exc_type or "unknown", message or reason)
 
 
 # --- Классификация ---
@@ -442,7 +448,7 @@ def post_estimate_comment(req: EstimateRequest, result: EstimateResult) -> None:
 
 
 @activity.defn
-def post_estimate_error(req: EstimateRequest, stage: str) -> None:
+def post_estimate_error(req: EstimateRequest, stage: str, reason: str = "") -> None:
     github_client.post_comment(
         req.repo,
         req.issue_number,
@@ -450,3 +456,5 @@ def post_estimate_error(req: EstimateRequest, stage: str) -> None:
         f"подробности прогона видны в Temporal UI.",
     )
     github_client.add_reaction(req.repo, req.comment_id, "confused")
+    exc_type, _, message = reason.partition(": ")
+    sentry_setup.capture_estimate_failure(req, stage, exc_type or "unknown", message or reason)

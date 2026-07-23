@@ -16,8 +16,11 @@ logging.basicConfig(
 import activities
 import consolidation_activities as ca
 from consolidation_workflow import ConsolidationWorkflow
+from shared import sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import IssueEstimation, IssueLifecycle
+
+sentry_setup.configure("worker")  # no-op без SENTRY_DSN
 
 
 async def main() -> None:
