@@ -23,6 +23,7 @@ from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared.commands import ESTIMATE, parse_command
+from shared.temporal_client import connect_temporal
 from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
 
 app = FastAPI()
@@ -35,7 +36,7 @@ _temporal_client: Client | None = None
 async def get_temporal_client() -> Client:
     global _temporal_client
     if _temporal_client is None:
-        _temporal_client = await Client.connect(os.environ["TEMPORAL_ADDRESS"])
+        _temporal_client = await connect_temporal()
     return _temporal_client
 
 

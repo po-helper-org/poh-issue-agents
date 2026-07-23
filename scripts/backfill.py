@@ -25,9 +25,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
 
+from shared.temporal_client import connect_temporal
 from shared.workflow_ids import issue_workflow_id
 from shared.workflow_types import IssueInput
 
@@ -82,7 +82,7 @@ async def main() -> None:
     else:
         items = list_open_issues(args.repo, args.limit)
 
-    client = await Client.connect(os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"))
+    client = await connect_temporal()
 
     started, skipped = 0, 0
     for item in items:

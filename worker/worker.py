@@ -1,9 +1,7 @@
 import asyncio
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 
-from temporalio.client import Client
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 # Surface INFO logs — notably github_client's [DRY_RUN] lines, which are the
@@ -18,11 +16,12 @@ logging.basicConfig(
 import activities
 import consolidation_activities as ca
 from consolidation_workflow import ConsolidationWorkflow
+from shared.temporal_client import connect_temporal
 from workflows import IssueEstimation, IssueLifecycle
 
 
 async def main() -> None:
-    client = await Client.connect(os.environ["TEMPORAL_ADDRESS"])
+    client = await connect_temporal()
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
