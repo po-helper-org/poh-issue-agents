@@ -518,6 +518,26 @@ async def prepare_workspace(analyze: AnalyzeInput) -> None:
 
 
 @activity.defn
+async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
+    """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
+    затем стадия, затем проверка ожидаемого артефакта. Возвращает компактный
+    отчёт {stage, artifact, bytes}; статус/тайминг Temporal фиксирует сам."""
+    description = f"{analyze.title}\n\n{analyze.body}"
+    prompt, expected, requires = _fnr_stage(stage_name, description)
+    clone_dir = _require_workspace(analyze, requires)
+    await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
+    artifact: str | None = None
+    size = 0
+    if expected:
+        path = Path(clone_dir) / expected
+        if not path.exists():
+            raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
+        artifact = expected
+        size = path.stat().st_size
+    return {"stage": stage_name, "artifact": artifact, "bytes": size}
+
+
+@activity.defn
 async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
     """Полный прогон SA-helper одной activity.
 

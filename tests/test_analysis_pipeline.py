@@ -354,3 +354,71 @@ def test_prepare_workspace_builds_clone_and_repomix(stage_env):
     clone_dir = activities._clone_dir(_analyze())
     assert Path(clone_dir).exists()
     assert (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists()
+
+
+def test_stage_reports_stage_artifact_and_size(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    result = asyncio.run(activities.run_fnr_stage(a, "task"))
+    assert result["stage"] == "task"
+    assert result["artifact"] == f"{activities.FNR_DIR}/task.md"
+    assert result["bytes"] > 0
+    assert any(p.startswith("/fnr-new-task") for p in stage_env["claude_prompts"])
+
+
+def test_stage_without_expected_artifact_reports_none(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    asyncio.run(activities.run_fnr_stage(a, "task"))
+    asyncio.run(activities.run_fnr_stage(a, "concept"))
+    result = asyncio.run(activities.run_fnr_stage(a, "debate"))  # debate: артефакта нет
+    assert result == {"stage": "debate", "artifact": None, "bytes": 0}
+
+
+def test_stage_missing_expected_artifact_raises(stage_env, monkeypatch):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)  # ничего не пишет
+    with pytest.raises(RuntimeError, match="task.md не создан"):
+        asyncio.run(activities.run_fnr_stage(a, "task"))
+
+
+def test_stage_without_workspace_fails_fast(stage_env):
+    with pytest.raises(RuntimeError, match="потерян"):
+        asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+
+
+def test_stage_without_input_artifact_fails_fast(stage_env):
+    asyncio.run(activities.prepare_workspace(_analyze()))
+    with pytest.raises(RuntimeError, match="нет входа"):  # concept требует task.md
+        asyncio.run(activities.run_fnr_stage(_analyze(), "concept"))
+
+
+def test_stage_heartbeats_during_long_claude(stage_env, monkeypatch):
+    monkeypatch.setattr(activities, "HEARTBEAT_INTERVAL_SEC", 0.01)
+    asyncio.run(activities.prepare_workspace(_analyze()))
+
+    def slow_claude(prompt, cwd):
+        time.sleep(0.05)
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        (fnr / "task.md").write_text("# task", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_run_claude", slow_claude)
+    asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    assert stage_env["beats"].count("task") >= 1
+
+
+def test_stage_runs_claude_off_event_loop_thread(stage_env, monkeypatch):
+    asyncio.run(activities.prepare_workspace(_analyze()))
+    seen = {}
+
+    def record(prompt, cwd):
+        seen["thread"] = threading.current_thread()
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        (fnr / "task.md").write_text("# task", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_run_claude", record)
+    asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    assert seen["thread"] is not threading.main_thread()
