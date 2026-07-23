@@ -45,6 +45,13 @@ Compose-файл — `docker-compose.full.yml` (конфигурация **full*
 Вкладка **Environment**. Dokploy сохраняет их в `.env` рядом с compose-файлом;
 оба сервиса подхватывают его через `env_file: .env`.
 
+**Мультирепо через GitHub App (рекомендуется).** Как в `poh-pr-agents`: установи
+App на нужные репозитории, укажи вебхук в самом App, задай 4 переменные —
+`GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_B64` (`base64 -w0 ключ.pem`),
+`GITHUB_WEBHOOK_SECRET`, `ISSUE_AGENT_REPOS` (`owner/repo,owner2/*` или `*`/пусто).
+Installation определяется по репозиторию — `GITHUB_INSTALLATION_ID` не нужен.
+Ниже — dev-вариант на PAT + один репозиторий.
+
 ```env
 DRY_RUN=1
 GITHUB_REPOSITORY=your-org/your-repo

@@ -16,6 +16,7 @@ Webhook receiver: единственная точка входа для GitHub. 
 
 import hashlib
 import hmac
+import logging
 import os
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -24,8 +25,11 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared import sentry_setup
 from shared.commands import ESTIMATE, parse_command
+from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
+
+_log = logging.getLogger("webhook")
 
 sentry_setup.configure("webhook")  # no-op без SENTRY_DSN; FastAPI инструментируется автоматически
 
@@ -67,6 +71,13 @@ async def github_webhook(
     body = await request.body()
     verify_signature(body, x_hub_signature_256)
     payload = await request.json()
+
+    # Allowlist: действуем только на репозитории из ISSUE_AGENT_REPOS (пусто/* —
+    # любой установленный). Чужой репозиторий игнорируем до старта workflow.
+    repo_full = (payload.get("repository") or {}).get("full_name")
+    if repo_full and not is_allowed(repo_full, allowed_specs()):
+        _log.info("ignored repo %s (not in ISSUE_AGENT_REPOS)", repo_full)
+        return {"ok": True}
 
     client = await get_temporal_client()
 
