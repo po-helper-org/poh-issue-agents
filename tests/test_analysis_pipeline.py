@@ -422,3 +422,38 @@ def test_stage_runs_claude_off_event_loop_thread(stage_env, monkeypatch):
     monkeypatch.setattr(activities, "_run_claude", record)
     asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
     assert seen["thread"] is not threading.main_thread()
+
+
+def test_publish_pushes_branch_and_comments(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    for name in activities.FNR_STAGE_NAMES:
+        asyncio.run(activities.run_fnr_stage(a, name))
+    branch = asyncio.run(activities.publish_analysis(a))
+    assert branch == "research/issue-5"
+    pushed_branch, files = stage_env["pushed"]
+    assert pushed_branch == "research/issue-5"
+    assert f"{activities.FNR_DIR}/system_requirements.md" in files
+    assert "research/issue-5" in stage_env["comment"]
+    assert "system_requirements.md" in stage_env["comment"]
+
+
+def test_publish_without_artifacts_raises(stage_env, monkeypatch):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    monkeypatch.setattr(activities, "_collect_fnr_artifacts", lambda clone_dir: {})
+    with pytest.raises(RuntimeError, match="ни одного артефакта"):
+        asyncio.run(activities.publish_analysis(a))
+
+
+def test_cleanup_removes_workspace(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    assert activities._workspace_dir(a).exists()
+    asyncio.run(activities.cleanup_workspace(a))
+    assert not activities._workspace_dir(a).exists()
+
+
+def test_cleanup_is_idempotent_when_absent(stage_env):
+    # каталога нет — cleanup не должен падать
+    asyncio.run(activities.cleanup_workspace(_analyze()))

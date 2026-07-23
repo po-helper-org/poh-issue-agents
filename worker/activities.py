@@ -538,6 +538,33 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
 
 
 @activity.defn
+async def publish_analysis(analyze: AnalyzeInput) -> str:
+    """Финал пайплайна: собрать артефакты, push ветки research/issue-N,
+    итоговый коммент. Мутации GitHub гейтятся DRY_RUN внутри github_client."""
+    clone_dir = _require_workspace(analyze, None)
+    files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
+    if not files:
+        raise RuntimeError("пайплайн не произвёл ни одного артефакта")
+    branch = f"research/issue-{analyze.issue_number}"
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        analyze.repo, branch, files,
+        f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
+    )
+    await asyncio.to_thread(
+        github_client.post_comment,
+        analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
+    )
+    return branch
+
+
+@activity.defn
+async def cleanup_workspace(analyze: AnalyzeInput) -> None:
+    """Best-effort снос рабочего каталога прогона."""
+    await asyncio.to_thread(shutil.rmtree, str(_workspace_dir(analyze)), ignore_errors=True)
+
+
+@activity.defn
 async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
     """Полный прогон SA-helper одной activity.
 
