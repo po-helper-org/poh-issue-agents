@@ -366,18 +366,36 @@ def _run_repomix(clone_dir: str) -> None:
     )
 
 
+def _claude_anthropic_creds() -> tuple[str, str]:
+    """Креды для `claude -p` из тех же ZAI_*, что и Python-стадии (единый ключ
+    z.ai). claude-code говорит по протоколу Anthropic, поэтому нужен другой ПУТЬ
+    эндпоинта того же хоста: ZAI_BASE_URL = .../coding/paas/v4 (OpenAI-формат),
+    Anthropic-формат живёт на .../api/anthropic. Отдельные ANTHROPIC_* задавать
+    не нужно, но если заданы — приоритетнее (явный override)."""
+    token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ZAI_API_KEY", "")
+    base = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if not base:
+        zai = os.environ.get("ZAI_BASE_URL", "")
+        if zai:
+            from urllib.parse import urlsplit
+            p = urlsplit(zai)
+            base = f"{p.scheme}://{p.netloc}/api/anthropic"
+    return token, base
+
+
 def _run_claude(prompt: str, cwd: str) -> None:
     """Одна стадия FNR — отдельный процесс `claude -p` с чистым контекстом.
 
-    ANTHROPIC_* берутся из окружения контейнера (env_file .env) и направляют
-    claude-code на Anthropic-совместимый эндпоинт z.ai.
+    Креды берутся из ZAI_* (как в main) и прокидываются в claude-code через его
+    ANTHROPIC_* — единый ключ z.ai, отдельную пару переменных заводить не нужно.
     """
-    # Понятная ошибка вместо голого "exit 1", если окружение не сконфигурировано:
-    # без этих переменных claude-code уходит на дефолтный Anthropic API и падает.
-    if not os.environ.get("ANTHROPIC_BASE_URL") or not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+    token, base = _claude_anthropic_creds()
+    # Понятная ошибка вместо голого "exit 1", если z.ai не сконфигурирован:
+    # без креды claude-code уходит на дефолтный Anthropic API и падает.
+    if not token or not base:
         raise RuntimeError(
-            "claude -p не сконфигурирован: задай ANTHROPIC_BASE_URL и "
-            "ANTHROPIC_AUTH_TOKEN в окружении воркера (Anthropic-эндпоинт z.ai)."
+            "claude -p не сконфигурирован: задай ZAI_API_KEY и ZAI_BASE_URL "
+            "(или явные ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) в окружении воркера."
         )
     result = subprocess.run(
         # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
@@ -386,6 +404,8 @@ def _run_claude(prompt: str, cwd: str) -> None:
         ["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
         cwd=cwd, capture_output=True, text=True,
         timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
+        # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
+        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_BASE_URL": base},
     )
     if result.returncode != 0:
         # claude-code часто пишет диагностику в stdout, а не stderr — берём оба

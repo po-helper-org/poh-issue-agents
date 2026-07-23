@@ -221,3 +221,36 @@ def test_blocking_stages_run_off_the_event_loop_thread(wired, monkeypatch):
     asyncio.run(activities.run_analysis_pipeline(_analyze()))
 
     assert threads["claude"] is not threading.main_thread()
+
+
+# --- claude креды выводятся из ZAI_* (единый ключ z.ai, как в main) ---
+
+def test_claude_creds_derived_from_zai(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ZAI_API_KEY", "zkey")
+    monkeypatch.setenv("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
+
+    token, base = activities._claude_anthropic_creds()
+
+    assert token == "zkey"
+    # тот же хост, Anthropic-путь
+    assert base == "https://api.z.ai/api/anthropic"
+
+
+def test_explicit_anthropic_overrides_zai(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "zkey")
+    monkeypatch.setenv("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "atok")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://custom/anthropic")
+
+    token, base = activities._claude_anthropic_creds()
+
+    assert (token, base) == ("atok", "https://custom/anthropic")
+
+
+def test_claude_creds_empty_when_nothing_set(monkeypatch):
+    for v in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ZAI_API_KEY", "ZAI_BASE_URL"):
+        monkeypatch.delenv(v, raising=False)
+
+    assert activities._claude_anthropic_creds() == ("", "")
