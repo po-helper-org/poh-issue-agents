@@ -372,6 +372,13 @@ def _run_claude(prompt: str, cwd: str) -> None:
     ANTHROPIC_* берутся из окружения контейнера (env_file .env) и направляют
     claude-code на Anthropic-совместимый эндпоинт z.ai.
     """
+    # Понятная ошибка вместо голого "exit 1", если окружение не сконфигурировано:
+    # без этих переменных claude-code уходит на дефолтный Anthropic API и падает.
+    if not os.environ.get("ANTHROPIC_BASE_URL") or not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        raise RuntimeError(
+            "claude -p не сконфигурирован: задай ANTHROPIC_BASE_URL и "
+            "ANTHROPIC_AUTH_TOKEN в окружении воркера (Anthropic-эндпоинт z.ai)."
+        )
     result = subprocess.run(
         # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
         # работает от root, а тот флаг под root запрещён самим claude-code
@@ -381,7 +388,10 @@ def _run_claude(prompt: str, cwd: str) -> None:
         timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"claude -p exit {result.returncode}: {result.stderr[-1000:]}")
+        # claude-code часто пишет диагностику в stdout, а не stderr — берём оба
+        # (stderr приоритетнее), иначе сообщение об ошибке оказывается пустым.
+        detail = result.stderr.strip() or result.stdout.strip() or "(пустой вывод)"
+        raise RuntimeError(f"claude -p exit {result.returncode}: {detail[-1500:]}")
 
 
 def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
