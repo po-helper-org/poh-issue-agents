@@ -177,3 +177,33 @@ async def test_analyze_requested_labels_only_once():
             await handle.result()
 
     assert _analyze_signal_state["count"] == 1, "повторный /analyze не должен плодить лейблы"
+
+
+@pytest.mark.asyncio
+async def test_analyze_requested_before_run_init_still_labels():
+    """Сигнал в САМОЙ ПЕРВОЙ активации воркфлоу (start_signal) приходит раньше,
+    чем run() выполнил `self._issue = issue` — Temporal применяет сигналы до
+    создания задачи run(). Хендлер обязан ДОЖДАТЬСЯ инициализации через
+    wait_condition, а не молча выйти по `self._issue is None`. Без фикса
+    mark_analyzing не вызвался бы ни разу (count == 0)."""
+    _analyze_signal_state["count"] = 0
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        async with Worker(
+            env.client, task_queue="tq-analyze-init", workflows=[IssueLifecycle],
+            activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
+                        stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
+                        stub_mark_analyzing],
+        ):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run,
+                IssueInput(repo="o/r", issue_number=42, title="t", body="b",
+                           author_login="u", author_type="User", interactive=True),
+                id=f"wf-{uuid.uuid4()}", task_queue="tq-analyze-init",
+                # доставляет analyze_requested в первой активации — вместе со
+                # стартом, раньше первой строки run()
+                start_signal="analyze_requested", start_signal_args=[111],
+            )
+            await handle.signal(IssueLifecycle.human_decision, "no-match")
+            await handle.result()
+
+    assert _analyze_signal_state["count"] == 1, "метка потеряна: сигнал до init не дождался self._issue"

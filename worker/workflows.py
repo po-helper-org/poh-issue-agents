@@ -54,10 +54,26 @@ class IssueLifecycle:
         не плодит лейблы). Тяжёлую работу из хендлера не запускаем: run() обычно
         припаркован в _wait_for_signal(), спавн оттуда гонялся бы с основным
         циклом; лёгкая activity add_label безопасна.
+
+        `_analyze_labeled` ставим ДО первого await: хендлеры кооперативны
+        (переключение только на await), поэтому второй почти одновременный
+        сигнал увидит True и не поставит второй лейбл. Сигнал может прийти в
+        самой первой активации воркфлоу — раньше, чем run() выполнил
+        `self._issue = issue` (Temporal применяет сигналы до создания задачи
+        run()); поэтому ЖДЁМ инициализацию через wait_condition, а не роняем
+        метку молча по `self._issue is None`.
+
+        Известный компромисс: политика незавершённых хендлеров по умолчанию —
+        WARN_AND_ABANDON. Если run() успеет завершиться (например, через
+        `else: return` без await), пока mark_analyzing лишь запланирована, метка
+        не встанет, а в лог уйдёт warning. Метка косметическая (её никто не
+        читает), гарантировать её ожиданием all_handlers_finished в run() не
+        стоит — само-лечится при следующем /analyze в припаркованном состоянии.
         """
-        if self._analyze_labeled or self._issue is None:
+        if self._analyze_labeled:
             return
         self._analyze_labeled = True
+        await workflow.wait_condition(lambda: self._issue is not None)
         await workflow.execute_activity(
             activities.mark_analyzing,
             args=[self._issue.repo, self._issue.issue_number],
