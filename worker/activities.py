@@ -351,6 +351,40 @@ def _fnr_stage(name: str, description: str) -> tuple[str, str | None, str | None
     raise ValueError(f"неизвестная стадия FNR: {name}")
 
 
+def _workspace_dir(analyze: AnalyzeInput) -> Path:
+    """Детерминированный рабочий каталог прогона (переживает activity в пределах
+    жизни контейнера). База — ANALYSIS_WORKSPACE_ROOT или системный temp."""
+    root = os.environ.get("ANALYSIS_WORKSPACE_ROOT") or tempfile.gettempdir()
+    slug = f"analysis-{analyze.repo.replace('/', '__')}-{analyze.issue_number}"
+    return Path(root) / slug
+
+
+def _clone_dir(analyze: AnalyzeInput) -> str:
+    return str(_workspace_dir(analyze) / "repo")
+
+
+def _build_workspace(analyze: AnalyzeInput) -> str:
+    """Свежий каталог: снести остаток прежнего прогона, clone, repomix."""
+    shutil.rmtree(_workspace_dir(analyze), ignore_errors=True)
+    clone_dir = _clone_dir(analyze)
+    _clone_repo(analyze.repo, clone_dir)
+    _run_repomix(clone_dir)
+    return clone_dir
+
+
+def _require_workspace(analyze: AnalyzeInput, requires: str | None) -> str:
+    """Guard стадии: каталог+repomix на месте? требуемый вход на месте? Иначе
+    fail-fast (без пере-клона — он дал бы свежий репозиторий без артефактов)."""
+    clone_dir = _clone_dir(analyze)
+    if not (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists():
+        raise RuntimeError("рабочий каталог потерян (рестарт воркера?) — повтори /analyze")
+    if requires and not (Path(clone_dir) / requires).exists():
+        raise RuntimeError(
+            f"нет входа {requires} (стадия-предшественник не отработала?) — повтори /analyze"
+        )
+    return clone_dir
+
+
 def _clone_repo(repo: str, dest: str) -> None:
     """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
     реальный код (`файл:строка`), одного текста Issue недостаточно.

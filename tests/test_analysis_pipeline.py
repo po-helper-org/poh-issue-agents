@@ -275,3 +275,75 @@ def test_fnr_stage_task_has_no_required_input():
 def test_fnr_stage_unknown_raises():
     with pytest.raises(ValueError, match="неизвестная стадия"):
         activities._fnr_stage("nope", "desc")
+
+
+@pytest.fixture
+def stage_env(monkeypatch, tmp_path):
+    """Реальный каталог под ANALYSIS_WORKSPACE_ROOT; внешние эффекты — заглушки."""
+    monkeypatch.setenv("ANALYSIS_WORKSPACE_ROOT", str(tmp_path))
+    state = {"beats": [], "claude_prompts": [], "pushed": None, "comment": None}
+
+    monkeypatch.setattr(activities.activity, "heartbeat",
+                        lambda *a: state["beats"].append(a[0] if a else None))
+
+    def fake_clone(repo, dest):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+
+    def fake_repomix(clone_dir):
+        out = Path(clone_dir) / "sa_documentation" / "repomix-output.xml"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("<repo/>", encoding="utf-8")
+
+    def fake_claude(prompt, cwd):
+        state["claude_prompts"].append(prompt)
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        produced = {
+            "/fnr-new-task": "task.md",
+            "/fnr-concept": "concept.md",
+            "/fnr-system-requirements": "system_requirements.md",
+            "/validate-doc": "validation.md",
+        }.get(prompt.split()[0])
+        if produced:
+            (fnr / produced).write_text(f"# {produced}\n", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_clone_repo", fake_clone)
+    monkeypatch.setattr(activities, "_run_repomix", fake_repomix)
+    monkeypatch.setattr(activities, "_run_claude", fake_claude)
+    monkeypatch.setattr(activities.github_client, "push_artifacts_to_branch",
+                        lambda repo, branch, files, message: state.update(pushed=(branch, dict(files))))
+    monkeypatch.setattr(activities.github_client, "post_comment",
+                        lambda repo, n, body: state.update(comment=body))
+    return state
+
+
+def test_workspace_dir_is_deterministic_under_root(stage_env, tmp_path):
+    d1 = activities._workspace_dir(_analyze())
+    d2 = activities._workspace_dir(_analyze())
+    assert d1 == d2
+    assert str(tmp_path) in str(d1)
+    assert d1.name == "analysis-o__r-5"
+
+
+def test_build_workspace_clones_and_packs(stage_env):
+    clone_dir = activities._build_workspace(_analyze())
+    assert (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists()
+
+
+def test_build_workspace_wipes_prior_remnant(stage_env):
+    stale = activities._workspace_dir(_analyze()) / "repo" / "STALE.txt"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("old", encoding="utf-8")
+    activities._build_workspace(_analyze())
+    assert not stale.exists()
+
+
+def test_require_workspace_missing_repomix_fails_fast(stage_env):
+    with pytest.raises(RuntimeError, match="потерян"):
+        activities._require_workspace(_analyze(), None)
+
+
+def test_require_workspace_missing_input_fails_fast(stage_env):
+    activities._build_workspace(_analyze())  # repomix есть, task.md нет
+    with pytest.raises(RuntimeError, match="нет входа"):
+        activities._require_workspace(_analyze(), f"{activities.FNR_DIR}/task.md")
