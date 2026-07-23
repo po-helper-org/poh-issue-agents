@@ -4,11 +4,18 @@
 вебхуки на публичный адрес с TLS, команда `/estimate` в комментарии Issue
 работает без туннелей на ноутбуке.
 
-Temporal здесь **не поднимается** — сервис ходит в централизованный Temporal в
-инфраструктуре по `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` (задаются в
-Environment, см. шаг 2). Compose-файл — `docker-compose.dokploy.yml`, в нём только
-`webhook` и `worker`. Локальный `docker-compose.yml` для продакшна не годится: он
-умеет поднимать локальный Temporal-стек и публиковать порты.
+Compose-файл — `docker-compose.full.yml` (конфигурация **full**): поднимает
+полный стек со **встроенным** Temporal (`postgres` + `temporal` + `temporal-ui` +
+`webhook` + `worker`). Сервис самодостаточен и не зависит от внешнего Temporal —
+это и есть смысл прод-варианта. Наружу выставлен только `webhook` (через Traefik
+самого Dokploy, с TLS), инфраструктурные порты не публикуются.
+
+> **Альтернатива — конфигурация main** (`docker-compose.yml`): то же приложение,
+> но против ВНЕШНЕГО централизованного Temporal (`TEMPORAL_ADDRESS` /
+> `TEMPORAL_NAMESPACE` в Environment), без встроенного `postgres`/`temporal`.
+> Выбирай её, если в инфраструктуре уже есть централизованный Temporal-кластер.
+> Тогда Compose Path — `docker-compose.yml`, а из переменных ниже вместо
+> `POSTGRES_PASSWORD` задай `TEMPORAL_ADDRESS`/`TEMPORAL_NAMESPACE`.
 
 ## Что понадобится
 
@@ -28,7 +35,8 @@ Environment, см. шаг 2). Compose-файл — `docker-compose.dokploy.yml`,
 
 - **Provider** — Git, репозиторий `po-helper-org/poh-issue-agents`, нужная
   ветка.
-- **Compose Path** — `docker-compose.dokploy.yml`.
+- **Compose Path** — `docker-compose.full.yml` (или `docker-compose.yml` для
+  варианта main с внешним Temporal).
 - **Compose Type** — `docker-compose`, не `stack`. Режим Docker Stack не
   поддерживает директиву `build`, а оба образа собираются из исходников.
 
@@ -38,8 +46,6 @@ Environment, см. шаг 2). Compose-файл — `docker-compose.dokploy.yml`,
 оба сервиса подхватывают его через `env_file: .env`.
 
 ```env
-TEMPORAL_ADDRESS=<temporal-host>:7233
-TEMPORAL_NAMESPACE=<namespace>
 DRY_RUN=1
 GITHUB_REPOSITORY=your-org/your-repo
 GH_TOKEN=ghp_...
@@ -48,21 +54,19 @@ ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4
 ZAI_API_KEY=...
 MODEL_GATE=glm-4.5-air
 MODEL_CLASSIFY=glm-4.6
+POSTGRES_PASSWORD=<openssl rand -hex 24>
 ```
 
-`TEMPORAL_ADDRESS` — host:port централизованного Temporal. По умолчанию
-подключение по plain gRPC; если кластер поддерживает TLS, добавь `TEMPORAL_TLS=1`.
-`TEMPORAL_NAMESPACE` — выделенный namespace под сервис; он **должен уже
-существовать** на кластере, иначе воркер не подключится:
+`POSTGRES_PASSWORD` — пароль к встроенному Postgres, где Temporal хранит историю
+событий workflow. Именно она даёт durable execution — падение воркера продолжается
+с последнего завершённого шага, а issue месяцами ждёт сигнала как штатное
+состояние. В `docker-compose.full.yml` деплой намеренно падает, если переменная
+пуста.
 
-```bash
-temporal operator namespace create <namespace> --address <temporal-host>:7233
-```
-
-Именно в Temporal живёт история событий workflow, и она даёт durable execution —
-падение воркера продолжается с последнего завершённого шага, а issue месяцами
-ждёт сигнала как штатное состояние. Хранилище (Postgres) — часть централизованного
-кластера, этот деплой его не поднимает.
+> Для варианта **main** (внешний Temporal) `POSTGRES_PASSWORD` не нужен — вместо
+> него задай `TEMPORAL_ADDRESS=<host>:7233` и `TEMPORAL_NAMESPACE=<namespace>`
+> (namespace должен уже существовать на кластере). По умолчанию plain gRPC; если
+> кластер поддерживает TLS — добавь `TEMPORAL_TLS=1`.
 
 Один провайдер, одна модель GLM. `ZAI_*` — OpenAI-совместимый эндпоинт z.ai,
 через него идут все стадии, включая оценку. Второй пары `ANTHROPIC_*` из
@@ -88,8 +92,9 @@ temporal operator namespace create <namespace> --address <temporal-host>:7233
 | Host | `issue-agent.example.com` |
 | HTTPS | включить, Certificate Provider — Let's Encrypt |
 
-Домен получает только `webhook` — единственный публичный сервис этого деплоя.
-Temporal и его UI живут в централизованном кластере, здесь не поднимаются.
+Домен получает только `webhook`. Ни `temporal`, ни `temporal-ui`, ни `postgres`
+наружу не выставляются (у них `expose`, а не `ports`) — как дойти до UI, описано
+ниже. В варианте main этих сервисов нет вовсе, Temporal внешний.
 
 ## Шаг 4. Развернуть
 
@@ -100,11 +105,13 @@ worker:  Worker started, listening on task queue 'issue-lifecycle'
 webhook: Uvicorn running on http://0.0.0.0:3000
 ```
 
-Воркер при первом запуске может упасть с `Namespace <name> is not found`, если
-`TEMPORAL_NAMESPACE` ещё не создан на кластере (см. шаг 2) или Temporal временно
-недоступен по сети. Политика `restart: unless-stopped` перезапустит воркер.
-Если падение повторяется — проверь, что namespace существует и `TEMPORAL_ADDRESS`
-достижим с этого хоста (`nc -vz <host> 7233`).
+Воркер при первом запуске может один раз упасть с `Namespace default is not
+found` — контейнер `temporal` создаёт namespace через несколько секунд после
+старта, а `depends_on` ждёт только запуска контейнера, не готовности. Политика
+`restart: unless-stopped` перезапустит воркер, и вторая попытка пройдёт. Если
+падение повторяется больше двух-трёх раз — проблема не в гонке, смотри логи
+`temporal`. (В варианте main namespace должен уже существовать на внешнем
+кластере — тогда сообщение будет с его именем, а не `default`.)
 
 Проверить, что endpoint жив снаружи (подпись не сойдётся, поэтому ожидаемый
 ответ — 401, и это как раз признак работающей проверки HMAC):
@@ -166,16 +173,27 @@ Issue при этом не появилось ничего.
 ## Temporal UI
 
 Веб-интерфейс Temporal показывает каждый workflow на его текущей стадии — без
-него диагностика сводится к чтению логов. Он живёт в **централизованном
-кластере**, а не в этом деплое; как до него дойти, зависит от того, как поднят
-Temporal в инфраструктуре. Workflow-и этого сервиса ищи в namespace
-`TEMPORAL_NAMESPACE`.
+него диагностика сводится к чтению логов. В варианте **full** он входит в стек
+(`temporal-ui`), но хост-порт не публикует: на Dokploy-хосте порт 8080 обычно
+занят, а входа по паролю у интерфейса нет, тела Issue в нём видны — торчать
+наружу как есть он не должен.
 
-Быстрая проверка из CLI (с хоста, у которого есть доступ к кластеру):
+Доступ — через Dokploy-домен, закрытый basic-auth:
+
+1. **Domains → Add Domain**, **Service Name** `temporal-ui`, **Container Port**
+   `8080`, домен — свой или **Generate Domain**.
+2. Traefik-middleware с basic-auth (**Advanced → Middlewares** или ярлык
+   `traefik.http.middlewares.*.basicauth`). Без этого шага интерфейс окажется
+   открыт всему интернету — не выкладывай домен, пока basic-auth не включён.
+
+Альтернатива без домена — SSH-туннель в контейнер:
 
 ```bash
-temporal workflow list --namespace <namespace> --address <temporal-host>:7233
+ssh -N -L 8080:<container-name>:8080 user@server   # <container-name> из docker ps
 ```
+
+(В варианте **main** `temporal-ui` не поднимается — смотри UI централизованного
+кластера в инфраструктуре.)
 
 ## Обновления
 
@@ -188,8 +206,8 @@ temporal workflow list --namespace <namespace> --address <temporal-host>:7233
 образ**, а не примонтированы. Поменять коэффициент — значит закоммитить и
 передеплоить. Это осознанный размен: Dokploy очищает каталог репозитория при
 автодеплое, поэтому монтирование оттуда оставило бы воркер без файлов.
-Локальная разработка не меняется — `docker-compose.yml` по-прежнему монтирует
-эти каталоги поверх, и правка промпта видна без пересборки.
+Локальная разработка не меняется — `docker-compose.local.yml` монтирует эти
+каталоги поверх, и правка промпта видна без пересборки.
 
 Данные Temporal живут в именованном томе `pgdata` и передеплой переживают.
 
