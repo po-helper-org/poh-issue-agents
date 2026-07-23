@@ -46,14 +46,28 @@ def _app_jwt() -> str:
     return jwt.encode(payload, _app_private_key(), algorithm="RS256")
 
 
+def _cached_token(repo: str) -> str | None:
+    cached = _token_cache.get(repo)  # dict.get атомарен под GIL
+    if cached and cached[1] - 60 > time.time():
+        return cached[0]
+    return None
+
+
 def _installation_token_for(repo: str) -> str:
     """Installation-токен под установку App на данный репозиторий. Установка
     определяется по репо (не хардкод GITHUB_INSTALLATION_ID): App не установлен →
-    GET /repos/{repo}/installation вернёт 404 и вызов упадёт."""
+    GET /repos/{repo}/installation вернёт 404 и вызов упадёт.
+
+    Double-checked locking: горячий путь (кэш валиден) не берёт lock, поэтому
+    cache-hit по одному репо не блокируется за token-обменом другого. Lock
+    сериализует только сам обмен (редкий — раз в ~55 мин на репо)."""
+    hot = _cached_token(repo)
+    if hot is not None:
+        return hot
     with _token_lock:
-        cached = _token_cache.get(repo)
-        if cached and cached[1] - 60 > time.time():
-            return cached[0]
+        warm = _cached_token(repo)  # перепроверка под lock: конкурент мог уже выпустить
+        if warm is not None:
+            return warm
         app_headers = {"Authorization": f"Bearer {_app_jwt()}",
                        "Accept": "application/vnd.github+json"}
         inst = requests.get(
