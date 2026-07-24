@@ -61,6 +61,7 @@ def test_uses_timeline_endpoint_with_preview_header(monkeypatch):
     def fake_get(url, headers=None, params=None, timeout=None):
         seen["url"] = url
         seen["accept"] = headers.get("Accept", "")
+        seen["auth"] = headers.get("Authorization", "")
         return _FakeResp([])
 
     monkeypatch.setattr(github_client.requests, "get", fake_get)
@@ -69,3 +70,7 @@ def test_uses_timeline_endpoint_with_preview_header(monkeypatch):
 
     assert seen["url"].endswith("/repos/o/r/issues/1/timeline")
     assert "mockingbird" in seen["accept"]
+    # Токен уходит через _auth_headers (Authorization), а НЕ в URL: любой сбой
+    # git/HTTP рендерит URL в текст исключения, заголовки — нет.
+    assert "test_token" in seen["auth"]
+    assert "test_token" not in seen["url"]
