@@ -277,6 +277,14 @@ def test_fnr_stage_unknown_raises():
         activities._fnr_stage("nope", "desc")
 
 
+def test_fnr_stage_sources_stay_consistent():
+    # Имена стадий живут в трёх местах (_fnr_stages, FNR_STAGE_NAMES,
+    # _FNR_STAGE_REQUIRES). Рассинхрон превратил бы чистый ValueError из
+    # _fnr_stage в сырой KeyError — ловим его здесь, а не в проде.
+    names = {n for n, _, _ in activities._fnr_stages("desc")}
+    assert names == set(activities.FNR_STAGE_NAMES) == set(activities._FNR_STAGE_REQUIRES)
+
+
 @pytest.fixture
 def stage_env(monkeypatch, tmp_path):
     """Реальный каталог под ANALYSIS_WORKSPACE_ROOT; внешние эффекты — заглушки."""
@@ -386,12 +394,16 @@ def test_stage_missing_expected_artifact_raises(stage_env, monkeypatch):
 def test_stage_without_workspace_fails_fast(stage_env):
     with pytest.raises(RuntimeError, match="потерян"):
         asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    # Fail-fast обязан сработать ДО дорогого claude -p, не после.
+    assert stage_env["claude_prompts"] == []
 
 
 def test_stage_without_input_artifact_fails_fast(stage_env):
     asyncio.run(activities.prepare_workspace(_analyze()))
     with pytest.raises(RuntimeError, match="нет входа"):  # concept требует task.md
         asyncio.run(activities.run_fnr_stage(_analyze(), "concept"))
+    # Guard входа тоже до claude: пропущенный предшественник не жжёт вызов.
+    assert stage_env["claude_prompts"] == []
 
 
 def test_stage_heartbeats_during_long_claude(stage_env, monkeypatch):
