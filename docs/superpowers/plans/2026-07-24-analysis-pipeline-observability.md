@@ -731,6 +731,8 @@ git commit -m "feat(analyze): orchestrate FNR stages as per-stage Temporal activ
 
 ### Task 7: Удалить монолит и мёртвые тесты, финальная зелень
 
+> ⚠️ **ОТМЕНЕНО (2026-07-24).** Обнаружено при исполнении: `run_analysis_pipeline` НЕ мёртв — второй живой вызыватель `IssueLifecycle.run` (ветка `research-me`, worker/workflows.py:247). Удаление сломало бы research-me. Монолит и его 8 тестов остаются. Миграция research-me на пер-стадийные activity отложена отдельной задачей.
+
 **Files:**
 - Modify: `worker/activities.py` (удалить `run_analysis_pipeline`, строки ~458-510)
 - Modify: `worker/worker.py` (удалить строку `activities.run_analysis_pipeline,`)
