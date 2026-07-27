@@ -337,13 +337,19 @@ class IssueAnalysis:
             )
         finally:
             # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:
-            # провал уборки не должен затирать реальный исход.
-            await workflow.execute_activity(
-                activities.cleanup_workspace,
-                analyze,
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-            )
+            # провал самой уборки (timeout/краш воркера) не должен затирать реальный
+            # исход — ловим и логируем, но наружу не пробрасываем.
+            try:
+                await workflow.execute_activity(
+                    activities.cleanup_workspace,
+                    analyze,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except Exception as cleanup_exc:
+                workflow.logger.warning(
+                    "cleanup_workspace failed (best-effort, ignored): %s", cleanup_exc
+                )
 
 
 @workflow.defn(name="IssueEstimation")
