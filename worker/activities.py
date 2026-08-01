@@ -7,6 +7,7 @@ GITHUB_EVENT_PATH и вызова через subprocess-CLI-скрипт — о�
 """
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -35,6 +36,8 @@ from shared.workflow_types import (
     IssueInput,
     PriorityResult,
 )
+
+logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path("/app/prompts")
 CONFIG_DIR = Path("/app/config")
@@ -313,6 +316,12 @@ REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
 HEARTBEAT_INTERVAL_SEC = 30.0
 
+# Обогащение контекста /analyze (спека 2026-07-24). Двигаются без правки логики.
+CONTEXT_COMMENT_LIMIT = 20      # свежих комментариев в бриф
+CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментария
+CONTEXT_PR_LIMIT = 20           # связанных PR
+CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
+
 
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     """Стадии цепочки FNR: (имя, промпт, ожидаемый артефакт).
@@ -401,7 +410,7 @@ def _clone_repo(repo: str, dest: str) -> None:
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "credential.helper",
         "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
-        "GH_CLONE_TOKEN": github_client.auth_token(),
+        "GH_CLONE_TOKEN": github_client.auth_token(repo),
     }
     subprocess.run(
         ["git", "clone", "--depth", "1", url, dest],
@@ -510,6 +519,100 @@ async def _run_with_heartbeat(fn, *args, label: str):
         activity.heartbeat(label)
 
 
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …[обрезано]"
+
+
+def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
+    """Свежие комментарии обсуждения (старые→свежие) без командного шума.
+
+    Командные комментарии (`/analyze`, `/estimate` и с хвостом) отсекаются
+    через parse_command — тот же разбор, что и в вебхуке. Сбой fetch ИЛИ
+    разбора ответа (неожиданная форма payload) → пустой список: анализ
+    продолжается на title+body. Фильтрация и сборка блоков нарочно внутри
+    того же try, что и сам fetch — некорректный элемент payload не должен
+    пробрасывать исключение мимо этого хелпера.
+    """
+    try:
+        comments = github_client.list_comments(
+            analyze.repo, analyze.issue_number, limit=50
+        )
+        kept = [c for c in comments if parse_command(c.get("body") or "") is None]
+        kept = kept[-CONTEXT_COMMENT_LIMIT:]
+        blocks: list[str] = []
+        for c in kept:
+            user = (c.get("user") or {}).get("login", "?")
+            date = (c.get("created_at") or "")[:10]
+            body = _truncate(c.get("body") or "", CONTEXT_COMMENT_CHARS)
+            blocks.append(f"**@{user} ({date}):**\n{body}")
+        return blocks
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for #%s: %s", analyze.issue_number, exc)
+        return []
+
+
+def _fetch_prs_section(analyze: AnalyzeInput) -> str:
+    """Секция связанных PR. Сбой fetch → пустая строка (прогон не падает)."""
+    try:
+        prs = github_client.list_linked_prs(
+            analyze.repo, analyze.issue_number, limit=CONTEXT_PR_LIMIT
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("list_linked_prs failed for #%s: %s", analyze.issue_number, exc)
+        return ""
+    if not prs:
+        return ""
+    lines = ["## Связанные PR"]
+    for pr in prs:
+        lines.append(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['url']}")
+    return "\n".join(lines)
+
+
+def _build_task_context(analyze: AnalyzeInput) -> str:
+    """Обогащённый бриф задачи для /fnr-new-task.
+
+    Живое состояние issue (обсуждение, связанные PR) поверх title+body: тело
+    issue — статичный снимок, решения и прогресс живут в комментариях и PR.
+
+    title+body — неприкосновенный пол, никогда не обрезается. Обогащение
+    (PR-секция и комментарии) бюджетируется остатком CONTEXT_TOTAL_CHARS
+    после title+body: PR-секция входит только целиком, если помещается —
+    частично не режется; комментарии отбрасываются от самых старых к свежим,
+    пока не влезут в то, что осталось от бюджета. Итог превышает
+    CONTEXT_TOTAL_CHARS только тогда, когда сам title+body уже больше
+    потолка — это принятый пол. Любой сбой fetch деградирует независимо.
+    """
+    base = f"# {analyze.title}\n\n{analyze.body}".strip()
+    prs = _fetch_prs_section(analyze)
+    blocks = _fetch_comment_blocks(analyze)
+
+    budget = CONTEXT_TOTAL_CHARS - len(base)
+    if budget <= 0:
+        return base  # title+body уже на потолке или за ним — пол есть пол
+
+    if prs and len(prs) + 2 <= budget:  # +2 — разделитель "\n\n" перед PR
+        budget -= len(prs) + 2
+    else:
+        prs = ""
+
+    while blocks:
+        section = "## Обсуждение\n" + "\n\n".join(blocks)
+        if len(section) + 2 <= budget:  # +2 — разделитель "\n\n" перед секцией
+            break
+        blocks = blocks[1:]  # выкинуть старейший комментарий
+    comments = "## Обсуждение\n" + "\n\n".join(blocks) if blocks else ""
+
+    parts = [base]
+    if comments:
+        parts.append(comments)
+    if prs:
+        parts.append(prs)
+    return "\n\n".join(parts)
+
+
 @activity.defn
 async def prepare_workspace(analyze: AnalyzeInput) -> None:
     """Стадия 0 пайплайна /analyze: свежий clone + repomix в детерминированный
@@ -593,7 +696,7 @@ async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
         await _run_with_heartbeat(_run_repomix, clone_dir, label="packing")
         activity.heartbeat("packed")
 
-        description = f"{analyze.title}\n\n{analyze.body}"
+        description = await asyncio.to_thread(_build_task_context, analyze)
         for name, prompt, expected in _fnr_stages(description):
             await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=name)
             if expected and not (Path(clone_dir) / expected).exists():

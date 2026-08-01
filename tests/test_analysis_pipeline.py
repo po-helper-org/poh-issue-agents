@@ -51,6 +51,10 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(activities, "_clone_repo", fake_clone)
     monkeypatch.setattr(activities, "_run_repomix", fake_repomix)
     monkeypatch.setattr(activities, "_run_claude", fake_claude)
+    monkeypatch.setattr(activities.github_client, "list_comments",
+                        lambda repo, n, limit=50: [])
+    monkeypatch.setattr(activities.github_client, "list_linked_prs",
+                        lambda repo, n, limit=20: [])
     monkeypatch.setattr(activities.github_client, "push_artifacts_to_branch",
                         lambda repo, branch, files, message: state.update(pushed=(branch, dict(files))))
     monkeypatch.setattr(activities.github_client, "post_comment",
@@ -152,7 +156,7 @@ def test_workspace_is_removed_even_on_failure(monkeypatch, wired):
 # человек полезет отлаживать сбой.
 
 def test_clone_failure_never_leaks_token_in_calledprocesserror(monkeypatch):
-    monkeypatch.setattr(activities.github_client, "auth_token", lambda: _SENTINEL_TOKEN)
+    monkeypatch.setattr(activities.github_client, "auth_token", lambda repo: _SENTINEL_TOKEN)
 
     captured = {}
 
@@ -178,7 +182,7 @@ def test_clone_failure_never_leaks_token_in_calledprocesserror(monkeypatch):
 
 
 def test_clone_timeout_never_leaks_token(monkeypatch):
-    monkeypatch.setattr(activities.github_client, "auth_token", lambda: _SENTINEL_TOKEN)
+    monkeypatch.setattr(activities.github_client, "auth_token", lambda repo: _SENTINEL_TOKEN)
 
     def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", activities.CLONE_TIMEOUT_SEC))
@@ -254,6 +258,8 @@ def test_claude_creds_empty_when_nothing_set(monkeypatch):
         monkeypatch.delenv(v, raising=False)
 
     assert activities._claude_anthropic_creds() == ("", "")
+
+
 
 
 def test_fnr_stage_names_are_the_five_stages():
@@ -469,3 +475,38 @@ def test_cleanup_removes_workspace(stage_env):
 def test_cleanup_is_idempotent_when_absent(stage_env):
     # каталога нет — cleanup не должен падать
     asyncio.run(activities.cleanup_workspace(_analyze()))
+
+
+def test_enriched_context_reaches_task_stage(monkeypatch, wired):
+    """Контекст обсуждения обязан долетать до стадии /fnr-new-task, а не
+    оставаться в title+body."""
+    monkeypatch.setattr(
+        activities.github_client, "list_comments",
+        lambda repo, n, limit=50: [
+            {"user": {"login": "kibarik"},
+             "body": "Зафиксировано: retry-only",
+             "created_at": "2026-07-20T10:00:00Z"}
+        ],
+    )
+    prompts = {}
+
+    def capture(prompt, cwd):
+        stage = prompt.split()[0]
+        prompts[stage] = prompt
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        produced = {
+            "/fnr-new-task": "task.md",
+            "/fnr-concept": "concept.md",
+            "/fnr-system-requirements": "system_requirements.md",
+            "/validate-doc": "validation.md",
+        }.get(stage)
+        if produced:
+            (fnr / produced).write_text(f"# {produced}", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_run_claude", capture)
+
+    asyncio.run(activities.run_analysis_pipeline(_analyze()))
+
+    assert "Зафиксировано: retry-only" in prompts["/fnr-new-task"]
+    assert prompts["/fnr-new-task"].startswith("/fnr-new-task")

@@ -25,7 +25,7 @@ class Resp:
 
 def test_auth_token_strips_bearer_prefix(monkeypatch):
     gc = _fresh(monkeypatch, dry=False)
-    assert gc.auth_token() == "tok"
+    assert gc.auth_token("o/r") == "tok"
 
 
 def test_dry_run_makes_no_http_calls(monkeypatch):

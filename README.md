@@ -152,23 +152,27 @@ GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / cla
 
 ---
 
-## Установка Layer B (webhook + GitHub App)
+## Установка Layer B (webhook + GitHub App, мультирепо)
 
 > Для Layer A и консолидации это НЕ нужно. App и публичный webhook требуются только
-> чтобы **новые** Issue обрабатывались автоматически при создании.
+> чтобы **новые** Issue и команды `/estimate` обрабатывались автоматически.
+
+Модель мультирепо — как в `poh-pr-agents`: устанавливаешь App на репозитории,
+задаёшь 4 переменные, указываешь **вебхук самого App** (не пер-репо hooks).
+Сервис отслеживает репозитории из `ISSUE_AGENT_REPOS` (installation находится
+по репозиторию автоматически, `GITHUB_INSTALLATION_ID` не нужен).
 
 1. Зарегистрировать GitHub App: permissions Issues (read/write), Contents
    (read/write); events Issues + Issue comments; webhook URL — публичный адрес
-   сервиса `webhook` (локально — `cloudflared`/`ngrok`).
-2. Установить App на репозиторий; сохранить App ID, Installation ID, `.pem`.
-3. `.env.example` → `.env`, заполнить GitHub App + `ZAI_API_KEY`.
-4. Положить `.pem` по пути `GITHUB_PRIVATE_KEY_PATH` (том/secret в
-   `docker-compose.yml` явно не прописан — добавить под свою модель секретов).
-5. `docker compose up --build`.
+   сервиса `webhook` (локально — `cloudflared`/`ngrok`), секрет = `GITHUB_WEBHOOK_SECRET`.
+2. Установить App на нужные репозитории.
+3. `.env` — 4 переменные: `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_B64`
+   (`base64 -w0 ключ.pem`), `GITHUB_WEBHOOK_SECRET`, `ISSUE_AGENT_REPOS`
+   (`owner/repo,owner2/*` или `*`/пусто — любой установленный). Плюс `ZAI_API_KEY`.
+4. `docker compose up --build`.
 
-> Для команды `/estimate` App не обязателен: хватает вебхука уровня
-> репозитория (событие `issue_comment`) и personal access token в `GH_TOKEN`.
-> См. `docs/DEPLOY-DOKPLOY.md`.
+> Dev-фолбэк на один репозиторий без App: `GH_TOKEN` (PAT со scope `repo`) +
+> вебхук уровня репозитория. См. `docs/DEPLOY-DOKPLOY.md`.
 
 ---
 
