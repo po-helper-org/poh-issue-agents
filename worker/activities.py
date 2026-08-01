@@ -355,7 +355,7 @@ def _clone_repo(repo: str, dest: str) -> None:
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "credential.helper",
         "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
-        "GH_CLONE_TOKEN": github_client.auth_token(),
+        "GH_CLONE_TOKEN": github_client.auth_token(repo),
     }
     subprocess.run(
         ["git", "clone", "--depth", "1", url, dest],

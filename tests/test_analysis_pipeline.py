@@ -156,7 +156,7 @@ def test_workspace_is_removed_even_on_failure(monkeypatch, wired):
 # человек полезет отлаживать сбой.
 
 def test_clone_failure_never_leaks_token_in_calledprocesserror(monkeypatch):
-    monkeypatch.setattr(activities.github_client, "auth_token", lambda: _SENTINEL_TOKEN)
+    monkeypatch.setattr(activities.github_client, "auth_token", lambda repo: _SENTINEL_TOKEN)
 
     captured = {}
 
@@ -182,7 +182,7 @@ def test_clone_failure_never_leaks_token_in_calledprocesserror(monkeypatch):
 
 
 def test_clone_timeout_never_leaks_token(monkeypatch):
-    monkeypatch.setattr(activities.github_client, "auth_token", lambda: _SENTINEL_TOKEN)
+    monkeypatch.setattr(activities.github_client, "auth_token", lambda repo: _SENTINEL_TOKEN)
 
     def fake_run(cmd, **kwargs):
         raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", activities.CLONE_TIMEOUT_SEC))
