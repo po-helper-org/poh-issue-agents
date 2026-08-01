@@ -1,3 +1,5 @@
+import asyncio
+
 import activities
 from shared.workflow_types import EstimateRequest, IssueInput
 
@@ -17,6 +19,16 @@ def test_post_error_label_comments_and_labels(monkeypatch):
 
     assert ("label", "o/r", 7, "advisor:error") in calls
     assert any(c[0] == "comment" and c[1] == "o/r" and c[2] == 7 for c in calls)
+
+
+def test_mark_analyzing_adds_label(monkeypatch):
+    calls = []
+    monkeypatch.setattr(activities.github_client, "add_label",
+                        lambda repo, n, label: calls.append((repo, n, label)))
+
+    asyncio.run(activities.mark_analyzing("o/r", 5))
+
+    assert calls == [("o/r", 5, "analyzing")]
 
 
 def test_post_error_label_reports_reason_to_sentry(monkeypatch):

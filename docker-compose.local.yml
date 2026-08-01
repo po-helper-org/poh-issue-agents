@@ -28,8 +28,10 @@ services:
       - POSTGRES_USER=temporal
       - POSTGRES_PWD=temporal
       - POSTGRES_SEEDS=postgres
+    # Хост-порты настраиваются через env (внутри контейнеров — стандартные):
+    # удобно, когда 7233/8080/3000 на хосте уже заняты другим стеком.
     ports:
-      - "7233:7233"
+      - "${TEMPORAL_HOST_PORT:-7233}:7233"
     depends_on:
       postgres:
         condition: service_healthy
@@ -38,9 +40,9 @@ services:
     image: temporalio/ui:2.31.2
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+      - TEMPORAL_CORS_ORIGINS=http://localhost:${TEMPORAL_UI_PORT:-8080}
     ports:
-      - "8080:8080"
+      - "${TEMPORAL_UI_PORT:-8080}:8080"
     depends_on:
       - temporal
 
@@ -53,7 +55,7 @@ services:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_NAMESPACE=default
     ports:
-      - "3000:3000"
+      - "${WEBHOOK_PORT:-3000}:3000"
     depends_on:
       - temporal
 

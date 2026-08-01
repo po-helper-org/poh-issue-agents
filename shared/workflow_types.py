@@ -40,6 +40,15 @@ class PriorityResult:
 
 
 @dataclass
+class AnalyzeInput:
+    repo: str
+    issue_number: int
+    title: str
+    body: str
+    comment_id: int | None = None  # комментарий-триггер, на него ставится реакция
+
+
+@dataclass
 class EstimateRequest:
     repo: str
     issue_number: int

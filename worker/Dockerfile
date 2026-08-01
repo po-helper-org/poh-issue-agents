@@ -9,10 +9,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y gh \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code repomix \
     && rm -rf /var/lib/apt/lists/*
 
 # TODO: установка deb8flow — подставь реальный способ (pip/бинарь/build).
+
+# Скиллы и FNR-команды SA-helper кладём в ПОЛЬЗОВАТЕЛЬСКИЙ ~/.claude, а не в
+# проектный .claude: `claude -p` запускается с cwd внутри КЛОНА целевого
+# репозитория, у которого может быть свой .claude — проектный каталог бы его
+# перекрыл. Пользовательский уровень виден из любого cwd и не конфликтует.
+COPY .claude/skills /root/.claude/skills
+COPY .claude/commands /root/.claude/commands
 
 WORKDIR /app
 COPY worker/requirements.txt .

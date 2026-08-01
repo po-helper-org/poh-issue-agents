@@ -6,8 +6,13 @@ GITHUB_EVENT_PATH и вызова через subprocess-CLI-скрипт — о�
 функции, вызываемые Temporal-воркером напрямую.
 """
 
+import asyncio
+import logging
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -21,6 +26,7 @@ import llm
 from shared import sentry_setup
 from shared.commands import parse_command
 from shared.workflow_types import (
+    AnalyzeInput,
     ClassificationResult,
     DuplicateResult,
     EstimateRequest,
@@ -30,6 +36,8 @@ from shared.workflow_types import (
     IssueInput,
     PriorityResult,
 )
+
+logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path("/app/prompts")
 CONFIG_DIR = Path("/app/config")
@@ -157,6 +165,13 @@ def post_error_label(issue: IssueInput, reason: str = "") -> None:
     # уходит, просто с менее точной группировкой.
     exc_type, _, message = reason.partition(": ")
     sentry_setup.capture_pipeline_failure(issue, exc_type or "unknown", message or reason)
+
+
+@activity.defn
+async def mark_analyzing(repo: str, issue_number: int) -> None:
+    """Видимая метка, что по Issue запущен автономный анализ (/analyze).
+    add_label соблюдает DRY_RUN, отдельного гарда не нужно."""
+    github_client.add_label(repo, issue_number, "analyzing")
 
 
 # --- Классификация ---
@@ -292,18 +307,313 @@ def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: Dupl
     github_client.add_label(issue.repo, issue.issue_number, f"priority:{priority.tier}")
 
 
-# --- Тяжёлые стадии: TODO, те же незакрытые вопросы, что были на Actions ---
+# --- Пайплайн SA-helper (FNR) ---
+
+FNR_DIR = "sa_documentation/FNR/FNR_1"
+ARTIFACT_FILES = ("task.md", "concept.md", "system_requirements.md", "validation.md")
+CLAUDE_STAGE_TIMEOUT_SEC = 900
+REPOMIX_TIMEOUT_SEC = 600
+CLONE_TIMEOUT_SEC = 300
+HEARTBEAT_INTERVAL_SEC = 30.0
+
+# Обогащение контекста /analyze (спека 2026-07-24). Двигаются без правки логики.
+CONTEXT_COMMENT_LIMIT = 20      # свежих комментариев в бриф
+CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментария
+CONTEXT_PR_LIMIT = 20           # связанных PR
+CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
+
+
+def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
+    """Стадии цепочки FNR: (имя, промпт, ожидаемый артефакт).
+
+    У `debate` и `validate` ожидаемого файла нет: дебаты дописываются в
+    concept.md, а валидация может остаться отчётом в выводе.
+    """
+    return [
+        ("task", f"/fnr-new-task {description}", f"{FNR_DIR}/task.md"),
+        ("concept", f"/fnr-concept {FNR_DIR}/task.md", f"{FNR_DIR}/concept.md"),
+        ("debate", f"/fnr-debate {FNR_DIR}/concept.md", None),
+        ("sysreq", f"/fnr-system-requirements {FNR_DIR}/concept.md",
+         f"{FNR_DIR}/system_requirements.md"),
+        ("validate", f"/validate-doc {FNR_DIR}/system_requirements.md", None),
+    ]
+
+
+def _clone_repo(repo: str, dest: str) -> None:
+    """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
+    реальный код (`файл:строка`), одного текста Issue недостаточно.
+
+    Токен идёт через credential.helper в env, а НЕ вклеен в URL: argv команды
+    целиком рендерится в текст subprocess.CalledProcessError/TimeoutExpired,
+    и без этого любой сбой клонирования (протухший токен, сетевой сбой,
+    таймаут) унёс бы живой GitHub-токен прямо в Temporal event history и
+    логи воркера — ровно туда, куда человек полезет отлаживать сбой.
+    """
+    url = f"https://github.com/{repo}.git"
+    env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
+        "GH_CLONE_TOKEN": github_client.auth_token(repo),
+    }
+    subprocess.run(
+        ["git", "clone", "--depth", "1", url, dest],
+        env=env, check=True, capture_output=True, text=True, timeout=CLONE_TIMEOUT_SEC,
+    )
+
+
+def _run_repomix(clone_dir: str) -> None:
+    """Упаковка кода один раз: 5 стадий переиспользуют один файл вместо того,
+    чтобы каждая заново обходила репозиторий."""
+    out = Path(clone_dir) / "sa_documentation" / "repomix-output.xml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["repomix", "--output", str(out)],
+        cwd=clone_dir, check=True, capture_output=True, text=True,
+        timeout=REPOMIX_TIMEOUT_SEC,
+    )
+
+
+def _claude_anthropic_creds() -> tuple[str, str]:
+    """Креды для `claude -p` из тех же ZAI_*, что и Python-стадии (единый ключ
+    z.ai). claude-code говорит по протоколу Anthropic, поэтому нужен другой ПУТЬ
+    эндпоинта того же хоста: ZAI_BASE_URL = .../coding/paas/v4 (OpenAI-формат),
+    Anthropic-формат живёт на .../api/anthropic. Отдельные ANTHROPIC_* задавать
+    не нужно, но если заданы — приоритетнее (явный override)."""
+    token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ZAI_API_KEY", "")
+    base = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if not base:
+        zai = os.environ.get("ZAI_BASE_URL", "")
+        if zai:
+            from urllib.parse import urlsplit
+            p = urlsplit(zai)
+            base = f"{p.scheme}://{p.netloc}/api/anthropic"
+    return token, base
+
+
+def _run_claude(prompt: str, cwd: str) -> None:
+    """Одна стадия FNR — отдельный процесс `claude -p` с чистым контекстом.
+
+    Креды берутся из ZAI_* (как в main) и прокидываются в claude-code через его
+    ANTHROPIC_* — единый ключ z.ai, отдельную пару переменных заводить не нужно.
+    """
+    token, base = _claude_anthropic_creds()
+    # Понятная ошибка вместо голого "exit 1", если z.ai не сконфигурирован:
+    # без креды claude-code уходит на дефолтный Anthropic API и падает.
+    if not token or not base:
+        raise RuntimeError(
+            "claude -p не сконфигурирован: задай ZAI_API_KEY и ZAI_BASE_URL "
+            "(или явные ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) в окружении воркера."
+        )
+    result = subprocess.run(
+        # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
+        # работает от root, а тот флаг под root запрещён самим claude-code
+        # (проверено спайком, docs/spikes/2026-07-22-claude-p-zai-tool-calling.md).
+        ["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
+        cwd=cwd, capture_output=True, text=True,
+        timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
+        # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
+        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_BASE_URL": base},
+    )
+    if result.returncode != 0:
+        # claude-code часто пишет диагностику в stdout, а не stderr — берём оба
+        # (stderr приоритетнее), иначе сообщение об ошибке оказывается пустым.
+        detail = result.stderr.strip() or result.stdout.strip() or "(пустой вывод)"
+        raise RuntimeError(f"claude -p exit {result.returncode}: {detail[-1500:]}")
+
+
+def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for name in ARTIFACT_FILES:
+        path = Path(clone_dir) / FNR_DIR / name
+        if path.exists():
+            files[f"{FNR_DIR}/{name}"] = path.read_text(encoding="utf-8")
+    return files
+
+
+def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) -> str:
+    base = f"https://github.com/{analyze.repo}/blob/{branch}"
+    links = "\n".join(f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})" for path in sorted(files))
+    return (
+        "## 🤖 Автономный анализ (SA-helper)\n\n"
+        f"Прогнал полную цепочку FNR по этой задаче. Артефакты — в ветке `{branch}`:\n\n"
+        f"{links}\n\n"
+        "Начни с `system_requirements.md` — это ответ на вопрос «как реализовать эту "
+        "задачу»: разбор текущего поведения на код-доказательствах, план миграции с "
+        "откатами, задачи с критериями приёмки и риски с митигацией.\n\n"
+        "Повторить анализ — командой `/analyze`."
+    )
+
+
+async def _run_with_heartbeat(fn, *args, label: str):
+    """Гоняет блокирующий fn в потоке и шлёт heartbeat каждые
+    HEARTBEAT_INTERVAL_SEC, пока он не завершится.
+
+    Heartbeat только между стадиями недостаточен: одна стадия claude -p идёт
+    до CLAUDE_STAGE_TIMEOUT_SEC (900с), а heartbeat_timeout воркфлоу — 300с;
+    без периодического сигнала внутри стадии сервер счёл бы activity мёртвой и
+    (при maximum_attempts=1) уронил бы весь прогон. to_thread освобождает event
+    loop, но сам по себе не бьёт — поэтому бьём здесь, пока поток занят.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SEC)
+        if task in done:
+            return task.result()  # переброс исключения из потока, если было
+        activity.heartbeat(label)
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + " …[обрезано]"
+
+
+def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
+    """Свежие комментарии обсуждения (старые→свежие) без командного шума.
+
+    Командные комментарии (`/analyze`, `/estimate` и с хвостом) отсекаются
+    через parse_command — тот же разбор, что и в вебхуке. Сбой fetch ИЛИ
+    разбора ответа (неожиданная форма payload) → пустой список: анализ
+    продолжается на title+body. Фильтрация и сборка блоков нарочно внутри
+    того же try, что и сам fetch — некорректный элемент payload не должен
+    пробрасывать исключение мимо этого хелпера.
+    """
+    try:
+        comments = github_client.list_comments(
+            analyze.repo, analyze.issue_number, limit=50
+        )
+        kept = [c for c in comments if parse_command(c.get("body") or "") is None]
+        kept = kept[-CONTEXT_COMMENT_LIMIT:]
+        blocks: list[str] = []
+        for c in kept:
+            user = (c.get("user") or {}).get("login", "?")
+            date = (c.get("created_at") or "")[:10]
+            body = _truncate(c.get("body") or "", CONTEXT_COMMENT_CHARS)
+            blocks.append(f"**@{user} ({date}):**\n{body}")
+        return blocks
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for #%s: %s", analyze.issue_number, exc)
+        return []
+
+
+def _fetch_prs_section(analyze: AnalyzeInput) -> str:
+    """Секция связанных PR. Сбой fetch → пустая строка (прогон не падает)."""
+    try:
+        prs = github_client.list_linked_prs(
+            analyze.repo, analyze.issue_number, limit=CONTEXT_PR_LIMIT
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("list_linked_prs failed for #%s: %s", analyze.issue_number, exc)
+        return ""
+    if not prs:
+        return ""
+    lines = ["## Связанные PR"]
+    for pr in prs:
+        lines.append(f"- #{pr['number']} {pr['title']} [{pr['state']}] {pr['url']}")
+    return "\n".join(lines)
+
+
+def _build_task_context(analyze: AnalyzeInput) -> str:
+    """Обогащённый бриф задачи для /fnr-new-task.
+
+    Живое состояние issue (обсуждение, связанные PR) поверх title+body: тело
+    issue — статичный снимок, решения и прогресс живут в комментариях и PR.
+
+    title+body — неприкосновенный пол, никогда не обрезается. Обогащение
+    (PR-секция и комментарии) бюджетируется остатком CONTEXT_TOTAL_CHARS
+    после title+body: PR-секция входит только целиком, если помещается —
+    частично не режется; комментарии отбрасываются от самых старых к свежим,
+    пока не влезут в то, что осталось от бюджета. Итог превышает
+    CONTEXT_TOTAL_CHARS только тогда, когда сам title+body уже больше
+    потолка — это принятый пол. Любой сбой fetch деградирует независимо.
+    """
+    base = f"# {analyze.title}\n\n{analyze.body}".strip()
+    prs = _fetch_prs_section(analyze)
+    blocks = _fetch_comment_blocks(analyze)
+
+    budget = CONTEXT_TOTAL_CHARS - len(base)
+    if budget <= 0:
+        return base  # title+body уже на потолке или за ним — пол есть пол
+
+    if prs and len(prs) + 2 <= budget:  # +2 — разделитель "\n\n" перед PR
+        budget -= len(prs) + 2
+    else:
+        prs = ""
+
+    while blocks:
+        section = "## Обсуждение\n" + "\n\n".join(blocks)
+        if len(section) + 2 <= budget:  # +2 — разделитель "\n\n" перед секцией
+            break
+        blocks = blocks[1:]  # выкинуть старейший комментарий
+    comments = "## Обсуждение\n" + "\n\n".join(blocks) if blocks else ""
+
+    parts = [base]
+    if comments:
+        parts.append(comments)
+    if prs:
+        parts.append(prs)
+    return "\n\n".join(parts)
+
 
 @activity.defn
-def run_research_pipeline(issue: IssueInput) -> None:
-    """TODO: перенести сюда содержимое research-pipeline.yml как
-    последовательность subprocess-вызовов (claude -p с ANTHROPIC_BASE_URL=
-    z.ai для po-helper/Repowise/SA-helper, deb8flow как CLI). Незакрытые
-    вопросы те же, что были на Actions: механизм загрузки скиллов,
-    точный синтаксис deb8flow, MCP-подключение Repowise к headless-среде.
-    """
-    raise NotImplementedError("research-pipeline: перенести шаги из старого research-pipeline.yml")
+async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
+    """Полный прогон SA-helper одной activity.
 
+    Одна activity, а не пять: клон, упаковка и стадии делят рабочий каталог на
+    локальном диске одного процесса — разбиение по activity потребовало бы
+    общего тома. Heartbeat идёт ВНУТРИ каждой долгой стадии через
+    _run_with_heartbeat, а не только между ними: одна стадия claude -p может
+    занять до CLAUDE_STAGE_TIMEOUT_SEC (900с) при heartbeat_timeout воркфлоу в
+    300с — без сигнала изнутри стадии сервер счёл бы activity мёртвой и (при
+    maximum_attempts=1) уронил бы весь прогон (та же причина, по которой
+    heartbeat вообще нужен — долгие стадии уже приводили к ложным срабатываниям
+    детектора дедлоков, worker/worker.py:44-51).
+
+    Каждый блокирующий вызов (git/repomix/claude/REST) идёт через
+    asyncio.to_thread (напрямую или через _run_with_heartbeat): воркер крутит
+    один event loop с max_concurrent_activities, и синхронный subprocess.run
+    на 900с заблокировал бы поток целиком — другие issue встали бы, а
+    activity.heartbeat не смог бы уйти на сервер (ему нужен тот же loop).
+    Вынос в поток освобождает loop и делает heartbeat реальным.
+    """
+    workdir = tempfile.mkdtemp(prefix=f"analysis-{analyze.issue_number}-")
+    clone_dir = str(Path(workdir) / "repo")
+    try:
+        await _run_with_heartbeat(_clone_repo, analyze.repo, clone_dir, label="cloning")
+        activity.heartbeat("cloned")
+        await _run_with_heartbeat(_run_repomix, clone_dir, label="packing")
+        activity.heartbeat("packed")
+
+        description = await asyncio.to_thread(_build_task_context, analyze)
+        for name, prompt, expected in _fnr_stages(description):
+            await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=name)
+            if expected and not (Path(clone_dir) / expected).exists():
+                raise RuntimeError(f"стадия {name}: артефакт {expected} не создан")
+            activity.heartbeat(name)
+
+        files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
+        if not files:
+            raise RuntimeError("пайплайн не произвёл ни одного артефакта")
+
+        branch = f"research/issue-{analyze.issue_number}"
+        await asyncio.to_thread(
+            github_client.push_artifacts_to_branch,
+            analyze.repo, branch, files,
+            f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
+        )
+        await asyncio.to_thread(
+            github_client.post_comment,
+            analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
+        )
+        return branch
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# --- Тяжёлые стадии: TODO, те же незакрытые вопросы, что были на Actions ---
 
 @activity.defn
 def run_bug_pipeline(issue: IssueInput) -> None:
@@ -316,6 +626,44 @@ def trigger_openhands_resolver(issue: IssueInput) -> None:
     """TODO: вызов OpenHands resolver — остаётся отдельным сервисом со
     своим sandboxing (docker.sock), не частью этого docker-compose."""
     raise NotImplementedError("OpenHands resolver — интеграция ещё не спроектирована")
+
+
+# --- Слой C: аналитика по запросу (команда /analyze) ---
+
+@activity.defn
+async def ack_command(analyze: AnalyzeInput) -> None:
+    """Видимое подтверждение приёма команды ДО тяжёлой работы.
+
+    Комментарий — это и есть подтверждение, поэтому он идёт первым и ничем не
+    гейтится. Реакция на комментарий-триггер — чисто декоративная добавка;
+    если комментарий-триггер к этому моменту удалили (404) или сработал
+    rate limit, сбой реакции не должен утопить сам ack.
+    """
+    github_client.post_comment(
+        analyze.repo,
+        analyze.issue_number,
+        "🔍 Взял `/analyze` в работу — запускаю автономный анализ через SA-helper.\n\n"
+        "Прогон занимает несколько минут: артефакты появятся в ветке "
+        f"`research/issue-{analyze.issue_number}`, а сводка — следующим комментарием.",
+    )
+    if analyze.comment_id is not None:
+        try:
+            github_client.add_reaction(analyze.repo, analyze.comment_id, "eyes")
+        except Exception:
+            pass  # best-effort: декорация не должна ронять ack или весь прогон
+
+
+@activity.defn
+async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
+    """Не молчать при провале: прогон дорогой и долгий, тихое падение
+    неотличимо от «ещё работает»."""
+    github_client.post_comment(
+        analyze.repo,
+        analyze.issue_number,
+        f"⚠️ Автономный анализ не удался: {reason}\n\n"
+        "Прогон не повторяется автоматически (он недетерминирован и дорог). "
+        "Запустить заново — командой `/analyze`.",
+    )
 
 
 # --- Оценка трудоёмкости по команде /estimate ---

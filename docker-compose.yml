@@ -15,8 +15,10 @@ services:
     restart: unless-stopped
     # TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE берутся из .env (внешний Temporal).
     env_file: .env
+    # Хост-порт настраивается через WEBHOOK_PORT (внутри контейнера всегда 3000).
+    # Нужно, когда 3000 на хосте уже занят (Dokploy: "port is already allocated").
     ports:
-      - "3000:3000"
+      - "${WEBHOOK_PORT:-3000}:3000"
 
   # Исполняет сам workflow и все activities (LLM-вызовы через GLM,
   # gh CLI, claude -p для po-helper/SA-helper, deb8flow).

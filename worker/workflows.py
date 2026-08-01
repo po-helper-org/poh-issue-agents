@@ -22,7 +22,12 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared.workflow_types import EstimateRequest, EstimateResult, IssueInput
+    from shared.workflow_types import (
+        AnalyzeInput,
+        EstimateRequest,
+        EstimateResult,
+        IssueInput,
+    )
 
     import activities
 
@@ -47,6 +52,8 @@ def _failure_reason(e: BaseException) -> str:
 class IssueLifecycle:
     def __init__(self) -> None:
         self._signal_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._analyze_labeled = False
+        self._issue: IssueInput | None = None
 
     @workflow.signal
     async def human_decision(self, label: str) -> None:
@@ -55,6 +62,43 @@ class IssueLifecycle:
     @workflow.signal
     async def user_comment(self, text: str) -> None:
         await self._signal_queue.put(f"__comment__:{text}")
+
+    @workflow.signal
+    async def analyze_requested(self, comment_id: int) -> None:
+        """По Issue запрошен автономный анализ командой /analyze.
+
+        Вешаем видимую метку `analyzing`, чтобы в ленте триажа было понятно, что
+        прогон идёт; сам анализ несёт отдельный воркфлоу IssueAnalysis (из
+        webhook), здесь — только метка, и ставим её один раз (повторный /analyze
+        не плодит лейблы). Тяжёлую работу из хендлера не запускаем: run() обычно
+        припаркован в _wait_for_signal(), спавн оттуда гонялся бы с основным
+        циклом; лёгкая activity add_label безопасна.
+
+        `_analyze_labeled` ставим ДО первого await: хендлеры кооперативны
+        (переключение только на await), поэтому второй почти одновременный
+        сигнал увидит True и не поставит второй лейбл. Сигнал может прийти в
+        самой первой активации воркфлоу — раньше, чем run() выполнил
+        `self._issue = issue` (Temporal применяет сигналы до создания задачи
+        run()); поэтому ЖДЁМ инициализацию через wait_condition, а не роняем
+        метку молча по `self._issue is None`.
+
+        Известный компромисс: политика незавершённых хендлеров по умолчанию —
+        WARN_AND_ABANDON. Если run() успеет завершиться (например, через
+        `else: return` без await), пока mark_analyzing лишь запланирована, метка
+        не встанет, а в лог уйдёт warning. Метка косметическая (её никто не
+        читает), гарантировать её ожиданием all_handlers_finished в run() не
+        стоит — само-лечится при следующем /analyze в припаркованном состоянии.
+        """
+        if self._analyze_labeled:
+            return
+        self._analyze_labeled = True
+        await workflow.wait_condition(lambda: self._issue is not None)
+        await workflow.execute_activity(
+            activities.mark_analyzing,
+            args=[self._issue.repo, self._issue.issue_number],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
 
     async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | None:
         try:
@@ -68,6 +112,7 @@ class IssueLifecycle:
 
     @workflow.run
     async def run(self, issue: IssueInput) -> None:
+        self._issue = issue  # даёт analyze_requested доступ к repo/number
         default_retry = RetryPolicy(maximum_attempts=3)
 
         try:
@@ -188,12 +233,33 @@ class IssueLifecycle:
         decision = await self._wait_for_signal()
 
         if decision == "research-me" and classification.label == "advisor:feature-request":
-            await workflow.execute_activity(
-                activities.run_research_pipeline,
-                issue,
-                start_to_close_timeout=timedelta(minutes=60),
-                retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой мультиагентный прогон вслепую
-            )
+            # Лейбл research-me — второй вход в ту же аналитику Слоя C, что и
+            # команда /analyze, но БЕЗ ack_command: триггер тут лейбл, а не
+            # комментарий, так что подтверждать нечего. Сам прогон и обработка
+            # сбоя — как в IssueAnalysis.run: пайплайн дорогой и недетерминиро-
+            # ванный, вслепую не ретраим, а падение обязано быть видно в
+            # GitHub через publish_analysis_error, а не просто уронить этот
+            # workflow молча.
+            analyze_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
+                                          title=issue.title, body=issue.body)
+            try:
+                await workflow.execute_activity(
+                    activities.run_analysis_pipeline,
+                    analyze_input,
+                    start_to_close_timeout=timedelta(seconds=4500),
+                    heartbeat_timeout=timedelta(seconds=300),
+                    retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой прогон вслепую
+                )
+            except Exception as exc:
+                # exc — ActivityError с общим текстом Temporal-core, настоящая
+                # причина лежит в exc.cause (см. тот же разбор в IssueAnalysis.run).
+                reason = str(getattr(exc, "cause", None) or exc)
+                await workflow.execute_activity(
+                    activities.publish_analysis_error,
+                    args=[analyze_input, reason[:500]],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
         elif decision == "bug-me" and classification.label == "advisor:bug":
             await workflow.execute_activity(
                 activities.run_bug_pipeline,
@@ -211,6 +277,50 @@ class IssueLifecycle:
                 activities.trigger_openhands_resolver,
                 issue,
                 start_to_close_timeout=timedelta(seconds=30),
+            )
+
+
+@workflow.defn(name="IssueAnalysis")
+class IssueAnalysis:
+    """Аналитика по запросу (Слой C) — отдельный воркфлоу на команду /analyze.
+
+    Отдельный, а не часть IssueLifecycle: команда приходит в произвольный
+    момент, когда воркфлоу триажа уже завершён (advisor-ответ) или припаркован
+    в ожидании лейбла. Фиксированный id `analysis-<repo>-<n>` даёт
+    идемпотентность: повторный /analyze упрётся в WorkflowAlreadyStarted.
+    """
+
+    @workflow.run
+    async def run(self, analyze: AnalyzeInput) -> None:
+        await workflow.execute_activity(
+            activities.ack_command,
+            analyze,
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
+        try:
+            await workflow.execute_activity(
+                activities.run_analysis_pipeline,
+                analyze,
+                start_to_close_timeout=timedelta(seconds=4500),  # 75 минут на 5 стадий
+                heartbeat_timeout=timedelta(seconds=300),
+                # Прогон недетерминирован и дорог — слепой авторетрай сжёг бы
+                # бюджет впустую. Повтор инициирует человек командой /analyze.
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except Exception as exc:
+            # exc здесь — ActivityError с общим текстом Temporal-core
+            # ("Activity task failed"); настоящая причина (наш RuntimeError
+            # из run_analysis_pipeline) лежит в exc.cause. Без разворачивания
+            # в GitHub-комментарий ушла бы бесполезная обёртка вместо
+            # диагностики (например, «стадия ...: артефакт ... не создан»).
+            reason = str(getattr(exc, "cause", None) or exc)
+            await workflow.execute_activity(
+                activities.publish_analysis_error,
+                args=[analyze, reason[:500]],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
 
 
