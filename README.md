@@ -162,14 +162,43 @@ GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / cla
 Сервис отслеживает репозитории из `ISSUE_AGENT_REPOS` (installation находится
 по репозиторию автоматически, `GITHUB_INSTALLATION_ID` не нужен).
 
-1. Зарегистрировать GitHub App: permissions Issues (read/write), Contents
-   (read/write); events Issues + Issue comments; webhook URL — публичный адрес
-   сервиса `webhook` (локально — `cloudflared`/`ngrok`), секрет = `GITHUB_WEBHOOK_SECRET`.
-2. Установить App на нужные репозитории.
-3. `.env` — 4 переменные: `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY_B64`
-   (`base64 -w0 ключ.pem`), `GITHUB_WEBHOOK_SECRET`, `ISSUE_AGENT_REPOS`
-   (`owner/repo,owner2/*` или `*`/пусто — любой установленный). Плюс `ZAI_API_KEY`.
-4. `docker compose up --build`.
+1. **Зарегистрировать GitHub App** — `github.com/settings/apps/new` (личный
+   App) либо `github.com/organizations/<org>/settings/apps/new` (org-level,
+   если App должен ставиться на репозитории конкретной организации).
+   - Permissions: **Issues** (read/write), **Pull requests** (read/write),
+     **Contents** (read/write).
+   - Webhook events: **Issues**, **Issue comments**.
+   - Webhook URL — публичный адрес сервиса `webhook` (локально —
+     туннель `cloudflared`/`ngrok`).
+   - Webhook secret — сгенерировать: `openssl rand -hex 32`. Это же значение
+     пойдёт в `GITHUB_WEBHOOK_SECRET`.
+2. **Установить App** на нужные репозитории (Install App → выбрать owner →
+   выбрать репозитории или "All repositories").
+3. **Скачать приватный ключ** App (.pem, кнопка "Generate a private key" в
+   настройках App) и закодировать в base64 одной строкой:
+   ```bash
+   # Linux (GNU coreutils)
+   base64 -w0 github-app-private-key.pem
+   # macOS (BSD base64 — флага -w нет)
+   base64 -i github-app-private-key.pem | tr -d '\n'
+   ```
+4. **`.env`** — задать 4 переменные:
+   ```env
+   GITHUB_APP_ID=<App ID из настроек App>
+   GITHUB_PRIVATE_KEY_B64=<вывод base64 из шага 3>
+   GITHUB_WEBHOOK_SECRET=<секрет из шага 1>
+   ISSUE_AGENT_REPOS=owner/repo,owner2/*
+   ```
+   Форматы `ISSUE_AGENT_REPOS` (comma-separated): `owner/repo` — конкретный
+   репозиторий; `owner/*` или голый `owner` — все репозитории owner'а; `*`
+   или пусто — любой установленный. Плюс `ZAI_API_KEY`, если ещё не задан.
+
+   > **Важно:** `github_client` предпочитает PAT (`GH_TOKEN`), если он
+   > задан, — тогда блок GitHub App игнорируется целиком. Если раньше был
+   > настроен Layer A (`GH_TOKEN`/`GITHUB_REPOSITORY`), очисти `GH_TOKEN=`
+   > в `.env`, иначе App-путь не заработает.
+5. `docker compose up --build` (или Redeploy, если сервис уже развёрнут на
+   Dokploy — см. `docs/DEPLOY-DOKPLOY.md`).
 
 > Dev-фолбэк на один репозиторий без App: `GH_TOKEN` (PAT со scope `repo`) +
 > вебхук уровня репозитория. См. `docs/DEPLOY-DOKPLOY.md`.
