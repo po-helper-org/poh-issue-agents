@@ -123,12 +123,105 @@ GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / cla
                           (централизованный, TEMPORAL_ADDRESS/TEMPORAL_NAMESPACE)
 ```
 
-Два workflow-типа на одной очереди `issue-lifecycle`:
+Четыре workflow-типа на одной очереди `issue-lifecycle`
+(`worker/worker.py`):
 
 - **`IssueLifecycle`** — один на Issue (id `issue-<repo>-<n>`). Лейблы
   `research-me`/`bug-me` и ответы-уточнения — это Temporal **signals**: workflow
   спит и ждёт сигнал сколько угодно долго.
+- **`IssueAnalysis`** — один на команду `/analyze` (id `analysis-<repo>-<n>`).
+- **`IssueEstimation`** — один на команду `/estimate` (id включает `comment_id`).
 - **`ConsolidationWorkflow`** — один на прогон консолидации, fan-out по бэклогу.
+
+### Путь Issue: от `issues.opened` до парковки
+
+```mermaid
+flowchart TD
+    A["GitHub: issues.opened"] --> B{"HMAC подпись<br/>X-Hub-Signature-256"}
+    B -->|invalid| B1["401"]
+    B -->|ok| C{"repo в ISSUE_AGENT_REPOS?"}
+    C -->|нет| C1["ok: true, игнор"]
+    C -->|да| D["start_workflow IssueLifecycle<br/>id = issue-repo-N"]
+
+    D --> E["1. prefilter_bot_and_security<br/>без LLM"]
+    E -->|Bot / dependabot / renovate| E1["метка bot-authored"] --> STOP1(["СТОП"])
+    E -->|"CVE / RCE / уязвимост"| E2["комментарий + security-sensitive"] --> STOP1
+
+    E -->|ok| F["2. intake_gate<br/>MODEL_GATE"]
+    F -->|SPAM| F1["метка spam + close_issue"] --> STOP1
+    F -->|"VAGUE, interactive=false"| F2["escalate_to_human<br/>needs-human-triage"] --> STOP1
+    F -->|VAGUE| G["post_clarifying_question<br/>метка needs-clarification"]
+
+    G --> H(["ПАРКОВКА<br/>await signal_queue.get"])
+    H -.->|"issue_comment.created<br/>signal user_comment"| I{"round_count > 2?"}
+    I -->|да| F2
+    I -->|нет| F
+
+    F -->|SUFFICIENT| J["3. classify_issue<br/>MODEL_CLASSIFY + capabilities.md<br/>постит ответ комментарием"]
+    J -->|"advisor:existing-functionality"| STOP2(["СТОП: закрыт ответом"])
+    J -->|"advisor:consultation"| STOP2
+    J -->|"advisor:bug / advisor:feature-request"| K["4. duplicate_check<br/>search_candidates + LLM"]
+
+    K -->|"p >= 0.85"| K1["метка duplicate + комментарий<br/>issue НЕ закрывается"] --> STOP3(["СТОП: решает человек"])
+    K -->|"0.5 <= p < 0.85"| L["метка possible-duplicate"]
+    K -->|"p < 0.5"| L2[" "]
+    L --> M
+    L2 --> M
+
+    M["5. score_priority<br/>LLM извлекает атрибуты"] --> N["формула из priority-weights.toml<br/>score = CoD × okr_mult / effort"]
+    N --> O["post_priority_comment<br/>метка priority:P0..P3"]
+
+    O --> P(["ПАРКОВКА №1<br/>ждём лейбл, без таймаута"])
+    P -.->|"issues.labeled<br/>signal-with-start"| Q{"лейбл vs тип"}
+    Q -->|"research-me + feature-request"| R["run_analysis_pipeline<br/>FNR"]
+    Q -->|"bug-me + advisor:bug"| R2["run_bug_pipeline<br/>NotImplementedError"]
+    Q -->|не совпал| STOP4(["СТОП"])
+
+    R --> S(["ПАРКОВКА №2"])
+    R2 --> S
+    S -.->|build-me| T["trigger_openhands_resolver<br/>NotImplementedError"]
+
+    E -.->|"любое исключение"| ERR["post_error_label<br/>метка advisor:error + Sentry"]
+    F -.-> ERR
+    J -.-> ERR
+    K -.-> ERR
+    M -.-> ERR
+```
+
+Ключевое: `issues.labeled` доставляется через **signal-with-start**, а не голый
+signal — Issue мог быть заведён до установки App, воркфлоу триажа не существует,
+и голый signal дал бы 500, после чего GitHub бросил бы доставку.
+
+### Команды в комментариях — отдельные workflow
+
+Триаж завершается после приоритизации (а на спаме и дубликате — раньше), поэтому
+`/analyze` и `/estimate` — не сигналы в `IssueLifecycle`, а самостоятельные
+воркфлоу со своими id.
+
+```mermaid
+flowchart TD
+    A["issue_comment.created"] --> B{"user.type == Bot?"}
+    B -->|да| B1["игнор: не сигналим сами себе"]
+    B -->|нет| C{"parse_command"}
+
+    C -->|"/estimate"| D["start IssueEstimation<br/>id включает comment_id"]
+    D --> D1["ack_estimate_command"] --> D2["collect_estimation_context"] --> D3["extract_estimation_facts<br/>LLM"] --> D4["compute_estimate<br/>детерминированный, attempts=1"] --> D5["post_estimate_comment"]
+    D1 -.->|fail| DE["post_estimate_error<br/>с именем стадии"]
+    D2 -.-> DE
+    D3 -.-> DE
+    D4 -.-> DE
+    D5 -.-> DE
+
+    C -->|"/analyze"| E["signal analyze_requested<br/>в IssueLifecycle: метка analyzing"]
+    E --> F["start IssueAnalysis<br/>id = analysis-repo-N"]
+    F --> F1["ack_command"] --> F2["prepare_workspace<br/>clone + repomix"] --> F3["цикл run_fnr_stage<br/>по FNR_STAGE_NAMES<br/>attempts=1 на стадию"] --> F4["publish_analysis"]
+    F2 -.->|fail| FE["publish_analysis_error"]
+    F3 -.-> FE
+    F4 --> FIN["finally: cleanup_workspace<br/>best-effort"]
+    FE --> FIN
+
+    C -->|обычный текст| G["signal user_comment<br/>в IssueLifecycle"] --> G1["кормит цикл уточнений intake gate"]
+```
 
 ## Модель — GLM через z.ai
 
