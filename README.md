@@ -13,12 +13,14 @@ Actions. Два независимых сценария: **триаж каждо
 | **Layer A — автономный триаж Issue**: предфильтры → intake-gate (с циклом уточнений) → 4-way классификация + advisor-ответ → duplicate-check (только метка) → приоритет по формуле | ✅ Работает, прогнан вживую по реальному бэклогу (64/67 Issue размечено, 0 ошибочных закрытий) | `make dry-run` / `make backfill-one issue=N` |
 | **Consolidation — группировка бэклога в зоны поставки** (taxonomy-first): профиль на Issue → вывод 8–12 зон → классификация Issue в зону → нарезка зоны на инкременты (MVP/MVP+1) → объединяющий Issue на инкремент → **PR** | ✅ Работает, прогнан вживую (8 зон, 19 инкрементов, PR с 20 файлами). ⚠️ см. «Ограничения» | `make consolidate` |
 | **`/estimate` — оценка трудоёмкости Issue** по методологии (тип работы → декомпозиция → FP cross-check → PERT → риски/надбавки → sanity bounds → грейды → Story Points), обоснование комментарием | ✅ Работает, прогнано вживую через webhook | комментарий `/estimate` в Issue |
+| **`/analyze` — автономный анализ Issue** (Слой C): клон репозитория → repomix → цепочка FNR через `claude -p` (`task → concept → debate → sysreq → validate`) → артефакты в ветку `research/issue-<n>` + итоговый комментарий | ✅ Работает | комментарий `/analyze` в Issue либо лейбл `research-me` |
 | **Layer B — webhook-автостарт** на новых Issue (GitHub App) | ⚙️ Код есть (`webhook/`), требует регистрации App + публичного URL | см. «Установка Layer B» |
-| **Тяжёлые стадии** `run_research_pipeline` / `run_bug_pipeline` (БФТ/Blueprint/SA-helper через `claude -p`) | ❌ `NotImplementedError` — не реализовано | — |
-| **Доставка скиллов po-helper/SA-helper в воркер**, установка `deb8flow` | ❌ Не решено (`worker/Dockerfile` — TODO) | — |
+| **Доставка скиллов po-helper/SA-helper в воркер** (`.claude/skills` + `.claude/commands` → `/root/.claude/`, `claude-code` и `repomix` в образе) | ✅ Решено в `worker/Dockerfile` | — |
+| **Установка `deb8flow`** в образ воркера | ❌ Не решено (`worker/Dockerfile:15` — TODO) | — |
+| **Тяжёлая стадия по багам** `run_bug_pipeline` (перенос `bug-pipeline.yml`) | ❌ `NotImplementedError` — не реализовано | — |
 | **OpenHands resolver** | ❌ `NotImplementedError`, намеренно вне этого compose | — |
 
-Тесты: `make test` — **32 теста**.
+Тесты: **214 тестов**, `make test` (после `make setup` — цель зовёт `.venv/bin/pytest`).
 
 ---
 
@@ -68,8 +70,9 @@ make go-live   # выключить DRY_RUN, перезапустить worker, 
   целевой, см. #111).
 - Приоритет: LLM извлекает атрибуты → детерминированная формула из
   `config/priority-weights.toml` → метка `priority:*` + комментарий с разбором.
-- Дальше workflow **паркуется** и ждёт сигнал `research-me` / `bug-me` (эти стадии
-  пока не реализованы — см. таблицу выше).
+- Дальше workflow **паркуется** и ждёт лейбл `research-me` / `bug-me`.
+  `research-me` запускает ту же аналитику Слоя C, что и команда `/analyze`;
+  `bug-me` пока `NotImplementedError` — см. таблицу выше.
 
 ---
 
@@ -111,8 +114,12 @@ make consolidate   # или: scripts/consolidate.py --repo <owner>/<repo>
   Issue занимает десятки минут.
 - **Таксономия не версионируется**: `derive_taxonomy` вызывается с `prior=None`,
   temperature не фиксирована → зоны могут «плыть» между прогонами.
-- **Activity — синхронные `def`** (исполняются в ThreadPoolExecutor). Делать их
-  `async def` нельзя: блокирующий LLM-вызов на event-loop замораживает воркер.
+- **LLM-стадии — синхронные `def`** (исполняются в ThreadPoolExecutor). Делать их
+  `async def` нельзя, не вынеся блокирующий вызов: LLM-вызов прямо на event-loop
+  замораживает воркер. Activity долгого анализа (`prepare_workspace`,
+  `run_fnr_stage`, `publish_analysis`, `run_analysis_pipeline`, …) — наоборот
+  `async def`: им нужен heartbeat, а каждый блокирующий git/repomix/`claude -p`/REST
+  внутри обёрнут в `asyncio.to_thread`, иначе heartbeat не уходит на сервер.
 
 ---
 
@@ -230,8 +237,27 @@ flowchart TD
   (по умолчанию `glm-4.5-air`), сильная `MODEL_CLASSIFY` (по умолчанию `glm-5.2`,
   переопределяется через `.env`).
 - `claude -p` для скиллов po-helper/SA-helper — Anthropic-совместимый эндпоинт z.ai
-  (`ANTHROPIC_BASE_URL`). Используется только тяжёлыми стадиями, которые пока не
-  реализованы.
+  (`ANTHROPIC_BASE_URL`). Используется стадиями FNR в `/analyze` — по одному
+  вызову `claude -p` на стадию.
+
+## Наблюдаемость — Sentry
+
+`shared/sentry_setup.py`, включается переменной `SENTRY_DSN` (пусто — полный
+no-op, это же и процедура отката). Плюс `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`,
+`SENTRY_TRACES_SAMPLE_RATE` — см. `.env.example`.
+
+Ловит не падение процесса, а главный класс сбоя этого стека — **пойманный** сбой,
+который иначе виден только комментарием в Issue: триаж упал и повесил
+`advisor:error`, `/estimate` упал на стадии. События приходят с тегами
+service/repo/issue/stage.
+
+Два ограничения, которые нельзя нарушать при правках:
+- модуль зовётся только из entrypoint'ов (`worker.py`, `webhook/main.py`) и из
+  activity — **никогда** из workflow-кода: сетевой вызов там недетерминирован и
+  ломает replay;
+- скраббер `_scrub_event` вырезает значения локальных переменных по денилисту имён
+  до отправки — через этот код ходят `ZAI_API_KEY`, GitHub-токен и
+  `GITHUB_PRIVATE_KEY_B64`.
 
 ## Развёртывание как постоянного сервиса
 
@@ -248,7 +274,8 @@ flowchart TD
 ## Установка Layer B (webhook + GitHub App, мультирепо)
 
 > Для Layer A и консолидации это НЕ нужно. App и публичный webhook требуются только
-> чтобы **новые** Issue и команды `/estimate` обрабатывались автоматически.
+> чтобы **новые** Issue, лейблы-решения (`research-me`/`bug-me`/`build-me`) и
+> команды `/analyze` и `/estimate` обрабатывались автоматически.
 
 Модель мультирепо — как в `poh-pr-agents`: устанавливаешь App на репозитории,
 задаёшь 4 переменные, указываешь **вебхук самого App** (не пер-репо hooks).
@@ -298,6 +325,34 @@ flowchart TD
 
 ---
 
+## Автономный анализ — команда `/analyze` (Слой C)
+
+Комментарий `/analyze` в Issue (или лейбл `research-me` на Issue с типом
+`advisor:feature-request`) запускает воркфлоу `IssueAnalysis`. Что происходит:
+
+1. `ack_command` — 👀 на комментарий с командой; в идущий воркфлоу триажа уходит
+   сигнал, который вешает метку `analyzing`.
+2. `prepare_workspace` — клон целевого репозитория во временный каталог и упаковка
+   его в один файл через `repomix`.
+3. Цепочка FNR через `claude -p`, каждая стадия — **отдельная activity** со своим
+   таймаутом и своим шагом Event History:
+   `task → concept → debate → sysreq → validate`
+   (артефакты в `sa_documentation/FNR/FNR_1/`). Стадия не ретраится
+   (`maximum_attempts=1`): прогон дорогой и недетерминированный, повтор инициирует
+   человек.
+4. `publish_analysis` — артефакты пушатся в ветку `research/issue-<n>`, в Issue
+   уходит итоговый комментарий со списком файлов.
+5. `cleanup_workspace` в `finally` — рабочий каталог сносится на обоих путях.
+
+Падение любой стадии → `publish_analysis_error`: комментарий с названием стадии и
+причиной, а не молчаливый обвал. Повторный `/analyze` по тому же Issue упирается в
+`WorkflowAlreadyStarted` (id `analysis-<repo>-<n>`) — второго прогона не будет.
+
+Требования: в образе воркера должны быть `claude-code`, `repomix` и `gh` — они
+ставятся в `worker/Dockerfile`, скиллы SA-helper копируются в `/root/.claude/`.
+
+---
+
 ## Оценка трудоёмкости — команда `/estimate`
 
 Комментарий `/estimate` в любом Issue запускает оценку. Агент ставит 👀 на
@@ -313,6 +368,14 @@ cross-check, PERT, разбивка по грейдам, каждый приме
 Методология — `docs/methodology/task-estimation.md`. Все коэффициенты
 вынесены в `config/estimation-rules.toml`: меняя их, не трогаешь ни промпт,
 ни код расчёта. Модель извлекает только факты, все числа считает Python.
+
+Прогнать оценку **без Layer B** (вебхука и GitHub App): `scripts/estimate.py`
+стартует тот же воркфлоу напрямую в Temporal — нужен только поднятый `worker`.
+
+```bash
+python scripts/estimate.py --issue 83                        # DRY_RUN, реакция только в лог
+python scripts/estimate.py --issue 83 --comment-id 2145678901  # реальный прогон
+```
 
 ---
 
