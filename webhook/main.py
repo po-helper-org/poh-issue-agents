@@ -6,8 +6,10 @@ Webhook receiver: единственная точка входа для GitHub. 
                                `/estimate` — IssueEstimation; любой другой
                                комментарий — сигнал уже идущему workflow
                                (используется циклом уточнений)
-- issues.labeled           -> сигнал, если лейбл — одна из точек решения
-                               человека (research-me / bug-me / build-me)
+- issues.labeled           -> signal-with-start, если лейбл — одна из точек
+                               решения человека (research-me / bug-me /
+                               build-me): воркфлоу триажа может не
+                               существовать, тогда он поднимается тем же вызовом
 
 Ничего из бизнес-логики здесь нет — это чистый транспортный слой.
 """
@@ -111,8 +113,33 @@ async def github_webhook(
         elif action == "labeled":
             label = payload["label"]["name"]
             if label in HUMAN_DECISION_LABELS:
-                handle = client.get_workflow_handle(wf_id)
-                await handle.signal("human_decision", label)
+                from shared.workflow_types import IssueInput
+
+                # signal-with-start, а не голый signal: лейбл прилетает и по
+                # issue, у которого воркфлоу триажа не существует (issue завели
+                # до установки App — `issues.opened` никто не доставил; либо
+                # триаж прогнали в обход Temporal). signal() в несуществующий
+                # workflow бросает исключение, вебхук отвечает 500, GitHub
+                # ретраит и бросает доставку — лейбл остаётся мёртвым молча.
+                await client.start_workflow(
+                    "IssueLifecycle",
+                    IssueInput(
+                        repo=repo,
+                        issue_number=issue_number,
+                        title=payload["issue"]["title"],
+                        body=payload["issue"].get("body") or "",
+                        author_login=payload["issue"]["user"]["login"],
+                        author_type=payload["issue"]["user"]["type"],
+                        # Отвечать на уточняющий вопрос тут некому: триггер —
+                        # лейбл, а не диалог. VAGUE обязан эскалировать, иначе
+                        # цикл уточнений съест только что доставленный сигнал.
+                        interactive=False,
+                    ),
+                    id=wf_id,
+                    task_queue="issue-lifecycle",
+                    start_signal="human_decision",
+                    start_signal_args=[label],
+                )
 
     elif x_github_event == "issue_comment":
         if payload["action"] != "created":
