@@ -171,7 +171,7 @@ def post_error_label(issue: IssueInput, reason: str = "") -> None:
 async def mark_analyzing(repo: str, issue_number: int) -> None:
     """Видимая метка, что по Issue запущен автономный анализ (/analyze).
     add_label соблюдает DRY_RUN, отдельного гарда не нужно."""
-    github_client.add_label(repo, issue_number, "analyzing")
+    await asyncio.to_thread(github_client.add_label, repo, issue_number, "analyzing")
 
 
 # --- Классификация ---
@@ -748,7 +748,8 @@ async def ack_command(analyze: AnalyzeInput) -> None:
     если комментарий-триггер к этому моменту удалили (404) или сработал
     rate limit, сбой реакции не должен утопить сам ack.
     """
-    github_client.post_comment(
+    await asyncio.to_thread(
+        github_client.post_comment,
         analyze.repo,
         analyze.issue_number,
         "🔍 Взял `/analyze` в работу — запускаю автономный анализ через SA-helper.\n\n"
@@ -757,7 +758,7 @@ async def ack_command(analyze: AnalyzeInput) -> None:
     )
     if analyze.comment_id is not None:
         try:
-            github_client.add_reaction(analyze.repo, analyze.comment_id, "eyes")
+            await asyncio.to_thread(github_client.add_reaction, analyze.repo, analyze.comment_id, "eyes")
         except Exception:
             pass  # best-effort: декорация не должна ронять ack или весь прогон
 
@@ -766,7 +767,8 @@ async def ack_command(analyze: AnalyzeInput) -> None:
 async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
     """Не молчать при провале: прогон дорогой и долгий, тихое падение
     неотличимо от «ещё работает»."""
-    github_client.post_comment(
+    await asyncio.to_thread(
+        github_client.post_comment,
         analyze.repo,
         analyze.issue_number,
         f"⚠️ Автономный анализ не удался: {reason}\n\n"
