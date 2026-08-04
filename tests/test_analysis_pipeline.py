@@ -260,6 +260,223 @@ def test_claude_creds_empty_when_nothing_set(monkeypatch):
     assert activities._claude_anthropic_creds() == ("", "")
 
 
+
+
+def test_fnr_stage_names_are_the_five_stages():
+    assert activities.FNR_STAGE_NAMES == ("task", "concept", "debate", "sysreq", "validate")
+
+
+def test_fnr_stage_lookup_returns_prompt_expected_and_input():
+    prompt, expected, requires = activities._fnr_stage("concept", "Заголовок\n\nтело")
+    assert prompt == f"/fnr-concept {activities.FNR_DIR}/task.md"
+    assert expected == f"{activities.FNR_DIR}/concept.md"
+    assert requires == f"{activities.FNR_DIR}/task.md"
+
+
+def test_fnr_stage_task_has_no_required_input():
+    _, _, requires = activities._fnr_stage("task", "desc")
+    assert requires is None
+
+
+def test_fnr_stage_unknown_raises():
+    with pytest.raises(ValueError, match="неизвестная стадия"):
+        activities._fnr_stage("nope", "desc")
+
+
+def test_fnr_stage_sources_stay_consistent():
+    # Имена стадий живут в трёх местах (_fnr_stages, FNR_STAGE_NAMES,
+    # _FNR_STAGE_REQUIRES). Рассинхрон превратил бы чистый ValueError из
+    # _fnr_stage в сырой KeyError — ловим его здесь, а не в проде.
+    names = {n for n, _, _ in activities._fnr_stages("desc")}
+    assert names == set(activities.FNR_STAGE_NAMES) == set(activities._FNR_STAGE_REQUIRES)
+
+
+@pytest.fixture
+def stage_env(monkeypatch, tmp_path):
+    """Реальный каталог под ANALYSIS_WORKSPACE_ROOT; внешние эффекты — заглушки."""
+    monkeypatch.setenv("ANALYSIS_WORKSPACE_ROOT", str(tmp_path))
+    state = {"beats": [], "claude_prompts": [], "pushed": None, "comment": None}
+
+    monkeypatch.setattr(activities.activity, "heartbeat",
+                        lambda *a: state["beats"].append(a[0] if a else None))
+
+    def fake_clone(repo, dest):
+        Path(dest).mkdir(parents=True, exist_ok=True)
+
+    def fake_repomix(clone_dir):
+        out = Path(clone_dir) / "sa_documentation" / "repomix-output.xml"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("<repo/>", encoding="utf-8")
+
+    def fake_claude(prompt, cwd):
+        state["claude_prompts"].append(prompt)
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        produced = {
+            "/fnr-new-task": "task.md",
+            "/fnr-concept": "concept.md",
+            "/fnr-system-requirements": "system_requirements.md",
+            "/validate-doc": "validation.md",
+        }.get(prompt.split()[0])
+        if produced:
+            (fnr / produced).write_text(f"# {produced}\n", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_clone_repo", fake_clone)
+    monkeypatch.setattr(activities, "_run_repomix", fake_repomix)
+    monkeypatch.setattr(activities, "_run_claude", fake_claude)
+    monkeypatch.setattr(activities.github_client, "push_artifacts_to_branch",
+                        lambda repo, branch, files, message: state.update(pushed=(branch, dict(files))))
+    monkeypatch.setattr(activities.github_client, "post_comment",
+                        lambda repo, n, body: state.update(comment=body))
+    return state
+
+
+def test_workspace_dir_is_deterministic_under_root(stage_env, tmp_path):
+    d1 = activities._workspace_dir(_analyze())
+    d2 = activities._workspace_dir(_analyze())
+    assert d1 == d2
+    assert str(tmp_path) in str(d1)
+    assert d1.name == "analysis-o__r-5"
+
+
+def test_build_workspace_clones_and_packs(stage_env):
+    clone_dir = activities._build_workspace(_analyze())
+    assert (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists()
+
+
+def test_build_workspace_wipes_prior_remnant(stage_env):
+    stale = activities._workspace_dir(_analyze()) / "repo" / "STALE.txt"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("old", encoding="utf-8")
+    activities._build_workspace(_analyze())
+    assert not stale.exists()
+
+
+def test_require_workspace_missing_repomix_fails_fast(stage_env):
+    with pytest.raises(RuntimeError, match="потерян"):
+        activities._require_workspace(_analyze(), None)
+
+
+def test_require_workspace_missing_input_fails_fast(stage_env):
+    activities._build_workspace(_analyze())  # repomix есть, task.md нет
+    with pytest.raises(RuntimeError, match="нет входа"):
+        activities._require_workspace(_analyze(), f"{activities.FNR_DIR}/task.md")
+
+
+def test_prepare_workspace_builds_clone_and_repomix(stage_env):
+    asyncio.run(activities.prepare_workspace(_analyze()))
+    clone_dir = activities._clone_dir(_analyze())
+    assert Path(clone_dir).exists()
+    assert (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists()
+
+
+def test_stage_reports_stage_artifact_and_size(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    result = asyncio.run(activities.run_fnr_stage(a, "task"))
+    assert result["stage"] == "task"
+    assert result["artifact"] == f"{activities.FNR_DIR}/task.md"
+    assert result["bytes"] > 0
+    assert any(p.startswith("/fnr-new-task") for p in stage_env["claude_prompts"])
+
+
+def test_stage_without_expected_artifact_reports_none(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    asyncio.run(activities.run_fnr_stage(a, "task"))
+    asyncio.run(activities.run_fnr_stage(a, "concept"))
+    result = asyncio.run(activities.run_fnr_stage(a, "debate"))  # debate: артефакта нет
+    assert result == {"stage": "debate", "artifact": None, "bytes": 0}
+
+
+def test_stage_missing_expected_artifact_raises(stage_env, monkeypatch):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)  # ничего не пишет
+    with pytest.raises(RuntimeError, match="task.md не создан"):
+        asyncio.run(activities.run_fnr_stage(a, "task"))
+
+
+def test_stage_without_workspace_fails_fast(stage_env):
+    with pytest.raises(RuntimeError, match="потерян"):
+        asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    # Fail-fast обязан сработать ДО дорогого claude -p, не после.
+    assert stage_env["claude_prompts"] == []
+
+
+def test_stage_without_input_artifact_fails_fast(stage_env):
+    asyncio.run(activities.prepare_workspace(_analyze()))
+    with pytest.raises(RuntimeError, match="нет входа"):  # concept требует task.md
+        asyncio.run(activities.run_fnr_stage(_analyze(), "concept"))
+    # Guard входа тоже до claude: пропущенный предшественник не жжёт вызов.
+    assert stage_env["claude_prompts"] == []
+
+
+def test_stage_heartbeats_during_long_claude(stage_env, monkeypatch):
+    monkeypatch.setattr(activities, "HEARTBEAT_INTERVAL_SEC", 0.01)
+    asyncio.run(activities.prepare_workspace(_analyze()))
+
+    def slow_claude(prompt, cwd):
+        time.sleep(0.05)
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        (fnr / "task.md").write_text("# task", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_run_claude", slow_claude)
+    asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    assert stage_env["beats"].count("task") >= 1
+
+
+def test_stage_runs_claude_off_event_loop_thread(stage_env, monkeypatch):
+    asyncio.run(activities.prepare_workspace(_analyze()))
+    seen = {}
+
+    def record(prompt, cwd):
+        seen["thread"] = threading.current_thread()
+        fnr = Path(cwd) / activities.FNR_DIR
+        fnr.mkdir(parents=True, exist_ok=True)
+        (fnr / "task.md").write_text("# task", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_run_claude", record)
+    asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    assert seen["thread"] is not threading.main_thread()
+
+
+def test_publish_pushes_branch_and_comments(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    for name in activities.FNR_STAGE_NAMES:
+        asyncio.run(activities.run_fnr_stage(a, name))
+    branch = asyncio.run(activities.publish_analysis(a))
+    assert branch == "research/issue-5"
+    pushed_branch, files = stage_env["pushed"]
+    assert pushed_branch == "research/issue-5"
+    assert f"{activities.FNR_DIR}/system_requirements.md" in files
+    assert "research/issue-5" in stage_env["comment"]
+    assert "system_requirements.md" in stage_env["comment"]
+
+
+def test_publish_without_artifacts_raises(stage_env, monkeypatch):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    monkeypatch.setattr(activities, "_collect_fnr_artifacts", lambda clone_dir: {})
+    with pytest.raises(RuntimeError, match="ни одного артефакта"):
+        asyncio.run(activities.publish_analysis(a))
+
+
+def test_cleanup_removes_workspace(stage_env):
+    a = _analyze()
+    asyncio.run(activities.prepare_workspace(a))
+    assert activities._workspace_dir(a).exists()
+    asyncio.run(activities.cleanup_workspace(a))
+    assert not activities._workspace_dir(a).exists()
+
+
+def test_cleanup_is_idempotent_when_absent(stage_env):
+    # каталога нет — cleanup не должен падать
+    asyncio.run(activities.cleanup_workspace(_analyze()))
+
+
 def test_enriched_context_reaches_task_stage(monkeypatch, wired):
     """Контекст обсуждения обязан долетать до стадии /fnr-new-task, а не
     оставаться в title+body."""

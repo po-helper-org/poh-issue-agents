@@ -339,6 +339,61 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     ]
 
 
+FNR_STAGE_NAMES = ("task", "concept", "debate", "sysreq", "validate")
+
+# Входной артефакт каждой стадии — что уже должно лежать в рабочем каталоге,
+# чтобы стадия имела смысл (используется guard'ом _require_workspace).
+_FNR_STAGE_REQUIRES = {
+    "task": None,
+    "concept": f"{FNR_DIR}/task.md",
+    "debate": f"{FNR_DIR}/concept.md",
+    "sysreq": f"{FNR_DIR}/concept.md",
+    "validate": f"{FNR_DIR}/system_requirements.md",
+}
+
+
+def _fnr_stage(name: str, description: str) -> tuple[str, str | None, str | None]:
+    """(промпт, ожидаемый артефакт, требуемый вход) для стадии по имени."""
+    for n, prompt, expected in _fnr_stages(description):
+        if n == name:
+            return prompt, expected, _FNR_STAGE_REQUIRES[name]
+    raise ValueError(f"неизвестная стадия FNR: {name}")
+
+
+def _workspace_dir(analyze: AnalyzeInput) -> Path:
+    """Детерминированный рабочий каталог прогона (переживает activity в пределах
+    жизни контейнера). База — ANALYSIS_WORKSPACE_ROOT или системный temp."""
+    root = os.environ.get("ANALYSIS_WORKSPACE_ROOT") or tempfile.gettempdir()
+    slug = f"analysis-{analyze.repo.replace('/', '__')}-{analyze.issue_number}"
+    return Path(root) / slug
+
+
+def _clone_dir(analyze: AnalyzeInput) -> str:
+    return str(_workspace_dir(analyze) / "repo")
+
+
+def _build_workspace(analyze: AnalyzeInput) -> str:
+    """Свежий каталог: снести остаток прежнего прогона, clone, repomix."""
+    shutil.rmtree(_workspace_dir(analyze), ignore_errors=True)
+    clone_dir = _clone_dir(analyze)
+    _clone_repo(analyze.repo, clone_dir)
+    _run_repomix(clone_dir)
+    return clone_dir
+
+
+def _require_workspace(analyze: AnalyzeInput, requires: str | None) -> str:
+    """Guard стадии: каталог+repomix на месте? требуемый вход на месте? Иначе
+    fail-fast (без пере-клона — он дал бы свежий репозиторий без артефактов)."""
+    clone_dir = _clone_dir(analyze)
+    if not (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists():
+        raise RuntimeError("рабочий каталог потерян (рестарт воркера?) — повтори /analyze")
+    if requires and not (Path(clone_dir) / requires).exists():
+        raise RuntimeError(
+            f"нет входа {requires} (стадия-предшественник не отработала?) — повтори /analyze"
+        )
+    return clone_dir
+
+
 def _clone_repo(repo: str, dest: str) -> None:
     """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
     реальный код (`файл:строка`), одного текста Issue недостаточно.
@@ -556,6 +611,60 @@ def _build_task_context(analyze: AnalyzeInput) -> str:
     if prs:
         parts.append(prs)
     return "\n\n".join(parts)
+
+
+@activity.defn
+async def prepare_workspace(analyze: AnalyzeInput) -> None:
+    """Стадия 0 пайплайна /analyze: свежий clone + repomix в детерминированный
+    каталог. Идемпотентна (сносит остаток и строит заново)."""
+    await _run_with_heartbeat(_build_workspace, analyze, label="preparing")
+
+
+@activity.defn
+async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
+    """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
+    затем стадия, затем проверка ожидаемого артефакта. Возвращает компактный
+    отчёт {stage, artifact, bytes}; статус/тайминг Temporal фиксирует сам."""
+    description = f"{analyze.title}\n\n{analyze.body}"
+    prompt, expected, requires = _fnr_stage(stage_name, description)
+    clone_dir = _require_workspace(analyze, requires)
+    await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
+    artifact: str | None = None
+    size = 0
+    if expected:
+        path = Path(clone_dir) / expected
+        if not path.exists():
+            raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
+        artifact = expected
+        size = path.stat().st_size
+    return {"stage": stage_name, "artifact": artifact, "bytes": size}
+
+
+@activity.defn
+async def publish_analysis(analyze: AnalyzeInput) -> str:
+    """Финал пайплайна: собрать артефакты, push ветки research/issue-N,
+    итоговый коммент. Мутации GitHub гейтятся DRY_RUN внутри github_client."""
+    clone_dir = _require_workspace(analyze, None)
+    files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
+    if not files:
+        raise RuntimeError("пайплайн не произвёл ни одного артефакта")
+    branch = f"research/issue-{analyze.issue_number}"
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        analyze.repo, branch, files,
+        f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
+    )
+    await asyncio.to_thread(
+        github_client.post_comment,
+        analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
+    )
+    return branch
+
+
+@activity.defn
+async def cleanup_workspace(analyze: AnalyzeInput) -> None:
+    """Best-effort снос рабочего каталога прогона."""
+    await asyncio.to_thread(shutil.rmtree, str(_workspace_dir(analyze)), ignore_errors=True)
 
 
 @activity.defn

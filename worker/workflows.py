@@ -298,23 +298,36 @@ class IssueAnalysis:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-
         try:
             await workflow.execute_activity(
-                activities.run_analysis_pipeline,
+                activities.prepare_workspace,
                 analyze,
-                start_to_close_timeout=timedelta(seconds=4500),  # 75 минут на 5 стадий
+                start_to_close_timeout=timedelta(seconds=1000),  # clone 300 + repomix 600 + буфер
                 heartbeat_timeout=timedelta(seconds=300),
-                # Прогон недетерминирован и дорог — слепой авторетрай сжёг бы
-                # бюджет впустую. Повтор инициирует человек командой /analyze.
-                retry_policy=RetryPolicy(maximum_attempts=1),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+            # Пер-стадийные activity: каждая — свой шаг Event History со своим
+            # таймингом. Застрявшая стадия падает по СВОЕМУ start_to_close, а не
+            # прячется под общим потолком, и называет себя в ошибке.
+            for stage_name in activities.FNR_STAGE_NAMES:
+                await workflow.execute_activity(
+                    activities.run_fnr_stage,
+                    args=[analyze, stage_name],
+                    start_to_close_timeout=timedelta(seconds=1200),  # claude до 900 + буфер
+                    heartbeat_timeout=timedelta(seconds=300),
+                    # Прогон недетерминирован и мутирует файлы — авторетрай сжёг бы
+                    # бюджет и мог бы задвоить артефакт. Повтор инициирует человек.
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            await workflow.execute_activity(
+                activities.publish_analysis,
+                analyze,
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
         except Exception as exc:
-            # exc здесь — ActivityError с общим текстом Temporal-core
-            # ("Activity task failed"); настоящая причина (наш RuntimeError
-            # из run_analysis_pipeline) лежит в exc.cause. Без разворачивания
-            # в GitHub-комментарий ушла бы бесполезная обёртка вместо
-            # диагностики (например, «стадия ...: артефакт ... не создан»).
+            # exc — ActivityError с общим текстом; настоящая причина в exc.cause
+            # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
             reason = str(getattr(exc, "cause", None) or exc)
             await workflow.execute_activity(
                 activities.publish_analysis_error,
@@ -322,6 +335,21 @@ class IssueAnalysis:
                 start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
+        finally:
+            # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:
+            # провал самой уборки (timeout/краш воркера) не должен затирать реальный
+            # исход — ловим и логируем, но наружу не пробрасываем.
+            try:
+                await workflow.execute_activity(
+                    activities.cleanup_workspace,
+                    analyze,
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except Exception as cleanup_exc:
+                workflow.logger.warning(
+                    "cleanup_workspace failed (best-effort, ignored): %s", cleanup_exc
+                )
 
 
 @workflow.defn(name="IssueEstimation")
