@@ -397,3 +397,5 @@ Durable execution: воркер упал посреди долгого прог�
 - `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ROADMAP.md`,
   `docs/diagrams/` — архитектура, журнал решений, план, диаграммы.
 - `docs/demo-plan.md` — сценарий демонстрации с критериями приёмки.
+- `docs/telegram-bot.md` — Telegram-бот (`tgbot/`): long polling, вебхук и
+  мини-апп на общем ядре.
