@@ -7,6 +7,8 @@
 import logging
 from typing import Any
 
+import httpx
+
 from .api import TelegramAPI, TelegramError
 from .handlers import dispatch
 
@@ -18,5 +20,5 @@ async def handle_update(api: TelegramAPI, update: dict[str, Any],
     for method, payload in dispatch(update, miniapp_url):
         try:
             await api.call(method, **payload)
-        except TelegramError as exc:
+        except (TelegramError, httpx.HTTPError) as exc:
             _log.error("update %s: %s не прошёл — %s", update.get("update_id"), method, exc)

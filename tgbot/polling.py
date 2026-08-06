@@ -14,6 +14,8 @@ import signal
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .api import TelegramAPI, TelegramError
 from .config import Config
 from .runner import handle_update
@@ -45,7 +47,8 @@ async def run_polling(config: Config, *, poll_timeout: int = 30) -> None:
         while not stop.is_set():
             try:
                 updates = await api.get_updates(offset, poll_timeout)
-            except (TelegramError, OSError) as exc:
+            except (TelegramError, httpx.HTTPError, OSError) as exc:
+                # Telegram штатно рвёт долгий getUpdates — это не повод падать.
                 _log.warning("getUpdates упал (%s), повтор через 3с", exc)
                 await asyncio.sleep(3)
                 continue
