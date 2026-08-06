@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Мини-апп</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 16px;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    /* Цвета отдаёт сам Telegram — так мини-апп выглядит родным в любой теме. */
+    background: var(--tg-theme-bg-color, #fff);
+    color: var(--tg-theme-text-color, #000);
+  }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  .hint { color: var(--tg-theme-hint-color, #707579); font-size: 13px; margin: 0 0 16px; }
+  .card {
+    background: var(--tg-theme-secondary-bg-color, #f1f1f1);
+    border-radius: 12px; padding: 12px 14px; margin-bottom: 12px;
+  }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
+  .row span:first-child { color: var(--tg-theme-hint-color, #707579); }
+  .row span:last-child { font-weight: 500; text-align: right; word-break: break-all; }
+  input, button {
+    font: inherit; width: 100%; box-sizing: border-box;
+    border-radius: 10px; padding: 11px 14px; border: none;
+  }
+  input {
+    background: var(--tg-theme-bg-color, #fff);
+    color: var(--tg-theme-text-color, #000);
+    border: 1px solid var(--tg-theme-hint-color, #ccc); margin-bottom: 10px;
+  }
+  button {
+    background: var(--tg-theme-button-color, #2481cc);
+    color: var(--tg-theme-button-text-color, #fff);
+    cursor: pointer; margin-bottom: 8px;
+  }
+  button.secondary {
+    background: transparent; color: var(--tg-theme-link-color, #2481cc);
+    border: 1px solid var(--tg-theme-hint-color, #ccc);
+  }
+  pre {
+    white-space: pre-wrap; word-break: break-all; font-size: 12px; margin: 0;
+    color: var(--tg-theme-hint-color, #707579);
+  }
+</style>
+</head>
+<body>
+<h1>Мини-апп работает</h1>
+<p class="hint" id="env">Загрузка…</p>
+
+<div class="card" id="user"></div>
+
+<div class="card">
+  <input id="note" placeholder="Напиши что-нибудь" autocomplete="off">
+  <button id="send">Отправить в чат</button>
+  <button id="verify" class="secondary">Проверить подпись на сервере</button>
+  <pre id="out"></pre>
+</div>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const out = document.getElementById('out');
+  const envEl = document.getElementById('env');
+  const userEl = document.getElementById('user');
+
+  if (!tg || !tg.initData) {
+    envEl.textContent = 'Открыто вне Telegram — часть возможностей недоступна.';
+  }
+  if (!tg) { return; }
+
+  tg.ready();
+  tg.expand();
+
+  const user = (tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
+  envEl.textContent = 'Telegram ' + (tg.platform || '?') + ', Bot API ' + (tg.version || '?')
+    + ', тема: ' + (tg.colorScheme || '?');
+
+  const rows = [
+    ['Имя', [user.first_name, user.last_name].filter(Boolean).join(' ') || '—'],
+    ['Username', user.username ? '@' + user.username : '—'],
+    ['user_id', user.id || '—'],
+    ['Язык', user.language_code || '—'],
+  ];
+  userEl.innerHTML = rows
+    .map(([k, v]) => '<div class="row"><span>' + k + '</span><span>' + v + '</span></div>')
+    .join('');
+
+  // sendData доставляет пейлоад боту как message.web_app_data — но только если
+  // мини-апп открыт из кнопки обычной клавиатуры, не из inline и не из меню.
+  document.getElementById('send').addEventListener('click', function () {
+    const payload = {
+      action: 'note',
+      note: document.getElementById('note').value || '(пусто)',
+      from: user.id || null,
+    };
+    try {
+      tg.sendData(JSON.stringify(payload));
+    } catch (e) {
+      out.textContent = 'sendData недоступен: ' + e.message
+        + '\nОткрой мини-апп кнопкой «🚀 Мини-апп» под полем ввода.';
+    }
+  });
+
+  // Бэкенд задаётся через ?api=https://... — без него проверять подпись негде.
+  const apiBase = new URLSearchParams(location.search).get('api');
+  document.getElementById('verify').addEventListener('click', function () {
+    if (!apiBase) {
+      out.textContent = 'Бэкенд не задан. Добавь ?api=https://<host> к URL мини-аппа.';
+      return;
+    }
+    out.textContent = 'Проверяю…';
+    fetch(apiBase.replace(/\/$/, '') + '/api/miniapp/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ init_data: tg.initData }),
+    })
+      .then((r) => r.json())
+      .then((d) => { out.textContent = JSON.stringify(d, null, 2); })
+      .catch((e) => { out.textContent = 'Ошибка: ' + e.message; });
+  });
+})();
+</script>
+</body>
+</html>
