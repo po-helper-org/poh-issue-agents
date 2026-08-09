@@ -28,6 +28,7 @@ with workflow.unsafe.imports_passed_through():
         EstimateRequest,
         EstimateResult,
         IssueInput,
+        WebhookAuditInput,
     )
 
     import activities
@@ -49,6 +50,70 @@ def _failure_reason(e: BaseException) -> str:
     return f"{exc_type}: {cause}"
 
 
+async def _run_staged_analysis(analyze: AnalyzeInput) -> None:
+    """Пер-стадийный прогон FNR — общий для обоих входов в аналитику.
+
+    Один код на команду `/analyze` (IssueAnalysis) и на лейбл research-me внутри
+    IssueLifecycle. Раньше вторая ветка звала монолитную activity
+    run_analysis_pipeline: те же пять стадий, но одним чёрным ящиком — застрявшая
+    стадия не называла себя, а прогон по лейблу и прогон по команде расходились
+    в поведении, оставаясь «одной и той же аналитикой» на словах.
+
+    Каждая стадия — свой шаг Event History со своим таймингом; ретраев нет
+    (прогон недетерминирован, мутирует файлы и стоит денег — повтор инициирует
+    человек), сбой всегда доезжает до GitHub, каталог снимается на обоих путях.
+    """
+    try:
+        await workflow.execute_activity(
+            activities.prepare_workspace,
+            analyze,
+            start_to_close_timeout=timedelta(seconds=1000),  # clone 300 + repomix 600 + буфер
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        for stage_name in activities.FNR_STAGE_NAMES:
+            await workflow.execute_activity(
+                activities.run_fnr_stage,
+                args=[analyze, stage_name],
+                start_to_close_timeout=timedelta(seconds=1200),  # claude до 900 + буфер
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        await workflow.execute_activity(
+            activities.publish_analysis,
+            analyze,
+            start_to_close_timeout=timedelta(seconds=120),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=True)
+    except Exception as exc:
+        # exc — ActivityError с общим текстом; настоящая причина в exc.cause
+        # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
+        reason = str(getattr(exc, "cause", None) or exc)
+        await workflow.execute_activity(
+            activities.publish_analysis_error,
+            args=[analyze, reason[:500]],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=False)
+    finally:
+        # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:
+        # провал самой уборки (timeout/краш воркера) не должен затирать реальный
+        # исход — ловим и логируем, но наружу не пробрасываем.
+        try:
+            await workflow.execute_activity(
+                activities.cleanup_workspace,
+                analyze,
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except Exception as cleanup_exc:
+            workflow.logger.warning(
+                "cleanup_workspace failed (best-effort, ignored): %s", cleanup_exc
+            )
+
+
 async def _finish_labels(repo: str, issue_number: int, command: str, ok: bool) -> None:
     """Обратный ход меток команды — один вызов на все терминальные ветки.
 
@@ -64,12 +129,50 @@ async def _finish_labels(repo: str, issue_number: int, command: str, ok: bool) -
     )
 
 
+@workflow.defn(name="WebhookAudit")
+class WebhookAudit:
+    """Надгробие для доставки, отброшенной по конфигу.
+
+    Не исполняет ни одной activity и завершается сразу: вся ценность в том, что
+    вход виден в Temporal UI. До него единственным следом отказа была строка в
+    логах контейнера — а туда никто не смотрит, пока не заподозрит проблему.
+
+    Аудитом покрыт ровно один случай — repo_not_allowed. Боты, неподдержанные
+    action и сигналы в завершённый workflow — штатный высокочастотный шум; их
+    аудит утопил бы настоящие прогоны в мусоре.
+    """
+
+    @workflow.run
+    async def run(self, audit: WebhookAuditInput) -> str:
+        workflow.logger.warning(
+            "доставка %s (%s/%s) по %s отброшена: %s; allowlist=%s",
+            audit.delivery_id, audit.event, audit.action, audit.repo,
+            audit.reason, audit.allowlist,
+        )
+        return audit.reason
+
+
 @workflow.defn(name="IssueLifecycle")
 class IssueLifecycle:
     def __init__(self) -> None:
         self._signal_queue: asyncio.Queue[str] = asyncio.Queue()
         self._analyze_labeled = False
         self._issue: IssueInput | None = None
+        self._stage = "intake"
+
+    @workflow.query
+    def stage(self) -> str:
+        """Текущая стадия прогона — для Temporal UI (вкладка Queries).
+
+        Прогон, припаркованный в ожидании лейбла, показан просто как `Running`
+        бессрочно, и отличить «триаж закончен, ждём человека» от «активность
+        зависла» можно было только разбирая Event History руками. Значение
+        `awaiting-human-decision` снимает эту двусмысленность прямо в UI.
+
+        Чтение атрибута детерминировано и побочных эффектов не имеет, поэтому
+        на воспроизведение истории query не влияет.
+        """
+        return self._stage
 
     @workflow.signal
     async def human_decision(self, label: str) -> None:
@@ -139,6 +242,7 @@ class IssueLifecycle:
                 start_to_close_timeout=timedelta(seconds=30),
             )
             if skip_reason is not None:
+                self._stage = "skipped"
                 return  # bot-authored / security-sensitive — дальше не идём
 
             # --- Intake Gate (дешёвая модель) с циклом уточнений ---
@@ -157,6 +261,7 @@ class IssueLifecycle:
                     issue,
                     start_to_close_timeout=timedelta(seconds=30),
                 )
+                self._stage = "escalated"
                 return
 
             comment_thread: list[str] = []
@@ -169,6 +274,7 @@ class IssueLifecycle:
                         issue,
                         start_to_close_timeout=timedelta(seconds=30),
                     )
+                    self._stage = "escalated"
                     return
 
                 await workflow.execute_activity(
@@ -191,6 +297,7 @@ class IssueLifecycle:
                 )
 
             if gate.status == "SPAM":
+                self._stage = "spam"
                 await workflow.execute_activity(
                     activities.close_as_spam,
                     args=[issue, gate.content],
@@ -199,6 +306,7 @@ class IssueLifecycle:
                 return
 
             # --- Классификация (более сильная модель) ---
+            self._stage = "classify"
             classification = await workflow.execute_activity(
                 activities.classify_issue,
                 issue,
@@ -210,9 +318,11 @@ class IssueLifecycle:
                 "advisor:existing-functionality",
                 "advisor:consultation",
             ):
+                self._stage = "answered"
                 return  # закрыт содержательным ответом, дальше пайплайн не идёт
 
             # --- Duplicate Check ---
+            self._stage = "duplicate-check"
             dup = await workflow.execute_activity(
                 activities.duplicate_check,
                 issue,
@@ -220,9 +330,11 @@ class IssueLifecycle:
                 retry_policy=default_retry,
             )
             if dup.decision == "duplicate":
+                self._stage = "duplicate"
                 return  # закрыт как дубликат внутри самой activity
 
             # --- Priority Scoring ---
+            self._stage = "priority"
             priority = await workflow.execute_activity(
                 activities.score_priority,
                 args=[issue, classification, dup],
@@ -235,6 +347,7 @@ class IssueLifecycle:
                 start_to_close_timeout=timedelta(seconds=30),
             )
         except Exception as e:
+            self._stage = "failed"
             await workflow.execute_activity(
                 activities.post_error_label,
                 args=[issue, _failure_reason(e)],
@@ -246,16 +359,16 @@ class IssueLifecycle:
         # --- Точка решения человека №1: запускать ли тяжёлую стадию ---
         # Ждём research-me / bug-me. Никакого потолка по времени — issue
         # может неделями висеть в бэклоге с приоритетом, это нормально.
+        self._stage = "awaiting-human-decision"
         decision = await self._wait_for_signal()
 
         if decision == "research-me" and classification.label == "advisor:feature-request":
             # Лейбл research-me — второй вход в ту же аналитику Слоя C, что и
             # команда /analyze, но БЕЗ ack_command: триггер тут лейбл, а не
-            # комментарий, так что подтверждать нечего. Сам прогон и обработка
-            # сбоя — как в IssueAnalysis.run: пайплайн дорогой и недетерминиро-
-            # ванный, вслепую не ретраим, а падение обязано быть видно в
-            # GitHub через publish_analysis_error, а не просто уронить этот
-            # workflow молча.
+            # комментарий, так что подтверждать нечего. Дальше — ровно тот же
+            # пер-стадийный прогон, что и у команды: одна реализация на оба
+            # входа, иначе «та же аналитика» остаётся правдой только на словах.
+            self._stage = "analysis"
             analyze_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
                                           title=issue.title, body=issue.body)
             # Метку «идёт прогон» тут ставит сам воркфлоу: триггером был
@@ -267,27 +380,9 @@ class IssueLifecycle:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
-            try:
-                await workflow.execute_activity(
-                    activities.run_analysis_pipeline,
-                    analyze_input,
-                    start_to_close_timeout=timedelta(seconds=4500),
-                    heartbeat_timeout=timedelta(seconds=300),
-                    retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой прогон вслепую
-                )
-                await _finish_labels(issue.repo, issue.issue_number, ANALYZE, ok=True)
-            except Exception as exc:
-                # exc — ActivityError с общим текстом Temporal-core, настоящая
-                # причина лежит в exc.cause (см. тот же разбор в IssueAnalysis.run).
-                reason = str(getattr(exc, "cause", None) or exc)
-                await workflow.execute_activity(
-                    activities.publish_analysis_error,
-                    args=[analyze_input, reason[:500]],
-                    start_to_close_timeout=timedelta(seconds=60),
-                    retry_policy=RetryPolicy(maximum_attempts=3),
-                )
-                await _finish_labels(issue.repo, issue.issue_number, ANALYZE, ok=False)
+            await _run_staged_analysis(analyze_input)
         elif decision == "bug-me" and classification.label == "advisor:bug":
+            self._stage = "bug"
             await workflow.execute_activity(
                 activities.run_bug_pipeline,
                 issue,
@@ -295,9 +390,11 @@ class IssueLifecycle:
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
         else:
+            self._stage = "done"
             return  # лейбл не совпал с типом — тот же guard, что раньше был в YAML
 
         # --- Точка решения человека №2: передавать ли в разработку ---
+        self._stage = "awaiting-build-decision"
         build_decision = await self._wait_for_signal()
         if build_decision == "build-me":
             await workflow.execute_activity(
@@ -305,6 +402,7 @@ class IssueLifecycle:
                 issue,
                 start_to_close_timeout=timedelta(seconds=30),
             )
+        self._stage = "done"
 
 
 @workflow.defn(name="IssueAnalysis")
@@ -325,60 +423,7 @@ class IssueAnalysis:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-        try:
-            await workflow.execute_activity(
-                activities.prepare_workspace,
-                analyze,
-                start_to_close_timeout=timedelta(seconds=1000),  # clone 300 + repomix 600 + буфер
-                heartbeat_timeout=timedelta(seconds=300),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
-            # Пер-стадийные activity: каждая — свой шаг Event History со своим
-            # таймингом. Застрявшая стадия падает по СВОЕМУ start_to_close, а не
-            # прячется под общим потолком, и называет себя в ошибке.
-            for stage_name in activities.FNR_STAGE_NAMES:
-                await workflow.execute_activity(
-                    activities.run_fnr_stage,
-                    args=[analyze, stage_name],
-                    start_to_close_timeout=timedelta(seconds=1200),  # claude до 900 + буфер
-                    heartbeat_timeout=timedelta(seconds=300),
-                    # Прогон недетерминирован и мутирует файлы — авторетрай сжёг бы
-                    # бюджет и мог бы задвоить артефакт. Повтор инициирует человек.
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
-            await workflow.execute_activity(
-                activities.publish_analysis,
-                analyze,
-                start_to_close_timeout=timedelta(seconds=120),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
-            await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=True)
-        except Exception as exc:
-            # exc — ActivityError с общим текстом; настоящая причина в exc.cause
-            # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
-            reason = str(getattr(exc, "cause", None) or exc)
-            await workflow.execute_activity(
-                activities.publish_analysis_error,
-                args=[analyze, reason[:500]],
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
-            await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=False)
-        finally:
-            # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:
-            # провал самой уборки (timeout/краш воркера) не должен затирать реальный
-            # исход — ловим и логируем, но наружу не пробрасываем.
-            try:
-                await workflow.execute_activity(
-                    activities.cleanup_workspace,
-                    analyze,
-                    start_to_close_timeout=timedelta(seconds=60),
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
-            except Exception as cleanup_exc:
-                workflow.logger.warning(
-                    "cleanup_workspace failed (best-effort, ignored): %s", cleanup_exc
-                )
+        await _run_staged_analysis(analyze)
 
 
 @workflow.defn(name="IssueEstimation")

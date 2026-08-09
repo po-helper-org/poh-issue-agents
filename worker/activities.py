@@ -668,7 +668,17 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
     затем стадия, затем проверка ожидаемого артефакта. Возвращает компактный
     отчёт {stage, artifact, bytes}; статус/тайминг Temporal фиксирует сам."""
-    description = f"{analyze.title}\n\n{analyze.body}"
+    # Бриф с обсуждением и связанными PR нужен ровно стадии `task`: только её
+    # промпт несёт описание задачи, остальные ссылаются на уже готовые артефакты.
+    # Регрессия, из-за которой это место и появилось: при переходе на
+    # пер-стадийные activity обогащение осталось в монолите, и `/analyze`
+    # уезжал в модель с одними title+body — агент переоткрывал вопросы,
+    # закрытые в комментариях.
+    description = (
+        await asyncio.to_thread(_build_task_context, analyze)
+        if stage_name == "task"
+        else f"{analyze.title}\n\n{analyze.body}"
+    )
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
     await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
@@ -708,61 +718,6 @@ async def publish_analysis(analyze: AnalyzeInput) -> str:
 async def cleanup_workspace(analyze: AnalyzeInput) -> None:
     """Best-effort снос рабочего каталога прогона."""
     await asyncio.to_thread(shutil.rmtree, str(_workspace_dir(analyze)), ignore_errors=True)
-
-
-@activity.defn
-async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
-    """Полный прогон SA-helper одной activity.
-
-    Одна activity, а не пять: клон, упаковка и стадии делят рабочий каталог на
-    локальном диске одного процесса — разбиение по activity потребовало бы
-    общего тома. Heartbeat идёт ВНУТРИ каждой долгой стадии через
-    _run_with_heartbeat, а не только между ними: одна стадия claude -p может
-    занять до CLAUDE_STAGE_TIMEOUT_SEC (900с) при heartbeat_timeout воркфлоу в
-    300с — без сигнала изнутри стадии сервер счёл бы activity мёртвой и (при
-    maximum_attempts=1) уронил бы весь прогон (та же причина, по которой
-    heartbeat вообще нужен — долгие стадии уже приводили к ложным срабатываниям
-    детектора дедлоков, worker/worker.py:44-51).
-
-    Каждый блокирующий вызов (git/repomix/claude/REST) идёт через
-    asyncio.to_thread (напрямую или через _run_with_heartbeat): воркер крутит
-    один event loop с max_concurrent_activities, и синхронный subprocess.run
-    на 900с заблокировал бы поток целиком — другие issue встали бы, а
-    activity.heartbeat не смог бы уйти на сервер (ему нужен тот же loop).
-    Вынос в поток освобождает loop и делает heartbeat реальным.
-    """
-    workdir = tempfile.mkdtemp(prefix=f"analysis-{analyze.issue_number}-")
-    clone_dir = str(Path(workdir) / "repo")
-    try:
-        await _run_with_heartbeat(_clone_repo, analyze.repo, clone_dir, label="cloning")
-        activity.heartbeat("cloned")
-        await _run_with_heartbeat(_run_repomix, clone_dir, label="packing")
-        activity.heartbeat("packed")
-
-        description = await asyncio.to_thread(_build_task_context, analyze)
-        for name, prompt, expected in _fnr_stages(description):
-            await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=name)
-            if expected and not (Path(clone_dir) / expected).exists():
-                raise RuntimeError(f"стадия {name}: артефакт {expected} не создан")
-            activity.heartbeat(name)
-
-        files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
-        if not files:
-            raise RuntimeError("пайплайн не произвёл ни одного артефакта")
-
-        branch = f"research/issue-{analyze.issue_number}"
-        await asyncio.to_thread(
-            github_client.push_artifacts_to_branch,
-            analyze.repo, branch, files,
-            f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
-        )
-        await asyncio.to_thread(
-            github_client.post_comment,
-            analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
-        )
-        return branch
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # --- Тяжёлые стадии: TODO, те же незакрытые вопросы, что были на Actions ---

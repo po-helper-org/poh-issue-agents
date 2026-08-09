@@ -1,7 +1,7 @@
 # Наблюдаемость доставки вебхуков — почему issue не доехал до Temporal
 
 - **Дата:** 2026-08-05
-- **Статус:** согласован, ожидает ревью спеки
+- **Статус:** реализовано (PR к задачам #27, #28, #29)
 - **Ветка:** `claude/fix-labeled-signal-with-start`
 - **Затрагивает:** `webhook/main.py`, `worker/workflows.py`, `worker/worker.py`,
   `worker/github_client.py`, `shared/workflow_types.py`, `scripts/diag.py` (новый),

@@ -7,7 +7,7 @@ Actions.
 
 Для po-helper/SA-helper (Claude Code skills) используется ДРУГОЙ путь —
 Anthropic-совместимый эндпоинт z.ai через переменные окружения ANTHROPIC_*,
-см. activities.run_analysis_pipeline (запускает `claude -p` как subprocess,
+см. activities.run_fnr_stage (запускает `claude -p` как subprocess,
 а не через этот клиент).
 """
 

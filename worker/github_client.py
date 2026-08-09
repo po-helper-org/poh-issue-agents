@@ -90,11 +90,35 @@ def _installation_token_headers(repo: str) -> dict:
             "Accept": "application/vnd.github+json"}
 
 
+_pat_over_app_warned = False
+
+
+def _warn_pat_over_app() -> None:
+    """Один раз на процесс: PAT задан вместе с App и молча его отключает.
+
+    Симптом на стороне GitHub — всё постится от имени владельца токена, а не от
+    приложения, и понять это по поведению нельзя. Одиночный PAT — штатный
+    dev-фолбэк, он молчит; предупреждаем только про КОНФЛИКТ настроек.
+    Предупреждение одноразовое: _auth_headers зовётся на каждый REST-вызов.
+    """
+    global _pat_over_app_warned
+    if _pat_over_app_warned:
+        return
+    _pat_over_app_warned = True
+    _log.warning(
+        "GH_TOKEN/GITHUB_TOKEN задан одновременно с GITHUB_APP_ID: GitHub App НЕ "
+        "используется, все действия идут от имени владельца токена. Убери PAT, "
+        "если ожидаешь работу от приложения (см. scripts/diag.py)."
+    )
+
+
 def _auth_headers(repo: str) -> dict:
     """PAT path for the pilot: if GH_TOKEN/GITHUB_TOKEN is set, use it directly
     (repo-agnostic) and skip the GitHub App flow. Otherwise per-repo App auth."""
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
+        if os.environ.get("GITHUB_APP_ID"):
+            _warn_pat_over_app()
         return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     return _installation_token_headers(repo)
 
