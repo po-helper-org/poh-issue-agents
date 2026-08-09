@@ -35,6 +35,7 @@ from shared.commands import (
     parse_label_command,
 )
 from shared.authz import may_trigger, trigger_allowlist
+from shared.labels import parse_root_issue
 from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import (
@@ -101,6 +102,30 @@ def verify_signature(body: bytes, signature_header: str | None) -> None:
 # запуска, и разъехавшись, они потеряли бы идемпотентность.
 workflow_id_for = issue_workflow_id
 estimate_workflow_id_for = estimate_workflow_id
+
+
+def _search_attributes(repo: str, payload: dict, issue_number: int) -> dict | None:
+    """Сквозной ключ цепочки в Temporal: `RootIssue` и `Repo`.
+
+    Они дают одну ленту на всю цепочку от триажа Issue до стоп-слова на PR —
+    ради этого протокол и предпочитает централизованный кластер трём
+    изолированным.
+
+    За флагом TEMPORAL_SEARCH_ATTRIBUTES, потому что атрибут, не
+    зарегистрированный на кластере, роняет САМ старт воркфлоу:
+
+        temporal operator search-attribute create --name RootIssue --type Int
+        temporal operator search-attribute create --name Repo --type Keyword
+
+    Пока оператор их не завёл, включение сломало бы обработку целиком — цена
+    ошибки конфигурации несопоставима с пользой от фильтра в UI.
+    """
+    if not os.environ.get("TEMPORAL_SEARCH_ATTRIBUTES", "").strip():
+        return None
+    # Для обычного Issue корень — он сам; у follow-up он указан в теле строкой
+    # `root-issue: #N` (AGENT-PROTOCOL.md, раздел 3).
+    root = parse_root_issue((payload.get("issue") or {}).get("body")) or issue_number
+    return {"Repo": [repo], "RootIssue": [root]}
 
 
 def _may_start_expensive(payload: dict, what: str, repo: str, issue_number: int) -> bool:
@@ -216,6 +241,7 @@ async def github_webhook(
                 ),
                 id=wf_id,
                 task_queue="issue-lifecycle",
+                search_attributes=_search_attributes(repo, payload, issue_number),
             )
 
         elif action == "labeled":
@@ -236,6 +262,7 @@ async def github_webhook(
                         build_analyze_input(payload),  # без comment_id: триггер — метка
                         id=analysis_workflow_id(repo, issue_number),
                         task_queue="issue-lifecycle",
+                        search_attributes=_search_attributes(repo, payload, issue_number),
                     )
                 except WorkflowAlreadyStartedError:
                     # Метку сняли и поставили заново, пока прогон идёт: второй
@@ -254,6 +281,7 @@ async def github_webhook(
                         EstimateRequest(repo=repo, issue_number=issue_number),
                         id=estimate_workflow_id_for(repo, issue_number),
                         task_queue="issue-lifecycle",
+                        search_attributes=_search_attributes(repo, payload, issue_number),
                     )
                 except WorkflowAlreadyStartedError:
                     _log.info("estimate already running for %s#%s", repo, issue_number)
@@ -286,6 +314,7 @@ async def github_webhook(
                     ),
                     id=wf_id,
                     task_queue="issue-lifecycle",
+                    search_attributes=_search_attributes(repo, payload, issue_number),
                     start_signal="human_decision",
                     start_signal_args=[label],
                 )

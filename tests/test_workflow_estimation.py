@@ -5,7 +5,12 @@ from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from shared.workflow_types import EstimateRequest, EstimateResult, EstimationContext
+from shared.workflow_types import (
+    EstimateRequest,
+    EstimateResult,
+    EstimationContext,
+    ProtocolState,
+)
 from workflows import IssueEstimation
 
 _state: dict = {}
@@ -55,13 +60,18 @@ async def stub_context_boom(req: EstimateRequest):
     raise RuntimeError("GitHub недоступен")
 
 
+@activity.defn(name="read_protocol_state")
+async def stub_protocol(repo: str, issue_number: int) -> ProtocolState:
+    return ProtocolState()
+
+
 @activity.defn(name="finish_command_labels")
 async def stub_finish(repo: str, issue_number: int, command: str, ok: bool):
     _state["finished"] = (command, ok)
 
 
 ALL_STUBS = [stub_ack, stub_context, stub_facts, stub_compute, stub_post, stub_error,
-             stub_finish]
+             stub_finish, stub_protocol]
 
 
 async def _run(activities_list):
@@ -94,7 +104,7 @@ async def test_happy_path_acks_then_posts():
 async def test_failure_reports_the_stage_it_broke_on():
     _state.clear()
     await _run([stub_ack, stub_context_boom, stub_facts, stub_compute, stub_post, stub_error,
-                stub_finish])
+                stub_finish, stub_protocol])
     assert _state["error_stage"] == "сбор контекста"
     # reason "ExcType: message" пробрасывается в activity (для тегов Sentry).
     assert "GitHub недоступен" in _state["error_reason"]

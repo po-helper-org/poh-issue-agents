@@ -23,7 +23,7 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import sentry_setup
+from shared import labels, sentry_setup
 from shared.commands import (
     ANALYZE,
     ESTIMATE,
@@ -43,6 +43,7 @@ from shared.workflow_types import (
     GateResult,
     IssueInput,
     PriorityResult,
+    ProtocolState,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,12 +154,73 @@ def close_as_spam(issue: IssueInput, reason: str) -> None:
 
 
 @activity.defn
-def escalate_to_human(issue: IssueInput) -> None:
+def escalate_to_human(issue: IssueInput, reason: str = "") -> None:
+    """Передача человеку. Метка — из общего словаря контура (`needs-human:*`),
+    чтобы одна выборка по организации показывала всю очередь к людям."""
     github_client.post_comment(
         issue.repo, issue.issue_number,
-        "Не удалось сузить запрос за отведённое число уточнений. Передаю на ручной разбор.",
+        reason or "Не удалось сузить запрос за отведённое число уточнений. "
+                  "Передаю на ручной разбор.",
     )
-    github_client.add_label(issue.repo, issue.issue_number, "needs-human-triage")
+    github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_HUMAN_TRIAGE)
+
+
+@activity.defn
+def post_agents_off_notice(repo: str, issue_number: int, what: str) -> None:
+    """Короткий ответ на явную команду человека при поднятом рубильнике.
+
+    Молча проигнорировать нельзя: команду набрал человек и ждёт результата, а
+    тишина неотличима от поломки. Комментарий бюджета не стоит — правило R4
+    защищает от вызовов LLM, а не от одной строки в треде.
+    """
+    github_client.post_comment(
+        repo, issue_number,
+        f"⏸️ На Issue стоит `{labels.AGENTS_OFF}` — `{what}` не запускаю. "
+        "Сними метку, если работа агентов снова нужна.",
+    )
+
+
+@activity.defn
+def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
+    """Состояние Issue по протоколу — одно чтение на старте (правило R2).
+
+    Три вопроса сразу, потому что каждый меняет маршрут целиком:
+
+    - `agents:off` — человек забрал Issue себе. Проверяется здесь, ДО первого
+      обращения к LLM: смысл рубильника в том, чтобы не тратить бюджет (R4).
+    - `origin:agent` — Issue создал агент, значит он уже классифицирован, и
+      advisor-ответ был бы разговором сервиса с самим собой (R6).
+    - глубина цепочки — follow-up, порождённый follow-up-ом. Родителя ищем по
+      строке `root-issue: #N` в теле; если у родителя тоже `origin:agent`,
+      цепочка пошла на второй круг и дальше её ведёт человек (R7). Иначе контур
+      начинает кормить сам себя: каждый PR рождает Issue, каждый Issue — PR.
+
+    Родитель читается ТОЛЬКО когда сам Issue от агента: для обычной задачи это
+    лишний вызов GitHub на каждом прогоне.
+    """
+    issue = github_client.get_issue(repo, issue_number)
+    names = [label["name"] for label in issue.get("labels", [])]
+    origin_agent = labels.has(names, labels.ORIGIN_AGENT)
+    root_issue = labels.parse_root_issue(issue.get("body"))
+
+    depth_exceeded = False
+    if origin_agent and root_issue is not None:
+        try:
+            parent = github_client.get_issue(repo, root_issue)
+            parent_names = [label["name"] for label in parent.get("labels", [])]
+            depth_exceeded = labels.has(parent_names, labels.ORIGIN_AGENT)
+        except Exception as exc:
+            # Родителя могли удалить или он в другом репозитории. Это не повод
+            # ронять триаж: без доказательства второго круга считаем глубину
+            # допустимой — ложный стоп дороже лишнего прогона.
+            logger.warning("не прочитал родительский issue #%s: %s", root_issue, exc)
+
+    return ProtocolState(
+        agents_off=labels.has(names, labels.AGENTS_OFF),
+        origin_agent=origin_agent,
+        depth_exceeded=depth_exceeded,
+        root_issue=root_issue,
+    )
 
 
 @activity.defn

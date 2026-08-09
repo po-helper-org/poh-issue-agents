@@ -5,12 +5,18 @@ from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from shared.workflow_types import AnalyzeInput
+from shared.workflow_types import AnalyzeInput, ProtocolState
 from workflows import IssueAnalysis
 
 
 def _analyze():
     return AnalyzeInput(repo="o/r", issue_number=5, title="t", body="b", comment_id=1)
+
+
+@activity.defn(name="read_protocol_state")
+async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
+    """Рубильник `agents:off` снят — обычный прогон."""
+    return ProtocolState()
 
 
 def _finish_stub(calls):
@@ -57,7 +63,7 @@ async def test_orchestrates_all_stages_in_order():
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
                           activities=[ack, prepare, stage, publish, cleanup, publish_error,
-                                      _finish_stub(calls)]):
+                                      _finish_stub(calls), protocol_default]):
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
 
@@ -104,7 +110,7 @@ async def test_stage_failure_publishes_error_and_cleans_up():
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
                           activities=[ack, prepare, stage, publish, cleanup, publish_error,
-                                      _finish_stub(calls)]):
+                                      _finish_stub(calls), protocol_default]):
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
 
@@ -154,7 +160,7 @@ async def test_cleanup_failure_does_not_mask_success():
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
                           activities=[ack, prepare, stage, publish, cleanup, publish_error,
-                                      _finish_stub(calls)]):
+                                      _finish_stub(calls), protocol_default]):
             # завершается без ошибки, несмотря на падение cleanup
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
