@@ -16,6 +16,8 @@ import urllib.parse
 import jwt
 import requests
 
+from shared.labels import ORIGIN_AGENT
+
 _log = logging.getLogger("github_client")
 
 
@@ -367,7 +369,16 @@ def create_pr_with_files(repo: str, branch: str, base: str,
                          json={"title": title, "head": branch, "base": base,
                                "body": body}, timeout=30)
     resp.raise_for_status()
-    return resp.json()["html_url"]
+    pr = resp.json()
+    # R6 протокола: артефакт, созданный агентом, помечается провенансом. PR
+    # консолидации — единственное, что этот сервис создаёт сам, и без метки
+    # агенты не отличают его от работы человека. Best-effort: PR уже создан, и
+    # сбой пометки не должен превратить успешный прогон в ошибку.
+    try:
+        add_label(repo, pr["number"], ORIGIN_AGENT)
+    except Exception as exc:
+        _log.warning("PR %s создан, но не помечен %s: %s", pr["number"], ORIGIN_AGENT, exc)
+    return pr["html_url"]
 
 
 def list_open_issues(repo: str, limit: int = 300) -> list:

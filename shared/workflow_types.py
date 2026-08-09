@@ -29,6 +29,21 @@ class WebhookAuditInput:
 
 
 @dataclass
+class ProtocolState:
+    """Состояние Issue по протоколу агентов, прочитанное ОДИН раз на старте.
+
+    Правило R2: агент не полагается на порядок вебхуков и не хранит
+    предположений о том, чего не проверил сам. Поэтому все три вопроса —
+    выключен ли контур, свой ли это вход и не слишком ли глубока цепочка —
+    задаются одним чтением, а не размазаны по стадиям.
+    """
+    agents_off: bool = False       # R4: человек забрал Issue себе
+    origin_agent: bool = False     # R6: Issue создан агентом, уже классифицирован
+    depth_exceeded: bool = False   # R7: follow-up, порождённый follow-up-ом
+    root_issue: int | None = None  # сквозной ключ цепочки из тела
+
+
+@dataclass
 class GateResult:
     status: str  # "SPAM" | "VAGUE" | "SUFFICIENT"
     content: str

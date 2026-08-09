@@ -17,6 +17,7 @@ from shared.workflow_types import (
     GateResult,
     IssueInput,
     PriorityResult,
+    ProtocolState,
 )
 from workflows import IssueLifecycle
 
@@ -28,6 +29,12 @@ def _issue(interactive: bool = True) -> IssueInput:
 
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
+
+
+@activity.defn(name="read_protocol_state")
+async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
+    """Обычный Issue от человека: рубильник выключен, цепочки нет."""
+    return ProtocolState()
 
 
 @activity.defn(name="prefilter_bot_and_security")
@@ -93,7 +100,7 @@ async def _run_to_completion(activities_list, issue: IssueInput) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
-                          activities=activities_list):
+                          activities=[*activities_list, protocol_default]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, issue, id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()
@@ -107,7 +114,8 @@ async def test_parked_run_says_it_waits_for_a_human():
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
                           activities=[prefilter_ok, gate_sufficient, classify_feature,
-                                      duplicate_none, score, post_priority]):
+                                      duplicate_none, score, post_priority,
+                                      protocol_default]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 

@@ -32,6 +32,8 @@ async def main() -> None:
                    WebhookAudit],
         activities=[
             activities.prefilter_bot_and_security,
+            activities.read_protocol_state,
+            activities.post_agents_off_notice,
             activities.intake_gate,
             activities.post_clarifying_question,
             activities.close_as_spam,

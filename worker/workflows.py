@@ -25,6 +25,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.commands import ANALYZE, ESTIMATE
     from shared.workflow_types import (
         AnalyzeInput,
+        ClassificationResult,
         EstimateRequest,
         EstimateResult,
         IssueInput,
@@ -112,6 +113,30 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> None:
             workflow.logger.warning(
                 "cleanup_workspace failed (best-effort, ignored): %s", cleanup_exc
             )
+
+
+async def _agents_off(repo: str, issue_number: int, what: str) -> bool:
+    """R4: человек забрал Issue себе — прогон не стартует.
+
+    Проверка стоит ПЕРВЫМ шагом обоих командных воркфлоу, до ack и до любой
+    работы: смысл рубильника в том, чтобы не потратить бюджет, а не в том,
+    чтобы красиво остановиться посередине.
+    """
+    state = await workflow.execute_activity(
+        activities.read_protocol_state,
+        args=[repo, issue_number],
+        start_to_close_timeout=timedelta(seconds=30),
+        retry_policy=RetryPolicy(maximum_attempts=3),
+    )
+    if not state.agents_off:
+        return False
+    await workflow.execute_activity(
+        activities.post_agents_off_notice,
+        args=[repo, issue_number, what],
+        start_to_close_timeout=timedelta(seconds=30),
+        retry_policy=RetryPolicy(maximum_attempts=3),
+    )
+    return True
 
 
 async def _finish_labels(repo: str, issue_number: int, command: str, ok: bool) -> None:
@@ -245,30 +270,52 @@ class IssueLifecycle:
                 self._stage = "skipped"
                 return  # bot-authored / security-sensitive — дальше не идём
 
-            # --- Intake Gate (дешёвая модель) с циклом уточнений ---
-            gate = await workflow.execute_activity(
-                activities.intake_gate,
-                args=[issue, []],  # [] — переписки уточнений ещё нет
-                start_to_close_timeout=timedelta(seconds=120),
+            # --- Состояние по протоколу: одно чтение на старте (R2) ---
+            state = await workflow.execute_activity(
+                activities.read_protocol_state,
+                args=[issue.repo, issue.issue_number],
+                start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
 
-            # Batch/backfill mode: no human answers clarifications for 39 issues,
-            # so a VAGUE issue must escalate, not park on _wait_for_signal() forever.
-            if gate.status == "VAGUE" and not issue.interactive:
+            # R4: человек забрал Issue себе. Стоп ДО первого вызова LLM — в этом
+            # весь смысл рубильника, иначе бюджет уже потрачен.
+            if state.agents_off:
+                self._stage = "agents-off"
+                return
+
+            # R7: follow-up, порождённый follow-up-ом. Дальше цепочку ведёт
+            # человек, иначе контур кормит сам себя.
+            if state.depth_exceeded:
                 await workflow.execute_activity(
                     activities.escalate_to_human,
-                    issue,
+                    args=[issue, "Цепочка follow-up пошла на второй круг — "
+                                 "останавливаю автоматическую обработку (правило R7 "
+                                 "протокола агентов). Дальше нужен человек."],
                     start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=default_retry,
                 )
                 self._stage = "escalated"
                 return
 
-            comment_thread: list[str] = []
-            round_count = 0
-            while gate.status == "VAGUE":
-                round_count += 1
-                if round_count > MAX_CLARIFICATION_ROUNDS:
+            # R6: Issue создан агентом — он уже классифицирован. Intake gate и
+            # advisor-ответ пропускаем: это был бы разговор сервиса с самим собой.
+            # Остаются дедуп и приоритет — они по-прежнему нужны.
+            classification: ClassificationResult | None = None
+            if state.origin_agent:
+                self._stage = "duplicate-check"
+            else:
+                # --- Intake Gate (дешёвая модель) с циклом уточнений ---
+                gate = await workflow.execute_activity(
+                    activities.intake_gate,
+                    args=[issue, []],  # [] — переписки уточнений ещё нет
+                    start_to_close_timeout=timedelta(seconds=120),
+                    retry_policy=default_retry,
+                )
+
+                # Batch/backfill mode: no human answers clarifications for 39 issues,
+                # so a VAGUE issue must escalate, not park on _wait_for_signal() forever.
+                if gate.status == "VAGUE" and not issue.interactive:
                     await workflow.execute_activity(
                         activities.escalate_to_human,
                         issue,
@@ -277,49 +324,62 @@ class IssueLifecycle:
                     self._stage = "escalated"
                     return
 
-                await workflow.execute_activity(
-                    activities.post_clarifying_question,
-                    args=[issue, gate.content],
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
+                comment_thread: list[str] = []
+                round_count = 0
+                while gate.status == "VAGUE":
+                    round_count += 1
+                    if round_count > MAX_CLARIFICATION_ROUNDS:
+                        await workflow.execute_activity(
+                            activities.escalate_to_human,
+                            issue,
+                            start_to_close_timeout=timedelta(seconds=30),
+                        )
+                        self._stage = "escalated"
+                        return
 
-                # Ждём ответ пользователя без таймаута — это может быть и через
-                # 5 минут, и через 3 дня, Temporal не против.
-                raw = await self._wait_for_signal()
-                if raw and raw.startswith("__comment__:"):
-                    comment_thread.append(raw[len("__comment__:"):])
+                    await workflow.execute_activity(
+                        activities.post_clarifying_question,
+                        args=[issue, gate.content],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
 
-                gate = await workflow.execute_activity(
-                    activities.intake_gate,
-                    args=[issue, comment_thread],
-                    start_to_close_timeout=timedelta(seconds=120),
+                    # Ждём ответ пользователя без таймаута — это может быть и через
+                    # 5 минут, и через 3 дня, Temporal не против.
+                    raw = await self._wait_for_signal()
+                    if raw and raw.startswith("__comment__:"):
+                        comment_thread.append(raw[len("__comment__:"):])
+
+                    gate = await workflow.execute_activity(
+                        activities.intake_gate,
+                        args=[issue, comment_thread],
+                        start_to_close_timeout=timedelta(seconds=120),
+                        retry_policy=default_retry,
+                    )
+
+                if gate.status == "SPAM":
+                    self._stage = "spam"
+                    await workflow.execute_activity(
+                        activities.close_as_spam,
+                        args=[issue, gate.content],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    return
+
+                # --- Классификация (более сильная модель) ---
+                self._stage = "classify"
+                classification = await workflow.execute_activity(
+                    activities.classify_issue,
+                    issue,
+                    start_to_close_timeout=timedelta(seconds=180),
                     retry_policy=default_retry,
                 )
 
-            if gate.status == "SPAM":
-                self._stage = "spam"
-                await workflow.execute_activity(
-                    activities.close_as_spam,
-                    args=[issue, gate.content],
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
-                return
-
-            # --- Классификация (более сильная модель) ---
-            self._stage = "classify"
-            classification = await workflow.execute_activity(
-                activities.classify_issue,
-                issue,
-                start_to_close_timeout=timedelta(seconds=180),
-                retry_policy=default_retry,
-            )
-
-            if classification.label in (
-                "advisor:existing-functionality",
-                "advisor:consultation",
-            ):
-                self._stage = "answered"
-                return  # закрыт содержательным ответом, дальше пайплайн не идёт
+                if classification.label in (
+                    "advisor:existing-functionality",
+                    "advisor:consultation",
+                ):
+                    self._stage = "answered"
+                    return  # закрыт содержательным ответом, дальше пайплайн не идёт
 
             # --- Duplicate Check ---
             self._stage = "duplicate-check"
@@ -362,7 +422,14 @@ class IssueLifecycle:
         self._stage = "awaiting-human-decision"
         decision = await self._wait_for_signal()
 
-        if decision == "research-me" and classification.label == "advisor:feature-request":
+        # `classification is None` — сокращённый триаж (Issue от агента): он уже
+        # классифицирован на стороне создателя, и гвард «тип совпал с лейблом»
+        # здесь не на чем проверять. Пропускаем, а не блокируем: иначе follow-up
+        # от PR-Closer нельзя было бы отправить в аналитику вообще.
+        feature = classification is None or classification.label == "advisor:feature-request"
+        bug = classification is None or classification.label == "advisor:bug"
+
+        if decision == "research-me" and feature:
             # Лейбл research-me — второй вход в ту же аналитику Слоя C, что и
             # команда /analyze, но БЕЗ ack_command: триггер тут лейбл, а не
             # комментарий, так что подтверждать нечего. Дальше — ровно тот же
@@ -381,7 +448,7 @@ class IssueLifecycle:
                 retry_policy=default_retry,
             )
             await _run_staged_analysis(analyze_input)
-        elif decision == "bug-me" and classification.label == "advisor:bug":
+        elif decision == "bug-me" and bug:
             self._stage = "bug"
             await workflow.execute_activity(
                 activities.run_bug_pipeline,
@@ -417,6 +484,8 @@ class IssueAnalysis:
 
     @workflow.run
     async def run(self, analyze: AnalyzeInput) -> None:
+        if await _agents_off(analyze.repo, analyze.issue_number, "/analyze"):
+            return
         await workflow.execute_activity(
             activities.ack_command,
             analyze,
@@ -442,6 +511,8 @@ class IssueEstimation:
         default_retry = RetryPolicy(maximum_attempts=3)
         # Стадия нужна, чтобы человек в комментарии увидел, ЧТО именно
         # сломалось, а не абстрактное «ошибка обработки».
+        if await _agents_off(req.repo, req.issue_number, "/estimate"):
+            return
         stage = "подтверждение команды"
         try:
             await workflow.execute_activity(
