@@ -1,0 +1,35 @@
+name: tests
+
+# Зелёный прогон перестаёт быть добровольным: до этого 271 тест гонялся только
+# руками через `make test`, и регрессия попадала в main беспрепятственно.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Та же версия, что в обоих образах (worker/Dockerfile, webhook/Dockerfile):
+          # тесты должны падать там же, где упадёт прод, а не на версии CI.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установка зависимостей
+        # Тесты импортируют и воркер, и вебхук: нужны оба набора, не только dev.
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt \
+                      -r worker/requirements.txt \
+                      -r webhook/requirements.txt
+
+      - name: Тесты и покрытие
+        # Порог покрытия задан в .coveragerc; падение ниже роняет шаг.
+        run: pytest

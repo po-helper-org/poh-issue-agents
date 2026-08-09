@@ -21,7 +21,10 @@ Actions. Два независимых сценария: **триаж каждо
 | **Тяжёлая стадия по багам** `run_bug_pipeline` (перенос `bug-pipeline.yml`) | ❌ `NotImplementedError` — не реализовано | — |
 | **OpenHands resolver** | ❌ `NotImplementedError`, намеренно вне этого compose | — |
 
-Тесты: **271 тест**, `make test` (после `make setup` — цель зовёт `.venv/bin/pytest`).
+Тесты: **295 тестов**, покрытие **84%**. Локально — `make test` (после `make setup`
+цель зовёт `.venv/bin/pytest`), на каждый push и PR — GitHub Actions
+(`.github/workflows/tests.yml`). Порог покрытия — `.coveragerc`, `fail_under = 83`:
+он держит текущий уровень, чтобы тот не проседал незаметно, а не задаёт цель.
 
 ---
 

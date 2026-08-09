@@ -1,0 +1,20 @@
+# Конфигурация замера покрытия. Живёт отдельным файлом, а не в pytest.ini:
+# coverage.py читает только .coveragerc, setup.cfg, tox.ini или pyproject.toml.
+
+[run]
+source = worker, shared, webhook, scripts
+omit =
+    # Ручной инструмент проверки связи с Temporal: запускается человеком,
+    # логики не несёт. Тест на него проверял бы заглушку, а не поведение.
+    scripts/smoke_temporal.py
+    */__init__.py
+
+[report]
+# Порог держит текущий уровень, а не задаёт цель: смысл в том, чтобы покрытие
+# не проседало незаметно. Поднимать — отдельным осознанным решением.
+fail_under = 83
+skip_covered = True
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError
