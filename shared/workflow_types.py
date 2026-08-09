@@ -13,6 +13,22 @@ class IssueInput:
 
 
 @dataclass
+class WebhookAuditInput:
+    """След доставки, отброшенной вебхуком по конфигу.
+
+    Существует только ради видимости: workflow с таким входом — единственный
+    способ узнать, что событие приходило и было отклонено (GitHub получает 200,
+    ничего другого не остаётся).
+    """
+    delivery_id: str  # X-GitHub-Delivery: уникален на доставку, даёт идемпотентность
+    event: str
+    action: str
+    repo: str
+    reason: str  # пока единственная причина — "repo_not_allowed"
+    allowlist: list[str] = field(default_factory=list)
+
+
+@dataclass
 class GateResult:
     status: str  # "SPAM" | "VAGUE" | "SUFFICIENT"
     content: str

@@ -34,6 +34,7 @@ from shared.commands import (
     parse_command,
     parse_label_command,
 )
+from shared.authz import may_trigger, trigger_allowlist
 from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import (
@@ -51,6 +52,31 @@ _log = logging.getLogger("webhook")
 app = FastAPI()
 
 HUMAN_DECISION_LABELS = {"research-me", "bug-me", "build-me"}
+
+
+def _log_effective_config() -> None:
+    """Один раз на старте — какой конфиг реально действует.
+
+    Секреты не логируются: только режим авторизации. Полная картина —
+    `scripts/diag.py` внутри контейнера; эта строка нужна, чтобы после
+    передеплоя не гадать, подхватились ли переменные.
+    """
+    specs = [s for s in allowed_specs() if s.strip()]
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        auth = "PAT (перебивает GitHub App)" if os.environ.get("GITHUB_APP_ID") else "PAT"
+    elif os.environ.get("GITHUB_APP_ID"):
+        auth = "GitHub App"
+    else:
+        auth = "НЕ НАСТРОЕНА"
+    _log.info(
+        "effective config: ISSUE_AGENT_REPOS=%s auth=%s temporal=%s/%s",
+        specs or ["(пусто — любой репозиторий)"], auth,
+        os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"),
+        os.environ.get("TEMPORAL_NAMESPACE", "default"),
+    )
+
+
+_log_effective_config()
 
 _temporal_client: Client | None = None
 
@@ -77,11 +103,75 @@ workflow_id_for = issue_workflow_id
 estimate_workflow_id_for = estimate_workflow_id
 
 
+def _may_start_expensive(payload: dict, what: str, repo: str, issue_number: int) -> bool:
+    """Гейт на запуск дорогой стадии + аудит того, кто её запустил.
+
+    Проверяем автора события, а не факт наличия метки: метку может поставить
+    любой с правами на репозиторий, и это самый дешёвый способ потратить чужие
+    токены. Дешёвые пути (issues.opened, обычные комментарии) сюда не приходят —
+    триаж обязан работать для всех.
+
+    Отказ только логируем: вебхук — чистый транспорт, GitHub-клиента у него нет,
+    и заводить его ради комментария «недостаточно прав» значит дать наружу
+    процессу право писать в Issue.
+    """
+    login = (payload.get("sender") or {}).get("login")
+    allowlist = trigger_allowlist()
+    if may_trigger(login, allowlist):
+        # Аудит: кто и когда запустил дорогую стадию (время ставит логгер).
+        _log.info("expensive trigger %s by %s on %s#%s", what, login, repo, issue_number)
+        return True
+    _log.warning(
+        "отклонён запуск %s: %s не входит в AGENT_TRIGGER_ALLOWLIST %s (%s#%s)",
+        what, login, allowlist, repo, issue_number,
+    )
+    return False
+
+
+async def _audit_dropped_delivery(payload: dict, event: str, delivery_id: str | None,
+                                  repo: str, specs: list[str]) -> None:
+    """След в Temporal UI для события, отброшенного по allowlist.
+
+    Единственный молчаливый отказ, о котором иначе неоткуда узнать: workflow не
+    создаётся, GitHub получает 200. Аудит-воркфлоу не исполняет ни одной
+    activity — его ценность в том, что вход виден там же, где смотрят всё
+    остальное: пришло, отклонено, вот причина и вот действовавший allowlist.
+
+    Без заголовка X-GitHub-Delivery (ручной curl, тест) аудит пропускаем: без
+    уникального id ретраи GitHub плодили бы дубли. Сбой самого аудита тоже не
+    должен ронять обработку — это диагностика, а не путь события.
+    """
+    if not delivery_id:
+        return
+    from shared.workflow_types import WebhookAuditInput
+
+    try:
+        client = await get_temporal_client()
+        await client.start_workflow(
+            "WebhookAudit",
+            WebhookAuditInput(
+                delivery_id=delivery_id,
+                event=event,
+                action=str(payload.get("action") or ""),
+                repo=repo,
+                reason="repo_not_allowed",
+                allowlist=specs,
+            ),
+            id=f"webhook-drop-{delivery_id}",
+            task_queue="issue-lifecycle",
+        )
+    except WorkflowAlreadyStartedError:
+        pass  # ретрай той же доставки — запись уже есть
+    except Exception as exc:
+        _log.warning("не удалось записать аудит отброшенной доставки: %s", exc)
+
+
 @app.post("/webhook")
 async def github_webhook(
     request: Request,
     x_github_event: str = Header(...),
     x_hub_signature_256: str | None = Header(None),
+    x_github_delivery: str | None = Header(None),
 ):
     body = await request.body()
     verify_signature(body, x_hub_signature_256)
@@ -91,7 +181,16 @@ async def github_webhook(
     # любой установленный). Чужой репозиторий игнорируем до старта workflow.
     repo_full = (payload.get("repository") or {}).get("full_name")
     if repo_full and not is_allowed(repo_full, allowed_specs()):
-        _log.info("ignored repo %s (not in ISSUE_AGENT_REPOS)", repo_full)
+        specs = [s for s in allowed_specs() if s.strip()]
+        # warning, а не info, и вместе с действующим allowlist: строка лога
+        # обязана сама говорить, что чинить. Раньше отказ был неотличим от
+        # тишины — GitHub видел 200, в Temporal не появлялось ничего.
+        _log.warning(
+            "ignored repo %s — not in ISSUE_AGENT_REPOS %s; событие отброшено до Temporal",
+            repo_full, specs or ["(пусто)"],
+        )
+        await _audit_dropped_delivery(payload, x_github_event, x_github_delivery,
+                                      repo_full, specs)
         return {"ok": True}
 
     client = await get_temporal_client()
@@ -129,6 +228,8 @@ async def github_webhook(
             command = parse_label_command(label)
 
             if command == ANALYZE:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
                 try:
                     await client.start_workflow(
                         "IssueAnalysis",
@@ -143,6 +244,8 @@ async def github_webhook(
                 return {"ok": True}
 
             if command == ESTIMATE:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
                 from shared.workflow_types import EstimateRequest
 
                 try:
@@ -157,6 +260,8 @@ async def github_webhook(
                 return {"ok": True}
 
             if label in HUMAN_DECISION_LABELS:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
                 from shared.workflow_types import IssueInput
 
                 # signal-with-start, а не голый signal: лейбл прилетает и по
@@ -203,6 +308,8 @@ async def github_webhook(
         command = parse_command(payload["comment"].get("body") or "")
 
         if command == ESTIMATE:
+            if not _may_start_expensive(payload, "/estimate", repo, issue_number):
+                return {"ok": True}
             from shared.workflow_types import EstimateRequest
 
             comment_id = payload["comment"]["id"]
@@ -221,6 +328,8 @@ async def github_webhook(
             return {"ok": True}
 
         if command == ANALYZE:
+            if not _may_start_expensive(payload, "/analyze", repo, issue_number):
+                return {"ok": True}
             analyze = build_analyze_input(payload)
 
             # Живому воркфлоу триажа шлём только уведомление — оно повесит метку

@@ -92,10 +92,32 @@ async def stub_post_priority_comment(issue: IssueInput, priority: PriorityResult
     pass
 
 
-@activity.defn(name="run_analysis_pipeline")
-async def stub_pipeline_fails(analyze: AnalyzeInput) -> str:
-    _research_state.setdefault("attempts", []).append(1)
-    raise RuntimeError("boom-research-me")
+@activity.defn(name="prepare_workspace")
+async def stub_prepare(analyze: AnalyzeInput) -> None:
+    _research_state["prepared"] = True
+
+
+@activity.defn(name="run_fnr_stage")
+async def stub_stage_fails(analyze: AnalyzeInput, stage_name: str) -> dict:
+    """Ветка research-me идёт теми же пер-стадийными activity, что и /analyze:
+    падение конкретной стадии обязано называть себя, а не прятаться под общим
+    потолком монолита."""
+    _research_state.setdefault("stages", []).append(stage_name)
+    if stage_name == "concept":
+        _research_state.setdefault("attempts", []).append(1)
+        raise RuntimeError("boom-research-me")
+    return {"stage": stage_name, "artifact": None, "bytes": 0}
+
+
+@activity.defn(name="publish_analysis")
+async def stub_publish(analyze: AnalyzeInput) -> str:
+    _research_state["published"] = True
+    return "research/issue-7"
+
+
+@activity.defn(name="cleanup_workspace")
+async def stub_cleanup(analyze: AnalyzeInput) -> None:
+    _research_state["cleaned"] = True
 
 
 @activity.defn(name="publish_analysis_error")
@@ -124,8 +146,8 @@ async def test_research_me_label_surfaces_pipeline_failure():
             env.client, task_queue="tq-research", workflows=[IssueLifecycle],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_pipeline_fails, stub_publish_error, stub_mark_running,
-                        stub_finish_labels],
+                        stub_prepare, stub_stage_fails, stub_publish, stub_cleanup,
+                        stub_publish_error, stub_mark_running, stub_finish_labels],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -141,6 +163,11 @@ async def test_research_me_label_surfaces_pipeline_failure():
 
     assert _research_state["attempts"] == [1], "дорогой прогон не должен ретраиться"
     assert "boom-research-me" in _research_state["reason"]
+    # Остановились на сорвавшейся стадии и не пошли дальше по цепочке.
+    assert _research_state["stages"] == ["task", "concept"]
+    assert "published" not in _research_state
+    # Каталог прогона снимается на обоих путях.
+    assert _research_state["cleaned"] is True
     # Прогон по метке research-me виден в выборке `label:run:*`, пока идёт, и
     # получает метку исхода, когда закончился, — как и запуск через run:analyze.
     assert _research_state["running"] == "analyze"

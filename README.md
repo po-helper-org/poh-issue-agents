@@ -21,7 +21,7 @@ Actions. Два независимых сценария: **триаж каждо
 | **Тяжёлая стадия по багам** `run_bug_pipeline` (перенос `bug-pipeline.yml`) | ❌ `NotImplementedError` — не реализовано | — |
 | **OpenHands resolver** | ❌ `NotImplementedError`, намеренно вне этого compose | — |
 
-Тесты: **241 тест**, `make test` (после `make setup` — цель зовёт `.venv/bin/pytest`).
+Тесты: **271 тест**, `make test` (после `make setup` — цель зовёт `.venv/bin/pytest`).
 
 ---
 
@@ -118,7 +118,7 @@ make consolidate   # или: scripts/consolidate.py --repo <owner>/<repo>
 - **LLM-стадии — синхронные `def`** (исполняются в ThreadPoolExecutor). Делать их
   `async def` нельзя, не вынеся блокирующий вызов: LLM-вызов прямо на event-loop
   замораживает воркер. Activity долгого анализа (`prepare_workspace`,
-  `run_fnr_stage`, `publish_analysis`, `run_analysis_pipeline`, …) — наоборот
+  `run_fnr_stage`, `publish_analysis`, …) — наоборот
   `async def`: им нужен heartbeat, а каждый блокирующий git/repomix/`claude -p`/REST
   внутри обёрнут в `asyncio.to_thread`, иначе heartbeat не уходит на сервер.
 
@@ -181,7 +181,7 @@ flowchart TD
 
     O --> P(["ПАРКОВКА №1<br/>ждём лейбл, без таймаута"])
     P -.->|"issues.labeled<br/>signal-with-start"| Q{"лейбл vs тип"}
-    Q -->|"research-me + feature-request"| R["run_analysis_pipeline<br/>FNR"]
+    Q -->|"research-me + feature-request"| R["пер-стадийный прогон FNR<br/>тот же, что у /analyze"]
     Q -->|"bug-me + advisor:bug"| R2["run_bug_pipeline<br/>NotImplementedError"]
     Q -->|не совпал| STOP4(["СТОП"])
 
@@ -270,6 +270,48 @@ label:failed:* — где прогон сорвался
 **Авторизации пока нет:** метку может поставить любой с правами на репозиторий,
 а прогон стоит токенов — allowlist по `sender.login` отслеживается в
 [#7](https://github.com/po-helper-org/poh-issue-agents/issues/7).
+
+## Диагностика: почему issue не доехал
+
+Событие может пропасть молча — репозиторий вне `ISSUE_AGENT_REPOS` отбрасывается
+до старта workflow, а `GH_TOKEN` незаметно подменяет GitHub App личным
+аккаунтом. Снаружи оба случая выглядят одинаково: GitHub получает 200, в
+Temporal пусто.
+
+```bash
+docker compose exec webhook python scripts/diag.py                   # весь конфиг
+docker compose exec webhook python scripts/diag.py --repo owner/name # доедет или нет
+```
+
+Скрипт печатает действующий allowlist и результат его разбора, режим авторизации
+(с явным предупреждением, когда PAT перебивает настроенный App), адрес и
+namespace Temporal с реальной проверкой связи. **Значения секретов не печатаются
+никогда** — только «задан / не задан». Код возврата: `0` — конфиг рабочий, `1` —
+Temporal недостижим либо авторизация не настроена вовсе.
+
+Запускать нужно ВНУТРИ контейнера: снаружи прочитается окружение хоста, а не
+сервиса. Тот же конфиг вебхук логирует одной строкой на старте.
+
+Что ещё видно без захода в контейнер:
+
+- **Отброшенная доставка** оставляет след в Temporal — воркфлоу
+  `webhook-drop-<delivery-id>` с причиной и действовавшим allowlist. Это
+  единственный молчаливый отказ, о котором иначе неоткуда узнать.
+- **Стадия триажа** доступна query `stage` на `IssueLifecycle` (вкладка Queries):
+  `intake` → `classify` → `duplicate-check` → `priority` →
+  `awaiting-human-decision` → `analysis`/`bug` → `awaiting-build-decision` →
+  `done`; ранние выходы — `skipped`, `spam`, `escalated`, `answered`,
+  `duplicate`, `failed`. Припаркованный прогон теперь отличим от зависшего.
+
+## Кто вправе запускать дорогие стадии
+
+`AGENT_TRIGGER_ALLOWLIST` — comma-separated GitHub-логины. Пусто = разрешено
+всем (поведение по умолчанию). Проверяется автор события (`sender.login`), а не
+факт наличия метки: `run:analyze` может поставить любой с правами на
+репозиторий, а прогон стоит токенов. Гейт закрывает метки `run:*`,
+`research-me`/`bug-me`/`build-me` и команды `/analyze`, `/estimate`; **триаж
+новых Issue открыт для всех** — иначе Issue от постороннего просто не
+обработается. Кто запустил дорогую стадию, видно в логе вебхука.
 
 ## Модель — GLM через z.ai
 
