@@ -9,6 +9,12 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Артефакты замера покрытия (pytest-cov) — пересобираются каждым прогоном
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # OS
 .DS_Store
 .env.bak.*
