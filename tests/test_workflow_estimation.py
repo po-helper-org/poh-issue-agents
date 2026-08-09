@@ -55,7 +55,13 @@ async def stub_context_boom(req: EstimateRequest):
     raise RuntimeError("GitHub недоступен")
 
 
-ALL_STUBS = [stub_ack, stub_context, stub_facts, stub_compute, stub_post, stub_error]
+@activity.defn(name="finish_command_labels")
+async def stub_finish(repo: str, issue_number: int, command: str, ok: bool):
+    _state["finished"] = (command, ok)
+
+
+ALL_STUBS = [stub_ack, stub_context, stub_facts, stub_compute, stub_post, stub_error,
+             stub_finish]
 
 
 async def _run(activities_list):
@@ -80,13 +86,18 @@ async def test_happy_path_acks_then_posts():
     assert _state["computed_from"] == {"work_type": "new_development"}
     assert _state["posted"] == "## Оценка задачи"
     assert "error_stage" not in _state
+    # Прогон закончился — Issue не должен остаться висеть в `run:estimate`.
+    assert _state["finished"] == ("estimate", True)
 
 
 @pytest.mark.timeout(60)
 async def test_failure_reports_the_stage_it_broke_on():
     _state.clear()
-    await _run([stub_ack, stub_context_boom, stub_facts, stub_compute, stub_post, stub_error])
+    await _run([stub_ack, stub_context_boom, stub_facts, stub_compute, stub_post, stub_error,
+                stub_finish])
     assert _state["error_stage"] == "сбор контекста"
     # reason "ExcType: message" пробрасывается в activity (для тегов Sentry).
     assert "GitHub недоступен" in _state["error_reason"]
     assert "posted" not in _state
+    # Сорвавшийся прогон помечается своей меткой, а не просто снятым run:*.
+    assert _state["finished"] == ("estimate", False)

@@ -10,6 +10,8 @@ def _analyze(comment_id=999):
 
 def test_ack_reacts_and_comments(monkeypatch):
     calls = []
+    monkeypatch.setattr(activities.github_client, "add_label",
+                        lambda repo, n, label: calls.append(("label", repo, n, label)))
     monkeypatch.setattr(activities.github_client, "add_reaction",
                         lambda repo, cid, content="eyes": calls.append(("reaction", repo, cid, content)))
     monkeypatch.setattr(activities.github_client, "post_comment",
@@ -20,6 +22,9 @@ def test_ack_reacts_and_comments(monkeypatch):
     assert ("reaction", "o/r", 999, "eyes") in calls
     comment = next(c for c in calls if c[0] == "comment")
     assert "/analyze" in comment[3]
+    # Прогон сам помечает себя идущим — иначе выборка `label:run:*` пропустила
+    # бы запуск командой в комментарии.
+    assert ("label", "o/r", 5, "run:analyze") in calls
 
 
 def test_ack_posts_comment_even_when_reaction_raises(monkeypatch):
@@ -30,6 +35,7 @@ def test_ack_posts_comment_even_when_reaction_raises(monkeypatch):
         raise RuntimeError("404 Not Found: comment deleted")
 
     posted = {}
+    monkeypatch.setattr(activities.github_client, "add_label", lambda *a: None)
     monkeypatch.setattr(activities.github_client, "add_reaction", boom)
     monkeypatch.setattr(activities.github_client, "post_comment",
                         lambda repo, n, body: posted.update(repo=repo, n=n, body=body))
@@ -46,6 +52,7 @@ def test_ack_skips_reaction_without_comment_id(monkeypatch):
         raise AssertionError("reaction attempted without comment_id")
 
     posted = {}
+    monkeypatch.setattr(activities.github_client, "add_label", lambda *a: None)
     monkeypatch.setattr(activities.github_client, "add_reaction", boom)
     monkeypatch.setattr(activities.github_client, "post_comment",
                         lambda repo, n, body: posted.update(repo=repo, n=n, body=body))
@@ -55,7 +62,8 @@ def test_ack_skips_reaction_without_comment_id(monkeypatch):
     # Ensure acknowledgement comment was still posted even without comment_id
     assert posted["repo"] == "o/r"
     assert posted["n"] == 5
-    assert "/analyze" in posted["body"]
+    # Без comment_id триггером была метка — её и называем, а не команду.
+    assert "run:analyze" in posted["body"]
 
 
 def test_error_comment_mentions_reason_and_retry(monkeypatch):

@@ -24,7 +24,15 @@ import estimation
 import github_client
 import llm
 from shared import sentry_setup
-from shared.commands import parse_command
+from shared.commands import (
+    ANALYZE,
+    ESTIMATE,
+    done_label,
+    failed_label,
+    parse_command,
+    run_label,
+    running_labels,
+)
 from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
@@ -172,6 +180,41 @@ async def mark_analyzing(repo: str, issue_number: int) -> None:
     """Видимая метка, что по Issue запущен автономный анализ (/analyze).
     add_label соблюдает DRY_RUN, отдельного гарда не нужно."""
     await asyncio.to_thread(github_client.add_label, repo, issue_number, "analyzing")
+
+
+# --- Метки состояния команды: run:<cmd> → done:<cmd> | failed:<cmd> ---
+
+@activity.defn
+async def mark_command_running(repo: str, issue_number: int, command: str) -> None:
+    """Метка «прогон идёт» ставится САМИМ прогоном, а не только триггером.
+
+    Иначе выборка `label:run:*` врала бы: запуск командой в комментарии не
+    оставлял бы следа в ленте Issue. Повторная установка той же метки для
+    GitHub безопасна — при запуске лейблом она уже висит."""
+    await asyncio.to_thread(github_client.add_label, repo, issue_number, run_label(command))
+
+
+@activity.defn
+async def finish_command_labels(repo: str, issue_number: int, command: str, ok: bool) -> None:
+    """Обратный ход: снять метки «идёт», повесить исход.
+
+    Неуспех получает СВОЮ метку, а не просто снятый `run:*`: молча снятая метка
+    неотличима от «никто не запускал», а именно это и нужно увидеть в ленте.
+
+    Best-effort по каждой метке: прогон уже состоялся, и провал косметики не
+    должен превращать успешный анализ в проваленный. Ошибка уходит в лог, но
+    наружу не пробрасывается — activity зовётся из терминальных веток воркфлоу.
+    """
+    for stale in running_labels(command):
+        try:
+            await asyncio.to_thread(github_client.remove_label, repo, issue_number, stale)
+        except Exception as exc:
+            logger.warning("не снял метку %s с %s#%s: %s", stale, repo, issue_number, exc)
+    outcome = done_label(command) if ok else failed_label(command)
+    try:
+        await asyncio.to_thread(github_client.add_label, repo, issue_number, outcome)
+    except Exception as exc:
+        logger.warning("не поставил метку %s на %s#%s: %s", outcome, repo, issue_number, exc)
 
 
 # --- Классификация ---
@@ -747,14 +790,22 @@ async def ack_command(analyze: AnalyzeInput) -> None:
     гейтится. Реакция на комментарий-триггер — чисто декоративная добавка;
     если комментарий-триггер к этому моменту удалили (404) или сработал
     rate limit, сбой реакции не должен утопить сам ack.
+
+    Триггер виден по comment_id: он есть у команды в комментарии и пуст у
+    запуска меткой — реагировать там не на что, и подтверждение называет
+    метку, а не команду.
     """
+    trigger = f"`{run_label(ANALYZE)}`" if analyze.comment_id is None else "`/analyze`"
     await asyncio.to_thread(
         github_client.post_comment,
         analyze.repo,
         analyze.issue_number,
-        "🔍 Взял `/analyze` в работу — запускаю автономный анализ через SA-helper.\n\n"
+        f"🔍 Взял {trigger} в работу — запускаю автономный анализ через SA-helper.\n\n"
         "Прогон занимает несколько минут: артефакты появятся в ветке "
         f"`research/issue-{analyze.issue_number}`, а сводка — следующим комментарием.",
+    )
+    await asyncio.to_thread(
+        github_client.add_label, analyze.repo, analyze.issue_number, run_label(ANALYZE)
     )
     if analyze.comment_id is not None:
         try:
@@ -799,6 +850,18 @@ ARTIFACT_PATHS = (
 
 @activity.defn
 def ack_estimate_command(req: EstimateRequest) -> None:
+    """Подтверждение приёма. У команды в комментарии это реакция на него; у
+    запуска меткой реагировать не на что, поэтому подтверждением служит сама
+    метка `run:estimate` плюс короткий комментарий — иначе с телефона не видно,
+    что метка вообще доехала."""
+    github_client.add_label(req.repo, req.issue_number, run_label(ESTIMATE))
+    if req.comment_id is None:
+        github_client.post_comment(
+            req.repo, req.issue_number,
+            f"🧮 Взял `{run_label(ESTIMATE)}` в работу — считаю трудоёмкость по методологии. "
+            "Результат придёт следующим комментарием.",
+        )
+        return
     github_client.add_reaction(req.repo, req.comment_id, "eyes")
 
 
@@ -914,6 +977,7 @@ def post_estimate_error(req: EstimateRequest, stage: str, reason: str = "") -> N
         f"⚠️ Оценка не удалась на стадии «{stage}». Повтори `/estimate` позже — "
         f"подробности прогона видны в Temporal UI.",
     )
-    github_client.add_reaction(req.repo, req.comment_id, "confused")
+    if req.comment_id is not None:
+        github_client.add_reaction(req.repo, req.comment_id, "confused")
     exc_type, _, message = reason.partition(": ")
     sentry_setup.capture_estimate_failure(req, stage, exc_type or "unknown", message or reason)

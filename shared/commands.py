@@ -5,6 +5,12 @@
 намеренно не зависит ни от FastAPI, ни от temporalio: логика юнит-тестируема
 без веб-стека (в dev-окружении fastapi отсутствует). Оба Dockerfile копируют
 shared/ в образ.
+
+У команды два равноправных триггера — комментарий (`/analyze`) и метка
+(`run:analyze`). Оба ведут в один и тот же воркфлоу, поэтому набор команд
+объявлен здесь ОДИН раз, а имена меток из него выводятся: разъехавшись, они
+дали бы метку, которая ничего не запускает, и запуск, который ничего не
+помечает.
 """
 
 from shared.workflow_types import AnalyzeInput
@@ -13,6 +19,48 @@ ESTIMATE = "estimate"
 ANALYZE = "analyze"
 
 _COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE}
+
+# Схема имён — namespace через двоеточие, как в протоколе агентов v1
+# (needs-human:*, origin:agent). `run:*` — идёт прогон, `done:*` — проработано,
+# `failed:*` — прогон был и сорвался. Последнее отдельной меткой, а не молча
+# снятым `run:*`: иначе неуспех неотличим от «никто не запускал».
+RUN_PREFIX = "run:"
+DONE_PREFIX = "done:"
+FAILED_PREFIX = "failed:"
+
+# Метки прежних версий, означавшие «идёт прогон». Снимаются вместе с `run:*`,
+# чтобы на завершённом Issue не осталось противоречия `analyzing` + `done:analyze`.
+_LEGACY_RUNNING_LABELS = {ANALYZE: ("analyzing",)}
+
+
+def run_label(command: str) -> str:
+    return f"{RUN_PREFIX}{command}"
+
+
+def done_label(command: str) -> str:
+    return f"{DONE_PREFIX}{command}"
+
+
+def failed_label(command: str) -> str:
+    return f"{FAILED_PREFIX}{command}"
+
+
+def running_labels(command: str) -> tuple[str, ...]:
+    """Все метки «прогон идёт» для команды — их снимает финализация."""
+    return (run_label(command),) + _LEGACY_RUNNING_LABELS.get(command, ())
+
+
+def parse_label_command(label: str) -> str | None:
+    """Команда, которую запускает метка, иначе None.
+
+    Запускает ТОЛЬКО `run:<команда>`. Это же и защита от петли: метки исхода
+    (`done:*`, `failed:*`) агент ставит себе сам, они прилетают обратно
+    событием issues.labeled — и не совпадают ни с одним триггером.
+    """
+    if not label.startswith(RUN_PREFIX):
+        return None
+    command = label[len(RUN_PREFIX):].strip().lower()
+    return command if command in set(_COMMANDS.values()) else None
 
 
 def parse_command(comment_body: str) -> str | None:
@@ -34,12 +82,18 @@ def parse_command(comment_body: str) -> str | None:
 
 
 def build_analyze_input(payload: dict) -> AnalyzeInput:
-    """Собирает вход воркфлоу IssueAnalysis из payload вебхука issue_comment."""
+    """Собирает вход воркфлоу IssueAnalysis из payload вебхука.
+
+    Один сборщик на оба триггера: у события issue_comment есть комментарий, у
+    issues.labeled его нет — тогда comment_id остаётся None, и активности,
+    которым нужен комментарий (реакция на него), просто его не ставят.
+    """
     issue = payload["issue"]
+    comment = payload.get("comment") or {}
     return AnalyzeInput(
         repo=payload["repository"]["full_name"],
         issue_number=issue["number"],
         title=issue["title"],
         body=issue.get("body") or "",
-        comment_id=payload["comment"]["id"],
+        comment_id=comment.get("id"),
     )

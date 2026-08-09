@@ -6,10 +6,13 @@ Webhook receiver: единственная точка входа для GitHub. 
                                `/estimate` — IssueEstimation; любой другой
                                комментарий — сигнал уже идущему workflow
                                (используется циклом уточнений)
-- issues.labeled           -> signal-with-start, если лейбл — одна из точек
-                               решения человека (research-me / bug-me /
-                               build-me): воркфлоу триажа может не
-                               существовать, тогда он поднимается тем же вызовом
+- issues.labeled           -> `run:<команда>` запускает тот же воркфлоу, что и
+                               команда в комментарии (run:analyze ->
+                               IssueAnalysis, run:estimate -> IssueEstimation);
+                               точки решения человека (research-me / bug-me /
+                               build-me) идут через signal-with-start: воркфлоу
+                               триажа может не существовать, тогда он
+                               поднимается тем же вызовом
 
 Ничего из бизнес-логики здесь нет — это чистый транспортный слой.
 """
@@ -24,7 +27,13 @@ from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from shared import sentry_setup
-from shared.commands import ANALYZE, ESTIMATE, build_analyze_input, parse_command
+from shared.commands import (
+    ANALYZE,
+    ESTIMATE,
+    build_analyze_input,
+    parse_command,
+    parse_label_command,
+)
 from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import (
@@ -112,6 +121,41 @@ async def github_webhook(
 
         elif action == "labeled":
             label = payload["label"]["name"]
+
+            # Метка — второй триггер команды, равноправный с комментарием: два
+            # тапа в мобильном GitHub вместо набора текста в треде. Ведёт в тот
+            # же воркфлоу, что и `/analyze` — таблица соответствия одна
+            # (shared/commands.py), поэтому разъехаться им негде.
+            command = parse_label_command(label)
+
+            if command == ANALYZE:
+                try:
+                    await client.start_workflow(
+                        "IssueAnalysis",
+                        build_analyze_input(payload),  # без comment_id: триггер — метка
+                        id=analysis_workflow_id(repo, issue_number),
+                        task_queue="issue-lifecycle",
+                    )
+                except WorkflowAlreadyStartedError:
+                    # Метку сняли и поставили заново, пока прогон идёт: второй
+                    # дорогой прогон не нужен, а первый уже подтверждён ack'ом.
+                    _log.info("analysis already running for %s#%s", repo, issue_number)
+                return {"ok": True}
+
+            if command == ESTIMATE:
+                from shared.workflow_types import EstimateRequest
+
+                try:
+                    await client.start_workflow(
+                        "IssueEstimation",
+                        EstimateRequest(repo=repo, issue_number=issue_number),
+                        id=estimate_workflow_id_for(repo, issue_number),
+                        task_queue="issue-lifecycle",
+                    )
+                except WorkflowAlreadyStartedError:
+                    _log.info("estimate already running for %s#%s", repo, issue_number)
+                return {"ok": True}
+
             if label in HUMAN_DECISION_LABELS:
                 from shared.workflow_types import IssueInput
 

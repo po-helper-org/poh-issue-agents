@@ -11,6 +11,7 @@ import os
 import subprocess
 import threading
 import time
+import urllib.parse
 
 import jwt
 import requests
@@ -113,6 +114,25 @@ def add_label(repo: str, issue_number: int, label: str) -> None:
         return
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
     resp = requests.post(url, headers=_auth_headers(repo), json={"labels": [label]}, timeout=30)
+    resp.raise_for_status()
+
+
+def remove_label(repo: str, issue_number: int, label: str) -> None:
+    """Снимает метку. Отсутствующая метка (404) — штатная ситуация, а не ошибка:
+    финализация зовётся и после прогона, запущенного командой в комментарии, где
+    метки `run:*` никто не ставил, и после того, как человек снял её руками.
+
+    Имя метки уходит в путь URL, поэтому кодируется: в схеме `run:analyze` есть
+    двоеточие, а в метках вида `advisor:feature-request` — ещё и дефисы.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] label %s#%s -= %s", repo, issue_number, label)
+        return
+    quoted = urllib.parse.quote(label, safe="")
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels/{quoted}"
+    resp = requests.delete(url, headers=_auth_headers(repo), timeout=30)
+    if resp.status_code == 404:
+        return
     resp.raise_for_status()
 
 
