@@ -9,6 +9,7 @@ from workflows import IssueLifecycle
 from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
+    Deadlines,
     DuplicateResult,
     GateResult,
     IssueInput,
@@ -21,6 +22,12 @@ _state = {}
 
 @activity.defn(name="prefilter_bot_and_security")
 async def stub_prefilter(issue): return None
+
+
+@activity.defn(name="read_deadlines")
+async def deadlines_stub() -> Deadlines:
+    """Сроки по умолчанию: тесты проверяют маршруты, а не сами таймеры."""
+    return Deadlines()
 
 
 @activity.defn(name="read_protocol_state")
@@ -44,7 +51,7 @@ async def test_batch_vague_escalates_without_hanging():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
             env.client, task_queue="tq", workflows=[IssueLifecycle],
-            activities=[stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol],
+            activities=[stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol, deadlines_stub],
         ):
             await env.client.execute_workflow(
                 IssueLifecycle.run,
@@ -154,7 +161,7 @@ async def test_research_me_label_surfaces_pipeline_failure():
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
                         stub_prepare, stub_stage_fails, stub_publish, stub_cleanup,
                         stub_publish_error, stub_mark_running, stub_finish_labels,
-                        stub_protocol],
+                        stub_protocol, deadlines_stub],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -209,7 +216,7 @@ async def test_analyze_requested_labels_only_once():
             env.client, task_queue="tq-analyze-once", workflows=[IssueLifecycle],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_mark_analyzing, stub_protocol],
+                        stub_mark_analyzing, stub_protocol, deadlines_stub],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -241,7 +248,7 @@ async def test_analyze_requested_before_run_init_still_labels():
             env.client, task_queue="tq-analyze-init", workflows=[IssueLifecycle],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_mark_analyzing, stub_protocol],
+                        stub_mark_analyzing, stub_protocol, deadlines_stub],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,

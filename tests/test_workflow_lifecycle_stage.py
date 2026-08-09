@@ -13,6 +13,7 @@ from temporalio.worker import Worker
 
 from shared.workflow_types import (
     ClassificationResult,
+    Deadlines,
     DuplicateResult,
     GateResult,
     IssueInput,
@@ -29,6 +30,12 @@ def _issue(interactive: bool = True) -> IssueInput:
 
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
+
+
+@activity.defn(name="read_deadlines")
+async def deadlines_stub() -> Deadlines:
+    """Сроки по умолчанию: тесты проверяют маршруты, а не сами таймеры."""
+    return Deadlines()
 
 
 @activity.defn(name="read_protocol_state")
@@ -100,7 +107,7 @@ async def _run_to_completion(activities_list, issue: IssueInput) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
-                          activities=[*activities_list, protocol_default]):
+                          activities=[*activities_list, protocol_default, deadlines_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, issue, id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()
@@ -115,7 +122,7 @@ async def test_parked_run_says_it_waits_for_a_human():
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
                           activities=[prefilter_ok, gate_sufficient, classify_feature,
                                       duplicate_none, score, post_priority,
-                                      protocol_default]):
+                                      protocol_default, deadlines_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 

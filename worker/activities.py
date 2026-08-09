@@ -36,6 +36,7 @@ from shared.commands import (
 from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
+    Deadlines,
     DuplicateResult,
     EstimateRequest,
     EstimateResult,
@@ -163,6 +164,94 @@ def escalate_to_human(issue: IssueInput, reason: str = "") -> None:
                   "Передаю на ручной разбор.",
     )
     github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_HUMAN_TRIAGE)
+
+
+@activity.defn
+def read_deadlines() -> Deadlines:
+    """Сроки ожиданий из окружения (R3). Читаются activity, а не воркфлоу.
+
+    Воркфлоу не может брать их из os.environ напрямую: таймер вычисляется при
+    КАЖДОМ воспроизведении истории, и правка переменной сломала бы уже идущий
+    прогон недетерминизмом. Результат activity лежит в истории — реплей берёт
+    ровно то значение, с которым прогон начинался.
+    """
+    def _hours(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        try:
+            value = int(raw) if raw else default
+        except ValueError:
+            logger.warning("%s=%r не число, беру значение по умолчанию %s", name, raw, default)
+            return default
+        # 0 или отрицательное значение означало бы «истекло сразу» — почти
+        # наверняка опечатка, а не намерение выключить ожидание.
+        return value if value > 0 else default
+
+    return Deadlines(
+        human_decision_hours=_hours("PARK_DECISION_HOURS", 72),
+        clarification_hours=_hours("PARK_CLARIFICATION_HOURS", 48),
+        build_decision_hours=_hours("PARK_BUILD_HOURS", 72),
+    )
+
+
+# Маркер незакрытого вопроса в артефактах анализа: то, что разработчику
+# придётся решать самому. Выносится в чеклист готовности отдельным списком.
+OPEN_QUESTION_MARKER = "[УТОЧНИТЬ]"
+MAX_OPEN_QUESTIONS = 15
+
+
+def _open_questions(repo: str, branch: str) -> list[str]:
+    """Строки с маркером `[УТОЧНИТЬ]` из артефактов анализа.
+
+    Разработчик должен увидеть незакрытые вопросы ДО того, как возьмёт задачу,
+    а не наткнуться на них в середине реализации.
+    """
+    found: list[str] = []
+    for name in ARTIFACT_FILES:
+        path = f"{FNR_DIR}/{name}"
+        content = github_client.get_file(repo, path, branch)
+        if not content:
+            continue
+        for line in content.splitlines():
+            if OPEN_QUESTION_MARKER in line:
+                found.append(f"{name}: {line.strip()[:200]}")
+                if len(found) >= MAX_OPEN_QUESTIONS:
+                    return found
+    return found
+
+
+@activity.defn
+def mark_ready_for_dev(issue: IssueInput, priority_tier: str, branch: str) -> None:
+    """Точка передачи задачи разработчику (H1 протокола).
+
+    Единственное место, где контур отдаёт работу человеку по своей инициативе.
+    Метка `ready-for-dev` делает выборку рабочей очередью разработчика, а
+    комментарий отвечает на вопрос «что известно и чего не хватает», чтобы
+    задачу можно было взять, не задавая уточняющих вопросов о постановке.
+    """
+    base = f"https://github.com/{issue.repo}/blob/{branch}"
+    questions = _open_questions(issue.repo, branch)
+    open_block = (
+        "\n".join(f"- {q}" for q in questions)
+        if questions
+        else "- не осталось: анализ не оставил незакрытых вопросов"
+    )
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "## ✅ Задача готова к разработке\n\n"
+        "**Что известно:**\n"
+        f"- Классификация проведена, приоритет — `{priority_tier}`\n"
+        "- Дубли проверены\n"
+        f"- Аналитика прогнана, артефакты в ветке [`{branch}`]({base}/{FNR_DIR})\n\n"
+        "**С чего начать:** "
+        f"[`system_requirements.md`]({base}/{FNR_DIR}/system_requirements.md) — "
+        "разбор текущего поведения на код-доказательствах, план работ с критериями "
+        "приёмки и риски.\n\n"
+        "**Осталось неопределённым:**\n"
+        f"{open_block}\n\n"
+        f"Открывая PR, поставь `Closes #{issue.issue_number}` — по этой ссылке "
+        "цепочка связывается сквозным ключом, и агенты доведения увидят исходную задачу.",
+    )
+    github_client.add_label(issue.repo, issue.issue_number, labels.READY_FOR_DEV)
 
 
 @activity.defn

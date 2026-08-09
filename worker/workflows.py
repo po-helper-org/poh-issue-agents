@@ -51,7 +51,7 @@ def _failure_reason(e: BaseException) -> str:
     return f"{exc_type}: {cause}"
 
 
-async def _run_staged_analysis(analyze: AnalyzeInput) -> None:
+async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
     """Пер-стадийный прогон FNR — общий для обоих входов в аналитику.
 
     Один код на команду `/analyze` (IssueAnalysis) и на лейбл research-me внутри
@@ -63,7 +63,11 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> None:
     Каждая стадия — свой шаг Event History со своим таймингом; ретраев нет
     (прогон недетерминирован, мутирует файлы и стоит денег — повтор инициирует
     человек), сбой всегда доезжает до GitHub, каталог снимается на обоих путях.
+
+    Возвращает True, если артефакты опубликованы: от этого зависит, можно ли
+    передавать задачу разработчику — без аналитики передавать нечего.
     """
+    ok = True
     try:
         await workflow.execute_activity(
             activities.prepare_workspace,
@@ -88,6 +92,7 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> None:
         )
         await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=True)
     except Exception as exc:
+        ok = False
         # exc — ActivityError с общим текстом; настоящая причина в exc.cause
         # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
         reason = str(getattr(exc, "cause", None) or exc)
@@ -113,6 +118,7 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> None:
             workflow.logger.warning(
                 "cleanup_workspace failed (best-effort, ignored): %s", cleanup_exc
             )
+    return ok
 
 
 async def _agents_off(repo: str, issue_number: int, what: str) -> bool:
@@ -298,6 +304,15 @@ class IssueLifecycle:
                 self._stage = "escalated"
                 return
 
+            # R3: у каждой парковки свой срок. Читаем activity, а не из
+            # окружения: таймер пересчитывается при воспроизведении истории, и
+            # правка переменной уронила бы идущий прогон недетерминизмом.
+            deadlines = await workflow.execute_activity(
+                activities.read_deadlines,
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+
             # R6: Issue создан агентом — он уже классифицирован. Intake gate и
             # advisor-ответ пропускаем: это был бы разговор сервиса с самим собой.
             # Остаются дедуп и приоритет — они по-прежнему нужны.
@@ -343,10 +358,23 @@ class IssueLifecycle:
                         start_to_close_timeout=timedelta(seconds=30),
                     )
 
-                    # Ждём ответ пользователя без таймаута — это может быть и через
-                    # 5 минут, и через 3 дня, Temporal не против.
-                    raw = await self._wait_for_signal()
-                    if raw and raw.startswith("__comment__:"):
+                    # Ответ может прийти и через 5 минут, и через 3 дня — но не
+                    # никогда: без срока Issue, о котором забыли, держал бы
+                    # сессию вечно (R3).
+                    raw = await self._wait_for_signal(
+                        timedelta(hours=deadlines.clarification_hours))
+                    if raw is None:
+                        await workflow.execute_activity(
+                            activities.escalate_to_human,
+                            args=[issue, f"Уточнение не получено за "
+                                         f"{deadlines.clarification_hours} ч — "
+                                         "передаю на ручной разбор."],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=default_retry,
+                        )
+                        self._stage = "escalated"
+                        return
+                    if raw.startswith("__comment__:"):
                         comment_thread.append(raw[len("__comment__:"):])
 
                     gate = await workflow.execute_activity(
@@ -420,7 +448,20 @@ class IssueLifecycle:
         # Ждём research-me / bug-me. Никакого потолка по времени — issue
         # может неделями висеть в бэклоге с приоритетом, это нормально.
         self._stage = "awaiting-human-decision"
-        decision = await self._wait_for_signal()
+        decision = await self._wait_for_signal(
+            timedelta(hours=deadlines.human_decision_hours))
+        if decision is None:
+            await workflow.execute_activity(
+                activities.escalate_to_human,
+                args=[issue, f"Решение о тяжёлой стадии не принято за "
+                             f"{deadlines.human_decision_hours} ч "
+                             "(`research-me` / `bug-me`) — снимаю задачу с ожидания. "
+                             "Поставь метку, когда понадобится: прогон запустится заново."],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+            self._stage = "escalated"
+            return
 
         # `classification is None` — сокращённый триаж (Issue от агента): он уже
         # классифицирован на стороне создателя, и гвард «тип совпал с лейблом»
@@ -447,7 +488,17 @@ class IssueLifecycle:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
-            await _run_staged_analysis(analyze_input)
+            analysis_ok = await _run_staged_analysis(analyze_input)
+            if analysis_ok:
+                # H1 — единственная точка, где контур сам отдаёт работу человеку.
+                # Условия протокола выполнены разом: классификация проведена,
+                # дубли проверены, приоритет посчитан, артефакты лежат в ветке.
+                await workflow.execute_activity(
+                    activities.mark_ready_for_dev,
+                    args=[issue, priority.tier, f"research/issue-{issue.issue_number}"],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=default_retry,
+                )
         elif decision == "bug-me" and bug:
             self._stage = "bug"
             await workflow.execute_activity(
@@ -462,7 +513,8 @@ class IssueLifecycle:
 
         # --- Точка решения человека №2: передавать ли в разработку ---
         self._stage = "awaiting-build-decision"
-        build_decision = await self._wait_for_signal()
+        build_decision = await self._wait_for_signal(
+            timedelta(hours=deadlines.build_decision_hours))
         if build_decision == "build-me":
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
