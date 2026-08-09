@@ -13,6 +13,16 @@ def _analyze():
     return AnalyzeInput(repo="o/r", issue_number=5, title="t", body="b", comment_id=1)
 
 
+def _finish_stub(calls):
+    """Обратный ход меток: `run:analyze` снимается, вешается исход прогона."""
+
+    @activity.defn(name="finish_command_labels")
+    async def finish(repo: str, issue_number: int, command: str, ok: bool) -> None:
+        calls.append(f"finish:{command}:{'ok' if ok else 'failed'}")
+
+    return finish
+
+
 @pytest.mark.asyncio
 async def test_orchestrates_all_stages_in_order():
     calls = []
@@ -46,12 +56,14 @@ async def test_orchestrates_all_stages_in_order():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
-                          activities=[ack, prepare, stage, publish, cleanup, publish_error]):
+                          activities=[ack, prepare, stage, publish, cleanup, publish_error,
+                                      _finish_stub(calls)]):
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
 
     assert calls == ["ack", "prepare", "stage:task", "stage:concept", "stage:debate",
-                     "stage:sysreq", "stage:validate", "publish", "cleanup"]
+                     "stage:sysreq", "stage:validate", "publish", "finish:analyze:ok",
+                     "cleanup"]
 
 
 @pytest.mark.asyncio
@@ -91,7 +103,8 @@ async def test_stage_failure_publishes_error_and_cleans_up():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
-                          activities=[ack, prepare, stage, publish, cleanup, publish_error]):
+                          activities=[ack, prepare, stage, publish, cleanup, publish_error,
+                                      _finish_stub(calls)]):
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
 
@@ -99,6 +112,10 @@ async def test_stage_failure_publishes_error_and_cleans_up():
     assert "stage:validate" not in calls          # остановились на sysreq
     assert "publish" not in calls
     assert "error" in calls and "boom-sysreq" in reported["reason"]
+    # Сорвавшийся прогон помечается своей меткой: молча снятый run:* неотличим
+    # от «никто не запускал».
+    assert "finish:analyze:failed" in calls
+    assert "finish:analyze:ok" not in calls
     assert calls[-1] == "cleanup"                  # cleanup всегда последним
 
 
@@ -136,7 +153,8 @@ async def test_cleanup_failure_does_not_mask_success():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
-                          activities=[ack, prepare, stage, publish, cleanup, publish_error]):
+                          activities=[ack, prepare, stage, publish, cleanup, publish_error,
+                                      _finish_stub(calls)]):
             # завершается без ошибки, несмотря на падение cleanup
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
@@ -144,3 +162,4 @@ async def test_cleanup_failure_does_not_mask_success():
     assert "publish" in calls       # реальный результат состоялся
     assert "cleanup" in calls       # cleanup вызывался
     assert "error" not in calls     # успех НЕ превратился в ошибку
+    assert "finish:analyze:ok" in calls

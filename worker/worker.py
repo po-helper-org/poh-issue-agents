@@ -37,6 +37,8 @@ async def main() -> None:
             activities.escalate_to_human,
             activities.post_error_label,
             activities.mark_analyzing,
+            activities.mark_command_running,
+            activities.finish_command_labels,
             activities.classify_issue,
             activities.duplicate_check,
             activities.score_priority,

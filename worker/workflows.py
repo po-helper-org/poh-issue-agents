@@ -22,6 +22,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from shared.commands import ANALYZE, ESTIMATE
     from shared.workflow_types import (
         AnalyzeInput,
         EstimateRequest,
@@ -46,6 +47,21 @@ def _failure_reason(e: BaseException) -> str:
     cause = getattr(e, "cause", None) or e
     exc_type = getattr(cause, "type", None) or type(cause).__name__
     return f"{exc_type}: {cause}"
+
+
+async def _finish_labels(repo: str, issue_number: int, command: str, ok: bool) -> None:
+    """Обратный ход меток команды — один вызов на все терминальные ветки.
+
+    Зовётся из трёх мест (IssueAnalysis, IssueEstimation и ветка research-me в
+    IssueLifecycle), поэтому таймаут и политика ретраев заданы здесь: разъехавшись,
+    они дали бы Issue, застрявший в `run:*` после завершённого прогона.
+    """
+    await workflow.execute_activity(
+        activities.finish_command_labels,
+        args=[repo, issue_number, command, ok],
+        start_to_close_timeout=timedelta(seconds=60),
+        retry_policy=RetryPolicy(maximum_attempts=3),
+    )
 
 
 @workflow.defn(name="IssueLifecycle")
@@ -242,6 +258,15 @@ class IssueLifecycle:
             # workflow молча.
             analyze_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
                                           title=issue.title, body=issue.body)
+            # Метку «идёт прогон» тут ставит сам воркфлоу: триггером был
+            # research-me, а не run:analyze, и без этого выборка `label:run:*`
+            # не показала бы идущий анализ.
+            await workflow.execute_activity(
+                activities.mark_command_running,
+                args=[issue.repo, issue.issue_number, ANALYZE],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
             try:
                 await workflow.execute_activity(
                     activities.run_analysis_pipeline,
@@ -250,6 +275,7 @@ class IssueLifecycle:
                     heartbeat_timeout=timedelta(seconds=300),
                     retry_policy=RetryPolicy(maximum_attempts=1),  # не ретраим дорогой прогон вслепую
                 )
+                await _finish_labels(issue.repo, issue.issue_number, ANALYZE, ok=True)
             except Exception as exc:
                 # exc — ActivityError с общим текстом Temporal-core, настоящая
                 # причина лежит в exc.cause (см. тот же разбор в IssueAnalysis.run).
@@ -260,6 +286,7 @@ class IssueLifecycle:
                     start_to_close_timeout=timedelta(seconds=60),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )
+                await _finish_labels(issue.repo, issue.issue_number, ANALYZE, ok=False)
         elif decision == "bug-me" and classification.label == "advisor:bug":
             await workflow.execute_activity(
                 activities.run_bug_pipeline,
@@ -325,6 +352,7 @@ class IssueAnalysis:
                 start_to_close_timeout=timedelta(seconds=120),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
+            await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=True)
         except Exception as exc:
             # exc — ActivityError с общим текстом; настоящая причина в exc.cause
             # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
@@ -335,6 +363,7 @@ class IssueAnalysis:
                 start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
+            await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=False)
         finally:
             # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:
             # провал самой уборки (timeout/краш воркера) не должен затирать реальный
@@ -410,6 +439,7 @@ class IssueEstimation:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
+            await _finish_labels(req.repo, req.issue_number, ESTIMATE, ok=True)
         except Exception as e:
             await workflow.execute_activity(
                 activities.post_estimate_error,
@@ -417,3 +447,4 @@ class IssueEstimation:
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=5),
             )
+            await _finish_labels(req.repo, req.issue_number, ESTIMATE, ok=False)

@@ -52,7 +52,9 @@ class AnalyzeInput:
 class EstimateRequest:
     repo: str
     issue_number: int
-    comment_id: int  # комментарий с командой: на него ставится реакция
+    # Комментарий с командой: на него ставится реакция. None — запуск меткой
+    # `run:estimate`, реагировать не на что.
+    comment_id: int | None = None
 
 
 @dataclass

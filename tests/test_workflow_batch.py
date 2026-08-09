@@ -103,6 +103,16 @@ async def stub_publish_error(analyze: AnalyzeInput, reason: str) -> None:
     _research_state["reason"] = reason
 
 
+@activity.defn(name="mark_command_running")
+async def stub_mark_running(repo: str, issue_number: int, command: str) -> None:
+    _research_state["running"] = command
+
+
+@activity.defn(name="finish_command_labels")
+async def stub_finish_labels(repo: str, issue_number: int, command: str, ok: bool) -> None:
+    _research_state["finished"] = (command, ok)
+
+
 @pytest.mark.timeout(30)
 async def test_research_me_label_surfaces_pipeline_failure():
     """label-триггер research-me обязан давать ту же гарантию, что и команда
@@ -114,7 +124,8 @@ async def test_research_me_label_surfaces_pipeline_failure():
             env.client, task_queue="tq-research", workflows=[IssueLifecycle],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_pipeline_fails, stub_publish_error],
+                        stub_pipeline_fails, stub_publish_error, stub_mark_running,
+                        stub_finish_labels],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -130,6 +141,10 @@ async def test_research_me_label_surfaces_pipeline_failure():
 
     assert _research_state["attempts"] == [1], "дорогой прогон не должен ретраиться"
     assert "boom-research-me" in _research_state["reason"]
+    # Прогон по метке research-me виден в выборке `label:run:*`, пока идёт, и
+    # получает метку исхода, когда закончился, — как и запуск через run:analyze.
+    assert _research_state["running"] == "analyze"
+    assert _research_state["finished"] == ("analyze", False)
 
 
 # --- analyze_requested: лейбл ставится ровно один раз ---

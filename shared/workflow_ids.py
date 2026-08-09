@@ -16,8 +16,14 @@ def issue_workflow_id(repo_full_name: str, issue_number: int, suffix: str = "") 
     return f"{base}-{suffix}" if suffix else base
 
 
-def estimate_workflow_id(repo_full_name: str, issue_number: int, comment_id: int) -> str:
-    return f"estimate-{repo_full_name}-{issue_number}-{comment_id}"
+def estimate_workflow_id(repo_full_name: str, issue_number: int,
+                         comment_id: int | None = None) -> str:
+    # comment_id=None — запуск меткой `run:estimate`: комментария-триггера нет,
+    # различителем служит "label". Повторная доставка того же события упирается
+    # в WorkflowAlreadyStarted, а метка, поставленная заново после завершённого
+    # прогона, — честно новый прогон (прошлый закрыт, id свободен).
+    marker = "label" if comment_id is None else comment_id
+    return f"estimate-{repo_full_name}-{issue_number}-{marker}"
 
 
 def analysis_workflow_id(repo_full_name: str, issue_number: int) -> str:
