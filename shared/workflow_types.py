@@ -113,6 +113,10 @@ class AnalyzeInput:
     title: str
     body: str
     comment_id: int | None = None  # комментарий-триггер, на него ставится реакция
+    # Чем прогон вызван — для подтверждения приёма. Пусто означает `/analyze`
+    # либо метку `run:analyze`; цикл ставит сюда `research-me`, чтобы ack не
+    # называл человеку метку, которую тот не ставил.
+    trigger: str | None = None
 
 
 @dataclass

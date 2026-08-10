@@ -17,7 +17,7 @@ from shared.workflow_types import (
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueLifecycle
+from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
 
 _calls: list[str] = []
 
@@ -92,7 +92,7 @@ async def _run(state: ProtocolState) -> str:
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate, _state_stub(state), deadlines_stub, phase_stub]):
             handle = await env.client.start_workflow(
@@ -111,7 +111,7 @@ async def test_agents_off_spends_nothing():
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(agents_off=True)), deadlines_stub, phase_stub]):
@@ -129,7 +129,7 @@ async def test_agents_off_is_visible_as_a_stage():
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(agents_off=True)), deadlines_stub, phase_stub]):
@@ -168,7 +168,7 @@ async def test_second_round_follow_up_goes_straight_to_a_human():
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(origin_agent=True,

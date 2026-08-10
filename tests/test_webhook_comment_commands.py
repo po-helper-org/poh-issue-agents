@@ -17,31 +17,42 @@ SECRET = "test-secret"
 
 
 class FakeHandle:
-    def __init__(self, sink: list, fail: bool = False) -> None:
+    def __init__(self, sink: list, fail: bool = False,
+                 handles_agents: bool = True) -> None:
         self._sink = sink
         self._fail = fail
+        self._handles_agents = handles_agents
 
     async def signal(self, name, *args):
         if self._fail:
             raise RuntimeError("workflow уже завершён")
         self._sink.append((name, args))
 
+    async def query(self, name, *args):
+        """Ответ цикла на вопрос лаунчера «ведёшь ли ты агентов сам» (#37)."""
+        assert name == "handles_agents", name
+        return self._handles_agents
+
 
 class FakeClient:
-    def __init__(self, already: set[str] | None = None, signal_fails: bool = False) -> None:
+    def __init__(self, already: set[str] | None = None, signal_fails: bool = False,
+                 handles_agents: bool = True) -> None:
         self.started: list[dict] = []
         self.signals: list = []
         self._already = already or set()
         self._signal_fails = signal_fails
+        self._handles_agents = handles_agents
 
     async def start_workflow(self, workflow, arg, **kwargs):
         if workflow in self._already:
             raise WorkflowAlreadyStartedError(kwargs.get("id", ""), workflow)
         self.started.append({"workflow": workflow, "arg": arg, **kwargs})
+        return FakeHandle(self.signals, handles_agents=self._handles_agents)
 
     def get_workflow_handle(self, wf_id):
         self.signals.append(wf_id)
-        return FakeHandle(self.signals, fail=self._signal_fails)
+        return FakeHandle(self.signals, fail=self._signal_fails,
+                          handles_agents=self._handles_agents)
 
 
 @pytest.fixture
@@ -86,61 +97,74 @@ def _comment(body: str, user_type: str = "User", comment_id: int = 555) -> dict:
     }
 
 
-def test_estimate_command_starts_estimation_with_comment_id(webhook):
+def test_estimate_command_goes_through_the_live_cycle(webhook):
+    """Живой цикл поднимает оценку дочерним прогоном сам — вебхук только
+    доставляет ему команду вместе с комментарием-триггером (#37)."""
     fake, app_client = webhook()
 
     assert _post(app_client, _comment("/estimate")).status_code == 200
 
+    assert [c["workflow"] for c in fake.started] == ["IssueLifecycle"]
     call = fake.started[0]
-    assert call["workflow"] == "IssueEstimation"
+    assert call["id"] == "issue-acme/widgets-7"
+    assert call["start_signal"] == "estimate_requested"
+    assert call["start_signal_args"] == [555]
+
+
+def test_estimate_falls_back_to_a_root_run_for_an_old_cycle(webhook):
+    fake, app_client = webhook(handles_agents=False)
+
+    assert _post(app_client, _comment("/estimate")).status_code == 200
+
+    call = next(c for c in fake.started if c["workflow"] == "IssueEstimation")
     # comment_id в id прогона: повторная доставка того же вебхука не запустит вторую оценку.
     assert call["id"] == "estimate-acme/widgets-7-555"
     assert call["arg"].comment_id == 555
 
 
-def test_analyze_command_starts_analysis_and_notifies_the_cycle(webhook):
+def test_analyze_command_goes_through_the_live_cycle(webhook):
+    """Раньше здесь стартовал самостоятельный IssueAnalysis, а циклу уходило
+    лишь косметическое уведомление. Теперь работу ведёт владелец состояния."""
     fake, app_client = webhook()
 
     assert _post(app_client, _comment("/analyze")).status_code == 200
 
-    analysis = next(c for c in fake.started if c["workflow"] == "IssueAnalysis")
-    assert analysis["id"] == "analysis-acme/widgets-7"
-    assert analysis["arg"].comment_id == 555
-    # Уведомление владельцу состояния — он повесит метку `analyzing`.
-    cycle = next(c for c in fake.started if c["workflow"] == "IssueLifecycle")
+    assert [c["workflow"] for c in fake.started] == ["IssueLifecycle"]
+    cycle = fake.started[0]
     assert cycle["id"] == "issue-acme/widgets-7"
     assert cycle["start_signal"] == "analyze_requested"
     assert cycle["start_signal_args"] == [555]
-
-
-def test_analyze_raises_the_cycle_when_it_is_gone(webhook):
-    """Раньше сигнал в завершённый триаж молча проглатывался, и команда по
-    Issue без цикла не оставляла следа. Теперь тот же вызов поднимает цикл —
-    владельца состояния Issue (#36)."""
-    fake, app_client = webhook(signal_fails=True)
-
-    assert _post(app_client, _comment("/analyze")).status_code == 200
-
-    # signal-with-start не зависит от того, жив ли адресат: он либо сигналит,
-    # либо стартует. Голого signal() на этом пути больше нет.
-    assert fake.signals == []
-    assert {c["workflow"] for c in fake.started} == {"IssueLifecycle", "IssueAnalysis"}
-    assert fake.started[0]["arg"].interactive is True, (
+    assert cycle["arg"].interactive is True, (
         "команда пришла из треда — цикл уточнений здесь уместен")
 
 
+def test_analyze_falls_back_to_a_root_run_for_an_old_cycle(webhook):
+    """Прогон прежнего поколения сигнала не понимает: команда была бы принята и
+    потеряна. Лаунчер стартует ему самостоятельный прогон, как раньше."""
+    fake, app_client = webhook(handles_agents=False)
+
+    assert _post(app_client, _comment("/analyze")).status_code == 200
+
+    # Голого signal() на этом пути больше нет — только signal-with-start.
+    assert fake.signals == []
+    assert {c["workflow"] for c in fake.started} == {"IssueLifecycle", "IssueAnalysis"}
+    analysis = next(c for c in fake.started if c["workflow"] == "IssueAnalysis")
+    assert analysis["id"] == "analysis-acme/widgets-7"
+    assert analysis["arg"].comment_id == 555
+
+
 def test_repeated_analyze_does_not_start_a_second_run(webhook):
-    fake, app_client = webhook(already={"IssueAnalysis"})
+    fake, app_client = webhook(already={"IssueAnalysis"}, handles_agents=False)
 
     assert _post(app_client, _comment("/analyze")).status_code == 200
     assert not any(c["workflow"] == "IssueAnalysis" for c in fake.started)
 
 
 def test_repeated_estimate_delivery_is_swallowed(webhook):
-    fake, app_client = webhook(already={"IssueEstimation"})
+    fake, app_client = webhook(already={"IssueEstimation"}, handles_agents=False)
 
     assert _post(app_client, _comment("/estimate")).status_code == 200
-    assert fake.started == []
+    assert not any(c["workflow"] == "IssueEstimation" for c in fake.started)
 
 
 def test_plain_comment_feeds_the_clarification_loop(webhook):

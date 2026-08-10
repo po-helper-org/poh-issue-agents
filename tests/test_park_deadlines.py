@@ -21,7 +21,7 @@ from shared.workflow_types import (
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueLifecycle
+from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
 
 _calls: list[str] = []
 
@@ -142,7 +142,7 @@ async def _run(acts, deadlines: Deadlines) -> str:
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[*acts, _deadlines_stub(deadlines), phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
