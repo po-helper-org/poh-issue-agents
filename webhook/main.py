@@ -210,6 +210,121 @@ async def _audit_dropped_delivery(payload: dict, event: str, delivery_id: str | 
         _log.warning("не удалось записать аудит отброшенной доставки: %s", exc)
 
 
+def verify_agent_signature(body: bytes, signature_header: str | None) -> None:
+    """Подпись входящего события агента — своим секретом, не гитхабовским.
+
+    Сигнал, двигающий фазу Issue, не может приходить анонимно. Секрет отдельный:
+    у соседних сервисов свои права, и утечка одного не должна открывать второй
+    канал. Без переменной эндпоинт закрыт (503, а не «пропускаем всех») —
+    молчаливо открытый приём фазовых событий хуже, чем выключенный.
+    """
+    secret = os.environ.get("AGENT_EVENT_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="AGENT_EVENT_SECRET не задан")
+    if not signature_header or not signature_header.startswith("sha256="):
+        raise HTTPException(status_code=401, detail="Missing signature")
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature_header):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+
+async def _report_orphan(client, event, reason: str) -> None:
+    """Событие, которое не удалось связать с Issue, не пропадает молча.
+
+    Опознать работу не получилось — значит, ни одна фаза не сдвинется, и
+    единственное, что мы можем, — сделать это видимым. Тишина здесь означала бы
+    ровно тот обрыв трассировки, ради которого задача и ставилась.
+    """
+    from shared.workflow_types import OrphanEventInput
+
+    try:
+        await client.start_workflow(
+            "OrphanAgentEvent",
+            OrphanEventInput(repo=event.repo, agent=event.agent, phase=event.phase,
+                             status=event.status, ref=event.ref, reason=reason,
+                             detail=event.detail[:2000]),
+            # Тот же ключ, что и у идемпотентности в цикле: один факт — одна запись.
+            id=f"orphan-{event.repo}-{event.key()}",
+            task_queue="issue-lifecycle",
+        )
+    except WorkflowAlreadyStartedError:
+        pass  # повторная доставка того же факта — запись уже есть
+    except Exception as exc:
+        _log.warning("не удалось записать событие-сироту от %s: %s", event.agent, exc)
+
+
+@app.post("/agent-event")
+async def agent_event(
+    request: Request,
+    x_agent_signature_256: str | None = Header(None),
+):
+    """Приём фактов от внешних агентов контура (#38).
+
+    Транспорт узкий намеренно: соседние сервисы (PR-Agent, PR-Closer, CI) живут
+    своим релизным циклом и Temporal не используют. Общий namespace потребовал
+    бы втащить в них SDK и знание наших workflow id — связность, ради ухода от
+    которой задача и ставилась.
+    """
+    from shared.agent_events import InvalidAgentEvent, correlate, parse_event
+
+    body = await request.body()
+    verify_agent_signature(body, x_agent_signature_256)
+    try:
+        event = parse_event(await request.json())
+    except InvalidAgentEvent as exc:
+        # 400, а не 500: конверт некорректен, и ретраить его бессмысленно.
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    if not is_allowed(event.repo, allowed_specs()):
+        _log.warning("событие агента %s по чужому репозиторию %s отброшено",
+                     event.agent, event.repo)
+        return {"ok": True, "correlated": False}
+
+    client = await get_temporal_client()
+    issue_number, how = correlate(event)
+    if issue_number is None:
+        await _report_orphan(client, event, how)
+        return {"ok": True, "correlated": False, "reason": how}
+
+    event.correlation = how
+    await client.start_workflow(
+        "IssueLifecycle",
+        args=_lifecycle_args_for(event, issue_number),
+        id=issue_workflow_id(event.repo, issue_number),
+        task_queue="issue-lifecycle",
+        start_signal="agent_event",
+        start_signal_args=[event],
+    )
+    return {"ok": True, "correlated": True, "issue": issue_number, "by": how}
+
+
+def _lifecycle_args_for(event, issue_number: int) -> list:
+    """Аргументы старта цикла для события агента.
+
+    Цикла может не быть: Issue завели до установки App, либо его прогон уже
+    закрылся по сроку. Поднимать его обычным путём нельзя — триаж пошёл бы по
+    пустым заголовку и телу, задал бы человеку уточняющий вопрос и потратил
+    вызовы модели на задачу, которая давно в разработке.
+
+    Поэтому цикл поднимается СРАЗУ в той фазе, о которой доложил агент, через
+    тот же снимок состояния, что используется для continue-as-new (#36).
+    Триажу тут делать нечего: работа уже в PR.
+    """
+    from shared.agent_events import target_phase
+    from shared.workflow_types import IssueInput, LifecycleState
+
+    phase = target_phase(event)
+    return [
+        IssueInput(repo=event.repo, issue_number=issue_number,
+                   # Заголовок и тело в фазах внешних агентов не используются;
+                   # запрашивать их у GitHub значило бы завести в вебхуке
+                   # второй клиент ради полей, которые никто не прочитает.
+                   title="", body="", author_login="", author_type="User",
+                   interactive=False),
+        LifecycleState(phase=phase, stage=phase),
+    ]
+
+
 @app.post("/webhook")
 async def github_webhook(
     request: Request,

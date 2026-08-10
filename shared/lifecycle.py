@@ -120,26 +120,35 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     IN_DEVELOPMENT: (
         Transition(PR_OPEN, EXTERNAL, "открыт PR с Closes #N"),
         Transition(READY_FOR_DEV, HUMAN, "задача возвращена в очередь"),
+        Transition(FAILED, EXTERNAL, "шаг внешнего агента сорвался"),
+        Transition(ESCALATED, EXTERNAL, "нужен человек"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     PR_OPEN: (
         Transition(PR_REVIEW, EXTERNAL, "PR-Agent начал ревью"),
         Transition(IN_DEVELOPMENT, EXTERNAL, "PR закрыт без слияния"),
+        Transition(FAILED, EXTERNAL, "CI красный"),
+        Transition(ESCALATED, EXTERNAL, "нужен человек"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     PR_REVIEW: (
         Transition(MERGED, EXTERNAL, "PR влит"),
         Transition(IN_DEVELOPMENT, EXTERNAL, "запрошены изменения"),
         Transition(ESCALATED, EXTERNAL, "needs-human:pr — доведение не удалось"),
+        Transition(FAILED, EXTERNAL, "CI красный"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     MERGED: (
         Transition(TESTING, EXTERNAL, "отгрузка на стенд"),
+        Transition(FAILED, EXTERNAL, "отгрузка сорвалась"),
+        Transition(ESCALATED, EXTERNAL, "нужен человек"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     TESTING: (
         Transition(RELEASED, EXTERNAL, "выкатано в прод"),
         Transition(IN_DEVELOPMENT, HUMAN, "тестирование выявило дефект"),
+        Transition(FAILED, EXTERNAL, "прогон на стенде сорвался"),
+        Transition(ESCALATED, EXTERNAL, "нужен человек"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     RELEASED: (),
@@ -164,11 +173,18 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     ),
     ESCALATED: (
         Transition(CLASSIFIED, HUMAN, "человек разобрал и вернул в контур"),
+        # Работа могла уйти человеку уже из PR-части пути: возвращать её оттуда
+        # в начало значило бы потерять всё, что уже сделано.
+        Transition(IN_DEVELOPMENT, HUMAN, "человек вернул задачу в разработку"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     FAILED: (
         Transition(CREATED, HUMAN, "перезапустить обработку"),
         Transition(ESCALATED, HUMAN, "разбирать вручную"),
+        # Сорваться мог и шаг в PR-части: следующее событие агента (починили CI,
+        # ревью продолжилось) обязано находить дорогу обратно, иначе каждое
+        # такое событие уходило бы человеку заново.
+        Transition(IN_DEVELOPMENT, EXTERNAL, "работа над PR продолжилась"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
     CANCELLED: (),
@@ -201,6 +217,17 @@ STAGE_TO_PHASE: dict[str, str] = {
     "escalated": ESCALATED,
     "failed": FAILED,
     "agents-off": CANCELLED,
+    # Шаги, которые ведут внешние агенты (#38). Своего дробления у них нет:
+    # вся видимая деталь лежит в самом событии, поэтому стадия совпадает с
+    # фазой. Мост остаётся полным — иначе query `stage` таких прогонов не
+    # переводился бы в фазу обратно.
+    GROOMED: GROOMED,
+    IN_DEVELOPMENT: IN_DEVELOPMENT,
+    PR_OPEN: PR_OPEN,
+    PR_REVIEW: PR_REVIEW,
+    MERGED: MERGED,
+    TESTING: TESTING,
+    RELEASED: RELEASED,
 }
 
 

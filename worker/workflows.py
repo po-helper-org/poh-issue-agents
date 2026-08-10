@@ -27,6 +27,8 @@ with workflow.unsafe.imports_passed_through():
     from shared import lifecycle
     from shared.commands import ANALYZE, ESTIMATE
     from shared.workflow_ids import analysis_workflow_id, estimate_workflow_id
+    from shared import agent_events
+    from shared.agent_events import AgentEvent
     from shared.workflow_types import (
         AnalyzeInput,
         ClassificationResult,
@@ -34,6 +36,7 @@ with workflow.unsafe.imports_passed_through():
         EstimateResult,
         IssueInput,
         LifecycleState,
+        OrphanEventInput,
         WebhookAuditInput,
     )
 
@@ -45,6 +48,11 @@ MAX_CLARIFICATION_ROUNDS = 2
 # та же схема, что у `__comment__:`: одна очередь, разные виды событий, и
 # обработчик фазы решает, что с ними делать.
 AGENT_ANALYZE = "__agent__:analyze"
+
+# Сколько ключей событий помнить ради идемпотентности. Цикл живёт месяцами, а
+# событий по одному Issue — десятки: список без потолка рос бы вместе с
+# историей, ровно тем объёмом, который continue-as-new и призван обрывать.
+SEEN_EVENTS_KEPT = 50
 
 # Порог длины истории для continue-as-new. Ниже потолка, на котором уже
 # спотыкалась консолидация (~990 событий): реплей должен укладываться в
@@ -198,10 +206,34 @@ class WebhookAudit:
         return audit.reason
 
 
+@workflow.defn(name="OrphanAgentEvent")
+class OrphanAgentEvent:
+    """Надгробие для события агента, не связанного ни с одним Issue.
+
+    Тот же приём, что и у `WebhookAudit`: ни одной activity, вся ценность — в
+    том, что факт виден в Temporal UI. Событие уже случилось (PR открыт, CI
+    упал), но какой задаче оно принадлежит — неизвестно, и догадка здесь хуже
+    молчания: привязать работу не к тому Issue значит испортить трассировку
+    двум задачам сразу.
+    """
+
+    @workflow.run
+    async def run(self, orphan: OrphanEventInput) -> str:
+        workflow.logger.warning(
+            "событие агента %s (%s/%s) по %s в %s не связано с Issue: %s",
+            orphan.agent, orphan.phase, orphan.status, orphan.ref,
+            orphan.repo, orphan.reason,
+        )
+        return orphan.reason
+
+
 @workflow.defn(name="IssueLifecycle")
 class IssueLifecycle:
     def __init__(self) -> None:
-        self._signal_queue: asyncio.Queue[str] = asyncio.Queue()
+        # Очередь несёт и решения человека (строки), и факты внешних агентов
+        # (AgentEvent). Один поток вместо двух — иначе фаза, ждущая решения, не
+        # проснулась бы на событии, и наоборот.
+        self._signal_queue: asyncio.Queue[str | AgentEvent] = asyncio.Queue()
         self._analyze_labeled = False
         self._issue: IssueInput | None = None
         self._stage = "intake"
@@ -216,6 +248,8 @@ class IssueLifecycle:
         self._phase_since: datetime | None = None
         self._analyze_comment_id: int | None = None
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
+        # Ключи уже учтённых событий агентов: один факт двигает фазу один раз.
+        self._seen_agent_events: list[str] = []
 
     @workflow.query
     def stage(self) -> str:
@@ -329,6 +363,33 @@ class IssueLifecycle:
         await self._signal_queue.put(AGENT_ANALYZE)
 
     @workflow.signal
+    async def agent_event(self, event: AgentEvent) -> None:
+        """Факт от внешнего агента контура: PR открыт, ревью взято, CI упал (#38).
+
+        Кладём в общую очередь, а не двигаем фазу прямо здесь. Обработчик
+        сигнала конкурирует с основным циклом: пока тот, скажем, гонит
+        аналитику, смена фазы из-под него дала бы состояние, которого нет ни в
+        одном обработчике. Очередь снимает гонку — событие разбирает та фаза, в
+        которой Issue находится сейчас.
+
+        Идемпотентность по паре `(ref, status)`: доставку соседний сервис может
+        повторить (ретрай, дубль вебхука), но один факт обязан двигать фазу
+        один раз. Ключи копятся в состоянии прогона, поэтому храним только
+        последние: цикл живёт месяцами, а сюда попадает каждое событие по
+        каждому PR.
+        """
+        if not workflow.patched("issue-lifecycle-phase-loop"):
+            return  # прежнее поколение фаз не знает — двигать нечего
+        if isinstance(event, dict):
+            event = AgentEvent(**event)
+        if event.key() in self._seen_agent_events:
+            return
+        self._seen_agent_events.append(event.key())
+        del self._seen_agent_events[:-SEEN_EVENTS_KEPT]
+        await workflow.wait_condition(lambda: self._issue is not None)
+        await self._signal_queue.put(event)
+
+    @workflow.signal
     async def estimate_requested(self, comment_id: int | None) -> None:
         """По Issue запрошена оценка трудоёмкости.
 
@@ -361,7 +422,7 @@ class IssueLifecycle:
             workflow.logger.info("estimate already running for %s#%s",
                                  req.repo, req.issue_number)
 
-    async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | None:
+    async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | AgentEvent | None:
         # Нулевой остаток означает «срок уже вышел», а не «ждать без ограничения»:
         # `if timeout:` ниже принял бы timedelta(0) за отсутствие таймаута и
         # припарковал бы Issue навсегда — ровно то, от чего чинили #58.
@@ -531,6 +592,35 @@ class IssueLifecycle:
                                  issue.repo, issue.issue_number)
             return False
 
+    async def _agent_event(self, event: AgentEvent) -> tuple:
+        """Факт внешнего агента — переход по той же таблице, что и у своих.
+
+        Недопустимый переход НЕ роняет прогон, в отличие от `_enter`: там
+        источник — наш собственный код, и невозможный переход означает ошибку,
+        которую надо увидеть. Здесь источник — соседний сервис со своим
+        релизным циклом; его рассинхрон с нашей моделью должен приводить к
+        разбору человеком, а не к падению цикла Issue.
+        """
+        target = agent_events.target_phase(event)
+        if target == self._phase:
+            return (self._phase, self._stage, False)  # тот же факт другими словами
+        if not lifecycle.can(self._phase, target):
+            await workflow.execute_activity(
+                activities.escalate_to_human,
+                args=[self._issue, f"Агент `{event.agent}` сообщил "
+                                   f"`{event.phase}`/`{event.status}` по `{event.ref}`, "
+                                   f"но из фазы `{self._phase}` такого перехода нет. "
+                                   "Событие не потеряно — нужно решение человека."],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if lifecycle.can(self._phase, lifecycle.ESCALATED):
+                return (lifecycle.ESCALATED, "escalated", True)
+            return (self._phase, self._stage, False)
+        # Стадия совпадает с фазой: у шагов, которые ведут внешние агенты, нет
+        # собственного дробления — вся видимая деталь в самом событии.
+        return (target, target, True)
+
     async def _analysis_requested(self, issue: IssueInput) -> tuple:
         """Куда ведёт запрос аналитики из ТЕКУЩЕЙ фазы.
 
@@ -665,7 +755,12 @@ class IssueLifecycle:
                     # Команда на аналитику — не ответ на уточняющий вопрос:
                     # выполняем её и продолжаем ждать ответ, а не засчитываем
                     # раунд уточнения потраченным.
-                    while raw == AGENT_ANALYZE:
+                    while raw == AGENT_ANALYZE or isinstance(raw, AgentEvent):
+                        if isinstance(raw, AgentEvent):
+                            # Триаж ещё не закончен, фазу двигать некуда:
+                            # откладываем факт до ближайшей парковки.
+                            self._signal_queue.put_nowait(raw)
+                            break
                         await self._run_analysis_child(issue)
                         raw = await self._wait_for_signal(
                             timedelta(hours=deadlines.clarification_hours))
@@ -679,7 +774,7 @@ class IssueLifecycle:
                             retry_policy=default_retry,
                         )
                         return (lifecycle.ESCALATED, "escalated", True)
-                    if raw.startswith("__comment__:"):
+                    if isinstance(raw, str) and raw.startswith("__comment__:"):
                         comment_thread.append(raw[len("__comment__:"):])
 
                     gate = await workflow.execute_activity(
@@ -760,6 +855,8 @@ class IssueLifecycle:
             )
             return (lifecycle.ESCALATED, "escalated", True)
 
+        if isinstance(decision, AgentEvent):
+            return await self._agent_event(decision)
         if decision == AGENT_ANALYZE:
             # Явная команда человека сильнее гварда по типу Issue: он защищает
             # от неудачно поставленной метки, а не от прямого `/analyze`.
@@ -808,6 +905,8 @@ class IssueLifecycle:
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди
+        if isinstance(decision, AgentEvent):
+            return await self._agent_event(decision)
         if decision == AGENT_ANALYZE:
             return await self._analysis_requested(issue)
         if decision != "build-me":
@@ -835,6 +934,8 @@ class IssueLifecycle:
         signal = await self._wait_for_signal(self._park_timeout(deadlines.side_state_hours))
         if signal is None:
             return None
+        if isinstance(signal, AgentEvent):
+            return await self._agent_event(signal)
         if signal == AGENT_ANALYZE:
             # Команда работает и на припаркованном Issue: из бокового состояния
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
