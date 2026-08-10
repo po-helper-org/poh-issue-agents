@@ -162,6 +162,25 @@ def remove_label(repo: str, issue_number: int, label: str) -> None:
     resp.raise_for_status()
 
 
+def create_issue(repo: str, title: str, body: str, labels: list[str] | None = None) -> int:
+    """Создаёт Issue и возвращает его номер.
+
+    Нужно живому E2E: проверка контура начинается с появления задачи, а
+    подкладывать её руками — значит проверять не тот путь. В обычном пайплайне
+    сервис Issue не создаёт (их заводит человек либо PR-Closer).
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] create issue %s: %s", repo, title)
+        return 0
+    url = f"https://api.github.com/repos/{repo}/issues"
+    payload: dict = {"title": title, "body": body}
+    if labels:
+        payload["labels"] = labels
+    resp = requests.post(url, headers=_auth_headers(repo), json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["number"]
+
+
 def close_issue(repo: str, issue_number: int) -> None:
     if _dry_run():
         _log.info("[DRY_RUN] close %s#%s", repo, issue_number)
