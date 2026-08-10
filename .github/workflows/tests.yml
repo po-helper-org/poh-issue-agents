@@ -8,6 +8,14 @@ on:
   pull_request:
     branches: [main]
 
+# Ветка в PR даёт две одинаковые доставки (push и pull_request) — два прогона
+# одного коммита на разных раннерах. Кроме удвоенной очереди это удваивало и
+# шанс нарваться на медленную загрузку тестового сервера. Группируем по SHA,
+# чтобы оставался один прогон на коммит.
+concurrency:
+  group: tests-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -29,6 +37,33 @@ jobs:
           pip install -r requirements-dev.txt \
                       -r worker/requirements.txt \
                       -r webhook/requirements.txt
+
+      # Тестовый сервер Temporal SDK качает при первом обращении — то есть
+      # внутри теста, под таймаутом pytest. Один медленный раннер убил тест
+      # посреди загрузки, недокачанный файл остался в /tmp, и следующие 24
+      # теста разбились об него по 20 с каждый. Кэшируем бинарь и греем его
+      # отдельным шагом, где спешить некуда.
+      - name: Кэш тестового сервера Temporal
+        uses: actions/cache@v4
+        with:
+          path: /tmp/temporal-test-server-sdk-python-*
+          key: temporal-test-server-${{ runner.os }}-${{ hashFiles('worker/requirements.txt') }}
+
+      - name: Прогрев тестового сервера Temporal
+        # Заодно снимает недокачанный файл, если прошлый прогон оборвался: без
+        # этого стухший .downloading отравлял бы все прогоны на этом раннере.
+        run: |
+          rm -f /tmp/temporal-test-server-sdk-python-*.downloading
+          python - <<'PY'
+          import asyncio
+          from temporalio.testing import WorkflowEnvironment
+
+          async def main():
+              env = await WorkflowEnvironment.start_time_skipping()
+              await env.shutdown()
+
+          asyncio.run(main())
+          PY
 
       - name: Тесты и покрытие
         # Порог покрытия задан в .coveragerc; падение ниже роняет шаг.
