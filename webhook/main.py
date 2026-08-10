@@ -2,9 +2,10 @@
 Webhook receiver: единственная точка входа для GitHub. Проверяет подпись,
 транслирует событие в вызов Temporal:
 - issues.opened            -> старт нового workflow (ID = repo-issue-N)
-- issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis,
-                               `/estimate` — IssueEstimation; любой другой
-                               комментарий — сигнал уже идущему workflow
+- issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis и
+                               через signal-with-start поднимает цикл-владелец
+                               состояния, `/estimate` — IssueEstimation; любой
+                               другой комментарий — сигнал уже идущему workflow
                                (используется циклом уточнений)
 - issues.labeled           -> `run:<команда>` запускает тот же воркфлоу, что и
                                команда в комментарии (run:analyze ->
@@ -128,6 +129,26 @@ def _search_attributes(repo: str, payload: dict, issue_number: int) -> dict | No
     return {"Repo": [repo], "RootIssue": [root]}
 
 
+def _issue_input(payload: dict, *, interactive: bool):
+    """`IssueInput` из полезной нагрузки вебхука.
+
+    Импорт внутри функции — как и в остальных ветках: shared/ подтягивается
+    лениво, чтобы старт вебхука не зависел от воркерных зависимостей.
+    """
+    from shared.workflow_types import IssueInput
+
+    issue = payload["issue"]
+    return IssueInput(
+        repo=payload["repository"]["full_name"],
+        issue_number=issue["number"],
+        title=issue["title"],
+        body=issue.get("body") or "",
+        author_login=issue["user"]["login"],
+        author_type=issue["user"]["type"],
+        interactive=interactive,
+    )
+
+
 def _may_start_expensive(payload: dict, what: str, repo: str, issue_number: int) -> bool:
     """Гейт на запуск дорогой стадии + аудит того, кто её запустил.
 
@@ -227,18 +248,9 @@ async def github_webhook(
         wf_id = workflow_id_for(repo, issue_number)
 
         if action == "opened":
-            from shared.workflow_types import IssueInput
-
             await client.start_workflow(
                 "IssueLifecycle",  # имя workflow строкой — worker зарегистрирует класс под этим именем
-                IssueInput(
-                    repo=repo,
-                    issue_number=issue_number,
-                    title=payload["issue"]["title"],
-                    body=payload["issue"].get("body") or "",
-                    author_login=payload["issue"]["user"]["login"],
-                    author_type=payload["issue"]["user"]["type"],
-                ),
+                _issue_input(payload, interactive=True),
                 id=wf_id,
                 task_queue="issue-lifecycle",
                 search_attributes=_search_attributes(repo, payload, issue_number),
@@ -290,8 +302,6 @@ async def github_webhook(
             if label in HUMAN_DECISION_LABELS:
                 if not _may_start_expensive(payload, label, repo, issue_number):
                     return {"ok": True}
-                from shared.workflow_types import IssueInput
-
                 # signal-with-start, а не голый signal: лейбл прилетает и по
                 # issue, у которого воркфлоу триажа не существует (issue завели
                 # до установки App — `issues.opened` никто не доставил; либо
@@ -300,18 +310,10 @@ async def github_webhook(
                 # ретраит и бросает доставку — лейбл остаётся мёртвым молча.
                 await client.start_workflow(
                     "IssueLifecycle",
-                    IssueInput(
-                        repo=repo,
-                        issue_number=issue_number,
-                        title=payload["issue"]["title"],
-                        body=payload["issue"].get("body") or "",
-                        author_login=payload["issue"]["user"]["login"],
-                        author_type=payload["issue"]["user"]["type"],
-                        # Отвечать на уточняющий вопрос тут некому: триггер —
-                        # лейбл, а не диалог. VAGUE обязан эскалировать, иначе
-                        # цикл уточнений съест только что доставленный сигнал.
-                        interactive=False,
-                    ),
+                    # Отвечать на уточняющий вопрос тут некому: триггер —
+                    # лейбл, а не диалог. VAGUE обязан эскалировать, иначе цикл
+                    # уточнений съест только что доставленный сигнал.
+                    _issue_input(payload, interactive=False),
                     id=wf_id,
                     task_queue="issue-lifecycle",
                     search_attributes=_search_attributes(repo, payload, issue_number),
@@ -361,13 +363,24 @@ async def github_webhook(
                 return {"ok": True}
             analyze = build_analyze_input(payload)
 
-            # Живому воркфлоу триажа шлём только уведомление — оно повесит метку
+            # Воркфлоу-владельцу состояния шлём уведомление — оно повесит метку
             # `analyzing`; исполнителем всегда остаётся выделенный IssueAnalysis.
-            lifecycle = client.get_workflow_handle(workflow_id_for(repo, issue_number))
-            try:
-                await lifecycle.signal("analyze_requested", analyze.comment_id)
-            except Exception:
-                pass  # триаж уже завершён — уведомлять некого, это не ошибка
+            #
+            # signal-with-start, а не голый signal: раньше сигнал в
+            # несуществующий воркфлоу молча проглатывался (`except: pass`), и
+            # команда по Issue без цикла не оставляла следа вообще. Теперь цикл
+            # — владелец состояния Issue (#36), и поднять его тем же вызовом
+            # правильнее, чем потерять сигнал. Гейт на дорогую стадию уже
+            # пройден выше, так что бесплатный старт цикла посторонним исключён.
+            await client.start_workflow(
+                "IssueLifecycle",
+                _issue_input(payload, interactive=True),
+                id=workflow_id_for(repo, issue_number),
+                task_queue="issue-lifecycle",
+                search_attributes=_search_attributes(repo, payload, issue_number),
+                start_signal="analyze_requested",
+                start_signal_args=[analyze.comment_id],
+            )
 
             try:
                 await client.start_workflow(
@@ -387,8 +400,14 @@ async def github_webhook(
         try:
             await handle.signal("user_comment", payload["comment"]["body"])
         except Exception:
-            # Workflow мог уже завершиться (issue закрыт) — комментарий
-            # после этого просто не на что сигналить, это не ошибка.
-            pass
+            # Сознательное исключение из правила «сигнал поднимает цикл».
+            # Команды (`/analyze`, `/estimate`, метки решения) идут через
+            # signal-with-start и проходят гейт на дорогую стадию; обычный
+            # комментарий гейта не проходит — им можно завести триаж на любом
+            # Issue репозитория, включая тысячи старых. Цена ошибки здесь —
+            # веер LLM-прогонов, а польза — доставка реплики в цикл, которого
+            # нет; поэтому комментарий по-прежнему best-effort.
+            _log.info("no live lifecycle for %s#%s — комментарий не доставлен",
+                      repo, issue_number)
 
     return {"ok": True}

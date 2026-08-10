@@ -72,6 +72,11 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
         Transition(CLASSIFIED, AGENT, "триаж завершён"),
         Transition(SKIPPED, AGENT, "предфильтр: бот или security-sensitive"),
         Transition(SPAM, AGENT, "intake gate: спам"),
+        # Дедуп и advisor-ответ — шаги ВНУТРИ триажа, поэтому их исход виден из
+        # `created`, а не только из `classified`: до конца триажа Issue ещё не
+        # классифицирован формально.
+        Transition(DUPLICATE, AGENT, "duplicate-check"),
+        Transition(ANSWERED, AGENT, "advisor:consultation / existing-functionality"),
         Transition(ESCALATED, AGENT, "не удалось сузить запрос"),
         Transition(FAILED, AGENT, "сбой стадии"),
         Transition(CANCELLED, HUMAN, "agents:off"),
@@ -94,6 +99,10 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     ),
     SYSTEM_REQUIREMENTS: (
         Transition(GROOMED, HUMAN, "требования приняты"),
+        # Груминг — необязательный шаг: сегодня агент публикует чеклист
+        # готовности сразу после аналитики и передаёт задачу разработчику.
+        # Явная приёмка требований остаётся возможностью, а не условием.
+        Transition(READY_FOR_DEV, AGENT, "чеклист готовности опубликован"),
         Transition(BUSINESS_ANALYSIS, HUMAN, "актуализация: вернуть в анализ"),
         Transition(FAILED, AGENT, "сбой стадии"),
         Transition(CANCELLED, HUMAN, "agents:off"),

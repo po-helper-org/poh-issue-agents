@@ -31,6 +31,11 @@ def _issue(interactive: bool = True) -> IssueInput:
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
 
+@activity.defn(name="set_phase")
+async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
+    """Метка фазы: инвариант проверяется в test_lifecycle_phases, здесь — шум."""
+
+
 
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
@@ -68,7 +73,11 @@ async def close_as_spam(issue: IssueInput, reason: str) -> None: ...
 
 
 @activity.defn(name="escalate_to_human")
-async def escalate(issue: IssueInput) -> None: ...
+async def escalate(issue: IssueInput, reason: str = "") -> None: ...
+
+
+@activity.defn(name="post_error_label")
+async def error_label(issue: IssueInput, reason: str = "") -> None: ...
 
 
 @activity.defn(name="classify_issue")
@@ -107,7 +116,8 @@ async def _run_to_completion(activities_list, issue: IssueInput) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
-                          activities=[*activities_list, protocol_default, deadlines_stub]):
+                          activities=[*activities_list, protocol_default, deadlines_stub, phase_stub,
+                                      escalate, error_label]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, issue, id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()
@@ -122,7 +132,8 @@ async def test_parked_run_says_it_waits_for_a_human():
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
                           activities=[prefilter_ok, gate_sufficient, classify_feature,
                                       duplicate_none, score, post_priority,
-                                      protocol_default, deadlines_stub]):
+                                      protocol_default, deadlines_stub, phase_stub,
+                                      escalate, error_label]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 
@@ -155,7 +166,7 @@ async def test_spam_is_terminal_and_named():
 
 @pytest.mark.timeout(60)
 async def test_batch_vague_reports_escalated():
-    stage = await _run_to_completion([prefilter_ok, gate_vague, escalate],
+    stage = await _run_to_completion([prefilter_ok, gate_vague],
                                      _issue(interactive=False))
     assert stage == "escalated"
 

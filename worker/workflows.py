@@ -30,12 +30,18 @@ with workflow.unsafe.imports_passed_through():
         EstimateRequest,
         EstimateResult,
         IssueInput,
+        LifecycleState,
         WebhookAuditInput,
     )
 
     import activities
 
 MAX_CLARIFICATION_ROUNDS = 2
+
+# Порог длины истории для continue-as-new. Ниже потолка, на котором уже
+# спотыкалась консолидация (~990 событий): реплей должен укладываться в
+# workflow-task timeout с запасом, а не впритык.
+HISTORY_EVENT_THRESHOLD = 800
 
 
 def _failure_reason(e: BaseException) -> str:
@@ -191,6 +197,12 @@ class IssueLifecycle:
         self._analyze_labeled = False
         self._issue: IssueInput | None = None
         self._stage = "intake"
+        self._phase = lifecycle.CREATED
+        self._phase_driven = False  # True — прогон идёт фазовым циклом
+        self._priority_tier = ""
+        self._classification_label: str | None = None
+        self._analysis_done = False
+        self._generation = 0
 
     @workflow.query
     def stage(self) -> str:
@@ -210,12 +222,25 @@ class IssueLifecycle:
     def phase(self) -> str:
         """Фаза жизненного цикла — единый словарь на весь контур (#35).
 
-        Выводится из стадии, а не хранится отдельно: два источника правды о
-        состоянии разъехались бы при первом же изменении маршрута. Пока
-        IssueLifecycle линейный, стадия покрывает путь до передачи разработчику;
-        дальше по фазам его поведёт #36.
+        Фазовый цикл ведёт фазу сам. Прогоны ПРЕЖНЕГО поколения (линейный путь,
+        выбранный workflow.patched) фазы не знают — для них она выводится из
+        стадии через мост STAGE_TO_PHASE. Иначе такой прогон вечно показывал бы
+        `created`, хотя триаж давно прошёл.
         """
+        if self._phase_driven:
+            return self._phase
         return lifecycle.STAGE_TO_PHASE.get(self._stage, lifecycle.CREATED)
+
+    @workflow.query
+    def generation(self) -> int:
+        """Сколько раз цикл перезапускался через continue-as-new.
+
+        Долгоживущий прогон обязан обрывать историю, иначе реплей перестаёт
+        укладываться в workflow-task timeout. После перезапуска Event History в
+        UI начинается с чистого листа — без этого счётчика по одной истории
+        нельзя понять, это новый Issue или продолжение старого.
+        """
+        return self._generation
 
     @workflow.signal
     async def human_decision(self, label: str) -> None:
@@ -273,8 +298,387 @@ class IssueLifecycle:
             return None
 
     @workflow.run
-    async def run(self, issue: IssueInput) -> None:
+    async def run(self, issue: IssueInput,
+                  carried: LifecycleState | None = None) -> None:
+        """Владелец состояния Issue: живёт, пока у Issue есть непросроченное
+        ожидание, а не заканчивается после приоритизации.
+
+        Второй аргумент со значением по умолчанию — ради совместимости: вебхук и
+        скрипты стартуют воркфлоу одним аргументом, как раньше, а continue-as-new
+        передаёт снимок состояния вторым.
+
+        `workflow.patched` разводит поколения. Прогоны, запущенные до этого
+        изменения, припаркованы в проде: их история не знает маркера, patched()
+        вернёт False, и они доиграют по прежнему линейному коду. Новые пойдут
+        циклом. Без этого реплей старой истории новым кодом упал бы
+        недетерминизмом — самый дорогой класс отказа в Temporal.
+        """
+        # Вебхук и скрипты стартуют воркфлоу ОДНИМ аргументом, а сигнатура
+        # объявляет два. При таком расхождении Temporal не применяет типы ни к
+        # одному аргументу и отдаёт сырые словари — молча, на первом же
+        # обращении к полю. Нормализуем сами: ломать существующие стартеры ради
+        # красоты сигнатуры нельзя, а второй аргумент нужен continue-as-new.
+        if isinstance(issue, dict):
+            issue = IssueInput(**issue)
+        if isinstance(carried, dict):
+            carried = LifecycleState(**carried)
+
         self._issue = issue  # даёт analyze_requested доступ к repo/number
+        if carried is not None:
+            self._phase = carried.phase
+            self._stage = carried.stage
+            self._priority_tier = carried.priority_tier
+            self._classification_label = carried.classification_label
+            self._analysis_done = carried.analysis_done
+            self._generation = carried.generation
+
+        if not workflow.patched("issue-lifecycle-phase-loop"):
+            await self._run_linear(issue)
+            return
+        self._phase_driven = True
+        await self._run_phase_loop(issue)
+
+    # --- Фазовый цикл ---
+
+    def _snapshot(self) -> LifecycleState:
+        """Компактное состояние для continue-as-new: фаза и то немногое, что
+        нужно следующим фазам. Тред и история не переносятся — именно их объём
+        и упирается в потолок."""
+        return LifecycleState(
+            phase=self._phase,
+            stage=self._stage,
+            priority_tier=self._priority_tier,
+            classification_label=self._classification_label,
+            analysis_done=self._analysis_done,
+            generation=self._generation + 1,
+        )
+
+    def _history_is_long(self) -> bool:
+        """Порог по длине истории, а не по числу итераций: цена реплея зависит
+        от событий, а одна фаза может стоить и трёх событий, и трёхсот."""
+        return workflow.info().get_current_history_length() >= HISTORY_EVENT_THRESHOLD
+
+    async def _enter(self, phase: str, stage: str, *, write_label: bool = True) -> None:
+        """Переход в фазу: проверка допустимости, стадия, метка.
+
+        Недопустимый переход поднимает InvalidTransition и роняет прогон — это
+        осознанно. Молчаливая перезапись фазы означала бы Issue в состоянии, из
+        которого не выводится ни предыстория, ни следующий шаг; такую ошибку
+        лучше увидеть в тестах и в Temporal UI, чем годами не замечать.
+        """
+        if phase == self._phase:
+            # Остаться в своей фазе, не дождавшись нужного сигнала, — штатное
+            # поведение парковки, а не смена состояния: ни проверять переход,
+            # ни переписывать метку не нужно.
+            self._stage = stage
+            return
+        lifecycle.transition(self._phase, phase)
+        self._phase = phase
+        self._stage = stage
+        if write_label and self._issue is not None:
+            await workflow.execute_activity(
+                activities.set_phase,
+                args=[self._issue.repo, self._issue.issue_number, phase],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+
+    async def _run_phase_loop(self, issue: IssueInput) -> None:
+        deadlines = await workflow.execute_activity(
+            activities.read_deadlines,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        while True:
+            if lifecycle.is_terminal(self._phase):
+                return  # «вечноживущий» не значит «незакрываемый»
+
+            if self._phase == lifecycle.CREATED:
+                nxt = await self._phase_triage(issue, deadlines)
+            elif self._phase == lifecycle.CLASSIFIED:
+                nxt = await self._phase_await_decision(issue, deadlines)
+            elif self._phase == lifecycle.BUSINESS_ANALYSIS:
+                nxt = await self._phase_analysis(issue)
+            elif self._phase == lifecycle.SYSTEM_REQUIREMENTS:
+                nxt = await self._phase_handoff(issue)
+            elif self._phase == lifecycle.READY_FOR_DEV:
+                nxt = await self._phase_await_build(issue, deadlines)
+            else:
+                # Боковые состояния и фазы, которые ведут внешние агенты (#38):
+                # цикл держит их живыми, пока не истечёт срок ожидания.
+                nxt = await self._phase_park(deadlines)
+
+            if nxt is None:
+                return  # срок ожидания истёк — цикл закрывается (правило R3)
+            phase, stage, write_label = nxt
+            await self._enter(phase, stage, write_label=write_label)
+
+            # Точка перезапуска — сразу после смены фазы: состояние согласовано,
+            # незавершённой работы нет.
+            #
+            # Очередь сигналов в снимок не переносится: она живёт в памяти
+            # прогона, и перезапуск с непрочитанным сигналом потерял бы его
+            # молча — ровно тот отказ, от которого уходит #36. Пока очередь не
+            # пуста, ждём следующей фазы: порог не жёсткий дедлайн, а несколько
+            # лишних событий дешевле съеденной команды человека.
+            if (self._history_is_long()
+                    and self._signal_queue.empty()
+                    and not lifecycle.is_terminal(self._phase)):
+                workflow.continue_as_new(args=[issue, self._snapshot()])
+
+    async def _phase_triage(self, issue: IssueInput, deadlines) -> tuple | None:
+        """Фаза `created`: тот же триаж, что и раньше, но его исход — фаза.
+
+        Ранние выходы перестают завершать воркфлоу: `spam`, `duplicate`,
+        `answered`, `skipped` становятся состояниями, из которых человек может
+        вернуть Issue в работу. Сегодня это невозможно в принципе — воркфлоу
+        уже нет, и сигналить некому.
+        """
+        default_retry = RetryPolicy(maximum_attempts=3)
+        try:
+            skip_reason = await workflow.execute_activity(
+                activities.prefilter_bot_and_security,
+                issue,
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            if skip_reason is not None:
+                return (lifecycle.SKIPPED, "skipped", True)
+
+            state = await workflow.execute_activity(
+                activities.read_protocol_state,
+                args=[issue.repo, issue.issue_number],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=default_retry,
+            )
+            if state.agents_off:
+                # Метку не пишем: человек забрал Issue себе, и наши пометки на
+                # нём — ровно то, от чего он отгородился рубильником.
+                return (lifecycle.CANCELLED, "agents-off", False)
+            if state.depth_exceeded:
+                await workflow.execute_activity(
+                    activities.escalate_to_human,
+                    args=[issue, "Цепочка follow-up пошла на второй круг — "
+                                 "останавливаю автоматическую обработку (правило R7 "
+                                 "протокола агентов). Дальше нужен человек."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=default_retry,
+                )
+                return (lifecycle.ESCALATED, "escalated", True)
+
+            classification: ClassificationResult | None = None
+            if not state.origin_agent:
+                gate = await workflow.execute_activity(
+                    activities.intake_gate,
+                    args=[issue, []],
+                    start_to_close_timeout=timedelta(seconds=120),
+                    retry_policy=default_retry,
+                )
+                if gate.status == "VAGUE" and not issue.interactive:
+                    await workflow.execute_activity(
+                        activities.escalate_to_human,
+                        issue,
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    return (lifecycle.ESCALATED, "escalated", True)
+
+                comment_thread: list[str] = []
+                round_count = 0
+                while gate.status == "VAGUE":
+                    round_count += 1
+                    if round_count > MAX_CLARIFICATION_ROUNDS:
+                        await workflow.execute_activity(
+                            activities.escalate_to_human,
+                            issue,
+                            start_to_close_timeout=timedelta(seconds=30),
+                        )
+                        return (lifecycle.ESCALATED, "escalated", True)
+
+                    await workflow.execute_activity(
+                        activities.post_clarifying_question,
+                        args=[issue, gate.content],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    raw = await self._wait_for_signal(
+                        timedelta(hours=deadlines.clarification_hours))
+                    if raw is None:
+                        await workflow.execute_activity(
+                            activities.escalate_to_human,
+                            args=[issue, f"Уточнение не получено за "
+                                         f"{deadlines.clarification_hours} ч — "
+                                         "передаю на ручной разбор."],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=default_retry,
+                        )
+                        return (lifecycle.ESCALATED, "escalated", True)
+                    if raw.startswith("__comment__:"):
+                        comment_thread.append(raw[len("__comment__:"):])
+
+                    gate = await workflow.execute_activity(
+                        activities.intake_gate,
+                        args=[issue, comment_thread],
+                        start_to_close_timeout=timedelta(seconds=120),
+                        retry_policy=default_retry,
+                    )
+
+                if gate.status == "SPAM":
+                    await workflow.execute_activity(
+                        activities.close_as_spam,
+                        args=[issue, gate.content],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    return (lifecycle.SPAM, "spam", True)
+
+                self._stage = "classify"
+                classification = await workflow.execute_activity(
+                    activities.classify_issue,
+                    issue,
+                    start_to_close_timeout=timedelta(seconds=180),
+                    retry_policy=default_retry,
+                )
+                if classification.label in ("advisor:existing-functionality",
+                                            "advisor:consultation"):
+                    return (lifecycle.ANSWERED, "answered", True)
+            self._classification_label = classification.label if classification else None
+
+            self._stage = "duplicate-check"
+            dup = await workflow.execute_activity(
+                activities.duplicate_check,
+                issue,
+                start_to_close_timeout=timedelta(seconds=180),
+                retry_policy=default_retry,
+            )
+            if dup.decision == "duplicate":
+                return (lifecycle.DUPLICATE, "duplicate", True)
+
+            self._stage = "priority"
+            priority = await workflow.execute_activity(
+                activities.score_priority,
+                args=[issue, classification, dup],
+                start_to_close_timeout=timedelta(seconds=180),
+                retry_policy=default_retry,
+            )
+            self._priority_tier = priority.tier
+            await workflow.execute_activity(
+                activities.post_priority_comment,
+                args=[issue, priority, dup],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+        except Exception as e:
+            # Сбой больше не закрывает цикл: Issue переходит в фазу, из которой
+            # человек может перезапустить обработку.
+            await workflow.execute_activity(
+                activities.post_error_label,
+                args=[issue, _failure_reason(e)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=5),
+            )
+            return (lifecycle.FAILED, "failed", True)
+        return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
+
+    async def _phase_await_decision(self, issue: IssueInput, deadlines) -> tuple | None:
+        """Фаза `classified`: ждём решения человека о тяжёлой стадии."""
+        decision = await self._wait_for_signal(
+            timedelta(hours=deadlines.human_decision_hours))
+        if decision is None:
+            await workflow.execute_activity(
+                activities.escalate_to_human,
+                args=[issue, f"Решение о тяжёлой стадии не принято за "
+                             f"{deadlines.human_decision_hours} ч "
+                             "(`research-me` / `bug-me`) — снимаю задачу с ожидания. "
+                             "Поставь метку, когда понадобится: прогон запустится заново."],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (lifecycle.ESCALATED, "escalated", True)
+
+        # `classification_label is None` — сокращённый триаж (Issue от агента):
+        # он уже классифицирован на стороне создателя, гвард проверять не на чем.
+        label = self._classification_label
+        feature = label is None or label == "advisor:feature-request"
+        bug = label is None or label == "advisor:bug"
+        if decision == "research-me" and feature:
+            return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+        if decision == "bug-me" and bug:
+            return (lifecycle.READY_FOR_DEV, "bug", True)
+        # Лейбл не совпал с типом либо пришёл посторонний сигнал: раньше это
+        # завершало воркфлоу, теперь — просто не переход. Ждём дальше, до срока.
+        return (lifecycle.CLASSIFIED, "awaiting-human-decision", False)
+
+    async def _phase_analysis(self, issue: IssueInput) -> tuple | None:
+        """Фаза `business-analysis`: тот же пер-стадийный прогон FNR."""
+        analyze_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
+                                     title=issue.title, body=issue.body)
+        await workflow.execute_activity(
+            activities.mark_command_running,
+            args=[issue.repo, issue.issue_number, ANALYZE],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        self._analysis_done = await _run_staged_analysis(analyze_input)
+        if not self._analysis_done:
+            return (lifecycle.FAILED, "failed", True)
+        return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
+
+    async def _phase_handoff(self, issue: IssueInput) -> tuple | None:
+        """Фаза `system-requirements`: передача разработчику (H1)."""
+        await workflow.execute_activity(
+            activities.mark_ready_for_dev,
+            args=[issue, self._priority_tier, f"research/issue-{issue.issue_number}"],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
+
+    async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
+        """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку."""
+        decision = await self._wait_for_signal(
+            timedelta(hours=deadlines.build_decision_hours))
+        if decision is None:
+            self._stage = "done"
+            return None  # срок вышел — цикл закрывается, задача осталась в очереди
+        if decision != "build-me":
+            return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
+        try:
+            await workflow.execute_activity(
+                activities.trigger_openhands_resolver,
+                issue,
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+        except Exception as e:
+            # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
+            # исчезал, и Issue терял владельца состояния.
+            workflow.logger.warning("build-me не выполнен: %s", _failure_reason(e))
+            return (lifecycle.FAILED, "failed", True)
+        return (lifecycle.IN_DEVELOPMENT, "in-development", True)
+
+    async def _phase_park(self, deadlines) -> tuple | None:
+        """Боковые фазы и фазы внешних агентов.
+
+        Парковка со сроком, а не навсегда (правило R3): «не тупик» не означает
+        «вечная сессия». Сигнал `reopen` возвращает Issue в работу по таблице
+        переходов — первым допустимым переходом обратно в основной путь.
+        """
+        signal = await self._wait_for_signal(timedelta(hours=deadlines.side_state_hours))
+        if signal is None:
+            return None
+        if signal != "reopen":
+            return (self._phase, self._stage, False)  # посторонний сигнал — ждём дальше
+        back = next((t for t in lifecycle.allowed(self._phase)
+                     if t.to in (lifecycle.CREATED, lifecycle.CLASSIFIED)), None)
+        if back is None:
+            return (self._phase, self._stage, False)
+        stage = "intake" if back.to == lifecycle.CREATED else "awaiting-human-decision"
+        return (back.to, stage, True)
+
+    async def _run_linear(self, issue: IssueInput) -> None:
+        """Прежний линейный сценарий — БЕЗ ИЗМЕНЕНИЙ.
+
+        Живёт ради прогонов, запущенных до перехода на фазовый цикл: они
+        припаркованы в проде, и их история не знает маркера патча. Реплей такой
+        истории обязан идти по тому же коду, иначе Temporal уронит прогон
+        недетерминизмом. Удалять — только когда все прогоны этого поколения
+        завершатся (workflow.deprecate_patch).
+        """
         default_retry = RetryPolicy(maximum_attempts=3)
 
         try:

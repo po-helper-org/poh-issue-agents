@@ -98,34 +98,42 @@ def test_estimate_command_starts_estimation_with_comment_id(webhook):
     assert call["arg"].comment_id == 555
 
 
-def test_analyze_command_starts_analysis_and_notifies_triage(webhook):
+def test_analyze_command_starts_analysis_and_notifies_the_cycle(webhook):
     fake, app_client = webhook()
 
     assert _post(app_client, _comment("/analyze")).status_code == 200
 
-    call = fake.started[0]
-    assert call["workflow"] == "IssueAnalysis"
-    assert call["id"] == "analysis-acme/widgets-7"
-    assert call["arg"].comment_id == 555
-    # Живому триажу уходит уведомление — он повесит метку `analyzing`.
-    assert ("analyze_requested", (555,)) in fake.signals
+    analysis = next(c for c in fake.started if c["workflow"] == "IssueAnalysis")
+    assert analysis["id"] == "analysis-acme/widgets-7"
+    assert analysis["arg"].comment_id == 555
+    # Уведомление владельцу состояния — он повесит метку `analyzing`.
+    cycle = next(c for c in fake.started if c["workflow"] == "IssueLifecycle")
+    assert cycle["id"] == "issue-acme/widgets-7"
+    assert cycle["start_signal"] == "analyze_requested"
+    assert cycle["start_signal_args"] == [555]
 
 
-def test_analyze_survives_a_finished_triage_workflow(webhook):
-    """Триаж мог завершиться неделю назад — сигналить некому, но анализ обязан
-    стартовать: уведомление косметическое, исполнитель — IssueAnalysis."""
+def test_analyze_raises_the_cycle_when_it_is_gone(webhook):
+    """Раньше сигнал в завершённый триаж молча проглатывался, и команда по
+    Issue без цикла не оставляла следа. Теперь тот же вызов поднимает цикл —
+    владельца состояния Issue (#36)."""
     fake, app_client = webhook(signal_fails=True)
 
     assert _post(app_client, _comment("/analyze")).status_code == 200
 
-    assert [c["workflow"] for c in fake.started] == ["IssueAnalysis"]
+    # signal-with-start не зависит от того, жив ли адресат: он либо сигналит,
+    # либо стартует. Голого signal() на этом пути больше нет.
+    assert fake.signals == []
+    assert {c["workflow"] for c in fake.started} == {"IssueLifecycle", "IssueAnalysis"}
+    assert fake.started[0]["arg"].interactive is True, (
+        "команда пришла из треда — цикл уточнений здесь уместен")
 
 
 def test_repeated_analyze_does_not_start_a_second_run(webhook):
     fake, app_client = webhook(already={"IssueAnalysis"})
 
     assert _post(app_client, _comment("/analyze")).status_code == 200
-    assert fake.started == []
+    assert not any(c["workflow"] == "IssueAnalysis" for c in fake.started)
 
 
 def test_repeated_estimate_delivery_is_swallowed(webhook):
