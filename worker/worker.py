@@ -41,6 +41,7 @@ async def main() -> None:
             activities.read_protocol_state,
             activities.read_deadlines,
             activities.set_phase,
+            activities.mark_awaiting,
             activities.mark_ready_for_dev,
             activities.post_agents_off_notice,
             activities.intake_gate,

@@ -29,6 +29,11 @@ from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
 _calls: list[str] = []
 
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
 
@@ -100,7 +105,7 @@ def _event(phase: str, status: str = STARTED, ref: str = "42",
 def _worker(env, tq):
     return Worker(env.client, task_queue=tq,
                   workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                  activities=ACTIVITIES)
+                  activities=[*ACTIVITIES, awaiting_stub])
 
 
 async def _await_phase(env, handle, expected: str, tries: int = 200) -> str:

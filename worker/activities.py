@@ -24,6 +24,7 @@ import estimation
 import github_client
 import llm
 from shared import labels, lifecycle, sentry_setup
+from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
     ESTIMATE,
@@ -185,6 +186,29 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
                 logger.warning("не снял метку фазы %s с %s#%s: %s",
                                stale, repo, issue_number, exc)
     github_client.add_label(repo, issue_number, target)
+
+
+@activity.defn
+def mark_awaiting(repo: str, issue_number: int, waiting=None) -> None:
+    """Отражение ожидания в GitHub: очередь к людям обязана быть полной (#39).
+
+    Метка ставится, пока ход за человеком, и снимается, как только ожидание
+    закрыто. До этого `needs-human:*` появлялась только по истечении дедлайна —
+    то есть выборка показывала не очередь, а её просроченный хвост.
+
+    Ожидание машины (стенд, соседний сервис) метку НЕ ставит: задача, по которой
+    человеку делать нечего, в его очереди — шум, из-за которого перестают
+    смотреть на саму выборку.
+    """
+    if waiting is not None and isinstance(waiting, dict):
+        waiting = Awaiting(**waiting)
+    if waiting is not None and waiting.blocks_on_human:
+        github_client.add_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
+        return
+    try:
+        github_client.remove_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
+    except Exception as exc:
+        logger.warning("не снял метку ожидания с %s#%s: %s", repo, issue_number, exc)
 
 
 @activity.defn

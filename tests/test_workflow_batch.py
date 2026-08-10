@@ -20,6 +20,11 @@ from shared.workflow_types import (
 _state = {}
 
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def stub_prefilter(issue): return None
 
@@ -56,7 +61,7 @@ async def test_batch_vague_escalates_without_hanging():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
             env.client, task_queue="tq", workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-            activities=[stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol, deadlines_stub, phase_stub],
+            activities=[awaiting_stub, stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol, deadlines_stub, phase_stub],
         ):
             await env.client.execute_workflow(
                 IssueLifecycle.run,
@@ -167,7 +172,7 @@ async def test_research_me_label_surfaces_pipeline_failure():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
             env.client, task_queue="tq-research", workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-            activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
+            activities=[awaiting_stub, stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
                         stub_ack, stub_prepare, stub_stage_fails, stub_publish, stub_cleanup,
                         stub_publish_error, stub_mark_running, stub_finish_labels,
@@ -271,7 +276,7 @@ async def test_repeated_analyze_does_not_start_a_second_expensive_run():
         async with Worker(
             env.client, task_queue="tq-analyze-once",
             workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-            activities=ANALYZE_STUBS,
+            activities=[*ANALYZE_STUBS, awaiting_stub],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -299,7 +304,7 @@ async def test_analyze_requested_in_the_first_activation_is_not_lost():
         async with Worker(
             env.client, task_queue="tq-analyze-init",
             workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-            activities=ANALYZE_STUBS,
+            activities=[*ANALYZE_STUBS, awaiting_stub],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,

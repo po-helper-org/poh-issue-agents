@@ -108,6 +108,11 @@ def test_open_questions_are_capped(monkeypatch):
 _calls: list[str] = []
 
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
 
@@ -202,7 +207,7 @@ async def _run_research(stage_activity) -> None:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[prefilter_ok, protocol_default, deadlines_stub, gate,
+                          activities=[awaiting_stub, prefilter_ok, protocol_default, deadlines_stub, gate,
                                       classify, duplicate, score, post_priority,
                                       mark_running, finish, ack, prepare, stage_activity,
                                       publish, cleanup, publish_error, ready, phase_stub]):

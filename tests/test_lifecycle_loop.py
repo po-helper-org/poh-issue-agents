@@ -40,6 +40,11 @@ _calls: list[str] = []
 
 # --- заглушки границ ---
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput):
     return None
@@ -185,7 +190,7 @@ async def test_side_state_keeps_the_cycle_alive():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_consultation]):
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_consultation]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 
@@ -202,7 +207,7 @@ async def test_reopen_returns_a_side_state_to_work():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_consultation]):
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_consultation]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await _await_phase(env, handle, lifecycle.ANSWERED)
@@ -221,7 +226,7 @@ async def test_foreign_signal_does_not_move_a_parked_issue():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_consultation]):
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_consultation]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await _await_phase(env, handle, lifecycle.ANSWERED)
@@ -241,7 +246,7 @@ async def test_failed_stage_becomes_a_phase_not_the_end():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_fails_once]):
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_fails_once]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 
@@ -258,7 +263,7 @@ async def test_reopen_after_failure_runs_the_triage_again():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_fails_once]):
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_fails_once]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await _await_phase(env, handle, lifecycle.FAILED)
@@ -285,7 +290,7 @@ async def test_continue_as_new_truncates_history_without_losing_state(monkeypatc
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_feature,
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_feature,
                                       *ANALYSIS_ACTIVITIES],
                           # порог читается из модуля: песочница импортировала бы
                           # его копию, и monkeypatch до воркфлоу не дошёл бы
@@ -350,7 +355,7 @@ async def test_previous_generation_still_completes_its_triage():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[_LegacyLifecycle],
-                          activities=[*TRIAGE_ACTIVITIES, classify_feature,
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_feature,
                                       *ANALYSIS_ACTIVITIES]):
             handle = await env.client.start_workflow(
                 _LegacyLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
@@ -375,7 +380,7 @@ async def test_history_of_the_new_generation_replays_cleanly():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*TRIAGE_ACTIVITIES, classify_feature,
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES, classify_feature,
                                       *ANALYSIS_ACTIVITIES]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
