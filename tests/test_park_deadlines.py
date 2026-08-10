@@ -71,6 +71,11 @@ def test_zero_and_negative_fall_back(monkeypatch):
 async def prefilter_ok(issue: IssueInput):
     return None
 
+@activity.defn(name="set_phase")
+async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
+    """Метка фазы: инвариант проверяется в test_lifecycle_phases, здесь — шум."""
+
+
 
 @activity.defn(name="read_protocol_state")
 async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
@@ -138,7 +143,7 @@ async def _run(acts, deadlines: Deadlines) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
-                          activities=[*acts, _deadlines_stub(deadlines)]):
+                          activities=[*acts, _deadlines_stub(deadlines), phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()

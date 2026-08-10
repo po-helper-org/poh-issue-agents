@@ -111,6 +111,11 @@ _calls: list[str] = []
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
 
+@activity.defn(name="set_phase")
+async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
+    """Метка фазы: инвариант проверяется в test_lifecycle_phases, здесь — шум."""
+
+
 
 @activity.defn(name="read_protocol_state")
 async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
@@ -196,7 +201,7 @@ async def _run_research(stage_activity) -> None:
                           activities=[prefilter_ok, protocol_default, deadlines_stub, gate,
                                       classify, duplicate, score, post_priority,
                                       mark_running, finish, prepare, stage_activity,
-                                      publish, cleanup, publish_error, ready]):
+                                      publish, cleanup, publish_error, ready, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")

@@ -32,6 +32,11 @@ async def prefilter_ok(issue: IssueInput):
     _calls.append("prefilter")
     return None
 
+@activity.defn(name="set_phase")
+async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
+    """Метка фазы: инвариант проверяется в test_lifecycle_phases, здесь — шум."""
+
+
 
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
@@ -89,7 +94,7 @@ async def _run(state: ProtocolState) -> str:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
-                                      post_priority, escalate, _state_stub(state), deadlines_stub]):
+                                      post_priority, escalate, _state_stub(state), deadlines_stub, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             # Триаж без сигнала припарковался бы навсегда — шлём заведомо
@@ -109,7 +114,7 @@ async def test_agents_off_spends_nothing():
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
-                                      _state_stub(ProtocolState(agents_off=True)), deadlines_stub]):
+                                      _state_stub(ProtocolState(agents_off=True)), deadlines_stub, phase_stub]):
             await env.client.execute_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 
@@ -127,7 +132,7 @@ async def test_agents_off_is_visible_as_a_stage():
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
-                                      _state_stub(ProtocolState(agents_off=True)), deadlines_stub]):
+                                      _state_stub(ProtocolState(agents_off=True)), deadlines_stub, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()
@@ -167,7 +172,7 @@ async def test_second_round_follow_up_goes_straight_to_a_human():
                           activities=[prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(origin_agent=True,
-                                                                depth_exceeded=True)), deadlines_stub]):
+                                                                depth_exceeded=True)), deadlines_stub, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()

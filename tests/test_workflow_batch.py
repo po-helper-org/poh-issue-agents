@@ -23,6 +23,11 @@ _state = {}
 @activity.defn(name="prefilter_bot_and_security")
 async def stub_prefilter(issue): return None
 
+@activity.defn(name="set_phase")
+async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
+    """Метка фазы: инвариант проверяется в test_lifecycle_phases, здесь — шум."""
+
+
 
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
@@ -51,7 +56,7 @@ async def test_batch_vague_escalates_without_hanging():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
             env.client, task_queue="tq", workflows=[IssueLifecycle],
-            activities=[stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol, deadlines_stub],
+            activities=[stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol, deadlines_stub, phase_stub],
         ):
             await env.client.execute_workflow(
                 IssueLifecycle.run,
@@ -161,7 +166,7 @@ async def test_research_me_label_surfaces_pipeline_failure():
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
                         stub_prepare, stub_stage_fails, stub_publish, stub_cleanup,
                         stub_publish_error, stub_mark_running, stub_finish_labels,
-                        stub_protocol, deadlines_stub],
+                        stub_protocol, deadlines_stub, phase_stub],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -203,6 +208,12 @@ async def stub_mark_analyzing(repo: str, issue_number: int) -> None:
     _analyze_signal_state["count"] += 1
 
 
+@activity.defn(name="escalate_to_human")
+async def stub_escalate_any(issue: IssueInput, reason: str = "") -> None:
+    """Цикл больше не завершается на несовпавшем лейбле — он ждёт до срока и
+    эскалирует. Заглушка нужна всем прогонам, доходящим до дедлайна."""
+
+
 @pytest.mark.timeout(30)
 async def test_analyze_requested_labels_only_once():
     """Два сигнала analyze_requested подряд обязаны дать ровно один вызов
@@ -216,7 +227,8 @@ async def test_analyze_requested_labels_only_once():
             env.client, task_queue="tq-analyze-once", workflows=[IssueLifecycle],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_mark_analyzing, stub_protocol, deadlines_stub],
+                        stub_mark_analyzing, stub_protocol, deadlines_stub, phase_stub,
+                        stub_escalate_any],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -248,7 +260,8 @@ async def test_analyze_requested_before_run_init_still_labels():
             env.client, task_queue="tq-analyze-init", workflows=[IssueLifecycle],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_mark_analyzing, stub_protocol, deadlines_stub],
+                        stub_mark_analyzing, stub_protocol, deadlines_stub, phase_stub,
+                        stub_escalate_any],
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,

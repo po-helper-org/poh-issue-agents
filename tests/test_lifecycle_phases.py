@@ -192,11 +192,24 @@ def test_set_phase_removes_the_previous_one():
     assert lc.phase_label(lc.GROOMED) not in removed, "новая метка не должна сниматься"
 
 
-def test_workflow_phase_query_derives_from_stage():
-    """Фаза выводится из стадии, а не хранится вторым источником правды."""
+def test_phase_query_follows_the_loop_when_it_drives():
+    """Фазовый цикл ведёт фазу сам — query отдаёт её, а не догадку по стадии."""
     from workflows import IssueLifecycle
 
     wf = IssueLifecycle()
+    wf._phase_driven = True
+    wf._phase = lc.BUSINESS_ANALYSIS
+    wf._stage = "analysis"
+
+    assert wf.phase() == lc.BUSINESS_ANALYSIS
+
+
+def test_phase_query_derives_from_stage_for_older_runs():
+    """Прогоны прежнего поколения идут линейным путём и фазы не знают. Без
+    вывода из стадии такой прогон вечно показывал бы `created`."""
+    from workflows import IssueLifecycle
+
+    wf = IssueLifecycle()  # _phase_driven остаётся False
     assert wf.phase() == lc.CREATED
 
     wf._stage = "awaiting-human-decision"

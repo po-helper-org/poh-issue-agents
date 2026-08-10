@@ -44,6 +44,7 @@ E2E_ACTIVITIES = [
     activities_module.prefilter_bot_and_security,
     activities_module.read_protocol_state,
     activities_module.read_deadlines,
+    activities_module.set_phase,
     activities_module.mark_ready_for_dev,
     activities_module.post_agents_off_notice,
     activities_module.intake_gate,
@@ -360,10 +361,19 @@ async def test_research_me_produces_artifacts_and_hands_off(e2e, monkeypatch):
                     break
                 await env.sleep(1)
 
-            # Человек ставит research-me, затем не даёт build-me.
+            # Человек ставит research-me — дальше контур идёт сам, до H1.
             assert _post(client, "issues", _labeled("research-me")).status_code == 200
+            for _ in range(300):
+                if await handle.query(IssueLifecycle.stage) == "awaiting-build-decision":
+                    break
+                await env.sleep(1)
+            assert await handle.query(IssueLifecycle.stage) == "awaiting-build-decision"
+
+            # Посторонний сигнал не закрывает цикл: владелец состояния Issue
+            # остаётся живым и продолжает ждать решения о разработке.
             await handle.signal(IssueLifecycle.human_decision, "no-build")
-            await handle.result()
+            await env.sleep(1)
+            assert await handle.query(IssueLifecycle.phase) == "ready-for-dev"
 
     branch = "research/issue-7"
     assert branch in gh.branches, "артефакты анализа не опубликованы"

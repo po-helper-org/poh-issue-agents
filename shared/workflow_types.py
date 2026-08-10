@@ -41,6 +41,27 @@ class Deadlines:
     human_decision_hours: int = 72   # ожидание research-me / bug-me
     clarification_hours: int = 48    # ответ на уточняющий вопрос intake gate
     build_decision_hours: int = 72   # ожидание build-me после аналитики
+    # Боковые фазы (spam, duplicate, answered, skipped, escalated, failed) —
+    # не тупики: человек может вернуть Issue в работу. Но и не вечная сессия.
+    side_state_hours: int = 168      # неделя на возврат из бокового состояния
+
+
+@dataclass
+class LifecycleState:
+    """Снимок цикла для continue-as-new.
+
+    Переносится КОМПАКТНОЕ состояние — фаза, стадия и то немногое, что нужно
+    следующим фазам, — а не тред и не история. Долгоживущий цикл на активном
+    Issue иначе упрётся в тот же потолок, который уже словила консолидация:
+    на ~75 Issue история превышает ~990 событий и реплей не укладывается в
+    workflow-task timeout.
+    """
+    phase: str = "created"
+    stage: str = "intake"
+    priority_tier: str = ""              # нужен чеклисту готовности (H1)
+    classification_label: str | None = None  # None — сокращённый триаж (R6)
+    analysis_done: bool = False
+    generation: int = 0                  # сколько раз цикл перезапускался
 
 
 @dataclass
