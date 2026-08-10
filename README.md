@@ -21,7 +21,7 @@ Actions. Два независимых сценария: **триаж каждо
 | **Тяжёлая стадия по багам** `run_bug_pipeline` (перенос `bug-pipeline.yml`) | ❌ `NotImplementedError` — не реализовано | — |
 | **OpenHands resolver** | ❌ `NotImplementedError`, намеренно вне этого compose | — |
 
-Тесты: **354 теста**, покрытие **88%**. Локально — `make test` (после `make setup`
+Тесты: **383 теста**, покрытие **88%**. Локально — `make test` (после `make setup`
 цель зовёт `.venv/bin/pytest`), на каждый push и PR — GitHub Actions
 (`.github/workflows/tests.yml`). Порог покрытия — `.coveragerc`, `fail_under = 83`:
 он держит текущий уровень, чтобы тот не проседал незаметно, а не задаёт цель.
@@ -333,6 +333,34 @@ Temporal недостижим либо авторизация не настро�
   `done`; ранние выходы — `skipped`, `spam`, `escalated`, `answered`,
   `duplicate`, `failed`, `agents-off`. Припаркованный прогон теперь отличим от
   зависшего.
+
+## Фазы жизненного цикла Issue
+
+`shared/lifecycle.py` — единственный источник правды о состоянии Issue: перечень
+фаз, таблица переходов и инициатор каждого перехода. Из него выводятся значения
+query, метки `phase:*`, search attribute и строки таймлайна. Модуль чистый — ни
+сети, ни Temporal, как `estimation.py`.
+
+Основной путь: `created` → `classified` → `business-analysis` →
+`system-requirements` → `groomed` → `ready-for-dev` → `in-development` →
+`pr-open` → `pr-review` → `merged` → `testing` → `released`. Путь бага короче —
+из `classified` сразу в `ready-for-dev`, мимо аналитики.
+
+Боковые состояния — `spam`, `duplicate`, `answered`, `skipped`, `escalated`,
+`failed` — **не тупики**: человек возвращает Issue в работу явным переходом.
+Терминальны только `released` и `cancelled`.
+
+У каждого перехода записан инициатор: `agent`, `human` или `external` (PR-Agent,
+PR-Closer, CI). «Ждём агента» и «ждём человека» — разные состояния для того, кто
+смотрит на очередь. Недопустимый переход — `InvalidTransition` с перечнем того,
+что было возможно, а не молчаливая перезапись.
+
+Инвариант: одна фаза — ровно одна метка `phase:*`; при переходе предыдущая
+снимается (`set_phase`). Две метки фазы означали бы противоречие, и
+`phase_from_labels` отказывается угадывать.
+
+Пока `IssueLifecycle` линейный, фаза выводится из стадии (`STAGE_TO_PHASE`) и
+доступна query `phase`. Полноценным владельцем состояния цикл станет в #36.
 
 ## Протокол агентов v1
 
