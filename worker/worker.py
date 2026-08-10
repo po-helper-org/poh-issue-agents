@@ -18,7 +18,13 @@ import consolidation_activities as ca
 from consolidation_workflow import ConsolidationWorkflow
 from shared import sentry_setup
 from shared.temporal_client import connect_temporal
-from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle, WebhookAudit
+from workflows import (
+    IssueAnalysis,
+    IssueEstimation,
+    IssueLifecycle,
+    OrphanAgentEvent,
+    WebhookAudit,
+)
 
 sentry_setup.configure("worker")  # no-op без SENTRY_DSN
 
@@ -29,7 +35,7 @@ async def main() -> None:
         client,
         task_queue="issue-lifecycle",
         workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation, ConsolidationWorkflow,
-                   WebhookAudit],
+                   WebhookAudit, OrphanAgentEvent],
         activities=[
             activities.prefilter_bot_and_security,
             activities.read_protocol_state,
