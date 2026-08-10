@@ -23,7 +23,7 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import labels, sentry_setup
+from shared import labels, lifecycle, sentry_setup
 from shared.commands import (
     ANALYZE,
     ESTIMATE,
@@ -164,6 +164,27 @@ def escalate_to_human(issue: IssueInput, reason: str = "") -> None:
                   "Передаю на ручной разбор.",
     )
     github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_HUMAN_TRIAGE)
+
+
+@activity.defn
+def set_phase(repo: str, issue_number: int, phase: str) -> None:
+    """Метка фазы с соблюдением инварианта «одна фаза — одна метка».
+
+    Две метки `phase:*` на Issue — противоречие, а не история: по ним нельзя
+    восстановить состояние. Поэтому предыдущая снимается, а не остаётся рядом.
+
+    Допустимость самого перехода проверяет воркфлоу (у него есть предыдущая
+    фаза); здесь — только запись, идемпотентная по построению.
+    """
+    target = lifecycle.phase_label(phase)
+    for stale in (lifecycle.phase_label(other) for other in lifecycle.PHASES):
+        if stale != target:
+            try:
+                github_client.remove_label(repo, issue_number, stale)
+            except Exception as exc:
+                logger.warning("не снял метку фазы %s с %s#%s: %s",
+                               stale, repo, issue_number, exc)
+    github_client.add_label(repo, issue_number, target)
 
 
 @activity.defn

@@ -22,6 +22,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
+    from shared import lifecycle
     from shared.commands import ANALYZE, ESTIMATE
     from shared.workflow_types import (
         AnalyzeInput,
@@ -204,6 +205,17 @@ class IssueLifecycle:
         на воспроизведение истории query не влияет.
         """
         return self._stage
+
+    @workflow.query
+    def phase(self) -> str:
+        """Фаза жизненного цикла — единый словарь на весь контур (#35).
+
+        Выводится из стадии, а не хранится отдельно: два источника правды о
+        состоянии разъехались бы при первом же изменении маршрута. Пока
+        IssueLifecycle линейный, стадия покрывает путь до передачи разработчику;
+        дальше по фазам его поведёт #36.
+        """
+        return lifecycle.STAGE_TO_PHASE.get(self._stage, lifecycle.CREATED)
 
     @workflow.signal
     async def human_decision(self, label: str) -> None:
