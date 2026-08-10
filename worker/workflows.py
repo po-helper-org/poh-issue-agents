@@ -27,8 +27,9 @@ with workflow.unsafe.imports_passed_through():
     from shared import lifecycle
     from shared.commands import ANALYZE, ESTIMATE
     from shared.workflow_ids import analysis_workflow_id, estimate_workflow_id
-    from shared import agent_events
+    from shared import agent_events, awaiting as awaiting_mod
     from shared.agent_events import AgentEvent
+    from shared.awaiting import Awaiting
     from shared.workflow_types import (
         AnalyzeInput,
         ClassificationResult,
@@ -250,6 +251,11 @@ class IssueLifecycle:
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
         # Ключи уже учтённых событий агентов: один факт двигает фазу один раз.
         self._seen_agent_events: list[str] = []
+        # Чего Issue ждёт прямо сейчас. None — работа идёт, ожидания нет.
+        self._awaiting: Awaiting | None = None
+        # Стоит ли сейчас метка очереди к людям. Нужен, чтобы не дёргать GitHub
+        # на каждом переходе: метку трогаем только когда состояние меняется.
+        self._human_queue_labelled = False
 
     @workflow.query
     def stage(self) -> str:
@@ -288,6 +294,16 @@ class IssueLifecycle:
         нельзя понять, это новый Issue или продолжение старого.
         """
         return self._generation
+
+    @workflow.query
+    def awaiting(self) -> Awaiting | None:
+        """Чего Issue ждёт: вид, адресат, с какого момента и до какого срока (#39).
+
+        Расширение query `stage`: та отвечает «в какой стадии прогон», эта —
+        «почему он там стоит и кто его сдвинет». Без неё припаркованный прогон
+        и зависший выглядят в Temporal UI одинаково.
+        """
+        return self._awaiting
 
     @workflow.query
     def handles_agents(self) -> bool:
@@ -507,6 +523,55 @@ class IssueLifecycle:
         от событий, а одна фаза может стоить и трёх событий, и трёхсот."""
         return workflow.info().get_current_history_length() >= HISTORY_EVENT_THRESHOLD
 
+    async def _park(self, kind: str, who: str, reason: str, hours: int) -> timedelta:
+        """Встать в ожидание: описать его и вернуть срок таймера.
+
+        Одно место на все точки парковки. Разнесённые «поставить таймер» и
+        «записать, чего ждём» разошлись бы при первой же правке одной из них —
+        и получилось бы ожидание с таймером, но без причины, то есть ровно то,
+        что чинит #39.
+        """
+        since = self._phase_since or workflow.now()
+        self._awaiting = Awaiting(
+            kind=kind, who=who, reason=reason,
+            since_epoch=since.timestamp(),
+            deadline_epoch=(since + timedelta(hours=hours)).timestamp(),
+        )
+        await self._publish_awaiting()
+        return self._park_timeout(hours)
+
+    async def _publish_awaiting(self) -> None:
+        """Отражение ожидания в GitHub: очередь к людям должна быть полной.
+
+        Метку вешаем только на ожидание ЧЕЛОВЕКА: задача, ждущая стенд или
+        соседний сервис, в очереди к людям — шум, из-за которого перестают
+        смотреть на саму выборку.
+
+        Под patched: у идущих прогонов этой команды в истории нет.
+        """
+        if not workflow.patched("issue-lifecycle-awaiting") or self._issue is None:
+            return
+        want = self._awaiting is not None and self._awaiting.blocks_on_human
+        if want == self._human_queue_labelled:
+            # Состояние метки не изменилось. Без этой проверки каждый переход
+            # фазы давал бы пару «снять/поставить»: лишние вызовы GitHub и
+            # мигание метки в таймлайне Issue.
+            return
+        self._human_queue_labelled = want
+        await workflow.execute_activity(
+            activities.mark_awaiting,
+            args=[self._issue.repo, self._issue.issue_number, self._awaiting],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
+    async def _stop_awaiting(self) -> None:
+        """Ожидание снято: описание очищается, метка уходит."""
+        if self._awaiting is None:
+            return
+        self._awaiting = None
+        await self._publish_awaiting()
+
     def _park_timeout(self, hours: int) -> timedelta:
         """Сколько ещё ждать в этой фазе — остаток от срока, а не полный срок.
 
@@ -544,6 +609,10 @@ class IssueLifecycle:
         lifecycle.transition(self._phase, phase)
         self._phase = phase
         self._stage = stage
+        # Прежнее ожидание закрыто самим фактом перехода. Метку здесь не
+        # трогаем: следующая точка парковки опишет новое ожидание и приведёт
+        # метку в порядок одним вызовом.
+        self._awaiting = None
         # Отсчёт срока парковки начинается здесь и только здесь.
         self._phase_since = workflow.now()
         if write_label and self._issue is not None:
@@ -643,6 +712,7 @@ class IssueLifecycle:
         )
         while True:
             if lifecycle.is_terminal(self._phase):
+                await self._stop_awaiting()  # ждать больше нечего
                 return  # «вечноживущий» не значит «незакрываемый»
 
             if self._phase == lifecycle.CREATED:
@@ -661,7 +731,11 @@ class IssueLifecycle:
                 nxt = await self._phase_park(issue, deadlines)
 
             if nxt is None:
-                return  # срок ожидания истёк — цикл закрывается (правило R3)
+                # Срок ожидания истёк — цикл закрывается (правило R3). Метку
+                # очереди снимаем: её место занимает `needs-human:*` от
+                # эскалации, и два источника одной метки разошлись бы.
+                await self._stop_awaiting()
+                return
             phase, stage, write_label = nxt
             await self._enter(phase, stage, write_label=write_label)
 
@@ -841,8 +915,12 @@ class IssueLifecycle:
 
     async def _phase_await_decision(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `classified`: ждём решения человека о тяжёлой стадии."""
-        decision = await self._wait_for_signal(
-            self._park_timeout(deadlines.human_decision_hours))
+        decision = await self._wait_for_signal(await self._park(
+            awaiting_mod.kind_for_phase(lifecycle.CLASSIFIED),
+            who=awaiting_mod.who_for_phase(lifecycle.CLASSIFIED),
+            reason=awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED),
+            hours=awaiting_mod.deadline_hours(awaiting_mod.HUMAN_DECISION,
+                                              deadlines.human_decision_hours)))
         if decision is None:
             await workflow.execute_activity(
                 activities.escalate_to_human,
@@ -900,8 +978,12 @@ class IssueLifecycle:
 
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку."""
-        decision = await self._wait_for_signal(
-            self._park_timeout(deadlines.build_decision_hours))
+        decision = await self._wait_for_signal(await self._park(
+            awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV),
+            who=awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV),
+            reason=awaiting_mod.reason_for_phase(lifecycle.READY_FOR_DEV),
+            hours=awaiting_mod.deadline_hours(awaiting_mod.APPROVAL,
+                                              deadlines.build_decision_hours)))
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди
@@ -931,7 +1013,16 @@ class IssueLifecycle:
         «вечная сессия». Сигнал `reopen` возвращает Issue в работу по таблице
         переходов — первым допустимым переходом обратно в основной путь.
         """
-        signal = await self._wait_for_signal(self._park_timeout(deadlines.side_state_hours))
+        kind = awaiting_mod.kind_for_phase(self._phase)
+        signal = await self._wait_for_signal(await self._park(
+            kind,
+            who=awaiting_mod.who_for_phase(self._phase),
+            reason=awaiting_mod.reason_for_phase(self._phase),
+            # Срок из окружения — только для ожиданий человека: `PARK_SIDE_STATE_HOURS`
+            # настраивался под них. Машинные ждут по таблице своего вида.
+            hours=awaiting_mod.deadline_hours(
+                kind, deadlines.side_state_hours if kind in awaiting_mod.BLOCKED_ON_HUMAN
+                else None)))
         if signal is None:
             return None
         if isinstance(signal, AgentEvent):

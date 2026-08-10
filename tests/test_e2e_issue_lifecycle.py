@@ -45,6 +45,7 @@ E2E_ACTIVITIES = [
     activities_module.read_protocol_state,
     activities_module.read_deadlines,
     activities_module.set_phase,
+    activities_module.mark_awaiting,
     activities_module.mark_ready_for_dev,
     activities_module.post_agents_off_notice,
     activities_module.intake_gate,

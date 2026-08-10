@@ -27,6 +27,11 @@ def _issue() -> IssueInput:
                       author_login="u", author_type="User", interactive=False)
 
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput):
     _calls.append("prefilter")
@@ -93,7 +98,7 @@ async def _run(state: ProtocolState) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[prefilter_ok, gate, classify, duplicate, score,
+                          activities=[awaiting_stub, prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate, _state_stub(state), deadlines_stub, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
@@ -112,7 +117,7 @@ async def test_agents_off_spends_nothing():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[prefilter_ok, gate, classify, duplicate, score,
+                          activities=[awaiting_stub, prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(agents_off=True)), deadlines_stub, phase_stub]):
             await env.client.execute_workflow(
@@ -130,7 +135,7 @@ async def test_agents_off_is_visible_as_a_stage():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[prefilter_ok, gate, classify, duplicate, score,
+                          activities=[awaiting_stub, prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(agents_off=True)), deadlines_stub, phase_stub]):
             handle = await env.client.start_workflow(
@@ -169,7 +174,7 @@ async def test_second_round_follow_up_goes_straight_to_a_human():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[prefilter_ok, gate, classify, duplicate, score,
+                          activities=[awaiting_stub, prefilter_ok, gate, classify, duplicate, score,
                                       post_priority, escalate,
                                       _state_stub(ProtocolState(origin_agent=True,
                                                                 depth_exceeded=True)), deadlines_stub, phase_stub]):

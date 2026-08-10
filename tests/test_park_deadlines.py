@@ -67,6 +67,11 @@ def test_zero_and_negative_fall_back(monkeypatch):
 
 # --- поведение воркфлоу на истёкшем сроке ---
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput):
     return None
@@ -143,7 +148,7 @@ async def _run(acts, deadlines: Deadlines) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*acts, _deadlines_stub(deadlines), phase_stub]):
+                          activities=[awaiting_stub, *acts, _deadlines_stub(deadlines), phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.result()

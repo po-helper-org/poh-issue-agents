@@ -28,6 +28,11 @@ def _issue(interactive: bool = True) -> IssueInput:
                       author_login="u", author_type="User", interactive=interactive)
 
 
+@activity.defn(name="mark_awaiting")
+async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
+    """Метка ожидания: инвариант проверяется в test_awaiting_wiring, здесь — шум."""
+
+
 @activity.defn(name="prefilter_bot_and_security")
 async def prefilter_ok(issue: IssueInput): return None
 
@@ -116,7 +121,7 @@ async def _run_to_completion(activities_list, issue: IssueInput) -> str:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[*activities_list, protocol_default, deadlines_stub, phase_stub,
+                          activities=[awaiting_stub, *activities_list, protocol_default, deadlines_stub, phase_stub,
                                       escalate, error_label]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, issue, id=f"wf-{uuid.uuid4()}", task_queue=tq)
@@ -130,7 +135,7 @@ async def test_parked_run_says_it_waits_for_a_human():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
-                          activities=[prefilter_ok, gate_sufficient, classify_feature,
+                          activities=[awaiting_stub, prefilter_ok, gate_sufficient, classify_feature,
                                       duplicate_none, score, post_priority,
                                       protocol_default, deadlines_stub, phase_stub,
                                       escalate, error_label]):
