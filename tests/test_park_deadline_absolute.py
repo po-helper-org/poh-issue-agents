@@ -129,16 +129,24 @@ async def test_stray_signals_do_not_extend_the_park():
 
 @pytest.mark.timeout(120)
 async def test_park_still_ends_without_any_signal():
-    """Контроль: без сигналов поведение прежнее — эскалация по сроку."""
+    """Контроль: без сигналов поведение прежнее — эскалация по сроку.
+
+    Ждём наблюдаемый исход, а не `handle.result()`: цикл после эскалации уходит
+    в боковую фазу и живёт там до своего срока, а автопромотка времени под
+    `result()` на длинной парковке срабатывает не всегда.
+    """
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
                           workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[*ACTIVITIES, _deadlines(3)]):
-            handle = await env.client.start_workflow(
+            await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            await handle.result()
+            for _ in range(60):
+                if _calls:
+                    break
+                await env.sleep(timedelta(hours=1))
 
     assert "escalated" in _calls
 
