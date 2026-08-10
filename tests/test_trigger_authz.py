@@ -45,18 +45,25 @@ def test_missing_login_is_rejected_when_allowlist_is_set():
 
 # --- гейт в вебхуке ---
 
+class _Handle:
+    async def signal(self, *a, **k):
+        return None
+
+    async def query(self, name, *a):
+        """Живой цикл ведёт агентов сам (#37) — гейт стоит ДО этого вопроса."""
+        return True
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.started: list[dict] = []
 
     async def start_workflow(self, workflow, arg, **kwargs):
         self.started.append({"workflow": workflow, **kwargs})
+        return _Handle()
 
     def get_workflow_handle(self, wf_id):
-        class _H:
-            async def signal(self, *a, **k):
-                return None
-        return _H()
+        return _Handle()
 
 
 @pytest.fixture
@@ -122,7 +129,9 @@ def test_allowed_user_starts_analysis_by_label(webhook):
     fake, app_client = webhook("kibarik")
 
     assert _post(app_client, _labeled("run:analyze", "kibarik"), "issues").status_code == 200
-    assert [c["workflow"] for c in fake.started] == ["IssueAnalysis"]
+    # Гейт пропустил — команда доехала до цикла, который и ведёт аналитику.
+    assert [c["workflow"] for c in fake.started] == ["IssueLifecycle"]
+    assert fake.started[0]["start_signal"] == "analyze_requested"
 
 
 def test_stranger_cannot_start_estimate_by_command(webhook):
@@ -161,4 +170,5 @@ def test_without_allowlist_nothing_changes(webhook):
     fake, app_client = webhook("")
 
     assert _post(app_client, _labeled("run:analyze", "stranger"), "issues").status_code == 200
-    assert [c["workflow"] for c in fake.started] == ["IssueAnalysis"]
+    assert [c["workflow"] for c in fake.started] == ["IssueLifecycle"]
+    assert fake.started[0]["start_signal"] == "analyze_requested"

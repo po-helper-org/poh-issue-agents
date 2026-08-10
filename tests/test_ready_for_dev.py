@@ -23,7 +23,7 @@ from shared.workflow_types import (
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueLifecycle
+from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
 
 
 def _issue() -> IssueInput:
@@ -160,6 +160,10 @@ async def mark_running(repo: str, issue_number: int, command: str) -> None: ...
 async def finish(repo: str, issue_number: int, command: str, ok: bool) -> None: ...
 
 
+@activity.defn(name="ack_command")
+async def ack(analyze: AnalyzeInput) -> None: ...
+
+
 @activity.defn(name="prepare_workspace")
 async def prepare(analyze: AnalyzeInput) -> None: ...
 
@@ -197,10 +201,10 @@ async def _run_research(stage_activity) -> None:
     _calls.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[prefilter_ok, protocol_default, deadlines_stub, gate,
                                       classify, duplicate, score, post_priority,
-                                      mark_running, finish, prepare, stage_activity,
+                                      mark_running, finish, ack, prepare, stage_activity,
                                       publish, cleanup, publish_error, ready, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)

@@ -921,9 +921,13 @@ async def ack_command(analyze: AnalyzeInput) -> None:
 
     Триггер виден по comment_id: он есть у команды в комментарии и пуст у
     запуска меткой — реагировать там не на что, и подтверждение называет
-    метку, а не команду.
+    метку, а не команду. Явно переданный `trigger` перекрывает эту догадку:
+    аналитику запускает и цикл по метке `research-me`, и назвать её
+    `run:analyze` значило бы указать человеку на метку, которой он не ставил.
     """
-    trigger = f"`{run_label(ANALYZE)}`" if analyze.comment_id is None else "`/analyze`"
+    trigger = (f"`{analyze.trigger}`" if analyze.trigger
+               else f"`{run_label(ANALYZE)}`" if analyze.comment_id is None
+               else "`/analyze`")
     await asyncio.to_thread(
         github_client.post_comment,
         analyze.repo,

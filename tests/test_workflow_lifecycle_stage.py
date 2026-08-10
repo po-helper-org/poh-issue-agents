@@ -20,7 +20,7 @@ from shared.workflow_types import (
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueLifecycle
+from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
 
 
 def _issue(interactive: bool = True) -> IssueInput:
@@ -115,7 +115,7 @@ async def _run_to_completion(activities_list, issue: IssueInput) -> str:
     """Гоняет workflow до конца и возвращает финальную стадию."""
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[*activities_list, protocol_default, deadlines_stub, phase_stub,
                                       escalate, error_label]):
             handle = await env.client.start_workflow(
@@ -129,7 +129,7 @@ async def test_parked_run_says_it_waits_for_a_human():
     """Главный случай: прогон жив и ждёт лейбла, а не завис."""
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
-        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle],
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=[prefilter_ok, gate_sufficient, classify_feature,
                                       duplicate_none, score, post_priority,
                                       protocol_default, deadlines_stub, phase_stub,

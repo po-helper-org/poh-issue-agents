@@ -248,6 +248,21 @@ def _post(client, event: str, payload: dict):
         "X-GitHub-Delivery": f"dlv-{uuid.uuid4()}", "Content-Type": "application/json"})
 
 
+async def _apost(client, event: str, payload: dict):
+    """Тот же вызов, но не блокирующий цикл событий теста.
+
+    `TestClient` синхронный: он гоняет приложение в своём потоке, а вызывающий
+    поток стоит. Команды (`/analyze`, `/estimate`, `run:*`) внутри обработчика
+    спрашивают цикл о режиме запуска агента (`handles_agents`) — а ответить на
+    query может только воркер, который в тестах живёт в ЭТОМ же цикле событий.
+    Синхронный вызов запер бы их друг о друга. В проде вебхук и воркер — разные
+    процессы, и такого клинча нет.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(_post, client, event, payload)
+
+
 def _opened(number: int = 7) -> dict:
     return {
         "action": "opened",
@@ -395,7 +410,8 @@ async def test_label_command_runs_estimation_end_to_end(e2e, monkeypatch):
     env, main, client = await _harness(monkeypatch)
     async with env:
         async with _worker(env):
-            assert _post(client, "issues", _labeled("run:estimate")).status_code == 200
+            resp = await _apost(client, "issues", _labeled("run:estimate"))
+            assert resp.status_code == 200
             await env.client.get_workflow_handle(f"estimate-{REPO}-7-label").result()
 
     assert "done:estimate" in gh.labels

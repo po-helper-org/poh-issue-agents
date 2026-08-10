@@ -35,15 +35,12 @@ from shared.commands import (
     parse_command,
     parse_label_command,
 )
+from shared.agent_launcher import request_analysis, request_estimate
 from shared.authz import may_trigger, trigger_allowlist
 from shared.labels import parse_root_issue
 from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
-from shared.workflow_ids import (
-    analysis_workflow_id,
-    estimate_workflow_id,
-    issue_workflow_id,
-)
+from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
 
 _log = logging.getLogger("webhook")
 
@@ -268,18 +265,15 @@ async def github_webhook(
             if command == ANALYZE:
                 if not _may_start_expensive(payload, label, repo, issue_number):
                     return {"ok": True}
-                try:
-                    await client.start_workflow(
-                        "IssueAnalysis",
-                        build_analyze_input(payload),  # без comment_id: триггер — метка
-                        id=analysis_workflow_id(repo, issue_number),
-                        task_queue="issue-lifecycle",
-                        search_attributes=_search_attributes(repo, payload, issue_number),
-                    )
-                except WorkflowAlreadyStartedError:
-                    # Метку сняли и поставили заново, пока прогон идёт: второй
-                    # дорогой прогон не нужен, а первый уже подтверждён ack'ом.
-                    _log.info("analysis already running for %s#%s", repo, issue_number)
+                # Режим (child цикла или самостоятельный прогон) выбирает
+                # лаунчер — одна точка решения на все входы.
+                await request_analysis(
+                    client,
+                    # Отвечать на уточняющий вопрос тут некому: триггер — метка.
+                    _issue_input(payload, interactive=False),
+                    build_analyze_input(payload),  # без comment_id: триггер — метка
+                    search_attributes=_search_attributes(repo, payload, issue_number),
+                )
                 return {"ok": True}
 
             if command == ESTIMATE:
@@ -287,16 +281,12 @@ async def github_webhook(
                     return {"ok": True}
                 from shared.workflow_types import EstimateRequest
 
-                try:
-                    await client.start_workflow(
-                        "IssueEstimation",
-                        EstimateRequest(repo=repo, issue_number=issue_number),
-                        id=estimate_workflow_id_for(repo, issue_number),
-                        task_queue="issue-lifecycle",
-                        search_attributes=_search_attributes(repo, payload, issue_number),
-                    )
-                except WorkflowAlreadyStartedError:
-                    _log.info("estimate already running for %s#%s", repo, issue_number)
+                await request_estimate(
+                    client,
+                    _issue_input(payload, interactive=False),
+                    EstimateRequest(repo=repo, issue_number=issue_number),
+                    search_attributes=_search_attributes(repo, payload, issue_number),
+                )
                 return {"ok": True}
 
             if label in HUMAN_DECISION_LABELS:
@@ -344,55 +334,28 @@ async def github_webhook(
             from shared.workflow_types import EstimateRequest
 
             comment_id = payload["comment"]["id"]
-            try:
-                await client.start_workflow(
-                    "IssueEstimation",
-                    EstimateRequest(
-                        repo=repo, issue_number=issue_number, comment_id=comment_id
-                    ),
-                    id=estimate_workflow_id_for(repo, issue_number, comment_id),
-                    task_queue="issue-lifecycle",
-                )
-            except WorkflowAlreadyStartedError:
-                # Тот же вебхук доставлен повторно — оценка уже идёт.
-                pass
+            await request_estimate(
+                client,
+                _issue_input(payload, interactive=True),
+                EstimateRequest(repo=repo, issue_number=issue_number,
+                                comment_id=comment_id),
+                search_attributes=_search_attributes(repo, payload, issue_number),
+            )
             return {"ok": True}
 
         if command == ANALYZE:
             if not _may_start_expensive(payload, "/analyze", repo, issue_number):
                 return {"ok": True}
-            analyze = build_analyze_input(payload)
-
-            # Воркфлоу-владельцу состояния шлём уведомление — оно повесит метку
-            # `analyzing`; исполнителем всегда остаётся выделенный IssueAnalysis.
-            #
-            # signal-with-start, а не голый signal: раньше сигнал в
-            # несуществующий воркфлоу молча проглатывался (`except: pass`), и
-            # команда по Issue без цикла не оставляла следа вообще. Теперь цикл
-            # — владелец состояния Issue (#36), и поднять его тем же вызовом
-            # правильнее, чем потерять сигнал. Гейт на дорогую стадию уже
-            # пройден выше, так что бесплатный старт цикла посторонним исключён.
-            await client.start_workflow(
-                "IssueLifecycle",
+            # Одна точка решения child-vs-root: раньше здесь стартовал
+            # самостоятельный IssueAnalysis, а циклу уходило лишь косметическое
+            # уведомление — связь между владельцем состояния Issue и работой
+            # агента была декоративной (#37).
+            await request_analysis(
+                client,
                 _issue_input(payload, interactive=True),
-                id=workflow_id_for(repo, issue_number),
-                task_queue="issue-lifecycle",
+                build_analyze_input(payload),
                 search_attributes=_search_attributes(repo, payload, issue_number),
-                start_signal="analyze_requested",
-                start_signal_args=[analyze.comment_id],
             )
-
-            try:
-                await client.start_workflow(
-                    "IssueAnalysis",
-                    analyze,
-                    id=analysis_workflow_id(repo, issue_number),
-                    task_queue="issue-lifecycle",
-                )
-            except WorkflowAlreadyStartedError:
-                # Прогон по этому Issue уже идёт: пользователь видел ack первого
-                # запуска, второй ack был бы шумом. Webhook — чистый транспорт.
-                _log.info("analysis already running for %s#%s", repo, issue_number)
             return {"ok": True}
 
         wf_id = workflow_id_for(repo, issue_number)

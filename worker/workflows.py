@@ -20,10 +20,13 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from shared import lifecycle
     from shared.commands import ANALYZE, ESTIMATE
+    from shared.workflow_ids import analysis_workflow_id, estimate_workflow_id
     from shared.workflow_types import (
         AnalyzeInput,
         ClassificationResult,
@@ -37,6 +40,11 @@ with workflow.unsafe.imports_passed_through():
     import activities
 
 MAX_CLARIFICATION_ROUNDS = 2
+
+# Запрос на прогон аналитики, доставленный в общую очередь сигналов. Префикс —
+# та же схема, что у `__comment__:`: одна очередь, разные виды событий, и
+# обработчик фазы решает, что с ними делать.
+AGENT_ANALYZE = "__agent__:analyze"
 
 # Порог длины истории для continue-as-new. Ниже потолка, на котором уже
 # спотыкалась консолидация (~990 событий): реплей должен укладываться в
@@ -203,6 +211,8 @@ class IssueLifecycle:
         self._classification_label: str | None = None
         self._analysis_done = False
         self._generation = 0
+        self._analyze_comment_id: int | None = None
+        self._analyze_pending = False  # запрос на аналитику лежит в очереди
 
     @workflow.query
     def stage(self) -> str:
@@ -242,6 +252,20 @@ class IssueLifecycle:
         """
         return self._generation
 
+    @workflow.query
+    def handles_agents(self) -> bool:
+        """Ведёт ли этот прогон агентов дочерними воркфлоу (#37).
+
+        Спрашивает `shared/agent_launcher.py`, чтобы выбрать режим запуска.
+        Прогоны прежнего поколения (линейный путь) сигнала на запуск агента не
+        понимают — команда была бы принята и потеряна; для них лаунчер стартует
+        root-прогон, как раньше. Отдельного флага нет намеренно: цикл и
+        дочерние агенты приехали одним поколением, и разводить их двумя
+        независимыми признаками значило бы завести четыре состояния там, где
+        существуют два.
+        """
+        return self._phase_driven
+
     @workflow.signal
     async def human_decision(self, label: str) -> None:
         await self._signal_queue.put(label)
@@ -251,41 +275,88 @@ class IssueLifecycle:
         await self._signal_queue.put(f"__comment__:{text}")
 
     @workflow.signal
-    async def analyze_requested(self, comment_id: int) -> None:
-        """По Issue запрошен автономный анализ командой /analyze.
+    async def analyze_requested(self, comment_id: int | None) -> None:
+        """По Issue запрошена аналитика — командой `/analyze` или меткой.
 
-        Вешаем видимую метку `analyzing`, чтобы в ленте триажа было понятно, что
-        прогон идёт; сам анализ несёт отдельный воркфлоу IssueAnalysis (из
-        webhook), здесь — только метка, и ставим её один раз (повторный /analyze
-        не плодит лейблы). Тяжёлую работу из хендлера не запускаем: run() обычно
-        припаркован в _wait_for_signal(), спавн оттуда гонялся бы с основным
-        циклом; лёгкая activity add_label безопасна.
+        Цикл ведёт её сам: запрос уходит в общую очередь сигналов, а
+        обработчик фазы поднимает `IssueAnalysis` дочерним прогоном (#37).
+        Раньше здесь вешалась только метка, а работу нёс независимый воркфлоу
+        из вебхука — связь между циклом Issue и работой агента была
+        декоративной, о чём и говорил прежний докстринг.
 
-        `_analyze_labeled` ставим ДО первого await: хендлеры кооперативны
-        (переключение только на await), поэтому второй почти одновременный
-        сигнал увидит True и не поставит второй лейбл. Сигнал может прийти в
-        самой первой активации воркфлоу — раньше, чем run() выполнил
-        `self._issue = issue` (Temporal применяет сигналы до создания задачи
-        run()); поэтому ЖДЁМ инициализацию через wait_condition, а не роняем
-        метку молча по `self._issue is None`.
+        Тяжёлую работу из самого хендлера не запускаем: run() обычно
+        припаркован в `_wait_for_signal()`, и спавн отсюда гонялся бы с
+        основным циклом за фазу. Очередь снимает гонку — решение принимает та
+        фаза, в которой Issue находится сейчас.
 
-        Известный компромисс: политика незавершённых хендлеров по умолчанию —
-        WARN_AND_ABANDON. Если run() успеет завершиться (например, через
-        `else: return` без await), пока mark_analyzing лишь запланирована, метка
-        не встанет, а в лог уйдёт warning. Метка косметическая (её никто не
-        читает), гарантировать её ожиданием all_handlers_finished в run() не
-        стоит — само-лечится при следующем /analyze в припаркованном состоянии.
+        Сигнал может прийти в самой первой активации воркфлоу — раньше, чем
+        run() выполнил `self._issue = issue` (Temporal применяет сигналы до
+        создания задачи run()); поэтому ЖДЁМ инициализацию через
+        wait_condition, а не теряем запрос молча по `self._issue is None`.
         """
-        if self._analyze_labeled:
+        # Тот же маркер, что разводит поколения в run(): цикл и дочерние
+        # агенты приехали вместе, и прогон, не знающий одного, не знает и
+        # другого. Прежнее поколение обязано доиграть ПРЕЖНИМ кодом хендлера —
+        # иначе реплей его истории упрётся в несовпадение команд.
+        if not workflow.patched("issue-lifecycle-phase-loop"):
+            if self._analyze_labeled:
+                return
+            self._analyze_labeled = True
+            await workflow.wait_condition(lambda: self._issue is not None)
+            await workflow.execute_activity(
+                activities.mark_analyzing,
+                args=[self._issue.repo, self._issue.issue_number],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
             return
-        self._analyze_labeled = True
+
+        # Запрос уже в очереди — второй прогон был бы шумом и деньгами:
+        # повторная команда и дубль webhook-доставки означают одно намерение.
+        # Флаг ставим ДО первого await: хендлеры кооперативны (переключение
+        # только на await), поэтому почти одновременный второй сигнал увидит
+        # True. Идентификатор занятого прогона от этой гонки не спасает: к
+        # моменту второго сигнала первый может уже завершиться, и id
+        # освободится — а это законный повторный запуск, не дубль.
+        if self._analyze_pending:
+            return
+        self._analyze_pending = True
+        self._analyze_comment_id = comment_id
         await workflow.wait_condition(lambda: self._issue is not None)
-        await workflow.execute_activity(
-            activities.mark_analyzing,
-            args=[self._issue.repo, self._issue.issue_number],
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
+        await self._signal_queue.put(AGENT_ANALYZE)
+
+    @workflow.signal
+    async def estimate_requested(self, comment_id: int | None) -> None:
+        """По Issue запрошена оценка трудоёмкости.
+
+        В очередь НЕ кладём: оценка фазу не двигает — это боковая команда, а не
+        стадия пути. Поднимаем дочерний прогон прямо здесь и не ждём его
+        результата: цикл продолжает ждать своё, а оценка идёт параллельно.
+
+        Прогоны прежнего поколения этот сигнал получают, но обслужить не могут;
+        им лаунчер стартует root-прогон (см. query `handles_agents`), поэтому
+        здесь достаточно молча выйти — иначе на реплее их истории появилась бы
+        команда, которой там нет.
+        """
+        if not workflow.patched("issue-lifecycle-phase-loop"):
+            return
+        await workflow.wait_condition(lambda: self._issue is not None)
+        req = EstimateRequest(repo=self._issue.repo,
+                              issue_number=self._issue.issue_number,
+                              comment_id=comment_id)
+        try:
+            await workflow.start_child_workflow(
+                IssueEstimation.run, req,
+                id=estimate_workflow_id(req.repo, req.issue_number, comment_id),
+                # Родитель переживёт continue-as-new и завершение цикла, а
+                # оценка — нет: ABANDON оставляет её доигрывать саму.
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except WorkflowAlreadyStartedError:
+            # Тот же вебхук доставлен повторно — оценка уже идёт.
+            workflow.logger.info("estimate already running for %s#%s",
+                                 req.repo, req.issue_number)
 
     async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | None:
         try:
@@ -383,6 +454,58 @@ class IssueLifecycle:
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
 
+    async def _run_analysis_child(self, issue: IssueInput,
+                                  trigger: str | None = None) -> bool:
+        """Аналитика дочерним прогоном — тот же воркфлоу, что и автономный.
+
+        Один код на оба режима (#37): в Temporal UI прогон виден как child
+        цикла, а id остаётся прежним (`analysis-<repo>-<n>`), поэтому повторная
+        команда по-прежнему упирается в `WorkflowAlreadyStarted`, а не тратит
+        деньги второй раз.
+        """
+        analyze = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
+                               title=issue.title, body=issue.body,
+                               comment_id=self._analyze_comment_id,
+                               trigger=trigger)
+        # Запрос израсходован: следующий прогон не должен реагировать на
+        # комментарий, к которому он отношения не имеет, а новая команда
+        # обязана снова доехать до цикла.
+        self._analyze_comment_id = None
+        self._analyze_pending = False
+        try:
+            return await workflow.execute_child_workflow(
+                IssueAnalysis.run, analyze,
+                id=analysis_workflow_id(issue.repo, issue.issue_number),
+                # Цепочка FNR идёт до 4500 с. Ни continue-as-new родителя, ни
+                # его завершение не должны её убивать — иначе дорогой прогон
+                # обрывается на середине по причине, к нему не относящейся.
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                # Прогон недетерминирован, мутирует файлы и стоит денег:
+                # повтор инициирует человек, а не политика ретраев.
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except WorkflowAlreadyStartedError:
+            # Прогон по этому Issue уже идёт — второй дорогой не нужен.
+            # Результата отсюда не видно (это чужой прогон), поэтому фазу
+            # дальше не двигаем: её сдвинет тот, кто анализ и запускал.
+            workflow.logger.info("analysis already running for %s#%s",
+                                 issue.repo, issue.issue_number)
+            return False
+
+    async def _analysis_requested(self, issue: IssueInput) -> tuple:
+        """Куда ведёт запрос аналитики из ТЕКУЩЕЙ фазы.
+
+        Если из неё есть ход в `business-analysis` — идём туда, и прогон
+        становится стадией пути Issue. Если нет (задача уже у разработчика, или
+        Issue в боковом состоянии), команду всё равно выполняем, но фазу не
+        трогаем: соврать про состояние хуже, чем не отразить в нём разовый
+        прогон.
+        """
+        if lifecycle.can(self._phase, lifecycle.BUSINESS_ANALYSIS):
+            return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+        await self._run_analysis_child(issue)
+        return (self._phase, self._stage, False)
+
     async def _run_phase_loop(self, issue: IssueInput) -> None:
         deadlines = await workflow.execute_activity(
             activities.read_deadlines,
@@ -406,7 +529,7 @@ class IssueLifecycle:
             else:
                 # Боковые состояния и фазы, которые ведут внешние агенты (#38):
                 # цикл держит их живыми, пока не истечёт срок ожидания.
-                nxt = await self._phase_park(deadlines)
+                nxt = await self._phase_park(issue, deadlines)
 
             if nxt is None:
                 return  # срок ожидания истёк — цикл закрывается (правило R3)
@@ -500,6 +623,13 @@ class IssueLifecycle:
                     )
                     raw = await self._wait_for_signal(
                         timedelta(hours=deadlines.clarification_hours))
+                    # Команда на аналитику — не ответ на уточняющий вопрос:
+                    # выполняем её и продолжаем ждать ответ, а не засчитываем
+                    # раунд уточнения потраченным.
+                    while raw == AGENT_ANALYZE:
+                        await self._run_analysis_child(issue)
+                        raw = await self._wait_for_signal(
+                            timedelta(hours=deadlines.clarification_hours))
                     if raw is None:
                         await workflow.execute_activity(
                             activities.escalate_to_human,
@@ -591,6 +721,11 @@ class IssueLifecycle:
             )
             return (lifecycle.ESCALATED, "escalated", True)
 
+        if decision == AGENT_ANALYZE:
+            # Явная команда человека сильнее гварда по типу Issue: он защищает
+            # от неудачно поставленной метки, а не от прямого `/analyze`.
+            return await self._analysis_requested(issue)
+
         # `classification_label is None` — сокращённый триаж (Issue от агента):
         # он уже классифицирован на стороне создателя, гвард проверять не на чем.
         label = self._classification_label
@@ -605,16 +740,14 @@ class IssueLifecycle:
         return (lifecycle.CLASSIFIED, "awaiting-human-decision", False)
 
     async def _phase_analysis(self, issue: IssueInput) -> tuple | None:
-        """Фаза `business-analysis`: тот же пер-стадийный прогон FNR."""
-        analyze_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
-                                     title=issue.title, body=issue.body)
-        await workflow.execute_activity(
-            activities.mark_command_running,
-            args=[issue.repo, issue.issue_number, ANALYZE],
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
-        self._analysis_done = await _run_staged_analysis(analyze_input)
+        """Фаза `business-analysis`: цепочка FNR дочерним прогоном.
+
+        Метку `run:analyze` и подтверждение приёма ставит сам дочерний прогон
+        (`ack_command`) — тот же код, что и при автономном запуске. Отдельного
+        `mark_command_running` здесь больше нет: две руки на одной метке
+        разъехались бы при первом же изменении в одной из них.
+        """
+        self._analysis_done = await self._run_analysis_child(issue, trigger="research-me")
         if not self._analysis_done:
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
@@ -636,6 +769,8 @@ class IssueLifecycle:
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди
+        if decision == AGENT_ANALYZE:
+            return await self._analysis_requested(issue)
         if decision != "build-me":
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
         try:
@@ -651,7 +786,7 @@ class IssueLifecycle:
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.IN_DEVELOPMENT, "in-development", True)
 
-    async def _phase_park(self, deadlines) -> tuple | None:
+    async def _phase_park(self, issue: IssueInput, deadlines) -> tuple | None:
         """Боковые фазы и фазы внешних агентов.
 
         Парковка со сроком, а не навсегда (правило R3): «не тупик» не означает
@@ -661,6 +796,10 @@ class IssueLifecycle:
         signal = await self._wait_for_signal(timedelta(hours=deadlines.side_state_hours))
         if signal is None:
             return None
+        if signal == AGENT_ANALYZE:
+            # Команда работает и на припаркованном Issue: из бокового состояния
+            # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
+            return await self._analysis_requested(issue)
         if signal != "reopen":
             return (self._phase, self._stage, False)  # посторонний сигнал — ждём дальше
         back = next((t for t in lifecycle.allowed(self._phase)
@@ -942,25 +1081,34 @@ class IssueLifecycle:
 
 @workflow.defn(name="IssueAnalysis")
 class IssueAnalysis:
-    """Аналитика по запросу (Слой C) — отдельный воркфлоу на команду /analyze.
+    """Аналитика по запросу (Слой C) — воркфлоу цепочки FNR.
 
-    Отдельный, а не часть IssueLifecycle: команда приходит в произвольный
-    момент, когда воркфлоу триажа уже завершён (advisor-ответ) или припаркован
-    в ожидании лейбла. Фиксированный id `analysis-<repo>-<n>` даёт
-    идемпотентность: повторный /analyze упрётся в WorkflowAlreadyStarted.
+    Работает в двух режимах (#37): дочерним прогоном `IssueLifecycle`, когда
+    цикл жив, и самостоятельным — при автономном запуске (скрипт, прогон
+    прежнего поколения). Код один и тот же; отличается только родитель.
+
+    Фиксированный id `analysis-<repo>-<n>` даёт идемпотентность в обоих
+    режимах: повторный `/analyze` упрётся в WorkflowAlreadyStarted, а не
+    запустит второй дорогой прогон.
     """
 
     @workflow.run
-    async def run(self, analyze: AnalyzeInput) -> None:
+    async def run(self, analyze: AnalyzeInput) -> bool:
+        """Возвращает, опубликованы ли артефакты.
+
+        Родителю этот ответ нужен, чтобы решить, можно ли передавать задачу
+        разработчику: без аналитики передавать нечего. Автономный запуск
+        результат просто игнорирует.
+        """
         if await _agents_off(analyze.repo, analyze.issue_number, "/analyze"):
-            return
+            return False
         await workflow.execute_activity(
             activities.ack_command,
             analyze,
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-        await _run_staged_analysis(analyze)
+        return await _run_staged_analysis(analyze)
 
 
 @workflow.defn(name="IssueEstimation")

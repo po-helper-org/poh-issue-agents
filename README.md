@@ -144,6 +144,12 @@ GitHub → webhook (FastAPI) → Temporal → worker (activities: GLM / gh / cla
 - **`IssueEstimation`** — один на команду `/estimate` (id включает `comment_id`).
 - **`ConsolidationWorkflow`** — один на прогон консолидации, fan-out по бэклогу.
 
+Агенты работают **в двух режимах** (#37): дочерним прогоном `IssueLifecycle`,
+когда цикл жив, и самостоятельным — при автономном запуске (скрипты,
+`make backfill-one`, прогон прежнего поколения). Код один и тот же, отличается
+только родитель; id остаётся каноническим (`shared/workflow_ids.py`), поэтому
+повторная команда упирается в `WorkflowAlreadyStarted` в обоих режимах.
+
 ### Путь Issue: от `issues.opened` до парковки
 
 ```mermaid
@@ -215,7 +221,7 @@ flowchart TD
     B -->|да| B1["игнор: не сигналим сами себе"]
     B -->|нет| C{"parse_command"}
 
-    C -->|"/estimate"| D["start IssueEstimation<br/>id включает comment_id"]
+    C -->|"/estimate"| D["signal estimate_requested<br/>цикл поднимает child<br/>id включает comment_id"]
     D --> D1["ack_estimate_command"] --> D2["collect_estimation_context"] --> D3["extract_estimation_facts<br/>LLM"] --> D4["compute_estimate<br/>детерминированный, attempts=1"] --> D5["post_estimate_comment"]
     D1 -.->|fail| DE["post_estimate_error<br/>с именем стадии"]
     D2 -.-> DE
@@ -223,8 +229,8 @@ flowchart TD
     D4 -.-> DE
     D5 -.-> DE
 
-    C -->|"/analyze"| E["signal analyze_requested<br/>в IssueLifecycle: метка analyzing"]
-    E --> F["start IssueAnalysis<br/>id = analysis-repo-N"]
+    C -->|"/analyze"| E["signal analyze_requested<br/>в IssueLifecycle"]
+    E --> F["child IssueAnalysis<br/>id = analysis-repo-N<br/>фаза → business-analysis"]
     F --> F1["ack_command"] --> F2["prepare_workspace<br/>clone + repomix"] --> F3["цикл run_fnr_stage<br/>по FNR_STAGE_NAMES<br/>attempts=1 на стадию"] --> F4["publish_analysis"]
     F2 -.->|fail| FE["publish_analysis_error"]
     F3 -.-> FE
@@ -242,8 +248,8 @@ flowchart TD
 
 | Поставить | Что запускает | Чем закончится |
 |---|---|---|
-| `run:analyze` | `IssueAnalysis` — то же, что `/analyze` | `done:analyze` либо `failed:analyze` |
-| `run:estimate` | `IssueEstimation` — то же, что `/estimate` | `done:estimate` либо `failed:estimate` |
+| `run:analyze` | `IssueAnalysis` — то же, что `/analyze` (дочерним прогоном цикла) | `done:analyze` либо `failed:analyze` |
+| `run:estimate` | `IssueEstimation` — то же, что `/estimate` (дочерним прогоном цикла) | `done:estimate` либо `failed:estimate` |
 
 Метка `run:*` снимается по завершении прогона, исход вешается своей меткой.
 Неуспех получает `failed:*`, а не просто снятый `run:*`: молча снятая метка
@@ -390,6 +396,36 @@ Event History упёрлась бы в тот же потолок, которы�
 
 Query `phase` отдаёт фазу цикла напрямую; для прогонов прежнего поколения она
 по-прежнему выводится из стадии через `STAGE_TO_PHASE`.
+
+### Агенты как дочерние прогоны
+
+`shared/agent_launcher.py` — единственное место, где решается, как запускать
+агента. Решение не «описать воркфлоу и посмотреть статус» (лишний round-trip и
+гонка между проверкой и стартом), а **всегда signal-with-start в цикл**: он
+либо получает команду, либо поднимается тем же вызовом, а дальше сам решает,
+поднимать ли дочерний прогон.
+
+Остаётся один случай, который цикл обслужить не может: прогоны прежнего
+поколения. Их история не знает ни фазового цикла, ни сигнала на запуск агента —
+команда была бы принята и потеряна. Их отличает query `handles_agents`; для них
+лаунчер стартует самостоятельный прогон, как раньше. Ветка исчезнет сама, когда
+прогоны того поколения завершатся.
+
+Дорогие прогоны запускаются с `ParentClosePolicy.ABANDON`: цепочка FNR идёт до
+4500 с, и ни `continue-as-new` родителя, ни его завершение не должны обрывать её
+по причине, к ней не относящейся.
+
+Аналитика двигает фазу (`business-analysis` → `system-requirements`), если из
+текущей фазы такой ход есть по таблице переходов. Если нет — задача уже у
+разработчика или Issue в боковом состоянии, — команда всё равно выполняется, но
+фаза не трогается: соврать про состояние хуже, чем не отразить в нём разовый
+прогон. Оценка фазу не двигает никогда: это боковая команда, а не стадия пути.
+
+Очередь у всех прогонов по-прежнему одна (`issue-lifecycle`,
+`max_concurrent_activities=3`): дочерний прогон наследует очередь родителя, и по
+сравнению с прежним поведением — когда цикл гонял те же стадии сам —
+конкуренция не изменилась. Выделенная очередь под тяжёлые прогоны остаётся
+отдельной задачей.
 
 **Сигнал поднимает цикл.** Все командные входы идут через signal-with-start:
 метки решения (`research-me`/`bug-me`/`build-me`) и `/analyze`. Команда по

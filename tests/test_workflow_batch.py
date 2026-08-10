@@ -5,7 +5,7 @@ from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from workflows import IssueLifecycle
+from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
 from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
@@ -55,7 +55,7 @@ async def test_batch_vague_escalates_without_hanging():
     _state.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
-            env.client, task_queue="tq", workflows=[IssueLifecycle],
+            env.client, task_queue="tq", workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
             activities=[stub_prefilter, stub_gate_vague, stub_escalate, stub_protocol, deadlines_stub, phase_stub],
         ):
             await env.client.execute_workflow(
@@ -110,6 +110,11 @@ async def stub_post_priority_comment(issue: IssueInput, priority: PriorityResult
     pass
 
 
+@activity.defn(name="ack_command")
+async def stub_ack(analyze: AnalyzeInput) -> None:
+    _research_state["acked"] = analyze.trigger
+
+
 @activity.defn(name="prepare_workspace")
 async def stub_prepare(analyze: AnalyzeInput) -> None:
     _research_state["prepared"] = True
@@ -161,10 +166,10 @@ async def test_research_me_label_surfaces_pipeline_failure():
     _research_state.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
-            env.client, task_queue="tq-research", workflows=[IssueLifecycle],
+            env.client, task_queue="tq-research", workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
             activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
                         stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_prepare, stub_stage_fails, stub_publish, stub_cleanup,
+                        stub_ack, stub_prepare, stub_stage_fails, stub_publish, stub_cleanup,
                         stub_publish_error, stub_mark_running, stub_finish_labels,
                         stub_protocol, deadlines_stub, phase_stub],
         ):
@@ -175,10 +180,13 @@ async def test_research_me_label_surfaces_pipeline_failure():
                 id=f"wf-{uuid.uuid4()}", task_queue="tq-research",
             )
             await handle.signal(IssueLifecycle.human_decision, "research-me")
-            # Вторая точка решения (build-me) иначе ждала бы сигнал вечно —
-            # шлём что угодно, кроме "build-me", просто чтобы workflow дошёл до конца.
-            await handle.signal(IssueLifecycle.human_decision, "skip")
-            await handle.result()  # не должно поднять исключение — сбой пойман внутри
+            # Сбой пойман внутри: цикл не падает, а уходит в фазу `failed`,
+            # из которой человек может перезапустить обработку (#36).
+            for _ in range(300):
+                if await handle.query(IssueLifecycle.phase) == "failed":
+                    break
+                await env.sleep(1)
+            assert await handle.query(IssueLifecycle.phase) == "failed"
 
     assert _research_state["attempts"] == [1], "дорогой прогон не должен ретраиться"
     assert "boom-research-me" in _research_state["reason"]
@@ -189,23 +197,48 @@ async def test_research_me_label_surfaces_pipeline_failure():
     assert _research_state["cleaned"] is True
     # Прогон по метке research-me виден в выборке `label:run:*`, пока идёт, и
     # получает метку исхода, когда закончился, — как и запуск через run:analyze.
-    assert _research_state["running"] == "analyze"
+    # Метку ставит сам дочерний прогон (ack_command), и называет он её тем
+    # триггером, который был на самом деле.
+    assert _research_state["acked"] == "research-me"
     assert _research_state["finished"] == ("analyze", False)
 
 
-# --- analyze_requested: лейбл ставится ровно один раз ---
+# --- analyze_requested: команда не теряется и не плодит дорогих прогонов ---
 #
-# Хендлер сигнала теперь не просто пишет поле — он вызывает activity
-# mark_analyzing. Guard (self._analyze_labeled) обязан держаться даже если
-# /analyze прилетает дважды (повторная команда, дубль webhook-доставки):
-# лейбл должен появиться один раз, а не на каждый сигнал.
+# Раньше хендлер вешал косметическую метку, а работу нёс независимый воркфлоу
+# из вебхука. Теперь аналитику ведёт сам цикл дочерним прогоном (#37), поэтому
+# проверять надо не число меток, а число прогонов: id фиксирован
+# (`analysis-<repo>-<n>`), и повторная команда обязана упереться в него.
 
-_analyze_signal_state = {"count": 0}
+_analyze_state: dict = {}
 
 
-@activity.defn(name="mark_analyzing")
-async def stub_mark_analyzing(repo: str, issue_number: int) -> None:
-    _analyze_signal_state["count"] += 1
+@activity.defn(name="ack_command")
+async def stub_ack_once(analyze: AnalyzeInput) -> None:
+    _analyze_state.setdefault("runs", []).append(analyze.comment_id)
+
+
+@activity.defn(name="run_fnr_stage")
+async def stub_stage_ok(analyze: AnalyzeInput, stage_name: str) -> dict:
+    return {"stage": stage_name, "artifact": None, "bytes": 0}
+
+
+@activity.defn(name="prepare_workspace")
+async def stub_prepare_ok(analyze: AnalyzeInput) -> None: ...
+
+
+@activity.defn(name="publish_analysis")
+async def stub_publish_ok(analyze: AnalyzeInput) -> str:
+    return "research/issue-42"
+
+
+@activity.defn(name="cleanup_workspace")
+async def stub_cleanup_ok(analyze: AnalyzeInput) -> None: ...
+
+
+@activity.defn(name="mark_ready_for_dev")
+async def stub_ready(issue: IssueInput, priority_tier: str, branch: str) -> None:
+    _analyze_state["handed-off"] = True
 
 
 @activity.defn(name="escalate_to_human")
@@ -214,21 +247,31 @@ async def stub_escalate_any(issue: IssueInput, reason: str = "") -> None:
     эскалирует. Заглушка нужна всем прогонам, доходящим до дедлайна."""
 
 
-@pytest.mark.timeout(30)
-async def test_analyze_requested_labels_only_once():
-    """Два сигнала analyze_requested подряд обязаны дать ровно один вызов
-    mark_analyzing: run() устанавливает self._issue первой же строкой (до
-    какого-либо await), так что к моменту, когда обработчики сигналов
-    получают своё исполнение, self._issue уже не None — guard проверяет
-    именно однократность лейбла, а не гонку за его инициализацию."""
-    _analyze_signal_state["count"] = 0
+ANALYZE_STUBS = [stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
+                 stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
+                 stub_protocol, deadlines_stub, phase_stub, stub_escalate_any,
+                 stub_ack_once, stub_prepare_ok, stub_stage_ok, stub_publish_ok,
+                 stub_cleanup_ok, stub_finish_labels, stub_publish_error, stub_ready]
+
+
+async def _await_phase(env, handle, expected: str) -> str:
+    for _ in range(300):
+        if await handle.query(IssueLifecycle.phase) == expected:
+            break
+        await env.sleep(1)
+    return await handle.query(IssueLifecycle.phase)
+
+
+@pytest.mark.timeout(60)
+async def test_repeated_analyze_does_not_start_a_second_expensive_run():
+    """Два `/analyze` подряд (повторная команда, дубль webhook-доставки) — это
+    один прогон, а не два: второй упирается в занятый id."""
+    _analyze_state.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
-            env.client, task_queue="tq-analyze-once", workflows=[IssueLifecycle],
-            activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
-                        stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_mark_analyzing, stub_protocol, deadlines_stub, phase_stub,
-                        stub_escalate_any],
+            env.client, task_queue="tq-analyze-once",
+            workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+            activities=ANALYZE_STUBS,
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -238,30 +281,25 @@ async def test_analyze_requested_labels_only_once():
             )
             await handle.signal(IssueLifecycle.analyze_requested, 111)
             await handle.signal(IssueLifecycle.analyze_requested, 222)
-            # "no-match" не совпадает ни с research-me, ни с bug-me — run()
-            # уходит в ветку else: return, не запуская тяжёлый пайплайн, так
-            # что для завершения теста лишних стабов (пайплайна и т.п.) не нужно.
-            await handle.signal(IssueLifecycle.human_decision, "no-match")
-            await handle.result()
 
-    assert _analyze_signal_state["count"] == 1, "повторный /analyze не должен плодить лейблы"
+            assert await _await_phase(env, handle, "ready-for-dev") == "ready-for-dev"
+
+    assert _analyze_state["runs"] == [111], "повторная команда завела второй дорогой прогон"
 
 
-@pytest.mark.asyncio
-async def test_analyze_requested_before_run_init_still_labels():
+@pytest.mark.timeout(60)
+async def test_analyze_requested_in_the_first_activation_is_not_lost():
     """Сигнал в САМОЙ ПЕРВОЙ активации воркфлоу (start_signal) приходит раньше,
     чем run() выполнил `self._issue = issue` — Temporal применяет сигналы до
     создания задачи run(). Хендлер обязан ДОЖДАТЬСЯ инициализации через
-    wait_condition, а не молча выйти по `self._issue is None`. Без фикса
-    mark_analyzing не вызвался бы ни разу (count == 0)."""
-    _analyze_signal_state["count"] = 0
+    wait_condition, а не выйти молча по `self._issue is None`: без этого
+    команда пропадала бы бесследно."""
+    _analyze_state.clear()
     async with await WorkflowEnvironment.start_time_skipping() as env:
         async with Worker(
-            env.client, task_queue="tq-analyze-init", workflows=[IssueLifecycle],
-            activities=[stub_prefilter_ok, stub_gate_sufficient, stub_classify_feature,
-                        stub_duplicate_none, stub_score_priority, stub_post_priority_comment,
-                        stub_mark_analyzing, stub_protocol, deadlines_stub, phase_stub,
-                        stub_escalate_any],
+            env.client, task_queue="tq-analyze-init",
+            workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+            activities=ANALYZE_STUBS,
         ):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run,
@@ -272,7 +310,8 @@ async def test_analyze_requested_before_run_init_still_labels():
                 # стартом, раньше первой строки run()
                 start_signal="analyze_requested", start_signal_args=[111],
             )
-            await handle.signal(IssueLifecycle.human_decision, "no-match")
-            await handle.result()
 
-    assert _analyze_signal_state["count"] == 1, "метка потеряна: сигнал до init не дождался self._issue"
+            assert await _await_phase(env, handle, "ready-for-dev") == "ready-for-dev"
+
+    assert _analyze_state["runs"] == [111], "команда потеряна: сигнал до init не дождался self._issue"
+    assert _analyze_state.get("handed-off") is True
