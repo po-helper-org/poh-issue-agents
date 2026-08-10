@@ -16,6 +16,7 @@ import urllib.parse
 import jwt
 import requests
 
+from shared.agent_comment import sign
 from shared.labels import ORIGIN_AGENT
 
 _log = logging.getLogger("github_client")
@@ -126,6 +127,14 @@ def _auth_headers(repo: str) -> dict:
 
 
 def post_comment(repo: str, issue_number: int, body: str) -> None:
+    """Комментарий сервиса — всегда подписанный.
+
+    Подпись ставится здесь, в единственной точке отправки, а не в каждом месте,
+    где текст собирается: пропущенная подпись означала бы, что вебхук примет наш
+    комментарий за ответ человека и накормит им цикл уточнений (см.
+    shared/agent_comment.py).
+    """
+    body = sign(body)
     if _dry_run():
         _log.info("[DRY_RUN] comment %s#%s: %s", repo, issue_number, body[:200])
         return

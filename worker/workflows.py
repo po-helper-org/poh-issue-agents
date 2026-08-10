@@ -16,7 +16,7 @@ Workflow буквально приостанавливается на await self
 """
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -211,6 +211,9 @@ class IssueLifecycle:
         self._classification_label: str | None = None
         self._analysis_done = False
         self._generation = 0
+        # Момент входа в текущую фазу. Проставляется в run() до первого await;
+        # None только пока воркфлоу не начал исполняться.
+        self._phase_since: datetime | None = None
         self._analyze_comment_id: int | None = None
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
 
@@ -359,6 +362,11 @@ class IssueLifecycle:
                                  req.repo, req.issue_number)
 
     async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | None:
+        # Нулевой остаток означает «срок уже вышел», а не «ждать без ограничения»:
+        # `if timeout:` ниже принял бы timedelta(0) за отсутствие таймаута и
+        # припарковал бы Issue навсегда — ровно то, от чего чинили #58.
+        if timeout is not None and timeout <= timedelta(0):
+            return None
         try:
             if timeout:
                 return await asyncio.wait_for(
@@ -395,6 +403,9 @@ class IssueLifecycle:
             carried = LifecycleState(**carried)
 
         self._issue = issue  # даёт analyze_requested доступ к repo/number
+        # Момент входа в фазу. `workflow.now()` детерминирован (время события из
+        # истории), поэтому реплей даёт то же значение, что и первый прогон.
+        self._phase_since = workflow.now()
         if carried is not None:
             self._phase = carried.phase
             self._stage = carried.stage
@@ -402,6 +413,11 @@ class IssueLifecycle:
             self._classification_label = carried.classification_label
             self._analysis_done = carried.analysis_done
             self._generation = carried.generation
+            if carried.phase_since_epoch:
+                # Перезапуск цикла не должен обнулять срок парковки: иначе
+                # continue-as-new сам стал бы способом ждать вечно.
+                self._phase_since = datetime.fromtimestamp(
+                    carried.phase_since_epoch, tz=timezone.utc)
 
         if not workflow.patched("issue-lifecycle-phase-loop"):
             await self._run_linear(issue)
@@ -422,12 +438,33 @@ class IssueLifecycle:
             classification_label=self._classification_label,
             analysis_done=self._analysis_done,
             generation=self._generation + 1,
+            phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
 
     def _history_is_long(self) -> bool:
         """Порог по длине истории, а не по числу итераций: цена реплея зависит
         от событий, а одна фаза может стоить и трёх событий, и трёхсот."""
         return workflow.info().get_current_history_length() >= HISTORY_EVENT_THRESHOLD
+
+    def _park_timeout(self, hours: int) -> timedelta:
+        """Сколько ещё ждать в этой фазе — остаток от срока, а не полный срок.
+
+        Обработчик фазы вызывается в цикле: посторонний сигнал (чужая метка,
+        комментарий) фазу не двигает, но возвращает управление наверх. Пока
+        таймер заводился на полный срок, каждый такой сигнал начинал отсчёт
+        заново — дедлайн получался «N часов с последнего шороха», и Issue,
+        которому раз в трое суток что-то прилетает, не эскалировался никогда.
+        Правило R3 требует обратного: срок отсчитывается от входа в фазу.
+
+        `workflow.patched` обязателен: у припаркованных прогонов таймер уже
+        записан в историю, и другая длительность на реплее — недетерминизм.
+        """
+        if not workflow.patched("issue-lifecycle-absolute-park-deadline"):
+            return timedelta(hours=hours)
+        if self._phase_since is None:
+            return timedelta(hours=hours)
+        left = self._phase_since + timedelta(hours=hours) - workflow.now()
+        return left if left > timedelta(0) else timedelta(0)
 
     async def _enter(self, phase: str, stage: str, *, write_label: bool = True) -> None:
         """Переход в фазу: проверка допустимости, стадия, метка.
@@ -446,6 +483,8 @@ class IssueLifecycle:
         lifecycle.transition(self._phase, phase)
         self._phase = phase
         self._stage = stage
+        # Отсчёт срока парковки начинается здесь и только здесь.
+        self._phase_since = workflow.now()
         if write_label and self._issue is not None:
             await workflow.execute_activity(
                 activities.set_phase,
@@ -708,7 +747,7 @@ class IssueLifecycle:
     async def _phase_await_decision(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `classified`: ждём решения человека о тяжёлой стадии."""
         decision = await self._wait_for_signal(
-            timedelta(hours=deadlines.human_decision_hours))
+            self._park_timeout(deadlines.human_decision_hours))
         if decision is None:
             await workflow.execute_activity(
                 activities.escalate_to_human,
@@ -765,7 +804,7 @@ class IssueLifecycle:
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку."""
         decision = await self._wait_for_signal(
-            timedelta(hours=deadlines.build_decision_hours))
+            self._park_timeout(deadlines.build_decision_hours))
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди
@@ -793,7 +832,7 @@ class IssueLifecycle:
         «вечная сессия». Сигнал `reopen` возвращает Issue в работу по таблице
         переходов — первым допустимым переходом обратно в основной путь.
         """
-        signal = await self._wait_for_signal(timedelta(hours=deadlines.side_state_hours))
+        signal = await self._wait_for_signal(self._park_timeout(deadlines.side_state_hours))
         if signal is None:
             return None
         if signal == AGENT_ANALYZE:

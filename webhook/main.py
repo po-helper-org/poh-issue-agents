@@ -35,6 +35,7 @@ from shared.commands import (
     parse_command,
     parse_label_command,
 )
+from shared.agent_comment import is_agent_comment
 from shared.agent_launcher import request_analysis, request_estimate
 from shared.authz import may_trigger, trigger_allowlist
 from shared.labels import parse_root_issue
@@ -318,6 +319,13 @@ async def github_webhook(
         # тот же принцип, что и guard `comment.user.type != 'Bot'` в старой
         # версии на Actions.
         if payload["comment"]["user"]["type"] == "Bot":
+            return {"ok": True}
+        # Гейта по типу автора мало: под PAT сервис пишет от имени человека, и
+        # его комментарии возвращаются с `type == "User"`. На живом прогоне
+        # именно так advisor-ответ и разбор приоритета приезжали обратно как
+        # `user_comment`. Различаем по подписи, а не по логину: владелец токена
+        # — тот же человек, чьи настоящие ответы кормят цикл уточнений.
+        if is_agent_comment(payload["comment"].get("body")):
             return {"ok": True}
 
         repo = payload["repository"]["full_name"]
