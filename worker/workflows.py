@@ -415,7 +415,15 @@ class IssueLifecycle:
 
             # Точка перезапуска — сразу после смены фазы: состояние согласовано,
             # незавершённой работы нет.
-            if self._history_is_long() and not lifecycle.is_terminal(self._phase):
+            #
+            # Очередь сигналов в снимок не переносится: она живёт в памяти
+            # прогона, и перезапуск с непрочитанным сигналом потерял бы его
+            # молча — ровно тот отказ, от которого уходит #36. Пока очередь не
+            # пуста, ждём следующей фазы: порог не жёсткий дедлайн, а несколько
+            # лишних событий дешевле съеденной команды человека.
+            if (self._history_is_long()
+                    and self._signal_queue.empty()
+                    and not lifecycle.is_terminal(self._phase)):
                 workflow.continue_as_new(args=[issue, self._snapshot()])
 
     async def _phase_triage(self, issue: IssueInput, deadlines) -> tuple | None:
