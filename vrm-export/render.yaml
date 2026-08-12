@@ -1,0 +1,55 @@
+# Blueprint для Render. Один веб-сервис с диском.
+#
+# ПОЧЕМУ НЕ CRON JOB: Render Cron Job не может примонтировать постоянный
+# диск, а системе нужно хранить базу виденных объявлений, накопленный
+# рейтинг и архив отчётов. Поэтому расписание живёт внутри процесса
+# (APScheduler), а состояние — на диске рядом.
+#
+# ПОЧЕМУ НЕ FREE: на free-плане сервис засыпает после 15 минут простоя,
+# внутренний планировщик не сработает, и диски там недоступны.
+
+services:
+  - type: web
+    name: viet-rent-monitor
+    runtime: python
+    plan: starter
+    region: singapore          # ближе всего к вьетнамским хостам
+    buildCommand: pip install -r requirements.txt
+    # -w 1: ровно один воркер — второй завёл бы второй APScheduler и продублировал
+    # бы ежедневный прогон. --threads 4: чтобы /healthz и /archive отвечали, пока
+    # фоновый поток (см. app.py, _run_job) тянет доски объявлений.
+    startCommand: gunicorn -w 1 -k gthread --threads 4 -t 300 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /healthz
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 5              # снимки копятся; 5 ГБ хватит надолго
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      - key: DATA_DIR
+        value: /data
+      - key: PRICE_MIN_VND
+        value: "12000000"
+      - key: PRICE_MAX_VND
+        value: "18000000"
+      - key: STUDIO_AREA
+        value: "45"
+      - key: RUN_CRON
+        value: "0 2 * * *"     # 02:00 UTC = 09:00 по Данангу
+      - key: CBR_URL
+        value: https://www.cbr.ru/scripts/XML_daily.asp
+      - key: BASIC_AUTH_USER
+        sync: false
+      - key: BASIC_AUTH_PASS
+        sync: false
+      - key: RUN_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      # PUBLIC_URL не задаём: Render сам прокидывает RENDER_EXTERNAL_URL в
+      # каждый сервис, pipeline/config.py подхватывает его для ссылки на
+      # отчёт в сводке Telegram. Задать вручную можно, если сервис висит
+      # за собственным доменом, отличным от *.onrender.com.

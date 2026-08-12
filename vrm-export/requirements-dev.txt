@@ -1,0 +1,7 @@
+# Зависимости только для тестов — на Render НЕ ставятся (см. render.yaml,
+# buildCommand использует requirements.txt, не этот файл).
+-r requirements.txt
+pytest==8.3.3
+# Версия должна быть достаточно свежей для предустановленного в CI-окружении
+# chromium (см. README: "тесты" — про --executable-path на случай расхождения).
+playwright==1.55.0
