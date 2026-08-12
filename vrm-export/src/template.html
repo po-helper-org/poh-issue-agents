@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="ru" class="nojs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>__TITLE__ · прогон __RUNDATE__</title>
+<style>
+/* ── токены ────────────────────────────────────────────────────────────────────────
+   Кривые взяты из скиллов Emil Kowalski, не выдуманы: встроенные CSS-easing
+   слишком слабые. ease-in на UI не используем нигде — он тормозит ровно тот
+   момент, на который пользователь смотрит внимательнее всего.            */
+:root{
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  --ease-in-out:cubic-bezier(.77,0,.175,1);
+  --bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;
+  --tx:#e6e9ef;--tx2:#9aa3b2;--tx3:#6b7484;--acc:#5b9cf8;--good:#3fb27f;--warn:#d99a2b;
+  --scrim:rgba(8,10,14,.72);--glass:rgba(23,26,33,.82);
+  --sh:0 1px 2px rgba(0,0,0,.28),0 8px 28px -6px rgba(0,0,0,.45);
+}
+@media(prefers-color-scheme:light){:root{
+  --bg:#f6f7f9;--panel:#fff;--panel2:#f1f3f6;--line:#dfe3ea;
+  --tx:#16191f;--tx2:#5a6472;--tx3:#8b94a3;--acc:#1f6fe0;
+  --scrim:rgba(20,24,31,.5);--glass:rgba(255,255,255,.86);
+  --sh:0 1px 2px rgba(16,24,40,.06),0 10px 30px -8px rgba(16,24,40,.16);}}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--tx);
+ font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+ font-optical-sizing:auto}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
+.wrap{max-width:1380px;margin:0 auto;padding:22px 16px 72px}
+
+/* трекинг зависит от кегля: крупный текст поджимаем, мелкий чуть распускаем */
+h1{font-size:22px;margin:0 0 5px;font-weight:650;letter-spacing:-.021em;line-height:1.15}
+.sub{color:var(--tx2);font-size:13px;margin-bottom:20px;letter-spacing:.002em}
+.sub b{color:var(--tx);font-weight:600}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(146px,1fr));gap:10px;margin-bottom:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px;box-shadow:var(--sh)}
+.card .n{font-size:26px;font-weight:660;letter-spacing:-.028em;line-height:1.05;font-variant-numeric:tabular-nums}
+.card .l{font-size:11.5px;color:var(--tx2);text-transform:uppercase;letter-spacing:.055em;margin-top:3px}
+
+details.src{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;box-shadow:var(--sh)}
+details.src summary{padding:12px 15px;cursor:pointer;font-size:13.5px;color:var(--tx2);list-style-position:inside}
+.srctbl{padding:0 15px 13px}
+.srctbl div{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid var(--line);font-size:13px}
+.srctbl div span:last-child{color:var(--tx2);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+.filters{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px;margin-bottom:14px;box-shadow:var(--sh)}
+.frow{display:flex;flex-wrap:wrap;gap:14px 20px;align-items:flex-end}
+.fld{display:flex;flex-direction:column;gap:5px}
+.fld label{font-size:11.5px;color:var(--tx2);text-transform:uppercase;letter-spacing:.045em}
+.fld input,.fld select{background:var(--panel2);border:1px solid var(--line);color:var(--tx);
+ border-radius:8px;padding:8px 10px;font:inherit;font-size:14px;min-width:92px;
+ transition:border-color 140ms ease,background-color 140ms ease}
+.chips{display:flex;flex-wrap:wrap;gap:7px}
+.chip{display:inline-flex;align-items:center;gap:7px;background:var(--panel2);border:1px solid var(--line);
+ border-radius:999px;padding:7px 13px;font-size:13px;cursor:pointer;user-select:none;white-space:nowrap;
+ transition:transform 160ms var(--ease-out),border-color 160ms ease,background-color 160ms ease,color 160ms ease}
+.chip input{margin:0;accent-color:var(--acc)}
+.chip:active{transform:scale(.97)}
+.chip.on{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 14%,transparent);color:var(--tx)}
+.reset{background:none;border:1px solid var(--line);color:var(--tx2);border-radius:8px;padding:8px 13px;
+ font:inherit;font-size:13px;cursor:pointer;
+ transition:transform 160ms var(--ease-out),color 160ms ease,border-color 160ms ease}
+.reset:active{transform:scale(.97)}
+.count{font-size:13px;color:var(--tx2);margin:0 0 10px}.count b{color:var(--tx)}
+
+.tblwrap{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow-x:auto;box-shadow:var(--sh)}
+table{border-collapse:collapse;width:100%;min-width:1080px}
+th,td{padding:12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:11.5px;text-transform:uppercase;letter-spacing:.045em;color:var(--tx2);cursor:pointer;
+ user-select:none;white-space:nowrap;position:sticky;top:0;z-index:2;
+ background:var(--glass);backdrop-filter:blur(14px) saturate(180%);-webkit-backdrop-filter:blur(14px) saturate(180%);
+ transition:color 140ms ease}
+th .ar{opacity:.28;font-size:10px;margin-left:4px;display:inline-block;
+ transition:opacity 160ms ease,transform 200ms var(--ease-out)}
+th.sorted{color:var(--tx)}th.sorted .ar{opacity:1;color:var(--acc)}
+th.sorted.asc .ar{transform:rotate(180deg)}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+tbody tr{transition:background-color 140ms ease}
+tbody tr:last-child td{border-bottom:none}
+.rank{color:var(--tx3);font-variant-numeric:tabular-nums;width:26px}
+.street{font-weight:590;letter-spacing:-.004em}
+.street a{color:var(--tx);text-decoration:none;background-image:linear-gradient(var(--tx3),var(--tx3));
+ background-size:100% 1px;background-repeat:no-repeat;background-position:0 100%;
+ transition:color 160ms ease,background-image 160ms ease}
+.meta{font-size:12px;color:var(--tx3);margin-top:3px}
+.meta .city{color:var(--acc);font-weight:600}
+.note{font-size:12.5px;color:var(--tx2);margin-top:6px;max-width:340px;line-height:1.5}
+.orig{display:inline-flex;align-items:center;gap:5px;margin-top:8px;font-size:12.5px;color:var(--acc);
+ text-decoration:none;border:1px solid var(--line);border-radius:7px;padding:5px 9px;background:var(--panel2);
+ transition:transform 160ms var(--ease-out),border-color 160ms ease,background-color 160ms ease}
+.orig:active{transform:scale(.97)}
+.orig .arw{font-size:11px;opacity:.8}
+.score{font-weight:660;font-variant-numeric:tabular-nums;letter-spacing:-.015em}
+.s-hi{color:var(--good)}.s-mid{color:var(--warn)}.s-lo{color:var(--tx3)}
+.rub{font-weight:590;letter-spacing:-.008em}.vnd{font-size:12px;color:var(--tx3);margin-top:2px}
+.am{display:inline-flex;gap:4px}
+.am i{font-style:normal;width:23px;height:23px;border-radius:7px;display:grid;place-items:center;
+ font-size:11px;font-weight:700;background:var(--panel2);color:var(--tx3);border:1px solid var(--line)}
+.am i.on{background:color-mix(in srgb,var(--good) 20%,transparent);color:var(--good);
+ border-color:color-mix(in srgb,var(--good) 45%,transparent)}
+.tag{display:inline-block;font-size:11px;padding:3px 8px;border-radius:6px;background:var(--panel2);
+ color:var(--tx2);border:1px solid var(--line);white-space:nowrap}
+.tag.b{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good);border-color:color-mix(in srgb,var(--good) 40%,transparent)}
+.tag.q{color:var(--tx3)}
+.tag.w{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+
+/* ── превью фото ── */
+.thumb{position:relative;width:108px;height:76px;border-radius:9px;overflow:hidden;border:1px solid var(--line);
+ background:var(--panel2);cursor:pointer;display:block;padding:0;text-decoration:none;
+ transition:transform 160ms var(--ease-out),border-color 160ms ease}
+/* подпись лежит СНИЗУ, поверх неё — слой с фоновой картинкой.
+   Не загрузилась картинка -> слой прозрачный -> видно подпись. Ломаного значка нет никогда. */
+.thumb .fb{position:absolute;inset:0;display:grid;place-items:center;z-index:0;
+ color:var(--tx3);font-size:11px;text-align:center;padding:4px;line-height:1.3}
+.thumb .ph{position:absolute;inset:0;z-index:1;background-size:cover;background-position:center;
+ transition:transform 260ms var(--ease-out)}
+.thumb .cnt{position:absolute;right:5px;bottom:5px;z-index:2;background:rgba(0,0,0,.72);color:#fff;font-size:11px;
+ padding:2px 7px;border-radius:99px;font-variant-numeric:tabular-nums;
+ backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.thumb:active{transform:scale(.97)}
+.thumb.nophoto{border-style:dashed;display:grid;place-items:center}
+.thumb .fh{color:var(--tx3);font-size:11px;text-align:center;padding:4px;line-height:1.3}
+.nophoto{width:108px;height:76px;border-radius:9px;border:1px dashed var(--line);display:grid;
+ place-items:center;color:var(--tx3);font-size:11px;text-align:center;padding:5px}
+
+/* ── кнопка владельца ── */
+.obtn{display:inline-flex;align-items:center;gap:7px;background:var(--panel2);border:1px solid var(--line);
+ color:var(--tx);border-radius:8px;padding:7px 11px;font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap;
+ transition:transform 160ms var(--ease-out),border-color 160ms ease,color 160ms ease}
+.obtn:active{transform:scale(.97)}
+.obtn.pf{border-color:color-mix(in srgb,var(--warn) 42%,transparent);color:var(--warn)}
+.obtn .dot{width:6px;height:6px;border-radius:99px;background:currentColor;flex:none}
+
+/* ── оверлеи: opacity+visibility, чтобы закрытие тоже анимировалось ── */
+.ov{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
+ background:var(--scrim);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
+ opacity:0;visibility:hidden;
+ transition:opacity 220ms var(--ease-out),visibility 0s linear 220ms}
+.ov.open{opacity:1;visibility:visible;transition:opacity 220ms var(--ease-out),visibility 0s}
+
+/* галерея: масштаб от 0.96, не от нуля — ничто в реальном мире не появляется из ничего */
+.gal{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+#gimg{max-width:92vw;max-height:80vh;object-fit:contain;border-radius:10px;background:#0a0c10;
+ box-shadow:0 24px 70px -12px rgba(0,0,0,.7);
+ transform:scale(.96);opacity:0;
+ transition:transform 260ms var(--ease-out),opacity 200ms var(--ease-out),filter 200ms ease}
+.ov.open #gimg{transform:scale(1);opacity:1}
+#gimg.swapping{opacity:0;filter:blur(6px)}   /* блюр маскирует стык между кадрами */
+.gcap{position:absolute;top:16px;left:0;right:0;text-align:center;color:#e9ecf2;font-size:13.5px;
+ padding:0 68px;text-shadow:0 1px 3px rgba(0,0,0,.6);letter-spacing:.004em}
+.gcap b{font-weight:620;letter-spacing:-.006em}
+.gnum{position:absolute;bottom:18px;left:0;right:0;text-align:center;color:#aab2c0;font-size:13px;
+ font-variant-numeric:tabular-nums;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+.gx,.gnav{background:rgba(255,255,255,.1);border:none;color:#fff;cursor:pointer;
+ backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+ transition:transform 160ms var(--ease-out),background-color 160ms ease}
+.gx{position:absolute;top:12px;right:14px;font-size:22px;line-height:1;padding:8px 13px;border-radius:10px}
+.gnav{position:absolute;top:50%;font-size:26px;line-height:1;padding:15px 19px;border-radius:12px;
+ transform:translateY(-50%)}
+.gprev{left:14px}.gnext{right:14px}
+.gx:active{transform:scale(.94)}
+.gnav:active{transform:translateY(-50%) scale(.94)}
+.gerr{color:#aab2c0;font-size:14px;text-align:center;padding:40px;max-width:440px;line-height:1.6}
+.gerr a{color:var(--acc)}
+
+/* модалка владельца: origin center — она не привязана к триггеру */
+.mod{background:var(--glass);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);
+ border:1px solid var(--line);border-radius:16px;max-width:470px;width:calc(100% - 32px);max-height:86vh;
+ overflow:auto;padding:22px;box-shadow:0 24px 60px -12px rgba(0,0,0,.55);
+ transform-origin:center;transform:scale(.96);opacity:0;
+ transition:transform 250ms var(--ease-out),opacity 250ms var(--ease-out)}
+.ov.open .mod{transform:scale(1);opacity:1}
+.mod h3{margin:0 0 3px;font-size:19px;font-weight:640;letter-spacing:-.018em}
+.mod .otype{color:var(--tx2);font-size:13px;margin-bottom:15px}
+.mrow{display:flex;justify-content:space-between;gap:14px;padding:10px 0;border-top:1px solid var(--line);font-size:14px}
+.mrow span:first-child{color:var(--tx2)}
+.mrow span:last-child{text-align:right;font-weight:560}
+.warn{background:color-mix(in srgb,var(--warn) 12%,transparent);
+ border:1px solid color-mix(in srgb,var(--warn) 34%,transparent);border-radius:10px;padding:11px 13px;
+ font-size:13px;margin:15px 0;line-height:1.52}
+.askbox{background:var(--panel2);border-radius:10px;padding:12px 14px;font-size:13.5px;color:var(--tx2);
+ margin:13px 0;line-height:1.55}
+.askbox b{color:var(--tx);display:block;margin-bottom:5px;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+.acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.acts a,.acts button{flex:1 1 auto;text-align:center;text-decoration:none;background:var(--panel2);
+ border:1px solid var(--line);color:var(--tx);border-radius:10px;padding:11px 12px;font:inherit;font-size:13.5px;
+ cursor:pointer;transition:transform 160ms var(--ease-out),border-color 160ms ease,background-color 160ms ease}
+.acts a:active,.acts button:active{transform:scale(.97)}
+.acts a.prim{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:570}
+
+.nojs .filters,.nojs .count{display:none}
+.nojs th{cursor:default}
+.nojs .ar{display:none}
+.nsnote{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 15px;
+ margin-bottom:14px;font-size:13px;color:var(--tx2);line-height:1.5}
+.ophone{font-size:11.5px;color:var(--tx3);margin-top:4px;font-variant-numeric:tabular-nums}
+.ophone a{color:var(--tx3);text-decoration:none}
+.empty{padding:44px 16px;text-align:center;color:var(--tx3);font-size:14px}
+.foot{margin-top:18px;font-size:12.5px;color:var(--tx3);line-height:1.65}
+
+/* ── ховер только там, где есть настоящий курсор: тач эмулирует hover по тапу ── */
+@media (hover:hover) and (pointer:fine){
+  tbody tr:hover{background:var(--panel2)}
+  th:hover{color:var(--tx)}
+  .street a:hover{color:var(--acc);background-image:linear-gradient(var(--acc),var(--acc))}
+  .thumb:hover{border-color:var(--acc)}
+  .thumb:hover .ph{transform:scale(1.04)}
+  .orig:hover{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 10%,transparent)}
+  .obtn:hover{border-color:var(--acc);color:var(--acc)}
+  .reset:hover{color:var(--tx);border-color:var(--tx3)}
+  .acts a:hover,.acts button:hover{border-color:var(--acc)}
+  .gx:hover,.gnav:hover{background:rgba(255,255,255,.2)}
+  .fld input:hover,.fld select:hover{border-color:var(--tx3)}
+}
+
+/* ── меньше движения: оставляем прозрачность и цвет, убираем перемещение ── */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
+   transition-duration:.14s!important}
+  .mod,#gimg{transform:none!important}
+  .thumb:hover img,.chip:active,.obtn:active,.thumb:active,.orig:active,
+  .acts a:active,.acts button:active,.reset:active,.gx:active{transform:none!important}
+  th.sorted.asc .ar{transform:none!important}
+  #gimg.swapping{filter:none!important}
+}
+/* ── меньше прозрачности: делаем стёкла плотными ── */
+@media (prefers-reduced-transparency:reduce){
+  .mod,th{background:var(--panel);backdrop-filter:none;-webkit-backdrop-filter:none}
+  .ov{backdrop-filter:none;-webkit-backdrop-filter:none}
+}
+
+/* ── до 760px таблица не помещается: раскладываем строку в карточку.
+      Подписи столбцов подставляем из data-l через ::before, шапку прячем.            ── */
+@media(max-width:760px){
+  .tblwrap{overflow-x:visible}
+  table{min-width:0;display:block}
+  thead{display:none}
+  tbody,tr{display:block;width:100%}
+  tr{position:relative;padding:15px 15px 17px;border-bottom:1px solid var(--line)}
+  tbody tr:last-child{border-bottom:none}
+  td{display:block;border:none;padding:0;white-space:normal}
+  .rank{position:absolute;top:15px;right:15px;font-size:12px;width:auto}
+  td[data-l]{margin-top:11px}
+  td[data-l]::before{content:attr(data-l);display:block;font-size:10.5px;text-transform:uppercase;
+    letter-spacing:.05em;color:var(--tx3);margin-bottom:4px}
+  /* цена, метраж и score — в одну строку, чтобы карточка не растягивалась */
+  td[data-l="Цена"],td[data-l="м²"],td[data-l="Score"]{display:inline-block;width:auto;
+    min-width:31%;vertical-align:top}
+  td[data-l="Уровень"],td[data-l="Спальня"]{display:inline-block;width:auto;min-width:48%;vertical-align:top}
+  .note{max-width:none}
+  .thumb{width:100%;height:170px}
+  .nophoto{width:100%;height:64px}
+  .orig{margin-top:10px}
+}
+@media(max-width:640px){
+  .wrap{padding:14px 10px 52px}h1{font-size:19px}
+  .gnav{padding:11px 13px;font-size:22px}.gcap{padding:0 56px;font-size:12.5px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>__TITLE__ · прогон __RUNDATE__</h1>
+  <div class="sub">Курс: __FX__ · __CRITERIA__</div>
+  <div class="cards">
+    <div class="card"><div class="n">__COLLECTED__</div><div class="l">карточек собрано</div></div>
+    <div class="card"><div class="n">__NEW__</div><div class="l">новых за прогон</div></div>
+    <div class="card"><div class="n">__NTOT__</div><div class="l">в рейтинге</div></div>
+    <div class="card"><div class="n" style="color:var(--good)">__NWASH__</div><div class="l">со стиралкой</div></div>
+    <div class="card"><div class="n">__NSRC__</div><div class="l">источников · __NERR__ ошибок</div></div>
+  </div>
+  <details class="src"><summary>Разбивка по источникам</summary><div class="srctbl" id="srctbl">__SRCTBL__</div></details>
+
+  <div class="filters">
+    <div class="frow">
+      <div class="fld"><label for="pmin">Цена от, ₽</label><input type="number" id="pmin" step="1000"></div>
+      <div class="fld"><label for="pmax">Цена до, ₽</label><input type="number" id="pmax" step="1000"></div>
+      <div class="fld"><label for="amin">Площадь от, м²</label><input type="number" id="amin" step="5"></div>
+      <div class="fld"><label for="smin">Score от</label><input type="number" id="smin" step="0.5"></div>
+      <div class="fld"><label for="limit">Показать</label><select id="limit">
+        <option value="5">Топ-5</option><option value="10">Топ-10</option>
+        <option value="0" selected>Все</option></select></div>
+      <div class="fld"><label>&nbsp;</label><button class="reset" id="reset">Сбросить</button></div>
+    </div>
+    <div class="frow" style="margin-top:15px"><div class="fld" style="flex:1">
+      <label>Ограничения</label>
+      <div class="chips">
+        <label class="chip"><input type="checkbox" id="fwash"> Только со стиралкой</label>
+        <label class="chip"><input type="checkbox" id="fph"> Только с фото</label>
+        <label class="chip"><input type="checkbox" id="fchk"> Только проверенные карточки</label>
+        <label class="chip"><input type="checkbox" id="fsep"> Спальня подтверждённо отдельная</label>
+        <label class="chip"><input type="checkbox" id="fstd"> Скрыть вероятные студии</label>
+        <label class="chip"><input type="checkbox" id="fpf"> Скрыть портфельные контакты</label>
+        <label class="chip"><input type="checkbox" id="fdn"> Только Дананг</label>
+        <label class="chip"><input type="checkbox" id="fnt"> Только Нячанг</label>
+        <label class="chip"><input type="checkbox" id="ftgt"> Только районы у пляжа</label>
+      </div>
+    </div></div>
+  </div>
+
+  <noscript><div class="nsnote">Скрипты в этом просмотрщике отключены — таблица ниже полная и отсортирована по score, но сортировка кликом, фильтры и галерея не работают. Откройте файл в браузере, чтобы они заработали.</div></noscript>
+  <p class="count" id="count">__COUNT__</p>
+  <div class="tblwrap">
+    <table><thead><tr id="head">__HEAD__</tr></thead><tbody id="body">__BODY__</tbody></table>
+    <div class="empty" id="empty" hidden>Под фильтры ничего не подходит.</div>
+  </div>
+
+  <p class="foot">
+    Столбцы сортируются кликом по заголовку, повторный клик меняет направление.
+    Клик по фото — галерея (← → листают, Esc закрывает). Кнопка в столбце «Владелец» —
+    контакт, дата публикации и что спросить. Ссылка «Оригинал» ведёт на исходное объявление.<br>
+    Значки: <b>С</b> — стиралка в квартире («giặt riêng» / «máy giặt»), <b>Су</b> — сушилка,
+    <b>П</b> — посудомойка, <b>☀</b> — признаки света.
+    «Портфель» = один телефон в 3+ объявлениях: формально «chính chủ», фактически оператор портфеля.<br>
+    Фото подгружаются прямо с сайтов объявлений. Если хост закроет хотлинк, вместо снимка
+    будет ссылка на карточку — это не поломка отчёта.
+  </p>
+</div>
+
+<div class="ov" id="gov"><div class="gal">
+  <div class="gcap" id="gcap"></div>
+  <button class="gx" id="gx" aria-label="Закрыть">&times;</button>
+  <button class="gnav gprev" id="gprev" aria-label="Предыдущее фото">&#8249;</button>
+  <img id="gimg" alt="" referrerpolicy="no-referrer">
+  <div class="gerr" id="gerr" hidden></div>
+  <button class="gnav gnext" id="gnext" aria-label="Следующее фото">&#8250;</button>
+  <div class="gnum" id="gnum"></div>
+</div></div>
+
+<div class="ov" id="oov"><div class="mod" id="omod" role="dialog" aria-modal="true"></div></div>
+
+<script>
+document.documentElement.className='js';
+const DATA=__DATA__, SOURCES=__SOURCES__, COLLECTED=__COLLECTED__;
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+
+const COLS=[{k:'_i',t:'#',s:0},{k:'_ph',t:'Фото',s:0},{k:'street',t:'Адрес',s:1},
+ {k:'rub',t:'Цена, ₽',s:1},{k:'area',t:'м²',s:1},{k:'score',t:'Score',s:1},
+ {k:'_am',t:'Удобства',s:0},{k:'level',t:'Уровень',s:1},{k:'sep',t:'Спальня',s:1},
+ {k:'owner',t:'Владелец',s:1}];
+let sortKey='score',sortDir=-1,view=[];
+
+document.querySelectorAll('th[data-k]').forEach(th=>{
+  const go=()=>{const k=th.dataset.k;
+    if(sortKey===k)sortDir=-sortDir;
+    else{sortKey=k;sortDir=['rub','street','owner','sep','level'].includes(k)?1:-1;}
+    render();};
+  th.onclick=go;
+  th.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go();}};
+});
+
+
+/* Разметка строки. Ссылки, а не кнопки: если скрипты в просмотрщике отключены,
+   фото открывается напрямую, а телефон набирается по tel:. С JS onclick
+   возвращает false и вместо перехода открывается галерея или карточка. */
+function rowHTML(r,i){
+  const sc=r.score>=7?'s-hi':r.score>=3?'s-mid':'s-lo';
+  const tel=r.phone?r.phone.replace(/\D/g,''):'';
+  const ph=r.photos.length
+    ? `<a class="thumb" href="${esc(r.photos[0])}" target="_blank" rel="noopener"
+          onclick="return openGal(${i},0)" aria-label="Фото: ${esc(r.street)}">
+         <span class="fb">Фото&nbsp;↗</span>
+         <span class="ph" style="background-image:url('${esc(r.photos[0])}')"></span>
+         <span class="cnt">${r.photos.length}</span></a>`
+    : `<div class="nophoto">нет фото</div>`;
+  return `<tr>
+    <td class="rank">${i+1}</td>
+    <td>${ph}</td>
+    <td>
+      <div class="street"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.street)}</a></div>
+      <div class="meta"><b class="city">${esc(r.city)}</b> · ${esc(r.district)}${r.floor?' · '+r.floor+'-й этаж':''} · ${esc(r.src)}</div>
+      ${r.note?`<div class="note">${esc(r.note)}</div>`:''}
+      <a class="orig" href="${esc(r.url)}" target="_blank" rel="noopener">
+        <span class="arw">↗</span> Оригинал на ${esc(r.src)}</a>
+    </td>
+    <td class="num" data-l="Цена"><div class="rub">${r.rub.toLocaleString('ru-RU')} ₽</div>
+        <div class="vnd">${(r.vnd/1e6).toFixed(1)} млн ₫</div></td>
+    <td class="num" data-l="м²">${r.area}</td>
+    <td class="num score ${sc}" data-l="Score">${r.score.toFixed(2)}</td>
+    <td data-l="Удобства"><span class="am">
+      <i class="${r.wash?'on':''}" title="стиралка в квартире">С</i>
+      <i class="${r.dryer?'on':''}" title="сушилка">Су</i>
+      <i class="${r.dish?'on':''}" title="посудомойка">П</i>
+      <i class="${r.bright?'on':''}" title="свет">☀</i></span></td>
+    <td data-l="Уровень"><span class="tag ${r.level==='B'?'b':'q'}">${r.level==='?'?'не проверен':'уровень '+r.level}</span></td>
+    <td data-l="Спальня"><span class="tag ${r.sep==='да'?'b':(r.sep==='спорно'||r.sep==='вероятно студия')?'w':'q'}">${esc(r.sep)}</span></td>
+    <td data-l="Владелец"><a class="obtn ${r.portfolio?'pf':''}" href="${tel?'tel:+84'+tel.replace(/^0/,''):esc(r.url)}"
+           onclick="return openOwner(${i})"><span class="dot"></span>${esc(r.owner||'нет данных')}</a>
+        ${tel?`<div class="ophone">${tel.replace(/(\d{4})(\d{3})(\d{3})/,'$1.$2.$3')}</div>`:''}</td>
+   </tr>`;
+}
+
+function render(){
+  const v=id=>{const e=document.getElementById(id).value.trim();return e===''?null:+e;};
+  const ck=id=>document.getElementById(id).checked;
+  const f={pmin:v('pmin'),pmax:v('pmax'),amin:v('amin'),smin:v('smin'),
+    limit:+document.getElementById('limit').value,wash:ck('fwash'),ph:ck('fph'),
+    chk:ck('fchk'),sep:ck('fsep'),std:ck('fstd'),tgt:ck('ftgt'),dn:ck('fdn'),nt:ck('fnt'),pf:ck('fpf'),};
+
+  let rows=DATA.filter(r=>{
+    if(f.pmin!==null&&r.rub<f.pmin)return false;
+    if(f.pmax!==null&&r.rub>f.pmax)return false;
+    if(f.amin!==null&&r.area<f.amin)return false;
+    if(f.smin!==null&&r.score<f.smin)return false;
+    if(f.wash&&!r.wash)return false;
+    if(f.ph&&!r.photos.length)return false;
+    if(f.chk&&!r.checked)return false;
+    if(f.sep&&r.sep!=='да')return false;
+    if(f.std&&r.sep==='вероятно студия')return false;
+    if(f.tgt&&r.district==='вне целевых')return false;
+    if(f.dn&&f.nt){}else{if(f.dn&&r.city!=='Дананг')return false;
+                         if(f.nt&&r.city!=='Нячанг')return false;}
+    if(f.pf&&r.portfolio)return false;
+    return true;});
+
+  rows.sort((a,b)=>{const x=a[sortKey],y=b[sortKey];
+    return typeof x==='string'?x.localeCompare(y,'ru')*sortDir:((x??-Infinity)-(y??-Infinity))*sortDir;});
+
+  const total=rows.length;
+  if(f.limit>0)rows=rows.slice(0,f.limit);
+  view=rows;
+
+  document.querySelectorAll('th[data-k]').forEach(th=>{
+    const on=th.dataset.k===sortKey;
+    th.classList.toggle('sorted',on);
+    th.classList.toggle('asc',on&&sortDir>0);});
+  document.getElementById('count').innerHTML=
+    `Показано <b>${rows.length}</b> из <b>${total}</b> прошедших фильтр (всего собрано ${COLLECTED})`;
+
+  const sc=s=>s>=7?'s-hi':s>=3?'s-mid':'s-lo';
+  document.getElementById('body').innerHTML=rows.map((r,i)=>rowHTML(r,i)).join('');
+  document.getElementById('empty').hidden=rows.length>0;
+  document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('on',c.querySelector('input').checked));
+}
+
+/* ── галерея ── */
+let gi=0,gp=[],lastFocus=null;
+const gov=document.getElementById('gov'),gimg=document.getElementById('gimg'),gerr=document.getElementById('gerr');
+function openGal(rowIdx,photoIdx){
+  const r=view[rowIdx];if(!r||!r.photos.length)return true;
+  lastFocus=document.activeElement;
+  gp=r.photos;gi=photoIdx;
+  document.getElementById('gcap').innerHTML=
+    `<b>${esc(r.street)}</b> · ${esc(r.district)} · ${r.rub.toLocaleString('ru-RU')} ₽`;
+  gov.classList.add('open');document.body.style.overflow='hidden';
+  show(true);document.getElementById('gx').focus();return false;
+}
+/* Смена кадра — крошечный кроссфейд с блюром: без него глаз видит два
+   отдельных объекта на стыке. Открытие — 260ms, листание — 120ms:
+   листают часто, поэтому оно должно быть почти незаметным.            */
+function show(instant){
+  gerr.hidden=true;gimg.hidden=false;
+  const load=()=>{gimg.src=gp[gi];gimg.classList.remove('swapping');};
+  if(instant){load();}
+  else{gimg.classList.add('swapping');setTimeout(load,120);}
+  document.getElementById('gnum').textContent=`${gi+1} / ${gp.length}`;
+  const many=gp.length>1;
+  document.getElementById('gprev').style.display=many?'':'none';
+  document.getElementById('gnext').style.display=many?'':'none';
+}
+gimg.onerror=()=>{gimg.hidden=true;gerr.hidden=false;
+  gerr.innerHTML=`Хост объявления не отдал это фото — скорее всего закрыт хотлинк.<br>
+    <a href="${esc(gp[gi])}" target="_blank" rel="noopener">Открыть снимок напрямую</a>`;};
+const gnext=()=>{gi=(gi+1)%gp.length;show();},gprev=()=>{gi=(gi-1+gp.length)%gp.length;show();};
+document.getElementById('gnext').onclick=gnext;
+document.getElementById('gprev').onclick=gprev;
+function closeGal(){
+  gov.classList.remove('open');document.body.style.overflow='';
+  setTimeout(()=>{if(!gov.classList.contains('open'))gimg.removeAttribute('src');},240);
+  lastFocus&&lastFocus.focus();
+}
+document.getElementById('gx').onclick=closeGal;
+gov.onclick=e=>{if(e.target===gov||e.target.classList.contains('gal'))closeGal();};
+
+/* ── владелец ── */
+const oov=document.getElementById('oov');
+function openOwner(i){
+  const r=view[i];if(!r)return true;
+  lastFocus=document.activeElement;
+  const tel=r.phone?r.phone.replace(/\D/g,''):'';
+  const pretty=tel?tel.replace(/(\d{4})(\d{3})(\d{3})/,'$1.$2.$3'):'не указан';
+  document.getElementById('omod').innerHTML=`
+    <h3>${esc(r.owner||'Контакт не найден')}</h3>
+    <div class="otype">${esc(r.otype)}</div>
+    <div class="mrow"><span>Объект</span><span>${esc(r.street)}, ${esc(r.district)}</span></div>
+    <div class="mrow"><span>Цена</span><span>${r.rub.toLocaleString('ru-RU')} ₽ · ${(r.vnd/1e6).toFixed(1)} млн ₫</span></div>
+    <div class="mrow"><span>Площадь / этаж</span><span>${r.area} м²${r.floor?' · '+r.floor+'-й':''}</span></div>
+    <div class="mrow"><span>Телефон</span><span>${pretty}</span></div>
+    <div class="mrow"><span>Zalo</span><span>${r.zalo?'есть':'—'}</span></div>
+    ${r.posted?`<div class="mrow"><span>Опубликовано</span><span>${esc(r.posted)}</span></div>`:''}
+    <div class="mrow"><span>Источник</span><span>${esc(r.src)}</span></div>
+    ${r.portfolio?`<div class="warn"><b>Портфельный контакт.</b> Этот телефон стоит под несколькими
+      объявлениями сразу и помечен «chính chủ», но по факту это оператор портфеля квартир,
+      а не частный владелец. Комиссии как таковой нет, но и «прямого хозяина» тоже нет —
+      зато реально торговаться сразу за несколько вариантов.</div>`:''}
+    ${r.ask?`<div class="askbox"><b>Что спросить</b>${esc(r.ask)}</div>`:''}
+    <div class="acts">
+      ${tel?`<a class="prim" href="tel:+84${tel.replace(/^0/,'')}">Позвонить</a>`:''}
+      ${tel&&r.zalo?`<a href="https://zalo.me/${tel}" target="_blank" rel="noopener">Zalo</a>`:''}
+      <a href="${esc(r.url)}" target="_blank" rel="noopener">Оригинал объявления</a>
+      <button onclick="closeOwner()">Закрыть</button>
+    </div>`;
+  oov.classList.add('open');document.body.style.overflow='hidden';return false;
+}
+function closeOwner(){oov.classList.remove('open');document.body.style.overflow='';lastFocus&&lastFocus.focus();}
+oov.onclick=e=>{if(e.target===oov)closeOwner();};
+
+document.addEventListener('keydown',e=>{
+  if(gov.classList.contains('open')){
+    if(e.key==='Escape')closeGal();
+    else if(e.key==='ArrowRight')gnext();
+    else if(e.key==='ArrowLeft')gprev();
+  } else if(oov.classList.contains('open')&&e.key==='Escape')closeOwner();
+});
+
+document.querySelectorAll('.filters input,.filters select').forEach(e=>e.addEventListener('input',render));
+document.getElementById('reset').onclick=()=>{
+  ['pmin','pmax','amin','smin'].forEach(id=>document.getElementById(id).value='');
+  ['fwash','fph','fchk','fsep','fstd','ftgt','fdn','fnt','fpf'].forEach(id=>document.getElementById(id).checked=false);
+  document.getElementById('limit').value='0';sortKey='score';sortDir=-1;render();};
+render();
+</script>
+</body>
+</html>
