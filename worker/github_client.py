@@ -433,3 +433,25 @@ def get_issue_body(repo: str, issue_number: int) -> str:
     resp = requests.get(url, headers=_auth_headers(repo), timeout=30)
     resp.raise_for_status()
     return resp.json().get("body") or ""
+
+
+def dispatch_workflow(repo: str, workflow_file: str, ref: str, inputs: dict) -> None:
+    """Запускает workflow репозитория-цели через `workflow_dispatch`.
+
+    Отсутствующий файл workflow, ветка без него и отключённые Actions — всё это
+    GitHub возвращает как 404/422, и все три означают одно: прогон НЕ начался.
+    Поднимаем ошибку с текстом ответа, а не глотаем: цикл на ней уходит в
+    `failed`, и человек видит причину, вместо Issue, который «уехал в
+    разработку» и там растворился.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] dispatch %s %s@%s inputs=%s", repo, workflow_file, ref, inputs)
+        return
+    quoted = urllib.parse.quote(workflow_file, safe="")
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{quoted}/dispatches"
+    resp = requests.post(url, headers=_auth_headers(repo),
+                         json={"ref": ref, "inputs": inputs}, timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"workflow_dispatch {workflow_file}@{ref} в {repo} не принят "
+            f"({resp.status_code}): {resp.text.strip()[:300]}")

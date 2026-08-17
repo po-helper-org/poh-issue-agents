@@ -1,0 +1,152 @@
+"""Активность Develop: передача подготовленного Issue агенту разработки.
+
+Второй ключевой шаг контура после Research. Проверяем ровно ту границу, на
+которой цикл перестаёт отвечать за работу: запуск либо состоялся и Issue уехал
+в `in-development`, либо не состоялся и это видно. Промежуточного состояния
+«метка стоит, прогона нет» быть не должно — именно оно превращает потерянную
+задачу в незаметную.
+"""
+
+import pytest
+
+import activities as activities_module
+from shared import develop
+from shared.workflow_types import IssueInput
+
+
+def _issue(number: int = 7) -> IssueInput:
+    return IssueInput(repo="o/r", issue_number=number, title="t", body="b",
+                      author_login="u", author_type="User", interactive=True)
+
+
+@pytest.fixture
+def gh(monkeypatch):
+    """Подменяет GitHub целиком: активность не должна ходить в сеть в тестах."""
+    calls: dict = {"dispatch": [], "labels": [], "comments": []}
+    monkeypatch.setattr(activities_module.github_client, "dispatch_workflow",
+                        lambda repo, wf, ref, inputs:
+                            calls["dispatch"].append((repo, wf, ref, inputs)))
+    monkeypatch.setattr(activities_module.github_client, "add_label",
+                        lambda repo, n, label: calls["labels"].append(label))
+    monkeypatch.setattr(activities_module.github_client, "post_comment",
+                        lambda repo, n, body: calls["comments"].append(body))
+    monkeypatch.setattr(activities_module.github_client, "branch_exists",
+                        lambda repo, branch: calls.get("branch_exists", True))
+    return calls
+
+
+# --- чистый контракт границы ---
+
+def test_inputs_are_all_strings():
+    """`workflow_dispatch` принимает только строки — число молча уронит прогон
+    на стороне GitHub, где мы его уже не увидим."""
+    inputs = develop.dispatch_inputs(12, branch="research/issue-12", priority="P1")
+
+    assert all(isinstance(v, str) for v in inputs.values())
+    assert inputs["issue_number"] == "12"
+
+
+def test_missing_branch_is_an_explicit_empty_string():
+    """Пустая строка — это «аналитики не было», и агент обязан отличать её от
+    несуществующей ветки. Отсутствие ключа означало бы «не передали»."""
+    inputs = develop.dispatch_inputs(12, branch="")
+
+    assert inputs["research_branch"] == ""
+
+
+def test_comment_says_where_to_watch_the_run():
+    body = develop.handoff_comment(12, repo="o/r", branch="research/issue-12")
+
+    assert "research/issue-12" in body
+    assert "o/r/actions/workflows/" in body
+    assert "Closes #12" in body          # чем прогон должен закончиться
+    assert "SubIssue" in body            # и что он делает с edge-кейсами
+
+
+def test_comment_without_analysis_says_so_instead_of_naming_a_branch():
+    body = develop.handoff_comment(12, repo="o/r", branch="")
+
+    assert "аналитики по задаче не было" in body
+    assert "research/issue-12" not in body
+
+
+def test_develop_is_on_by_default(monkeypatch):
+    """Забытая переменная не должна тихо обрывать контур на самом дорогом шаге."""
+    monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
+
+    assert develop.enabled() is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "off", "NO"])
+def test_develop_switches_off_only_explicitly(monkeypatch, raw):
+    monkeypatch.setenv("DEVELOP_ENABLED", raw)
+
+    assert develop.enabled() is False
+
+
+# --- сама активность ---
+
+def test_dispatch_carries_the_research_branch(gh, monkeypatch):
+    monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
+
+    activities_module.trigger_openhands_resolver(_issue(7))
+
+    repo, workflow_file, ref, inputs = gh["dispatch"][0]
+    assert repo == "o/r"
+    assert workflow_file == develop.DEFAULT_WORKFLOW_FILE
+    assert ref == develop.DEFAULT_REF
+    assert inputs["research_branch"] == "research/issue-7"
+
+
+def test_no_analysis_branch_still_dispatches(gh, monkeypatch):
+    """Путь бага: ветки с артефактами нет, и это не повод не начинать работу."""
+    monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
+    monkeypatch.setattr(activities_module.github_client, "branch_exists",
+                        lambda repo, branch: False)
+
+    activities_module.trigger_openhands_resolver(_issue(7))
+
+    _, _, _, inputs = gh["dispatch"][0]
+    assert inputs["research_branch"] == ""
+
+
+def test_failed_dispatch_leaves_no_trace_of_a_started_run(gh, monkeypatch):
+    """Соврать про запуск хуже, чем не запустить: без прогона не должно быть ни
+    метки, ни комментария о начале работы."""
+    monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("workflow_dispatch не принят (404)")
+
+    monkeypatch.setattr(activities_module.github_client, "dispatch_workflow", boom)
+
+    with pytest.raises(RuntimeError, match="404"):
+        activities_module.trigger_openhands_resolver(_issue(7))
+
+    assert gh["labels"] == []
+    assert gh["comments"] == []
+
+
+def test_label_failure_does_not_fail_a_started_run(gh, monkeypatch):
+    """Прогон уже идёт. Уронить активность из-за не поставленной метки значит
+    отправить в `failed` задачу, которая на самом деле в работе."""
+    monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("rate limit")
+
+    monkeypatch.setattr(activities_module.github_client, "add_label", boom)
+
+    activities_module.trigger_openhands_resolver(_issue(7))
+
+    assert gh["dispatch"], "прогон должен был стартовать"
+    assert gh["comments"], "комментарий не должен зависеть от метки"
+
+
+def test_switched_off_fails_visibly_instead_of_pretending(gh, monkeypatch):
+    monkeypatch.setenv("DEVELOP_ENABLED", "0")
+
+    with pytest.raises(RuntimeError, match="DEVELOP_ENABLED"):
+        activities_module.trigger_openhands_resolver(_issue(7))
+
+    assert gh["dispatch"] == []
