@@ -236,6 +236,8 @@ def read_deadlines() -> Deadlines:
         clarification_hours=_hours("PARK_CLARIFICATION_HOURS", 48),
         build_decision_hours=_hours("PARK_BUILD_HOURS", 72),
         side_state_hours=_hours("PARK_SIDE_STATE_HOURS", 168),
+        develop_autostart=os.environ.get(
+            "DEVELOP_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"},
     )
 
 

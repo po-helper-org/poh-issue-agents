@@ -1008,7 +1008,16 @@ class IssueLifecycle:
         return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
 
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
-        """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку."""
+        """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
+
+        При `DEVELOP_AUTOSTART` ожидания нет: контур замкнут и идёт от Issue до
+        PR без касания человека. Метка `ready-for-dev` при этом всё равно
+        ставится (`_phase_handoff` отработал раньше) — она сообщает состояние
+        задачи, а не то, кто именно её возьмёт.
+        """
+        if deadlines.develop_autostart:
+            return await self._start_development(issue)
+
         decision = await self._wait_for_signal(await self._park(
             awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV),
             who=awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV),
@@ -1024,6 +1033,15 @@ class IssueLifecycle:
             return await self._analysis_requested(issue)
         if decision != "build-me":
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
+        return await self._start_development(issue)
+
+    async def _start_development(self, issue: IssueInput) -> tuple:
+        """Активность Develop: передать задачу агенту разработки.
+
+        Одна точка на оба входа — решение человека `build-me` и автостарт. Две
+        копии этого вызова разъехались бы на первой же правке ретраев, и один из
+        входов молча остался бы со старым поведением.
+        """
         try:
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
@@ -1040,7 +1058,8 @@ class IssueLifecycle:
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.
-            workflow.logger.warning("build-me не выполнен: %s", _failure_reason(e))
+            workflow.logger.warning("передача в разработку не выполнена: %s",
+                                    _failure_reason(e))
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.IN_DEVELOPMENT, "in-development", True)
 
