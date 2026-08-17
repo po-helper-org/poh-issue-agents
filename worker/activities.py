@@ -23,7 +23,7 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import labels, lifecycle, sentry_setup
+from shared import develop, labels, lifecycle, sentry_setup
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
@@ -236,6 +236,8 @@ def read_deadlines() -> Deadlines:
         clarification_hours=_hours("PARK_CLARIFICATION_HOURS", 48),
         build_decision_hours=_hours("PARK_BUILD_HOURS", 72),
         side_state_hours=_hours("PARK_SIDE_STATE_HOURS", 168),
+        develop_autostart=os.environ.get(
+            "DEVELOP_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"},
     )
 
 
@@ -927,9 +929,48 @@ def run_bug_pipeline(issue: IssueInput) -> None:
 
 @activity.defn
 def trigger_openhands_resolver(issue: IssueInput) -> None:
-    """TODO: вызов OpenHands resolver — остаётся отдельным сервисом со
-    своим sandboxing (docker.sock), не частью этого docker-compose."""
-    raise NotImplementedError("OpenHands resolver — интеграция ещё не спроектирована")
+    """Активность Develop: передать подготовленный Issue агенту разработки.
+
+    Агент живёт в GitHub Actions репозитория-цели (OpenHands Resolver) — своё
+    окружение, свой sandboxing, свой релизный цикл; в этот compose он не
+    втаскивается. Граница между ним и циклом описана в `shared/develop.py`.
+
+    Порядок здесь не косметический. Сначала диспатч: он единственный может не
+    состояться (нет файла workflow, выключены Actions), и тогда ни метки, ни
+    комментария о начале работы быть не должно — соврать про запуск хуже, чем
+    не запустить. Метка и комментарий идут после и уже best-effort: прогон к
+    этому моменту начался, и падать из-за не поставленной метки значило бы
+    отправить в `failed` задачу, которая на самом деле в работе.
+    """
+    if not develop.enabled():
+        raise RuntimeError(
+            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
+
+    branch = f"research/issue-{issue.issue_number}"
+    if not github_client.branch_exists(issue.repo, branch):
+        # Путь бага: аналитики не было, и ветки с артефактами тоже. Это штатно —
+        # агент работает от тела Issue, но знать об этом он должен явно.
+        branch = ""
+
+    github_client.dispatch_workflow(
+        issue.repo,
+        develop.workflow_file(),
+        develop.workflow_ref(),
+        develop.dispatch_inputs(issue.issue_number, branch=branch),
+    )
+
+    for step, call in (
+        ("метка", lambda: github_client.add_label(
+            issue.repo, issue.issue_number, develop.IN_DEVELOPMENT_LABEL)),
+        ("комментарий", lambda: github_client.post_comment(
+            issue.repo, issue.issue_number,
+            develop.handoff_comment(issue.issue_number, repo=issue.repo, branch=branch))),
+    ):
+        try:
+            call()
+        except Exception as exc:
+            logger.warning("Develop %s#%s: %s не проставлен (%s) — прогон уже идёт",
+                           issue.repo, issue.issue_number, step, exc)
 
 
 # --- Слой C: аналитика по запросу (команда /analyze) ---

@@ -369,6 +369,19 @@ async def github_webhook(
                 search_attributes=_search_attributes(repo, payload, issue_number),
             )
 
+        elif action == "closed":
+            # Закрытый Issue не ждут. Голый signal, а НЕ signal-with-start:
+            # поднимать цикл по Issue, которым никто не занимался, чтобы тут же
+            # его закрыть, — лишний прогон в истории и лишние вызовы GitHub.
+            handle = client.get_workflow_handle(wf_id)
+            try:
+                await handle.signal(
+                    "issue_closed", (payload.get("sender") or {}).get("login"))
+            except Exception:
+                # Цикла нет или он уже завершён — сигналить некому. Это штатно:
+                # на 500 GitHub ретраит доставку и в итоге бросает её насовсем.
+                _log.info("no live cycle for closed %s#%s", repo, issue_number)
+
         elif action == "labeled":
             label = payload["label"]["name"]
 

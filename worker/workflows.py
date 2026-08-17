@@ -50,6 +50,10 @@ MAX_CLARIFICATION_ROUNDS = 2
 # обработчик фазы решает, что с ними делать.
 AGENT_ANALYZE = "__agent__:analyze"
 
+# Issue закрыт на GitHub. Тот же приём: сигнал будит парковку, а решение
+# принимает цикл — иначе обработчику каждой фазы пришлось бы знать про закрытие.
+CLOSED = "__closed__"
+
 # Сколько ключей событий помнить ради идемпотентности. Цикл живёт месяцами, а
 # событий по одному Issue — десятки: список без потолка рос бы вместе с
 # историей, ровно тем объёмом, который continue-as-new и призван обрывать.
@@ -256,6 +260,9 @@ class IssueLifecycle:
         # Стоит ли сейчас метка очереди к людям. Нужен, чтобы не дёргать GitHub
         # на каждом переходе: метку трогаем только когда состояние меняется.
         self._human_queue_labelled = False
+        # Кто закрыл Issue на GitHub. None — открыт. Закрытие обрывает любую
+        # парковку: досиживать срок в закрытом Issue незачем.
+        self._closed_by: str | None = None
 
     @workflow.query
     def stage(self) -> str:
@@ -326,6 +333,22 @@ class IssueLifecycle:
     @workflow.signal
     async def user_comment(self, text: str) -> None:
         await self._signal_queue.put(f"__comment__:{text}")
+
+    @workflow.signal
+    async def issue_closed(self, who: str | None = None) -> None:
+        """Issue закрыт на GitHub — цикл обязан завершиться.
+
+        Парковка со сроком (R3) гарантирует, что цикл не живёт вечно, но
+        закрытый Issue ждать нечего: в проде так набралось 22 прогона по уже
+        закрытым Issue, каждый досиживал свою парковку (до 168 ч) и продолжал
+        занимать место в выборке Running.
+
+        Флаг, а не переход прямо здесь: хендлер сигнала выполняется вне цикла
+        фаз, и смена фазы отсюда гонялась бы с обработчиком текущей фазы.
+        Значение в очереди будит парковку, решение принимает `_run_phase_loop`.
+        """
+        self._closed_by = who or "human"
+        await self._signal_queue.put(CLOSED)
 
     @workflow.signal
     async def analyze_requested(self, comment_id: int | None) -> None:
@@ -711,6 +734,14 @@ class IssueLifecycle:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         while True:
+            if self._closed_by is not None and not lifecycle.is_terminal(self._phase):
+                # Issue закрыт на GitHub: любая парковка потеряла смысл. Одна
+                # точка на все фазы — обработчику фазы про закрытие знать не
+                # надо, он лишь возвращает управление наверх на постороннем
+                # сигнале. `cancelled` в таблице переходов и означает «снято с
+                # обработки», и разрешён из любой нетерминальной фазы.
+                await self._enter(lifecycle.CANCELLED, "cancelled")
+
             if lifecycle.is_terminal(self._phase):
                 await self._stop_awaiting()  # ждать больше нечего
                 return  # «вечноживущий» не значит «незакрываемый»
@@ -977,7 +1008,16 @@ class IssueLifecycle:
         return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
 
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
-        """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку."""
+        """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
+
+        При `DEVELOP_AUTOSTART` ожидания нет: контур замкнут и идёт от Issue до
+        PR без касания человека. Метка `ready-for-dev` при этом всё равно
+        ставится (`_phase_handoff` отработал раньше) — она сообщает состояние
+        задачи, а не то, кто именно её возьмёт.
+        """
+        if deadlines.develop_autostart:
+            return await self._start_development(issue)
+
         decision = await self._wait_for_signal(await self._park(
             awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV),
             who=awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV),
@@ -993,16 +1033,33 @@ class IssueLifecycle:
             return await self._analysis_requested(issue)
         if decision != "build-me":
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
+        return await self._start_development(issue)
+
+    async def _start_development(self, issue: IssueInput) -> tuple:
+        """Активность Develop: передать задачу агенту разработки.
+
+        Одна точка на оба входа — решение человека `build-me` и автостарт. Две
+        копии этого вызова разъехались бы на первой же правке ретраев, и один из
+        входов молча остался бы со старым поведением.
+        """
         try:
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
                 issue,
-                start_to_close_timeout=timedelta(seconds=30),
+                start_to_close_timeout=timedelta(seconds=90),
+                # Явный потолок попыток обязателен. С политикой по умолчанию
+                # (бесконечные ретраи) отсутствующий workflow в репозитории-цели
+                # не давал бы ошибки вовсе: цикл висел бы на await, `except`
+                # ниже не сработал бы никогда, и Issue остался бы без владельца
+                # решения. Три попытки закрывают сетевой сбой и упираются в
+                # видимый `failed` на всём остальном.
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.
-            workflow.logger.warning("build-me не выполнен: %s", _failure_reason(e))
+            workflow.logger.warning("передача в разработку не выполнена: %s",
+                                    _failure_reason(e))
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.IN_DEVELOPMENT, "in-development", True)
 
@@ -1305,7 +1362,8 @@ class IssueLifecycle:
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
                 issue,
-                start_to_close_timeout=timedelta(seconds=30),
+                start_to_close_timeout=timedelta(seconds=90),
+                retry_policy=RetryPolicy(maximum_attempts=3),
             )
         self._stage = "done"
 
