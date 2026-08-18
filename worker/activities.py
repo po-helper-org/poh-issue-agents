@@ -517,8 +517,17 @@ def duplicate_check(issue: IssueInput) -> DuplicateResult:
 # --- Priority Scoring ---
 
 @activity.defn
-def score_priority(issue: IssueInput, classification: ClassificationResult, dup: DuplicateResult) -> PriorityResult:
-    user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nТип: {classification.label}"
+def score_priority(issue: IssueInput, classification: ClassificationResult | None,
+                   dup: DuplicateResult) -> PriorityResult:
+    """Приоритет по формуле. Классификации может не быть — и это штатно.
+
+    Сокращённый триаж (Issue с `origin:agent`, правило R6) классификацию
+    пропускает: задачу уже классифицировал тот агент, который её завёл. Приоритет
+    ему всё равно нужен — по нему follow-up встаёт в очередь наравне с
+    остальными, — поэтому отсутствие типа здесь не сбой, а вход.
+    """
+    kind = classification.label if classification is not None else "не указан (Issue заведён агентом)"
+    user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nТип: {kind}"
     extracted = llm.extract(
         _load_prompt("system_priority_extract.md"), user_message, PriorityExtraction, model=llm.MODEL_GATE,
     )

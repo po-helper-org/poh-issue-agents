@@ -7,6 +7,8 @@
 задачу в незаметную.
 """
 
+import pathlib
+
 import pytest
 
 import activities as activities_module
@@ -222,3 +224,40 @@ def test_in_development_label_survives_its_own_phase(monkeypatch):
     activities_module.set_phase("o/r", 7, "in-development")
 
     assert develop.IN_DEVELOPMENT_LABEL not in removed
+
+
+# --- Сокращённый триаж: приоритет без классификации ---
+
+def test_priority_is_scored_for_an_agent_issue_without_classification(monkeypatch):
+    """Сокращённый триаж классификацию пропускает — её уже сделал тот агент,
+    который завёл задачу. Приоритет ей всё равно нужен: по нему follow-up встаёт
+    в очередь наравне с остальными."""
+    seen: dict = {}
+
+    class _Extracted:
+        impact = time_criticality = risk_reduction = 3
+        effort = 4
+        okr_alignment = "unrelated"
+        okr_key_result = None
+        bug_severity = "none"
+        affected_domains: list[str] = []
+        who = ""
+        risks: list[str] = []
+        goal_impact = ""
+
+    monkeypatch.setattr(activities_module, "_load_prompt", lambda name: "prompt")
+    monkeypatch.setattr(activities_module, "CONFIG_DIR",
+                        pathlib.Path(__file__).resolve().parent.parent / "config")
+    def _fake_extract(prompt, msg, schema, model=None):
+        seen["msg"] = msg
+        return _Extracted()
+
+    monkeypatch.setattr(activities_module.llm, "extract", _fake_extract)
+
+    result = activities_module.score_priority(
+        _issue(7), None,
+        activities_module.DuplicateResult(decision="none", best_match_number=None,
+                                          probability=0.0, reason="", context_branch=None))
+
+    assert result.tier.startswith("P")
+    assert "Issue заведён агентом" in seen["msg"]
