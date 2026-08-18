@@ -959,47 +959,189 @@ def run_bug_pipeline(issue: IssueInput) -> None:
     raise NotImplementedError("bug-pipeline: перенести шаги из старого bug-pipeline.yml")
 
 
+DEV_CLONE_TIMEOUT_SEC = 300
+DEV_TESTS_TIMEOUT_SEC = 900
+
+
+def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
+    """Каталог задачи в общем томе и клон внутри него.
+
+    Том общий с раннером и смонтирован в обоих контейнерах по одному пути:
+    воркер готовит каталог и читает результат, раннер пишет. Через bind-mount
+    так не сделать — путь внутри воркера на хосте не существует.
+    """
+    root = Path(develop.workspace_mount()) / develop.task_slug(issue.repo, issue.issue_number)
+    return root, root / "repo"
+
+
+def _dev_prepare(issue: IssueInput, branch: str) -> str:
+    """Свежий клон + постановка файлом. Возвращает текст постановки.
+
+    Постановка собирается ЗДЕСЬ, а не в промпте агента: то, что уехало в
+    работу, должно быть видно дословно. Иначе на разборе «почему агент сделал
+    не то» предъявить нечего.
+    """
+    root, clone_dir = _dev_paths(issue)
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    _clone_repo(issue.repo, str(clone_dir))
+
+    parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
+             "", f"## {issue.title}", "", issue.body or "(тело пустое)", ""]
+
+    if branch:
+        # Требования идут ПЕРВЫМИ: то, что агент прочитает раньше, весит
+        # больше, а task/concept — путь к требованиям, а не сами требования.
+        parts.append("## Системные требования (аналитика Issue-Agent)")
+        parts.append("")
+        for name in ("system_requirements.md", "task.md", "concept.md"):
+            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
+            if text:
+                parts += [f"### {name}", "", text, ""]
+    else:
+        parts += ["## Аналитики по задаче нет — работай от тела Issue.", ""]
+
+    rules = (clone_dir / ".openhands" / "task-rules.md")
+    parts.append(rules.read_text(encoding="utf-8") if rules.exists() else _DEV_FALLBACK_RULES)
+
+    task = "\n".join(parts)
+    (clone_dir / ".task.md").write_text(task, encoding="utf-8")
+    return task
+
+
+_DEV_FALLBACK_RULES = """## Как работать
+
+Правила репозитория — в `AGENTS.md` и `CLAUDE.md`, они обязательны.
+
+1. **MVP первым.** Кратчайший путь к тому, что просят. Не углубляйся в
+   надёжность и редкие ветки, пока основное не работает.
+2. **Edge-кейс — не в эту ветку.** Найденное по дороге заводи отдельным
+   SubIssue и продолжай MVP.
+3. **Тесты.** Прогоняй проверки проекта; красный прогон в PR не отдаём.
+4. **Коммитить самому не надо** — коммит, пуш и PR делает контур после тебя.
+"""
+
+
+def _dev_run_agent(issue: IssueInput) -> str:
+    """Прогон одноразового контейнера. Возвращает хвост вывода."""
+    command = develop.runner_command(
+        develop.task_slug(issue.repo, issue.issue_number),
+        image=develop.runner_image(),
+        volume=develop.workspace_volume(),
+        mount=develop.workspace_mount(),
+    )
+    env = {**os.environ, **develop.runner_env(
+        os.environ.get("ZAI_API_KEY", ""),
+        os.environ.get("ZAI_BASE_URL", ""),
+        os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6",
+    )}
+    result = subprocess.run(command, env=env, capture_output=True, text=True,
+                            timeout=develop.run_timeout())
+    tail = (result.stdout or "")[-4000:] + (result.stderr or "")[-2000:]
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"прогон агента разработки завершился с кодом {result.returncode}: "
+            f"{tail[-1500:]}")
+    return tail
+
+
+def _dev_tests(issue: IssueInput) -> str:
+    """Прогон проверок проекта. Пусто в конфиге — шаг пропускается.
+
+    Гоняется ЗДЕСЬ, до пуша: красный код не должен доезжать до PR, а на PR от
+    агента CI может и не запуститься (события от токена Actions не порождают
+    прогонов).
+    """
+    command = os.environ.get("DEVELOP_TEST_COMMAND", "").strip()
+    if not command:
+        return "(проверки не заданы — DEVELOP_TEST_COMMAND пуст)"
+    _, clone_dir = _dev_paths(issue)
+    result = subprocess.run(command, shell=True, cwd=str(clone_dir),
+                            capture_output=True, text=True, timeout=DEV_TESTS_TIMEOUT_SEC)
+    out = ((result.stdout or "") + (result.stderr or ""))[-3000:]
+    if result.returncode != 0:
+        raise RuntimeError(f"проверки не прошли (код {result.returncode}):\n{out[-1500:]}")
+    return out
+
+
+def _dev_publish(issue: IssueInput, branch: str) -> int | None:
+    """Коммит, пуш и PR — руками воркера, его токеном.
+
+    Агенту токен не давали намеренно; здесь он уже не нужен агенту, а нужен
+    контуру. Возвращает номер PR либо None, если агент ничего не изменил.
+    """
+    _, clone_dir = _dev_paths(issue)
+    work = develop.work_branch(issue.issue_number)
+    return github_client.publish_worktree(
+        issue.repo, str(clone_dir), work,
+        title=f"feat(#{issue.issue_number}): {issue.title}",
+        body=develop.pr_body(issue.issue_number, branch=branch),
+        message=f"feat(#{issue.issue_number}): реализация по системным требованиям",
+    )
+
+
 @activity.defn
-def trigger_openhands_resolver(issue: IssueInput) -> None:
-    """Активность Develop: передать подготовленный Issue агенту разработки.
+async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
+    """Активность Develop: разработка по подготовленному Issue.
 
-    Агент живёт в GitHub Actions репозитория-цели (OpenHands Resolver) — своё
-    окружение, свой sandboxing, свой релизный цикл; в этот compose он не
-    втаскивается. Граница между ним и циклом описана в `shared/develop.py`.
+    Два режима (`shared/develop.py`). `local` — прогон одноразовым контейнером
+    на своём сервере, контур замкнут внутри стенда. `dispatch` — прогон уезжает
+    в GitHub Actions, для репозиториев без стенда.
 
-    Порядок здесь не косметический. Сначала диспатч: он единственный может не
-    состояться (нет файла workflow, выключены Actions), и тогда ни метки, ни
-    комментария о начале работы быть не должно — соврать про запуск хуже, чем
-    не запустить. Метка и комментарий идут после и уже best-effort: прогон к
-    этому моменту начался, и падать из-за не поставленной метки значило бы
-    отправить в `failed` задачу, которая на самом деле в работе.
+    Возвращает номер PR (режим `local`) либо None (`dispatch`: результат
+    придёт событием `pr-open`, прогон идёт на чужой стороне).
     """
     if not develop.enabled():
         raise RuntimeError(
             "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
 
     branch = f"research/issue-{issue.issue_number}"
-    if not github_client.branch_exists(issue.repo, branch):
-        # Путь бага: аналитики не было, и ветки с артефактами тоже. Это штатно —
-        # агент работает от тела Issue, но знать об этом он должен явно.
+    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
+        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
+        # агент работает от тела Issue, но знать об этом должен явно.
         branch = ""
 
-    github_client.dispatch_workflow(
-        issue.repo,
-        develop.workflow_file(),
-        develop.workflow_ref(),
-        develop.dispatch_inputs(issue.issue_number, branch=branch),
-    )
+    if develop.mode() == develop.DISPATCH:
+        await asyncio.to_thread(
+            github_client.dispatch_workflow,
+            issue.repo, develop.workflow_file(), develop.workflow_ref(),
+            develop.dispatch_inputs(issue.issue_number, branch=branch),
+        )
+        await _dev_announce(issue, branch, where="запустил OpenHands Resolver в GitHub Actions")
+        return None
 
+    # Порядок не косметический: сначала клон и постановка — они единственные
+    # могут не состояться до того, как что-либо сказано человеку.
+    task = await _run_with_heartbeat(_dev_prepare, issue, branch, label="dev:prepare")
+    logger.info("Develop %s#%s: постановка (%d симв.)\n%s",
+                issue.repo, issue.issue_number, len(task), task[:2000])
+    await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
+
+    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
+    number = await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+
+    if number is None:
+        raise RuntimeError("агент не изменил ни одного файла — открывать нечего")
+    return number
+
+
+async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:
+    """Метка и комментарий о начале работы — best-effort.
+
+    Прогон к этому моменту начался; падать из-за непоставленной метки значило
+    бы отправить в `failed` задачу, которая на самом деле в работе.
+    """
     for step, call in (
         ("метка", lambda: github_client.add_label(
             issue.repo, issue.issue_number, develop.IN_DEVELOPMENT_LABEL)),
         ("комментарий", lambda: github_client.post_comment(
             issue.repo, issue.issue_number,
-            develop.handoff_comment(issue.issue_number, repo=issue.repo, branch=branch))),
+            develop.handoff_comment(issue.issue_number, repo=issue.repo,
+                                    branch=branch, where=where))),
     ):
         try:
-            call()
+            await asyncio.to_thread(call)
         except Exception as exc:
             logger.warning("Develop %s#%s: %s не проставлен (%s) — прогон уже идёт",
                            issue.repo, issue.issue_number, step, exc)

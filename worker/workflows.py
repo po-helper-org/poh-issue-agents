@@ -1097,10 +1097,14 @@ class IssueLifecycle:
         входов молча остался бы со старым поведением.
         """
         try:
-            await workflow.execute_activity(
+            pr_number = await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
                 issue,
-                start_to_close_timeout=timedelta(seconds=90),
+                # Прогон агента идёт десятками минут, поэтому потолок общий на
+                # весь шаг, а живость сообщается heartbeat'ом: без него сервер
+                # счёл бы активность мёртвой на первой же долгой стадии.
+                start_to_close_timeout=timedelta(seconds=3600),
+                heartbeat_timeout=timedelta(seconds=300),
                 # Явный потолок попыток обязателен. С политикой по умолчанию
                 # (бесконечные ретраи) отсутствующий workflow в репозитории-цели
                 # не давал бы ошибки вовсе: цикл висел бы на await, `except`
@@ -1115,7 +1119,13 @@ class IssueLifecycle:
             workflow.logger.warning("передача в разработку не выполнена: %s",
                                     _failure_reason(e))
             return (lifecycle.FAILED, "failed", True)
-        return (lifecycle.IN_DEVELOPMENT, "in-development", True)
+        if pr_number is None:
+            # Режим `dispatch`: работа идёт на чужой стороне, и о её исходе
+            # придёт событие `pr-open`. Ждём в `in-development`.
+            return (lifecycle.IN_DEVELOPMENT, "in-development", True)
+        # Режим `local`: PR открыт прямо сейчас, ждать доклада не о чем — фаза
+        # двигается сразу. Ревью доложит о себе само, уже из `pr-open`.
+        return (lifecycle.PR_OPEN, "pr-open", True)
 
     async def _phase_park(self, issue: IssueInput, deadlines) -> tuple | None:
         """Боковые фазы и фазы внешних агентов.

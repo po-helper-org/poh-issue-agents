@@ -7,6 +7,7 @@
 задачу в незаметную.
 """
 
+import asyncio
 import pathlib
 
 import pytest
@@ -24,6 +25,7 @@ def _issue(number: int = 7) -> IssueInput:
 @pytest.fixture
 def gh(monkeypatch):
     """Подменяет GitHub целиком: активность не должна ходить в сеть в тестах."""
+    monkeypatch.setenv("DEVELOP_MODE", "dispatch")
     calls: dict = {"dispatch": [], "labels": [], "comments": []}
     monkeypatch.setattr(activities_module.github_client, "dispatch_workflow",
                         lambda repo, wf, ref, inputs:
@@ -56,17 +58,18 @@ def test_missing_branch_is_an_explicit_empty_string():
     assert inputs["research_branch"] == ""
 
 
-def test_comment_says_where_to_watch_the_run():
-    body = develop.handoff_comment(12, repo="o/r", branch="research/issue-12")
+def test_comment_says_where_the_run_happens():
+    body = develop.handoff_comment(12, repo="o/r", branch="research/issue-12",
+                                   where="запустил OpenHands на своём сервере")
 
     assert "research/issue-12" in body
-    assert "o/r/actions/workflows/" in body
+    assert "на своём сервере" in body    # где именно идёт работа
     assert "Closes #12" in body          # чем прогон должен закончиться
     assert "SubIssue" in body            # и что он делает с edge-кейсами
 
 
 def test_comment_without_analysis_says_so_instead_of_naming_a_branch():
-    body = develop.handoff_comment(12, repo="o/r", branch="")
+    body = develop.handoff_comment(12, repo="o/r", branch="", where="запустил агента")
 
     assert "аналитики по задаче не было" in body
     assert "research/issue-12" not in body
@@ -91,7 +94,7 @@ def test_develop_switches_off_only_explicitly(monkeypatch, raw):
 def test_dispatch_carries_the_research_branch(gh, monkeypatch):
     monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
 
-    activities_module.trigger_openhands_resolver(_issue(7))
+    asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     repo, workflow_file, ref, inputs = gh["dispatch"][0]
     assert repo == "o/r"
@@ -106,7 +109,7 @@ def test_no_analysis_branch_still_dispatches(gh, monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "branch_exists",
                         lambda repo, branch: False)
 
-    activities_module.trigger_openhands_resolver(_issue(7))
+    asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     _, _, _, inputs = gh["dispatch"][0]
     assert inputs["research_branch"] == ""
@@ -123,7 +126,7 @@ def test_failed_dispatch_leaves_no_trace_of_a_started_run(gh, monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "dispatch_workflow", boom)
 
     with pytest.raises(RuntimeError, match="404"):
-        activities_module.trigger_openhands_resolver(_issue(7))
+        asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     assert gh["labels"] == []
     assert gh["comments"] == []
@@ -139,7 +142,7 @@ def test_label_failure_does_not_fail_a_started_run(gh, monkeypatch):
 
     monkeypatch.setattr(activities_module.github_client, "add_label", boom)
 
-    activities_module.trigger_openhands_resolver(_issue(7))
+    asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     assert gh["dispatch"], "прогон должен был стартовать"
     assert gh["comments"], "комментарий не должен зависеть от метки"
@@ -149,7 +152,7 @@ def test_switched_off_fails_visibly_instead_of_pretending(gh, monkeypatch):
     monkeypatch.setenv("DEVELOP_ENABLED", "0")
 
     with pytest.raises(RuntimeError, match="DEVELOP_ENABLED"):
-        activities_module.trigger_openhands_resolver(_issue(7))
+        asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     assert gh["dispatch"] == []
 
@@ -261,3 +264,46 @@ def test_priority_is_scored_for_an_agent_issue_without_classification(monkeypatc
 
     assert result.tier.startswith("P")
     assert "Issue заведён агентом" in seen["msg"]
+
+
+# --- Локальный режим: прогон на своём сервере ---
+
+def test_local_is_the_default(monkeypatch):
+    """Стенд самодостаточен, пока явно не сказано иначе: репозиторий
+    обслуживается целиком внутри контура, без чужих раннеров."""
+    monkeypatch.delenv("DEVELOP_MODE", raising=False)
+
+    assert develop.mode() == develop.LOCAL
+
+
+def test_runner_gets_no_github_token():
+    """Агент исполняет код чужого репозитория. Токен ему не нужен: пушит и
+    открывает PR воркер — своим токеном и после прогона."""
+    command = develop.runner_command("dev-o__r-7", image="img",
+                                     volume="vol", mount="/workspaces")
+
+    passed = {command[i + 1] for i, part in enumerate(command) if part == "-e"}
+    assert passed == {"LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"}
+    assert not any("GH" in part or "TOKEN" in part for part in command)
+
+
+def test_runner_is_disposable_and_sees_only_its_task():
+    command = develop.runner_command("dev-o__r-7", image="img",
+                                     volume="vol", mount="/workspaces")
+
+    assert "--rm" in command                                  # не копим мусор с ключом
+    assert "vol:/workspaces" in command                       # общий том с воркером
+    assert command[command.index("-w") + 1] == "/workspaces/dev-o__r-7/repo"
+
+
+def test_task_slug_is_a_directory_name_not_a_path():
+    """Слэш репозитория в имени каталога создал бы вложенность вместо задачи."""
+    assert "/" not in develop.task_slug("po-helper-org/poh-demo-checkout", 7)
+
+
+def test_run_timeout_falls_back_on_garbage(monkeypatch):
+    """Битое значение не должно означать «без потолка»: зависший агент держал
+    бы задачу в неопределённости молча."""
+    monkeypatch.setenv("DEVELOP_TIMEOUT_SEC", "скоро")
+
+    assert develop.run_timeout() == develop.DEFAULT_RUN_TIMEOUT_SEC
