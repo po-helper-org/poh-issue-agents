@@ -7,6 +7,9 @@
 задачу в незаметную.
 """
 
+import asyncio
+import pathlib
+
 import pytest
 
 import activities as activities_module
@@ -22,6 +25,7 @@ def _issue(number: int = 7) -> IssueInput:
 @pytest.fixture
 def gh(monkeypatch):
     """Подменяет GitHub целиком: активность не должна ходить в сеть в тестах."""
+    monkeypatch.setenv("DEVELOP_MODE", "dispatch")
     calls: dict = {"dispatch": [], "labels": [], "comments": []}
     monkeypatch.setattr(activities_module.github_client, "dispatch_workflow",
                         lambda repo, wf, ref, inputs:
@@ -54,17 +58,18 @@ def test_missing_branch_is_an_explicit_empty_string():
     assert inputs["research_branch"] == ""
 
 
-def test_comment_says_where_to_watch_the_run():
-    body = develop.handoff_comment(12, repo="o/r", branch="research/issue-12")
+def test_comment_says_where_the_run_happens():
+    body = develop.handoff_comment(12, repo="o/r", branch="research/issue-12",
+                                   where="запустил OpenHands на своём сервере")
 
     assert "research/issue-12" in body
-    assert "o/r/actions/workflows/" in body
+    assert "на своём сервере" in body    # где именно идёт работа
     assert "Closes #12" in body          # чем прогон должен закончиться
     assert "SubIssue" in body            # и что он делает с edge-кейсами
 
 
 def test_comment_without_analysis_says_so_instead_of_naming_a_branch():
-    body = develop.handoff_comment(12, repo="o/r", branch="")
+    body = develop.handoff_comment(12, repo="o/r", branch="", where="запустил агента")
 
     assert "аналитики по задаче не было" in body
     assert "research/issue-12" not in body
@@ -89,7 +94,7 @@ def test_develop_switches_off_only_explicitly(monkeypatch, raw):
 def test_dispatch_carries_the_research_branch(gh, monkeypatch):
     monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
 
-    activities_module.trigger_openhands_resolver(_issue(7))
+    asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     repo, workflow_file, ref, inputs = gh["dispatch"][0]
     assert repo == "o/r"
@@ -104,7 +109,7 @@ def test_no_analysis_branch_still_dispatches(gh, monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "branch_exists",
                         lambda repo, branch: False)
 
-    activities_module.trigger_openhands_resolver(_issue(7))
+    asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     _, _, _, inputs = gh["dispatch"][0]
     assert inputs["research_branch"] == ""
@@ -121,7 +126,7 @@ def test_failed_dispatch_leaves_no_trace_of_a_started_run(gh, monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "dispatch_workflow", boom)
 
     with pytest.raises(RuntimeError, match="404"):
-        activities_module.trigger_openhands_resolver(_issue(7))
+        asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     assert gh["labels"] == []
     assert gh["comments"] == []
@@ -137,7 +142,7 @@ def test_label_failure_does_not_fail_a_started_run(gh, monkeypatch):
 
     monkeypatch.setattr(activities_module.github_client, "add_label", boom)
 
-    activities_module.trigger_openhands_resolver(_issue(7))
+    asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     assert gh["dispatch"], "прогон должен был стартовать"
     assert gh["comments"], "комментарий не должен зависеть от метки"
@@ -147,6 +152,158 @@ def test_switched_off_fails_visibly_instead_of_pretending(gh, monkeypatch):
     monkeypatch.setenv("DEVELOP_ENABLED", "0")
 
     with pytest.raises(RuntimeError, match="DEVELOP_ENABLED"):
-        activities_module.trigger_openhands_resolver(_issue(7))
+        asyncio.run(activities_module.trigger_openhands_resolver(_issue(7)))
 
     assert gh["dispatch"] == []
+
+
+# --- Провенанс сильнее фильтра ботов ---
+
+def test_agent_follow_up_is_not_filtered_as_a_bot(monkeypatch):
+    """Follow-up контура заводит агент, и по автору он бот. Но `origin:agent`
+    означает ровно обратное тому, ради чего фильтр заведён: это собственный
+    выход контура, которому протокол предписывает сокращённый триаж, а не
+    пропуск."""
+    labels_set: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "add_label",
+                        lambda repo, n, label: labels_set.append(label))
+
+    issue = IssueInput(repo="o/r", issue_number=9, title="edge-кейс", body="тело",
+                       author_login="github-actions[bot]", author_type="Bot",
+                       interactive=False)
+
+    assert activities_module.prefilter_bot_and_security(issue, origin_agent=True) is None
+    assert labels_set == []
+
+
+def test_bot_without_provenance_is_still_filtered(monkeypatch):
+    labels_set: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "add_label",
+                        lambda repo, n, label: labels_set.append(label))
+
+    issue = IssueInput(repo="o/r", issue_number=9, title="bump deps", body="",
+                       author_login="dependabot[bot]", author_type="Bot",
+                       interactive=False)
+
+    assert activities_module.prefilter_bot_and_security(issue) == "bot"
+    assert "bot-authored" in labels_set
+
+
+def test_security_check_survives_the_provenance_exception(monkeypatch):
+    """Проверка на безопасность — о содержимом, а не об авторе: репорт об
+    уязвимости не становится безопаснее оттого, что его завёл агент."""
+    monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+    monkeypatch.setattr(activities_module.github_client, "post_comment", lambda *a: None)
+
+    issue = IssueInput(repo="o/r", issue_number=9,
+                       title="Найдена уязвимость в расчёте", body="",
+                       author_login="openhands", author_type="Bot", interactive=False)
+
+    assert activities_module.prefilter_bot_and_security(issue, origin_agent=True) == "security"
+
+
+# --- Индикатор разработки не переживает смену фазы ---
+
+def test_in_development_label_is_dropped_when_the_phase_moves_on(monkeypatch):
+    """Метка сообщает «задача у агента разработки». После открытия PR это уже
+    неправда, а снять её в самой активности Develop нельзя — она к тому моменту
+    давно завершилась."""
+    removed: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "remove_label",
+                        lambda repo, n, label: removed.append(label))
+    monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+
+    activities_module.set_phase("o/r", 7, "pr-open")
+
+    assert develop.IN_DEVELOPMENT_LABEL in removed
+
+
+def test_in_development_label_survives_its_own_phase(monkeypatch):
+    removed: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "remove_label",
+                        lambda repo, n, label: removed.append(label))
+    monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+
+    activities_module.set_phase("o/r", 7, "in-development")
+
+    assert develop.IN_DEVELOPMENT_LABEL not in removed
+
+
+# --- Сокращённый триаж: приоритет без классификации ---
+
+def test_priority_is_scored_for_an_agent_issue_without_classification(monkeypatch):
+    """Сокращённый триаж классификацию пропускает — её уже сделал тот агент,
+    который завёл задачу. Приоритет ей всё равно нужен: по нему follow-up встаёт
+    в очередь наравне с остальными."""
+    seen: dict = {}
+
+    class _Extracted:
+        impact = time_criticality = risk_reduction = 3
+        effort = 4
+        okr_alignment = "unrelated"
+        okr_key_result = None
+        bug_severity = "none"
+        affected_domains: list[str] = []
+        who = ""
+        risks: list[str] = []
+        goal_impact = ""
+
+    monkeypatch.setattr(activities_module, "_load_prompt", lambda name: "prompt")
+    monkeypatch.setattr(activities_module, "CONFIG_DIR",
+                        pathlib.Path(__file__).resolve().parent.parent / "config")
+    def _fake_extract(prompt, msg, schema, model=None):
+        seen["msg"] = msg
+        return _Extracted()
+
+    monkeypatch.setattr(activities_module.llm, "extract", _fake_extract)
+
+    result = activities_module.score_priority(
+        _issue(7), None,
+        activities_module.DuplicateResult(decision="none", best_match_number=None,
+                                          probability=0.0, reason="", context_branch=None))
+
+    assert result.tier.startswith("P")
+    assert "Issue заведён агентом" in seen["msg"]
+
+
+# --- Локальный режим: прогон на своём сервере ---
+
+def test_local_is_the_default(monkeypatch):
+    """Стенд самодостаточен, пока явно не сказано иначе: репозиторий
+    обслуживается целиком внутри контура, без чужих раннеров."""
+    monkeypatch.delenv("DEVELOP_MODE", raising=False)
+
+    assert develop.mode() == develop.LOCAL
+
+
+def test_runner_gets_no_github_token():
+    """Агент исполняет код чужого репозитория. Токен ему не нужен: пушит и
+    открывает PR воркер — своим токеном и после прогона."""
+    command = develop.runner_command("dev-o__r-7", image="img",
+                                     volume="vol", mount="/workspaces")
+
+    passed = {command[i + 1] for i, part in enumerate(command) if part == "-e"}
+    assert passed == {"LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"}
+    assert not any("GH" in part or "TOKEN" in part for part in command)
+
+
+def test_runner_is_disposable_and_sees_only_its_task():
+    command = develop.runner_command("dev-o__r-7", image="img",
+                                     volume="vol", mount="/workspaces")
+
+    assert "--rm" in command                                  # не копим мусор с ключом
+    assert "vol:/workspaces" in command                       # общий том с воркером
+    assert command[command.index("-w") + 1] == "/workspaces/dev-o__r-7/repo"
+
+
+def test_task_slug_is_a_directory_name_not_a_path():
+    """Слэш репозитория в имени каталога создал бы вложенность вместо задачи."""
+    assert "/" not in develop.task_slug("po-helper-org/poh-demo-checkout", 7)
+
+
+def test_run_timeout_falls_back_on_garbage(monkeypatch):
+    """Битое значение не должно означать «без потолка»: зависший агент держал
+    бы задачу в неопределённости молча."""
+    monkeypatch.setenv("DEVELOP_TIMEOUT_SEC", "скоро")
+
+    assert develop.run_timeout() == develop.DEFAULT_RUN_TIMEOUT_SEC

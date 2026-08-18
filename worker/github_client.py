@@ -455,3 +455,78 @@ def dispatch_workflow(repo: str, workflow_file: str, ref: str, inputs: dict) -> 
         raise RuntimeError(
             f"workflow_dispatch {workflow_file}@{ref} в {repo} не принят "
             f"({resp.status_code}): {resp.text.strip()[:300]}")
+
+
+def publish_worktree(repo: str, clone_dir: str, branch: str, *,
+                     title: str, body: str, message: str) -> int | None:
+    """Коммит рабочего дерева в ветку и PR. None — изменений нет.
+
+    Делает это ВОРКЕР, а не агент разработки: агенту токен не давали намеренно,
+    он исполняет код чужого репозитория. Здесь токен уже нужен не агенту, а
+    контуру — и живёт он ровно в этом процессе.
+
+    Токен идёт через credential.helper в env, а не в URL: argv команды целиком
+    попадает в текст CalledProcessError, и вклеенный токен уехал бы в историю
+    Temporal при первом же сбое пуша.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] publish %s -> %s: %s", clone_dir, branch, title)
+        return None
+
+    token = auth_token(repo)
+    env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
+        "GIT_CONFIG_KEY_1": "user.name",
+        "GIT_CONFIG_VALUE_1": "openhands-agent",
+        "GIT_CONFIG_KEY_2": "user.email",
+        "GIT_CONFIG_VALUE_2": "openhands-agent@users.noreply.github.com",
+        "GH_PUSH_TOKEN": token,
+    }
+
+    def git(*args: str, check: bool = True):
+        return subprocess.run(["git", "-C", clone_dir, *args], env=env,
+                              capture_output=True, text=True, check=check, timeout=300)
+
+    git("checkout", "-B", branch)
+    git("add", "-A")
+    # Пустой коммит не делаем: PR без диффа ревьюить нечего, а фаза задачи от
+    # него сдвинулась бы как от настоящей работы.
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        _log.warning("%s: агент не изменил ни одного файла", repo)
+        return None
+
+    git("commit", "-m", message, "-m",
+        "Автор изменений — OpenHands, запущен активностью Develop.")
+    git("push", "--force-with-lease", "-u", "origin", branch)
+
+    resp = requests.post(
+        f"https://api.github.com/repos/{repo}/pulls",
+        headers=_auth_headers(repo),
+        json={"title": title, "head": branch, "base": _default_branch(repo), "body": body},
+        timeout=30,
+    )
+    if resp.status_code == 422 and "already exists" in resp.text:
+        # Ветку переоткрыли поверх существующего PR — это повтор прогона, а не
+        # сбой: возвращаем номер уже открытого.
+        existing = requests.get(
+            f"https://api.github.com/repos/{repo}/pulls",
+            headers=_auth_headers(repo),
+            params={"head": f"{repo.split('/')[0]}:{branch}", "state": "open"},
+            timeout=30,
+        )
+        existing.raise_for_status()
+        items = existing.json()
+        if items:
+            return items[0]["number"]
+    resp.raise_for_status()
+    return resp.json()["number"]
+
+
+def _default_branch(repo: str) -> str:
+    resp = requests.get(f"https://api.github.com/repos/{repo}",
+                        headers=_auth_headers(repo), timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("default_branch") or "main"

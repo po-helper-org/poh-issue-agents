@@ -253,6 +253,12 @@ class IssueLifecycle:
         self._phase_since: datetime | None = None
         self._analyze_comment_id: int | None = None
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
+        # Прогон аналитики идёт прямо сейчас. Отдельно от `_analyze_pending`:
+        # тот говорит «запрос в очереди», этот — «работа выполняется». Первый
+        # прогон запускает метка `research-me` мимо очереди сигналов, и без
+        # второго флага команда, пришедшая во время такого прогона, вставала
+        # бы в очередь и заводила второй.
+        self._analysis_running = False
         # Ключи уже учтённых событий агентов: один факт двигает фазу один раз.
         self._seen_agent_events: list[str] = []
         # Чего Issue ждёт прямо сейчас. None — работа идёт, ожидания нет.
@@ -394,7 +400,13 @@ class IssueLifecycle:
         # True. Идентификатор занятого прогона от этой гонки не спасает: к
         # моменту второго сигнала первый может уже завершиться, и id
         # освободится — а это законный повторный запуск, не дубль.
-        if self._analyze_pending:
+        # Идущий прогон — тоже причина отказать. Пока он идёт, `ack_command`
+        # вешает на Issue метку `run:analyze`; вебхук видит `issues.labeled` и
+        # шлёт команду обратно в цикл. Своя метка возвращается как новая
+        # команда, и на живом стенде это давало три прогона подряд по одному
+        # Issue. Идентификатор занятого прогона от этого не спасает: к моменту
+        # разбора очереди первый прогон уже завершён, и id свободен.
+        if self._analyze_pending or self._analysis_running:
             return
         self._analyze_pending = True
         self._analyze_comment_id = comment_id
@@ -659,11 +671,20 @@ class IssueLifecycle:
                                title=issue.title, body=issue.body,
                                comment_id=self._analyze_comment_id,
                                trigger=trigger)
-        # Запрос израсходован: следующий прогон не должен реагировать на
-        # комментарий, к которому он отношения не имеет, а новая команда
-        # обязана снова доехать до цикла.
-        self._analyze_comment_id = None
-        self._analyze_pending = False
+        # Запрос израсходован — но снимается он ПОСЛЕ прогона, а не до.
+        #
+        # Пока прогон идёт, `ack_command` вешает на Issue метку `run:analyze`.
+        # Вебхук видит `issues.labeled` и шлёт `analyze_requested` обратно в
+        # цикл: наша собственная метка возвращается как новая команда. Со
+        # снятым флагом она вставала в очередь, и по завершении прогона цикл
+        # запускал второй — на живом стенде это дало три прогона аналитики
+        # подряд по одному Issue. Идентификатор занятого прогона от этого не
+        # спасает: к моменту обработки очереди первый уже завершён, и id
+        # свободен.
+        #
+        # Команда, пришедшая ВО ВРЕМЯ прогона, — эхо своей метки либо повторный
+        # клик человека. Ни то, ни другое не стоит второго дорогого прогона.
+        self._analysis_running = True
         try:
             return await workflow.execute_child_workflow(
                 IssueAnalysis.run, analyze,
@@ -683,6 +704,10 @@ class IssueLifecycle:
             workflow.logger.info("analysis already running for %s#%s",
                                  issue.repo, issue.issue_number)
             return False
+        finally:
+            self._analyze_comment_id = None
+            self._analyze_pending = False
+            self._analysis_running = False
 
     async def _agent_event(self, event: AgentEvent) -> tuple:
         """Факт внешнего агента — переход по той же таблице, что и у своих.
@@ -793,20 +818,26 @@ class IssueLifecycle:
         """
         default_retry = RetryPolicy(maximum_attempts=3)
         try:
-            skip_reason = await workflow.execute_activity(
-                activities.prefilter_bot_and_security,
-                issue,
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            if skip_reason is not None:
-                return (lifecycle.SKIPPED, "skipped", True)
-
+            # Состояние протокола читается ПЕРВЫМ — раньше предфильтра, а не
+            # после. Порядок не косметический: follow-up контура заводит агент,
+            # и по автору он бот, поэтому предфильтр убивал бы его раньше, чем
+            # кто-либо посмотрит на провенанс. Каждый найденный агентом
+            # edge-кейс тихо оседал бы с меткой `bot-authored`, и декомпозиция
+            # работы не доезжала бы до бэклога.
             state = await workflow.execute_activity(
                 activities.read_protocol_state,
                 args=[issue.repo, issue.issue_number],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
+
+            skip_reason = await workflow.execute_activity(
+                activities.prefilter_bot_and_security,
+                args=[issue, state.origin_agent],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            if skip_reason is not None:
+                return (lifecycle.SKIPPED, "skipped", True)
             if state.agents_off:
                 # Метку не пишем: человек забрал Issue себе, и наши пометки на
                 # нём — ровно то, от чего он отгородился рубильником.
@@ -945,7 +976,30 @@ class IssueLifecycle:
         return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
 
     async def _phase_await_decision(self, issue: IssueInput, deadlines) -> tuple | None:
-        """Фаза `classified`: ждём решения человека о тяжёлой стадии."""
+        """Фаза `classified`: ждём решения человека о тяжёлой стадии.
+
+        При `RESEARCH_AUTOSTART` ожидания нет: триаж сам решает, куда двигаться
+        дальше, по типу задачи. Это первая из двух парковок основного пути;
+        вторая — перед разработкой (`DEVELOP_AUTOSTART`). Включены обе — контур
+        идёт от заявки до PR без единого касания человека.
+
+        Тип решает так же, как решала бы метка человека: запрос на функционал
+        уходит в аналитику, баг — сразу разработчику мимо неё. Сокращённый триаж
+        (`origin:agent`) типа не имеет — follow-up контура заводит агент, уже
+        понимая, что это; такую задачу ведём в аналитику, потому что описание в
+        ней короткое и требований не содержит.
+        """
+        if deadlines.research_autostart:
+            label = self._classification_label
+            if label == "advisor:bug":
+                return (lifecycle.READY_FOR_DEV, "bug", True)
+            if label is None or label == "advisor:feature-request":
+                return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+            # Консультация и «уже реализовано» закрываются ответом, а не кодом:
+            # автозапуск дорогой стадии по ним был бы тратой без адресата.
+            # Такие задачи и до этой фазы обычно не доходят, но если дошли —
+            # ждём человека, как раньше.
+
         decision = await self._wait_for_signal(await self._park(
             awaiting_mod.kind_for_phase(lifecycle.CLASSIFIED),
             who=awaiting_mod.who_for_phase(lifecycle.CLASSIFIED),
@@ -1043,10 +1097,14 @@ class IssueLifecycle:
         входов молча остался бы со старым поведением.
         """
         try:
-            await workflow.execute_activity(
+            pr_number = await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
                 issue,
-                start_to_close_timeout=timedelta(seconds=90),
+                # Прогон агента идёт десятками минут, поэтому потолок общий на
+                # весь шаг, а живость сообщается heartbeat'ом: без него сервер
+                # счёл бы активность мёртвой на первой же долгой стадии.
+                start_to_close_timeout=timedelta(seconds=3600),
+                heartbeat_timeout=timedelta(seconds=300),
                 # Явный потолок попыток обязателен. С политикой по умолчанию
                 # (бесконечные ретраи) отсутствующий workflow в репозитории-цели
                 # не давал бы ошибки вовсе: цикл висел бы на await, `except`
@@ -1061,7 +1119,13 @@ class IssueLifecycle:
             workflow.logger.warning("передача в разработку не выполнена: %s",
                                     _failure_reason(e))
             return (lifecycle.FAILED, "failed", True)
-        return (lifecycle.IN_DEVELOPMENT, "in-development", True)
+        if pr_number is None:
+            # Режим `dispatch`: работа идёт на чужой стороне, и о её исходе
+            # придёт событие `pr-open`. Ждём в `in-development`.
+            return (lifecycle.IN_DEVELOPMENT, "in-development", True)
+        # Режим `local`: PR открыт прямо сейчас, ждать доклада не о чем — фаза
+        # двигается сразу. Ревью доложит о себе само, уже из `pr-open`.
+        return (lifecycle.PR_OPEN, "pr-open", True)
 
     async def _phase_park(self, issue: IssueInput, deadlines) -> tuple | None:
         """Боковые фазы и фазы внешних агентов.

@@ -59,7 +59,7 @@ async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
 
 
 @activity.defn(name="prefilter_bot_and_security")
-async def prefilter_ok(issue: IssueInput): return None
+async def prefilter_ok(issue: IssueInput, origin_agent: bool = False): return None
 
 
 @activity.defn(name="set_phase")
@@ -141,10 +141,10 @@ async def develop(issue: IssueInput) -> None:
     _calls.append("develop")
 
 
-def _deadlines(autostart: bool):
+def _deadlines(autostart: bool, research: bool = False):
     @activity.defn(name="read_deadlines")
     async def stub() -> Deadlines:
-        return Deadlines(develop_autostart=autostart)
+        return Deadlines(develop_autostart=autostart, research_autostart=research)
     return stub
 
 
@@ -191,3 +191,115 @@ async def test_without_autostart_the_task_waits_for_a_human():
 
     assert "ready-for-dev" in _calls
     assert "develop" not in _calls
+
+
+# --- Своя метка не заводит второй прогон ---
+
+@activity.defn(name="trigger_openhands_resolver")
+async def develop_noop(issue: IssueInput) -> None: ...
+
+
+@pytest.mark.timeout(120)
+async def test_own_run_label_does_not_start_a_second_analysis():
+    """Пока прогон идёт, `ack_command` вешает `run:analyze`. Вебхук видит
+    `issues.labeled` и шлёт команду обратно в цикл — своя метка возвращается
+    как новая команда. На живом стенде это дало три прогона подряд по одному
+    Issue."""
+    started: list[str] = []
+
+    @activity.defn(name="ack_command")
+    async def slow_ack(analyze: AnalyzeInput) -> None:
+        started.append("run")
+        # Пока прогон идёт, прилетает эхо своей метки.
+        await asyncio.sleep(1.0)
+
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, protocol_default,
+                                      _deadlines(False), gate, classify, duplicate,
+                                      score, post_priority, mark_running, finish,
+                                      slow_ack, prepare, stage_ok, publish, cleanup,
+                                      publish_error, ready, develop_noop, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal(IssueLifecycle.human_decision, "research-me")
+            # Ждём, пока прогон реально начнётся: иначе сигнал прилетает до
+            # него, и второй прогон — законный повтор, а не эхо.
+            for _ in range(200):
+                if started:
+                    break
+                await asyncio.sleep(0.02)
+            # эхо метки: три доставки подряд, пока прогон ещё идёт
+            for _ in range(3):
+                await handle.signal(IssueLifecycle.analyze_requested, None)
+            for _ in range(100):
+                if "ready-for-dev" in _calls:
+                    break
+                await asyncio.sleep(0.05)
+            await handle.terminate()
+
+    assert len(started) == 1, f"прогонов аналитики: {len(started)}, ожидался один"
+
+
+# --- Первая парковка: запуск аналитики без человека ---
+
+@pytest.mark.parametrize("raw", ["1", "true", "on"])
+def test_research_autostart_reads_as_on(monkeypatch, raw):
+    monkeypatch.setenv("RESEARCH_AUTOSTART", raw)
+
+    assert activities_module.read_deadlines().research_autostart is True
+
+
+def test_research_autostart_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("RESEARCH_AUTOSTART", raising=False)
+
+    assert activities_module.read_deadlines().research_autostart is False
+
+
+async def _run_closed_loop(classification: str) -> list[str]:
+    """Оба тумблера включены: от заявки до передачи в разработку без человека."""
+
+    @activity.defn(name="classify_issue")
+    async def classify_as(issue: IssueInput) -> ClassificationResult:
+        return ClassificationResult(label=classification, answer="ok")
+
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, protocol_default,
+                                      _deadlines(True, research=True), gate, classify_as,
+                                      duplicate, score, post_priority, mark_running,
+                                      finish, ack, prepare, stage_ok, publish, cleanup,
+                                      publish_error, ready, develop, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            for _ in range(200):
+                if "develop" in _calls:
+                    break
+                await asyncio.sleep(0.05)
+            await handle.terminate()
+    return list(_calls)
+
+
+@pytest.mark.timeout(120)
+async def test_feature_goes_all_the_way_without_a_human():
+    """Ни одной метки от человека: заявка сама доходит до передачи в разработку."""
+    calls = await _run_closed_loop("advisor:feature-request")
+
+    assert "phase:business-analysis" in calls   # аналитика запустилась сама
+    assert "ready-for-dev" in calls
+    assert "develop" in calls
+
+
+@pytest.mark.timeout(120)
+async def test_bug_skips_analysis_but_still_reaches_development():
+    """Путь бага короче: аналитика ему не нужна, разработка — нужна."""
+    calls = await _run_closed_loop("advisor:bug")
+
+    assert "phase:business-analysis" not in calls
+    assert "develop" in calls

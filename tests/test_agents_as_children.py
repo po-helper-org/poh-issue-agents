@@ -45,7 +45,7 @@ async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
 
 
 @activity.defn(name="prefilter_bot_and_security")
-async def prefilter_ok(issue: IssueInput): return None
+async def prefilter_ok(issue: IssueInput, origin_agent: bool = False): return None
 
 
 @activity.defn(name="read_protocol_state")
