@@ -195,3 +195,30 @@ def test_security_check_survives_the_provenance_exception(monkeypatch):
                        author_login="openhands", author_type="Bot", interactive=False)
 
     assert activities_module.prefilter_bot_and_security(issue, origin_agent=True) == "security"
+
+
+# --- Индикатор разработки не переживает смену фазы ---
+
+def test_in_development_label_is_dropped_when_the_phase_moves_on(monkeypatch):
+    """Метка сообщает «задача у агента разработки». После открытия PR это уже
+    неправда, а снять её в самой активности Develop нельзя — она к тому моменту
+    давно завершилась."""
+    removed: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "remove_label",
+                        lambda repo, n, label: removed.append(label))
+    monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+
+    activities_module.set_phase("o/r", 7, "pr-open")
+
+    assert develop.IN_DEVELOPMENT_LABEL in removed
+
+
+def test_in_development_label_survives_its_own_phase(monkeypatch):
+    removed: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "remove_label",
+                        lambda repo, n, label: removed.append(label))
+    monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+
+    activities_module.set_phase("o/r", 7, "in-development")
+
+    assert develop.IN_DEVELOPMENT_LABEL not in removed

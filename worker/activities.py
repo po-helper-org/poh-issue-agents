@@ -191,7 +191,14 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
     фаза); здесь — только запись, идемпотентная по построению.
     """
     target = lifecycle.phase_label(phase)
-    for stale in (lifecycle.phase_label(other) for other in lifecycle.PHASES):
+    stale_labels = [lifecycle.phase_label(other) for other in lifecycle.PHASES]
+    # Индикатор разработки — не фаза, но живёт по тому же правилу: он сообщает
+    # «задача у агента разработки», и после открытия PR это уже неправда.
+    # Снимать его в самой активности Develop нельзя — она к тому моменту давно
+    # завершилась; единственная точка, которая знает о смене состояния, — здесь.
+    if phase != lifecycle.IN_DEVELOPMENT:
+        stale_labels.append(develop.IN_DEVELOPMENT_LABEL)
+    for stale in stale_labels:
         if stale != target:
             try:
                 github_client.remove_label(repo, issue_number, stale)
