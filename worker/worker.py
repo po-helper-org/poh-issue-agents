@@ -52,6 +52,8 @@ async def main() -> None:
             activities.mark_analyzing,
             activities.mark_command_running,
             activities.finish_command_labels,
+        activities.run_pr_fix_round,
+        activities.finish_pr_fixing,
             activities.classify_issue,
             activities.duplicate_check,
             activities.score_priority,

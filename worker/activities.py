@@ -23,7 +23,7 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import develop, labels, lifecycle, sentry_setup
+from shared import develop, labels, lifecycle, pr_closing, sentry_setup
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
@@ -261,6 +261,8 @@ def read_deadlines() -> Deadlines:
         side_state_hours=_hours("PARK_SIDE_STATE_HOURS", 168),
         develop_autostart=_flag("DEVELOP_AUTOSTART"),
         research_autostart=_flag("RESEARCH_AUTOSTART"),
+        pr_fix_enabled=pr_closing.enabled(),
+        pr_fix_max_rounds=pr_closing.max_rounds(),
     )
 
 
@@ -1145,6 +1147,98 @@ async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:
         except Exception as exc:
             logger.warning("Develop %s#%s: %s не проставлен (%s) — прогон уже идёт",
                            issue.repo, issue.issue_number, step, exc)
+
+
+# --- Доведение PR по замечаниям ревью (H3→H4) ---
+
+def _prfix_paths(repo: str, pr_number: int) -> tuple[Path, Path]:
+    root = Path(develop.workspace_mount()) / pr_closing.task_slug(repo, pr_number)
+    return root, root / "repo"
+
+
+def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
+    """Свежий клон ВЕТКИ PR + постановка круга файлом.
+
+    Клонируется именно ветка PR, а не основная: правки ложатся поверх того, что
+    ревьюер видел, иначе круг переписывал бы чужую работу.
+    """
+    root, clone_dir = _prfix_paths(repo, pr_number)
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    _clone_repo(repo, str(clone_dir), branch=branch)
+    (clone_dir / ".task.md").write_text(task, encoding="utf-8")
+
+
+@activity.defn
+async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
+    """Один круг правок.
+
+    `True` — правки внесены и запрошена перепроверка. Строка (возможно пустая) —
+    правок не потребовалось, и это её разбор: агент не нашёл в ревью того, что
+    требует изменений в коде. Законный исход, а не сбой; на нём круг и
+    останавливается.
+
+    Разные типы возврата намеренно: «сделали» и «не потребовалось» — разные
+    исходы, и сводить их к булеву значению значило бы потерять объяснение,
+    ради которого разбор и заводился.
+    """
+    pr = await asyncio.to_thread(github_client.get_pull, repo, pr_number)
+    branch = pr["head"]["ref"]
+    review = await asyncio.to_thread(github_client.review_text, repo, pr_number)
+    task = pr_closing.build_task(pr_number, review=review, round_number=round_number,
+                                 max_rounds_=pr_closing.max_rounds())
+
+    await _run_with_heartbeat(_prfix_prepare, repo, pr_number, branch, task,
+                              label="prfix:prepare")
+
+    command = develop.runner_command(
+        pr_closing.task_slug(repo, pr_number), image=develop.runner_image(),
+        volume=develop.workspace_volume(), mount=develop.workspace_mount())
+    env = {**os.environ, **develop.runner_env(
+        os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),
+        os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6")}
+
+    def _run() -> None:
+        result = subprocess.run(command, env=env, capture_output=True, text=True,
+                                timeout=develop.run_timeout())
+        if result.returncode != 0:
+            tail = ((result.stdout or "") + (result.stderr or ""))[-1500:]
+            raise RuntimeError(f"круг правок сорвался (код {result.returncode}): {tail}")
+
+    await _run_with_heartbeat(_run, label="prfix:agent")
+
+    _, clone_dir = _prfix_paths(repo, pr_number)
+    verdict_path = clone_dir / pr_closing.VERDICT_FILE
+    verdict = verdict_path.read_text(encoding="utf-8") if verdict_path.exists() else ""
+    # Разбор не должен уехать в коммит: он живёт в комментарии PR, а не в коде.
+    verdict_path.unlink(missing_ok=True)
+
+    pushed = await _run_with_heartbeat(
+        github_client.push_fixes, repo, str(clone_dir), branch,
+        f"fix(#{pr_number}): правки по замечаниям ревью (круг {round_number})",
+        label="prfix:push")
+    if not pushed:
+        return verdict or ""
+
+    await asyncio.to_thread(
+        github_client.post_comment, repo, pr_number,
+        pr_closing.round_comment(pr_number, round_number=round_number,
+                                 max_rounds_=pr_closing.max_rounds(), verdict=verdict))
+    return True
+
+
+@activity.defn
+async def finish_pr_fixing(repo: str, pr_number: int, rounds: int, settled: bool,
+                           verdict: str = "") -> None:
+    """Итог доведения: либо PR готов, либо он уходит человеку."""
+    if settled:
+        await asyncio.to_thread(github_client.post_comment, repo, pr_number,
+                                pr_closing.settled_comment(rounds, verdict))
+        return
+    await asyncio.to_thread(github_client.post_comment, repo, pr_number,
+                            pr_closing.exhausted_comment(pr_closing.max_rounds()))
+    await asyncio.to_thread(github_client.add_label, repo, pr_number,
+                            pr_closing.NEEDS_HUMAN_PR)
 
 
 # --- Слой C: аналитика по запросу (команда /analyze) ---

@@ -259,6 +259,9 @@ class IssueLifecycle:
         # второго флага команда, пришедшая во время такого прогона, вставала
         # бы в очередь и заводила второй.
         self._analysis_running = False
+        # Номер PR по этой задаче. Известен из доклада внешнего агента либо от
+        # локального прогона разработки; нужен фазе доведения.
+        self._pr_number: int | None = None
         # Ключи уже учтённых событий агентов: один факт двигает фазу один раз.
         self._seen_agent_events: list[str] = []
         # Чего Issue ждёт прямо сейчас. None — работа идёт, ожидания нет.
@@ -718,6 +721,15 @@ class IssueLifecycle:
         релизным циклом; его рассинхрон с нашей моделью должен приводить к
         разбору человеком, а не к падению цикла Issue.
         """
+        # `ref` внешнего агента для фаз PR — это номер PR. Запоминаем: фаза
+        # доведения без него не знает, что доводить, а второго источника этого
+        # номера у цикла нет.
+        if event.phase in (lifecycle.PR_OPEN, lifecycle.PR_REVIEW):
+            try:
+                self._pr_number = int(event.ref)
+            except (TypeError, ValueError):
+                workflow.logger.warning("ref события не номер PR: %r", event.ref)
+
         target = agent_events.target_phase(event)
         if target == self._phase:
             return (self._phase, self._stage, False)  # тот же факт другими словами
@@ -781,6 +793,8 @@ class IssueLifecycle:
                 nxt = await self._phase_handoff(issue)
             elif self._phase == lifecycle.READY_FOR_DEV:
                 nxt = await self._phase_await_build(issue, deadlines)
+            elif self._phase == lifecycle.PR_REVIEW:
+                nxt = await self._phase_pr_review(issue, deadlines)
             else:
                 # Боковые состояния и фазы, которые ведут внешние агенты (#38):
                 # цикл держит их живыми, пока не истечёт срок ожидания.
@@ -1125,7 +1139,68 @@ class IssueLifecycle:
             return (lifecycle.IN_DEVELOPMENT, "in-development", True)
         # Режим `local`: PR открыт прямо сейчас, ждать доклада не о чем — фаза
         # двигается сразу. Ревью доложит о себе само, уже из `pr-open`.
+        self._pr_number = pr_number
         return (lifecycle.PR_OPEN, "pr-open", True)
+
+    async def _phase_pr_review(self, issue: IssueInput, deadlines) -> tuple | None:
+        """Фаза `pr-review`: довести PR по замечаниям, пока они по делу.
+
+        Круг ведёт цикл, а не отдельный сервис: он уже владеет состоянием
+        задачи и стоит здесь же. Отдельный сервис потребовал бы второй копии
+        клона, раннера, прогона тестов и пуша — и ещё одного канала докладов.
+
+        Признак завершения — агент сам сказал, что правок не требуется. Тогда
+        активность возвращает разбор (строку), а не `True`.
+        """
+        if not self._pr_number or not deadlines.pr_fix_enabled:
+            return await self._phase_park(issue, deadlines)
+
+        rounds = 0
+        verdict = ""
+        while rounds < deadlines.pr_fix_max_rounds:
+            rounds += 1
+            try:
+                outcome = await workflow.execute_activity(
+                    activities.run_pr_fix_round,
+                    args=[issue.repo, self._pr_number, rounds],
+                    start_to_close_timeout=timedelta(seconds=3600),
+                    heartbeat_timeout=timedelta(seconds=300),
+                    # Круг недетерминирован и стоит денег: повтор инициирует
+                    # следующая итерация, а не политика ретраев.
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except Exception as e:
+                workflow.logger.warning("круг правок сорвался: %s", _failure_reason(e))
+                break
+            if outcome is not True:
+                verdict = outcome or ""
+                await workflow.execute_activity(
+                    activities.finish_pr_fixing,
+                    args=[issue.repo, self._pr_number, rounds, True, verdict],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                return await self._phase_park(issue, deadlines)
+            # Правки внесены и перепроверка запрошена. Ждём нового доклада
+            # ревью: без него следующий круг работал бы по устаревшему тексту.
+            signal = await self._wait_for_signal(timedelta(minutes=30))
+            if isinstance(signal, AgentEvent):
+                # Не всякое событие — это «ревью перепроверило». PR могли влить
+                # или вернуть в разработку, и тогда доводить больше нечего:
+                # фазу двигает событие, а круг заканчивается.
+                if agent_events.target_phase(signal) != lifecycle.PR_REVIEW:
+                    return await self._agent_event(signal)
+                continue
+            if signal is None:
+                break
+
+        await workflow.execute_activity(
+            activities.finish_pr_fixing,
+            args=[issue.repo, self._pr_number, rounds, False, verdict],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        return (lifecycle.ESCALATED, "escalated", True)
 
     async def _phase_park(self, issue: IssueInput, deadlines) -> tuple | None:
         """Боковые фазы и фазы внешних агентов.

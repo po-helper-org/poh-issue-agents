@@ -45,7 +45,10 @@ async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
 
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
-    return Deadlines()
+    # Круг правок здесь выключен намеренно: тест про цепочку событий, а не про
+    # доведение PR. С включённым кругом фаза `pr-review` уходила бы работать, и
+    # проверялся бы уже не тот путь.
+    return Deadlines(pr_fix_enabled=False)
 
 
 @activity.defn(name="set_phase")

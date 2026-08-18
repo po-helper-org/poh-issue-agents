@@ -530,3 +530,86 @@ def _default_branch(repo: str) -> str:
                         headers=_auth_headers(repo), timeout=30)
     resp.raise_for_status()
     return resp.json().get("default_branch") or "main"
+
+
+def get_pull(repo: str, number: int) -> dict:
+    resp = requests.get(f"https://api.github.com/repos/{repo}/pulls/{number}",
+                        headers=_auth_headers(repo), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def review_text(repo: str, number: int, limit: int = 12000) -> str:
+    """Замечания ревью одним текстом: обзорные комментарии + построчные.
+
+    Берутся комментарии БОТОВ и построчные замечания — они и есть ревью.
+    Реплики людей в тред сюда не попадают: круг правок отвечает ревьюеру, а не
+    участвует в обсуждении, и подмешивать туда чужие реплики значит кормить
+    агента спором вместо задачи.
+    """
+    parts: list[str] = []
+
+    reviews = requests.get(f"https://api.github.com/repos/{repo}/pulls/{number}/reviews",
+                           headers=_auth_headers(repo), params={"per_page": 50}, timeout=30)
+    if reviews.ok:
+        for item in reviews.json():
+            body = (item.get("body") or "").strip()
+            if body:
+                parts.append(f"### Ревью ({item.get('state','')})\n{body}")
+
+    inline = requests.get(f"https://api.github.com/repos/{repo}/pulls/{number}/comments",
+                          headers=_auth_headers(repo), params={"per_page": 100}, timeout=30)
+    if inline.ok:
+        for item in inline.json():
+            body = (item.get("body") or "").strip()
+            if body:
+                where = f"{item.get('path')}:{item.get('line') or item.get('original_line') or '?'}"
+                parts.append(f"### {where}\n{body}")
+
+    issue_comments = requests.get(
+        f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+        headers=_auth_headers(repo), params={"per_page": 100}, timeout=30)
+    if issue_comments.ok:
+        for item in issue_comments.json():
+            if (item.get("user") or {}).get("type") != "Bot":
+                continue
+            body = (item.get("body") or "").strip()
+            if body:
+                parts.append(body)
+
+    text = "\n\n".join(parts)
+    return text[-limit:] if len(text) > limit else text
+
+
+def push_fixes(repo: str, clone_dir: str, branch: str, message: str) -> bool:
+    """Коммит правок в ветку PR. False — агент ничего не изменил.
+
+    Пустой коммит не делаем: он выглядел бы как круг работы и заставил бы
+    ревьюера смотреть на PR заново без единой правки.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] push fixes %s -> %s", clone_dir, branch)
+        return False
+
+    env = {
+        **os.environ,
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
+        "GIT_CONFIG_KEY_1": "user.name",
+        "GIT_CONFIG_VALUE_1": "openhands-agent",
+        "GIT_CONFIG_KEY_2": "user.email",
+        "GIT_CONFIG_VALUE_2": "openhands-agent@users.noreply.github.com",
+        "GH_PUSH_TOKEN": auth_token(repo),
+    }
+
+    def git(*args: str, check: bool = True):
+        return subprocess.run(["git", "-C", clone_dir, *args], env=env,
+                              capture_output=True, text=True, check=check, timeout=300)
+
+    git("add", "-A")
+    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+        return False
+    git("commit", "-m", message)
+    git("push", "origin", f"HEAD:{branch}")
+    return True
