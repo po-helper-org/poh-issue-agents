@@ -191,3 +191,54 @@ async def test_without_autostart_the_task_waits_for_a_human():
 
     assert "ready-for-dev" in _calls
     assert "develop" not in _calls
+
+
+# --- Своя метка не заводит второй прогон ---
+
+@activity.defn(name="trigger_openhands_resolver")
+async def develop_noop(issue: IssueInput) -> None: ...
+
+
+@pytest.mark.timeout(120)
+async def test_own_run_label_does_not_start_a_second_analysis():
+    """Пока прогон идёт, `ack_command` вешает `run:analyze`. Вебхук видит
+    `issues.labeled` и шлёт команду обратно в цикл — своя метка возвращается
+    как новая команда. На живом стенде это дало три прогона подряд по одному
+    Issue."""
+    started: list[str] = []
+
+    @activity.defn(name="ack_command")
+    async def slow_ack(analyze: AnalyzeInput) -> None:
+        started.append("run")
+        # Пока прогон идёт, прилетает эхо своей метки.
+        await asyncio.sleep(1.0)
+
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, protocol_default,
+                                      _deadlines(False), gate, classify, duplicate,
+                                      score, post_priority, mark_running, finish,
+                                      slow_ack, prepare, stage_ok, publish, cleanup,
+                                      publish_error, ready, develop_noop, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal(IssueLifecycle.human_decision, "research-me")
+            # Ждём, пока прогон реально начнётся: иначе сигнал прилетает до
+            # него, и второй прогон — законный повтор, а не эхо.
+            for _ in range(200):
+                if started:
+                    break
+                await asyncio.sleep(0.02)
+            # эхо метки: три доставки подряд, пока прогон ещё идёт
+            for _ in range(3):
+                await handle.signal(IssueLifecycle.analyze_requested, None)
+            for _ in range(100):
+                if "ready-for-dev" in _calls:
+                    break
+                await asyncio.sleep(0.05)
+            await handle.terminate()
+
+    assert len(started) == 1, f"прогонов аналитики: {len(started)}, ожидался один"

@@ -253,6 +253,12 @@ class IssueLifecycle:
         self._phase_since: datetime | None = None
         self._analyze_comment_id: int | None = None
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
+        # Прогон аналитики идёт прямо сейчас. Отдельно от `_analyze_pending`:
+        # тот говорит «запрос в очереди», этот — «работа выполняется». Первый
+        # прогон запускает метка `research-me` мимо очереди сигналов, и без
+        # второго флага команда, пришедшая во время такого прогона, вставала
+        # бы в очередь и заводила второй.
+        self._analysis_running = False
         # Ключи уже учтённых событий агентов: один факт двигает фазу один раз.
         self._seen_agent_events: list[str] = []
         # Чего Issue ждёт прямо сейчас. None — работа идёт, ожидания нет.
@@ -394,7 +400,13 @@ class IssueLifecycle:
         # True. Идентификатор занятого прогона от этой гонки не спасает: к
         # моменту второго сигнала первый может уже завершиться, и id
         # освободится — а это законный повторный запуск, не дубль.
-        if self._analyze_pending:
+        # Идущий прогон — тоже причина отказать. Пока он идёт, `ack_command`
+        # вешает на Issue метку `run:analyze`; вебхук видит `issues.labeled` и
+        # шлёт команду обратно в цикл. Своя метка возвращается как новая
+        # команда, и на живом стенде это давало три прогона подряд по одному
+        # Issue. Идентификатор занятого прогона от этого не спасает: к моменту
+        # разбора очереди первый прогон уже завершён, и id свободен.
+        if self._analyze_pending or self._analysis_running:
             return
         self._analyze_pending = True
         self._analyze_comment_id = comment_id
@@ -659,11 +671,20 @@ class IssueLifecycle:
                                title=issue.title, body=issue.body,
                                comment_id=self._analyze_comment_id,
                                trigger=trigger)
-        # Запрос израсходован: следующий прогон не должен реагировать на
-        # комментарий, к которому он отношения не имеет, а новая команда
-        # обязана снова доехать до цикла.
-        self._analyze_comment_id = None
-        self._analyze_pending = False
+        # Запрос израсходован — но снимается он ПОСЛЕ прогона, а не до.
+        #
+        # Пока прогон идёт, `ack_command` вешает на Issue метку `run:analyze`.
+        # Вебхук видит `issues.labeled` и шлёт `analyze_requested` обратно в
+        # цикл: наша собственная метка возвращается как новая команда. Со
+        # снятым флагом она вставала в очередь, и по завершении прогона цикл
+        # запускал второй — на живом стенде это дало три прогона аналитики
+        # подряд по одному Issue. Идентификатор занятого прогона от этого не
+        # спасает: к моменту обработки очереди первый уже завершён, и id
+        # свободен.
+        #
+        # Команда, пришедшая ВО ВРЕМЯ прогона, — эхо своей метки либо повторный
+        # клик человека. Ни то, ни другое не стоит второго дорогого прогона.
+        self._analysis_running = True
         try:
             return await workflow.execute_child_workflow(
                 IssueAnalysis.run, analyze,
@@ -683,6 +704,10 @@ class IssueLifecycle:
             workflow.logger.info("analysis already running for %s#%s",
                                  issue.repo, issue.issue_number)
             return False
+        finally:
+            self._analyze_comment_id = None
+            self._analyze_pending = False
+            self._analysis_running = False
 
     async def _agent_event(self, event: AgentEvent) -> tuple:
         """Факт внешнего агента — переход по той же таблице, что и у своих.
