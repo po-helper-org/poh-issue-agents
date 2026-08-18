@@ -98,16 +98,29 @@ class PriorityExtraction(BaseModel):
 # --- Zero-cost предфильтры ---
 
 @activity.defn
-def prefilter_bot_and_security(issue: IssueInput) -> str | None:
-    """Возвращает причину пропуска, если стоит остановиться, иначе None."""
-    if issue.author_type == "Bot":
-        github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
-        return "bot"
+def prefilter_bot_and_security(issue: IssueInput, origin_agent: bool = False) -> str | None:
+    """Возвращает причину пропуска, если стоит остановиться, иначе None.
 
-    KNOWN_BOT_LOGINS = {"dependabot", "renovate", "snyk-bot", "github-actions"}
-    if issue.author_login.lower().removesuffix("[bot]") in KNOWN_BOT_LOGINS:
-        github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
-        return "bot"
+    `origin_agent` снимает ТОЛЬКО проверку на бота. Follow-up контура заводит
+    агент — под токеном Actions либо под своим App, — и по автору он бот. Но
+    провенанс `origin:agent` означает ровно обратное тому, ради чего фильтр
+    заведён: это не шум от dependabot, а собственный выход контура, которому
+    протокол (R6) предписывает сокращённый триаж, а не пропуск. Без этого
+    исключения каждый найденный агентом edge-кейс тихо умирал бы с меткой
+    `bot-authored`, и декомпозиция работы не доезжала бы до бэклога.
+
+    Проверка на безопасность остаётся: она о содержимом, а не об авторе, и
+    репорт об уязвимости не становится безопаснее оттого, что его завёл агент.
+    """
+    if not origin_agent:
+        if issue.author_type == "Bot":
+            github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
+            return "bot"
+
+        KNOWN_BOT_LOGINS = {"dependabot", "renovate", "snyk-bot", "github-actions"}
+        if issue.author_login.lower().removesuffix("[bot]") in KNOWN_BOT_LOGINS:
+            github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
+            return "bot"
 
     # Latin terms must match whole words: the substring "rce" otherwise fires on
     # "source"/"resource"/"ресурс" and false-flags most feature issues as

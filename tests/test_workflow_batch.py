@@ -26,7 +26,7 @@ async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
 
 
 @activity.defn(name="prefilter_bot_and_security")
-async def stub_prefilter(issue): return None
+async def stub_prefilter(issue, origin_agent: bool = False): return None
 
 @activity.defn(name="set_phase")
 async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
@@ -84,7 +84,7 @@ _research_state = {}
 
 
 @activity.defn(name="prefilter_bot_and_security")
-async def stub_prefilter_ok(issue: IssueInput): return None
+async def stub_prefilter_ok(issue: IssueInput, origin_agent: bool = False): return None
 
 
 @activity.defn(name="intake_gate")

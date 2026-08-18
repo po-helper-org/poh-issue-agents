@@ -34,7 +34,7 @@ async def awaiting_stub(repo: str, issue_number: int, waiting=None) -> None:
 
 
 @activity.defn(name="prefilter_bot_and_security")
-async def prefilter_ok(issue: IssueInput): return None
+async def prefilter_ok(issue: IssueInput, origin_agent: bool = False): return None
 
 @activity.defn(name="set_phase")
 async def phase_stub(repo: str, issue_number: int, phase: str) -> None:
@@ -55,7 +55,7 @@ async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
 
 
 @activity.defn(name="prefilter_bot_and_security")
-async def prefilter_skip(issue: IssueInput): return "bot-authored"
+async def prefilter_skip(issue: IssueInput, origin_agent: bool = False): return "bot-authored"
 
 
 @activity.defn(name="intake_gate")

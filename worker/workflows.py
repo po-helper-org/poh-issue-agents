@@ -793,20 +793,26 @@ class IssueLifecycle:
         """
         default_retry = RetryPolicy(maximum_attempts=3)
         try:
-            skip_reason = await workflow.execute_activity(
-                activities.prefilter_bot_and_security,
-                issue,
-                start_to_close_timeout=timedelta(seconds=30),
-            )
-            if skip_reason is not None:
-                return (lifecycle.SKIPPED, "skipped", True)
-
+            # Состояние протокола читается ПЕРВЫМ — раньше предфильтра, а не
+            # после. Порядок не косметический: follow-up контура заводит агент,
+            # и по автору он бот, поэтому предфильтр убивал бы его раньше, чем
+            # кто-либо посмотрит на провенанс. Каждый найденный агентом
+            # edge-кейс тихо оседал бы с меткой `bot-authored`, и декомпозиция
+            # работы не доезжала бы до бэклога.
             state = await workflow.execute_activity(
                 activities.read_protocol_state,
                 args=[issue.repo, issue.issue_number],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=default_retry,
             )
+
+            skip_reason = await workflow.execute_activity(
+                activities.prefilter_bot_and_security,
+                args=[issue, state.origin_agent],
+                start_to_close_timeout=timedelta(seconds=30),
+            )
+            if skip_reason is not None:
+                return (lifecycle.SKIPPED, "skipped", True)
             if state.agents_off:
                 # Метку не пишем: человек забрал Issue себе, и наши пометки на
                 # нём — ровно то, от чего он отгородился рубильником.

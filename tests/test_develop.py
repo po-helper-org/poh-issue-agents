@@ -150,3 +150,48 @@ def test_switched_off_fails_visibly_instead_of_pretending(gh, monkeypatch):
         activities_module.trigger_openhands_resolver(_issue(7))
 
     assert gh["dispatch"] == []
+
+
+# --- Провенанс сильнее фильтра ботов ---
+
+def test_agent_follow_up_is_not_filtered_as_a_bot(monkeypatch):
+    """Follow-up контура заводит агент, и по автору он бот. Но `origin:agent`
+    означает ровно обратное тому, ради чего фильтр заведён: это собственный
+    выход контура, которому протокол предписывает сокращённый триаж, а не
+    пропуск."""
+    labels_set: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "add_label",
+                        lambda repo, n, label: labels_set.append(label))
+
+    issue = IssueInput(repo="o/r", issue_number=9, title="edge-кейс", body="тело",
+                       author_login="github-actions[bot]", author_type="Bot",
+                       interactive=False)
+
+    assert activities_module.prefilter_bot_and_security(issue, origin_agent=True) is None
+    assert labels_set == []
+
+
+def test_bot_without_provenance_is_still_filtered(monkeypatch):
+    labels_set: list[str] = []
+    monkeypatch.setattr(activities_module.github_client, "add_label",
+                        lambda repo, n, label: labels_set.append(label))
+
+    issue = IssueInput(repo="o/r", issue_number=9, title="bump deps", body="",
+                       author_login="dependabot[bot]", author_type="Bot",
+                       interactive=False)
+
+    assert activities_module.prefilter_bot_and_security(issue) == "bot"
+    assert "bot-authored" in labels_set
+
+
+def test_security_check_survives_the_provenance_exception(monkeypatch):
+    """Проверка на безопасность — о содержимом, а не об авторе: репорт об
+    уязвимости не становится безопаснее оттого, что его завёл агент."""
+    monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+    monkeypatch.setattr(activities_module.github_client, "post_comment", lambda *a: None)
+
+    issue = IssueInput(repo="o/r", issue_number=9,
+                       title="Найдена уязвимость в расчёте", body="",
+                       author_login="openhands", author_type="Bot", interactive=False)
+
+    assert activities_module.prefilter_bot_and_security(issue, origin_agent=True) == "security"
