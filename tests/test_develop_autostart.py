@@ -141,10 +141,10 @@ async def develop(issue: IssueInput) -> None:
     _calls.append("develop")
 
 
-def _deadlines(autostart: bool):
+def _deadlines(autostart: bool, research: bool = False):
     @activity.defn(name="read_deadlines")
     async def stub() -> Deadlines:
-        return Deadlines(develop_autostart=autostart)
+        return Deadlines(develop_autostart=autostart, research_autostart=research)
     return stub
 
 
@@ -242,3 +242,64 @@ async def test_own_run_label_does_not_start_a_second_analysis():
             await handle.terminate()
 
     assert len(started) == 1, f"прогонов аналитики: {len(started)}, ожидался один"
+
+
+# --- Первая парковка: запуск аналитики без человека ---
+
+@pytest.mark.parametrize("raw", ["1", "true", "on"])
+def test_research_autostart_reads_as_on(monkeypatch, raw):
+    monkeypatch.setenv("RESEARCH_AUTOSTART", raw)
+
+    assert activities_module.read_deadlines().research_autostart is True
+
+
+def test_research_autostart_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("RESEARCH_AUTOSTART", raising=False)
+
+    assert activities_module.read_deadlines().research_autostart is False
+
+
+async def _run_closed_loop(classification: str) -> list[str]:
+    """Оба тумблера включены: от заявки до передачи в разработку без человека."""
+
+    @activity.defn(name="classify_issue")
+    async def classify_as(issue: IssueInput) -> ClassificationResult:
+        return ClassificationResult(label=classification, answer="ok")
+
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, protocol_default,
+                                      _deadlines(True, research=True), gate, classify_as,
+                                      duplicate, score, post_priority, mark_running,
+                                      finish, ack, prepare, stage_ok, publish, cleanup,
+                                      publish_error, ready, develop, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            for _ in range(200):
+                if "develop" in _calls:
+                    break
+                await asyncio.sleep(0.05)
+            await handle.terminate()
+    return list(_calls)
+
+
+@pytest.mark.timeout(120)
+async def test_feature_goes_all_the_way_without_a_human():
+    """Ни одной метки от человека: заявка сама доходит до передачи в разработку."""
+    calls = await _run_closed_loop("advisor:feature-request")
+
+    assert "phase:business-analysis" in calls   # аналитика запустилась сама
+    assert "ready-for-dev" in calls
+    assert "develop" in calls
+
+
+@pytest.mark.timeout(120)
+async def test_bug_skips_analysis_but_still_reaches_development():
+    """Путь бага короче: аналитика ему не нужна, разработка — нужна."""
+    calls = await _run_closed_loop("advisor:bug")
+
+    assert "phase:business-analysis" not in calls
+    assert "develop" in calls

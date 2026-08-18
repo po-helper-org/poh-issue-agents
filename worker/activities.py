@@ -251,13 +251,16 @@ def read_deadlines() -> Deadlines:
         # наверняка опечатка, а не намерение выключить ожидание.
         return value if value > 0 else default
 
+    def _flag(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
     return Deadlines(
         human_decision_hours=_hours("PARK_DECISION_HOURS", 72),
         clarification_hours=_hours("PARK_CLARIFICATION_HOURS", 48),
         build_decision_hours=_hours("PARK_BUILD_HOURS", 72),
         side_state_hours=_hours("PARK_SIDE_STATE_HOURS", 168),
-        develop_autostart=os.environ.get(
-            "DEVELOP_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"},
+        develop_autostart=_flag("DEVELOP_AUTOSTART"),
+        research_autostart=_flag("RESEARCH_AUTOSTART"),
     )
 
 

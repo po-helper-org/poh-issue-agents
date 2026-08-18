@@ -976,7 +976,30 @@ class IssueLifecycle:
         return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
 
     async def _phase_await_decision(self, issue: IssueInput, deadlines) -> tuple | None:
-        """Фаза `classified`: ждём решения человека о тяжёлой стадии."""
+        """Фаза `classified`: ждём решения человека о тяжёлой стадии.
+
+        При `RESEARCH_AUTOSTART` ожидания нет: триаж сам решает, куда двигаться
+        дальше, по типу задачи. Это первая из двух парковок основного пути;
+        вторая — перед разработкой (`DEVELOP_AUTOSTART`). Включены обе — контур
+        идёт от заявки до PR без единого касания человека.
+
+        Тип решает так же, как решала бы метка человека: запрос на функционал
+        уходит в аналитику, баг — сразу разработчику мимо неё. Сокращённый триаж
+        (`origin:agent`) типа не имеет — follow-up контура заводит агент, уже
+        понимая, что это; такую задачу ведём в аналитику, потому что описание в
+        ней короткое и требований не содержит.
+        """
+        if deadlines.research_autostart:
+            label = self._classification_label
+            if label == "advisor:bug":
+                return (lifecycle.READY_FOR_DEV, "bug", True)
+            if label is None or label == "advisor:feature-request":
+                return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+            # Консультация и «уже реализовано» закрываются ответом, а не кодом:
+            # автозапуск дорогой стадии по ним был бы тратой без адресата.
+            # Такие задачи и до этой фазы обычно не доходят, но если дошли —
+            # ждём человека, как раньше.
+
         decision = await self._wait_for_signal(await self._park(
             awaiting_mod.kind_for_phase(lifecycle.CLASSIFIED),
             who=awaiting_mod.who_for_phase(lifecycle.CLASSIFIED),
