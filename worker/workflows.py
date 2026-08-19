@@ -6,7 +6,8 @@ IssueLifecycle — один Temporal-workflow на один issue (ID = issue-<r
 Signals заменяют то, что раньше делали отдельные GitHub Actions,
 триггерящиеся на лейблы:
 - human_decision("research-me" | "bug-me" | "build-me")
-- user_comment(текст) — ответ на уточняющий вопрос intake gate
+- user_comment(текст, id) — реплика человека: ответ на уточняющий вопрос
+  либо новый вопрос по припаркованной задаче
 
 Workflow буквально приостанавливается на await self._wait_for_signal() —
 это устраняет и гонку между duplicate-check/priority-scoring (теперь
@@ -39,11 +40,13 @@ with workflow.unsafe.imports_passed_through():
         BftRequest,
         ClassificationResult,
         CommentAckInput,
+        Deadlines,
         EstimateRequest,
         EstimateResult,
         IssueInput,
         LifecycleState,
         OrphanEventInput,
+        UserComment,
         WebhookAuditInput,
     )
 
@@ -64,9 +67,9 @@ MAX_CLARIFICATION_ROUNDS = 2
 # возьмёт задачу.
 MAX_ANALYSIS_CLARIFY_ROUNDS = 2
 
-# Запрос на прогон аналитики, доставленный в общую очередь сигналов. Префикс —
-# та же схема, что у `__comment__:`: одна очередь, разные виды событий, и
-# обработчик фазы решает, что с ними делать.
+# Запрос на прогон аналитики, доставленный в общую очередь сигналов. Та же
+# схема, что у реплики человека (`UserComment`): одна очередь, разные виды
+# событий, и обработчик фазы решает, что с ними делать.
 AGENT_ANALYZE = "__agent__:analyze"
 
 # Issue закрыт на GitHub. Тот же приём: сигнал будит парковку, а решение
@@ -298,7 +301,7 @@ class IssueLifecycle:
         # Очередь несёт и решения человека (строки), и факты внешних агентов
         # (AgentEvent). Один поток вместо двух — иначе фаза, ждущая решения, не
         # проснулась бы на событии, и наоборот.
-        self._signal_queue: asyncio.Queue[str | AgentEvent] = asyncio.Queue()
+        self._signal_queue: asyncio.Queue[str | AgentEvent | UserComment] = asyncio.Queue()
         self._analyze_labeled = False
         self._issue: IssueInput | None = None
         self._stage = "intake"
@@ -319,6 +322,13 @@ class IssueLifecycle:
         # затем же, что и на входе: вопрос, на который не отвечают, не должен
         # держать задачу вечно.
         self._clarify_rounds = 0
+        # Сколько реплик человека уже отвечено содержательно и ключи последних
+        # из них. Ключ нужен из-за повторной доставки вебхука: одно событие
+        # приезжает сигналом дважды, и без него один вопрос получал бы два
+        # ответа. Потолок — из `Deadlines`, вместе с остальными тумблерами.
+        self._followup_rounds = 0
+        self._answered_comment_ids: list[int] = []
+        self._followup_max_rounds = Deadlines().followup_max_rounds
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -416,8 +426,14 @@ class IssueLifecycle:
         await self._signal_queue.put(label)
 
     @workflow.signal
-    async def user_comment(self, text: str) -> None:
-        await self._signal_queue.put(f"__comment__:{text}")
+    async def user_comment(self, text: str, comment_id: int | None = None) -> None:
+        """Реплика человека в Issue.
+
+        Второй аргумент со значением по умолчанию, а не новый сигнал: вебхук
+        прежнего поколения шлёт один аргумент, и прогоны, припаркованные до
+        этой правки, обязаны понимать обе формы.
+        """
+        await self._signal_queue.put(UserComment(text=text, comment_id=comment_id))
 
     @workflow.signal
     async def issue_closed(self, who: str | None = None) -> None:
@@ -603,7 +619,8 @@ class IssueLifecycle:
             workflow.logger.info("estimate already running for %s#%s",
                                  req.repo, req.issue_number)
 
-    async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | AgentEvent | None:
+    async def _wait_for_signal(
+            self, timeout: timedelta | None = None) -> str | AgentEvent | UserComment | None:
         # Нулевой остаток означает «срок уже вышел», а не «ждать без ограничения»:
         # `if timeout:` ниже принял бы timedelta(0) за отсутствие таймаута и
         # припарковал бы Issue навсегда — ровно то, от чего чинили #58.
@@ -658,6 +675,8 @@ class IssueLifecycle:
             self._root_issue = carried.root_issue
             self._pr_number = carried.pr_number
             self._clarify_rounds = carried.clarify_rounds
+            self._followup_rounds = carried.followup_rounds
+            self._answered_comment_ids = list(carried.answered_comment_ids)
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -687,6 +706,8 @@ class IssueLifecycle:
             root_issue=self._root_issue,
             pr_number=self._pr_number,
             clarify_rounds=self._clarify_rounds,
+            followup_rounds=self._followup_rounds,
+            answered_comment_ids=list(self._answered_comment_ids),
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -923,6 +944,7 @@ class IssueLifecycle:
         # Тумблеры едут вместе со сроками: значение обязано лежать в истории,
         # иначе переключённый посреди прогона уронил бы реплей недетерминизмом.
         self._decompose = deadlines.decompose_enabled
+        self._followup_max_rounds = deadlines.followup_max_rounds
         while True:
             if self._closed_by is not None and not lifecycle.is_terminal(self._phase):
                 # Issue закрыт на GitHub: любая парковка потеряла смысл. Одна
@@ -1084,8 +1106,8 @@ class IssueLifecycle:
                             retry_policy=default_retry,
                         )
                         return (lifecycle.ESCALATED, "escalated", True)
-                    if isinstance(raw, str) and raw.startswith("__comment__:"):
-                        comment_thread.append(raw[len("__comment__:"):])
+                    if isinstance(raw, UserComment):
+                        comment_thread.append(raw.text)
 
                     gate = await workflow.execute_activity(
                         activities.intake_gate,
@@ -1254,6 +1276,12 @@ class IssueLifecycle:
             # Явная команда человека сильнее гварда по типу Issue: он защищает
             # от неудачно поставленной метки, а не от прямого `/analyze`.
             return await self._analysis_requested(issue)
+        if isinstance(decision, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
+            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
+            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
+            # активность, которой там нет, — реплей упал бы недетерминизмом.
+            return await self._answer_followup(issue, decision)
 
         # `classification_label is None` — сокращённый триаж (Issue от агента):
         # он уже классифицирован на стороне создателя, гвард проверять не на чем.
@@ -1393,11 +1421,55 @@ class IssueLifecycle:
                 return await self._agent_event(signal)
             if signal == AGENT_ANALYZE:
                 return await self._analysis_requested(issue)
-            if isinstance(signal, str) and signal.startswith("__comment__:"):
+            if isinstance(signal, UserComment):
                 # Ответ получен. В анализ заново: он прочитает обсуждение и
                 # закроет вопрос — переписывать артефакты руками некому.
                 return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
             # Посторонний сигнал ответом не считается и круга не тратит.
+
+    async def _answer_followup(self, issue: IssueInput, comment: UserComment) -> tuple:
+        """Ответить на реплику человека, оставшись в той же фазе.
+
+        Отказ, ради которого это написано (`poh-demo-checkout#42`): триаж закрыл
+        консультацию содержательным ответом, человек спросил следующее — и цикл
+        отбросил его реплику как посторонний сигнал. Комментарий доехал, реакция
+        «глаза» встала, ответа не было. Со стороны человека это неотличимо от
+        сломанного контура, а с нашей — задача просто досиживала парковку.
+
+        Диалог идёт НА МЕСТЕ: фазу реплика не двигает. Вопрос по припаркованной
+        задаче — это вопрос, а не решение о ней; двигай он фазу, любая реплика
+        переписывала бы состояние Issue, и метка перестала бы означать
+        происходящее. Ходы между фазами остаются за метками и командами.
+
+        Ошибка модели гасится: реплика без ответа хуже, но упавшая по ней фаза
+        забирает с собой и парковку, и всё остальное состояние задачи.
+        """
+        # Повторная доставка вебхука (в истории #42 каждый сигнал ровно дважды)
+        # не должна давать второй ответ на тот же вопрос.
+        if comment.comment_id is not None and comment.comment_id in self._answered_comment_ids:
+            return (self._phase, self._stage, False)
+        # Потолок исчерпан — реплика по-прежнему будит парковку, но модель по ней
+        # не гоняем. Молчание здесь осознанное: круги кончились, разговор ведёт
+        # человек, которому задача поставлена в очередь.
+        if self._followup_rounds >= self._followup_max_rounds:
+            workflow.logger.info("потолок реплик исчерпан (%s) — отвечаю молчанием",
+                                 self._followup_max_rounds)
+            return (self._phase, self._stage, False)
+
+        self._followup_rounds += 1
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        try:
+            await workflow.execute_activity(
+                activities.answer_followup,
+                args=[issue, comment.text],
+                start_to_close_timeout=timedelta(seconds=180),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as exc:
+            workflow.logger.warning("не ответил на реплику: %s", _failure_reason(exc))
+        return (self._phase, self._stage, False)
 
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
@@ -1446,6 +1518,12 @@ class IssueLifecycle:
             return await self._agent_event(decision)
         if decision == AGENT_ANALYZE:
             return await self._analysis_requested(issue)
+        if isinstance(decision, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
+            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
+            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
+            # активность, которой там нет, — реплей упал бы недетерминизмом.
+            return await self._answer_followup(issue, decision)
         if decision != "build-me":
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
         return await self._start_development(issue)
@@ -1587,6 +1665,12 @@ class IssueLifecycle:
             # Команда работает и на припаркованном Issue: из бокового состояния
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
+        if isinstance(signal, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
+            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
+            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
+            # активность, которой там нет, — реплей упал бы недетерминизмом.
+            return await self._answer_followup(issue, signal)
         if signal != "reopen":
             return (self._phase, self._stage, False)  # посторонний сигнал — ждём дальше
         back = next((t for t in lifecycle.allowed(self._phase)
@@ -1716,8 +1800,8 @@ class IssueLifecycle:
                         )
                         self._stage = "escalated"
                         return
-                    if raw.startswith("__comment__:"):
-                        comment_thread.append(raw[len("__comment__:"):])
+                    if isinstance(raw, UserComment):
+                        comment_thread.append(raw.text)
 
                     gate = await workflow.execute_activity(
                         activities.intake_gate,

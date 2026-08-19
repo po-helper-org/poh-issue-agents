@@ -596,7 +596,8 @@ async def github_webhook(
         wf_id = workflow_id_for(repo, issue_number)
         handle = client.get_workflow_handle(wf_id)
         try:
-            await handle.signal("user_comment", payload["comment"]["body"])
+            await handle.signal("user_comment", args=[payload["comment"]["body"],
+                                                       payload["comment"]["id"]])
         except Exception:
             # Сознательное исключение из правила «сигнал поднимает цикл».
             # Команды (`/analyze`, `/estimate`, метки решения) идут через

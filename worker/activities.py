@@ -278,6 +278,7 @@ def read_deadlines() -> Deadlines:
         # ради возможности откатиться, поэтому и читается наоборот — выключение
         # требует явного BFT_ON_TRIAGE=0.
         bft_on_triage=_flag_on_by_default("BFT_ON_TRIAGE"),
+        followup_max_rounds=_hours("FOLLOWUP_MAX_ROUNDS", 10),
     )
 
 
@@ -542,6 +543,80 @@ def classify_issue(issue: IssueInput, bft_on_triage: bool = False) -> Classifica
         github_client.post_comment(issue.repo, issue.issue_number, answer)
     github_client.add_label(issue.repo, issue.issue_number, label)
     return ClassificationResult(label=label, answer=answer)
+
+
+# --- Диалог по припаркованной задаче ---
+
+# Реплика приходит по уже обработанному Issue, и отвечать на неё надо в
+# контексте всего разговора — включая прошлые ответы контура: именно к ним
+# человек и обращается. Поэтому комментарии сервиса тут НЕ отсеиваются, как и
+# в `/bft`.
+FOLLOWUP_THREAD_COMMENTS = 40
+FOLLOWUP_COMMENT_CHARS = 4000
+FOLLOWUP_THREAD_CHARS = 30_000
+
+
+class FollowupExtraction(BaseModel):
+    answer: str = Field(description="Ответ человеку, готовый к публикации комментарием")
+
+
+def _followup_thread(repo: str, issue_number: int) -> str:
+    """Переписка Issue текстом. Сбой чтения не отменяет ответа.
+
+    Без переписки модель ответит хуже — но ответит, а альтернатива здесь —
+    молчание, то есть ровно тот отказ, который эта активность и чинит.
+    """
+    try:
+        comments = github_client.list_comments(repo, issue_number,
+                                               limit=FOLLOWUP_THREAD_COMMENTS)
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for followup #%s: %s", issue_number, exc)
+        return ""
+
+    blocks: list[str] = []
+    for comment in comments:
+        user = (comment.get("user") or {}).get("login", "?")
+        date = (comment.get("created_at") or "")[:10]
+        body = _truncate(comment.get("body") or "", FOLLOWUP_COMMENT_CHARS)
+        blocks.append(f"**@{user} ({date}):**\n{body}")
+
+    # Обрезаем от самых старых: разговор идёт с конца, и свежие реплики нужнее
+    # первого комментария полугодовой давности.
+    while blocks and len("\n\n".join(blocks)) > FOLLOWUP_THREAD_CHARS:
+        blocks = blocks[1:]
+    return "\n\n".join(blocks)
+
+
+@activity.defn
+def answer_followup(issue: IssueInput, question: str) -> None:
+    """Ответ на реплику человека в припаркованном Issue.
+
+    Отдельная активность, а не повторный `classify_issue`: тот отвечает по
+    заголовку и телу Issue и ничего не знает о разговоре — на вопрос «а как
+    тогда устроен Dataflow?» он ответил бы заново на исходную заявку и заодно
+    переписал бы метку классификации. Здесь ответ идёт по всей переписке, а
+    состояние Issue не трогается вовсе: метки и фазу двигают метки и команды.
+    """
+    capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
+        if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
+    thread = _followup_thread(issue.repo, issue.issue_number)
+    parts = [f"# Issue {issue.repo}#{issue.issue_number}: {issue.title}", "",
+             "## Описание", "", issue.body.strip() or "(тело пустое)", "",
+             "## Известный функционал", "", capabilities]
+    if thread:
+        parts += ["", "## Переписка Issue", "", thread]
+    parts += ["", "## Реплика, на которую нужно ответить", "", question.strip()]
+
+    result = llm.extract(
+        _load_prompt("system_followup.md"), "\n".join(parts), FollowupExtraction,
+        model=llm.MODEL_CLASSIFY,
+    )
+    answer = result.answer.strip()
+    if not answer:
+        # Пустой ответ модели — не повод публиковать пустой комментарий: он
+        # выглядел бы как ответ и закрывал бы вопрос ничем.
+        raise RuntimeError("модель вернула пустой ответ на реплику")
+    github_client.post_comment(issue.repo, issue.issue_number, answer)
 
 
 # --- Duplicate Check ---

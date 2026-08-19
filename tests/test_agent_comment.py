@@ -109,8 +109,11 @@ class _Handle:
     def __init__(self, sink) -> None:
         self._sink = sink
 
-    async def signal(self, name, *args):
-        self._sink.append((name, args))
+    async def signal(self, name, *args, **kwargs):
+        # Реальный хендл Temporal принимает и одиночный аргумент, и `args=[...]`
+        # — вебхук шлёт реплику вторым способом, чтобы вместе с текстом уехал
+        # ключ комментария.
+        self._sink.append((name, tuple(kwargs.get("args", args))))
 
     async def query(self, name, *args):
         return True
@@ -169,7 +172,10 @@ def test_a_human_answer_still_gets_through(webhook):
 
     assert _post(app_client, "да, речь про мобильный клиент").status_code == 200
 
-    assert ("user_comment", ("да, речь про мобильный клиент",)) in fake.signals
+    assert ("user_comment", ("да, речь про мобильный клиент", 555)) in fake.signals, (
+        "реплика обязана ехать вместе с ключом комментария: вебхук доставляет "
+        "каждое событие дважды, и без ключа один вопрос получит два ответа"
+    )
 
 
 def test_command_quoted_by_our_own_comment_does_not_run(webhook):
