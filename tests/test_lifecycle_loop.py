@@ -352,6 +352,20 @@ def test_patch_marker_is_frozen():
     assert 'workflow.patched("issue-lifecycle-phase-loop")' in src
 
 
+def test_analyze_recovery_is_behind_a_patch_marker():
+    """Ход `failed → business-analysis` меняет РЕШЕНИЕ, уже записанное в истории.
+
+    Прогоны, у которых `/analyze` из `failed` однажды отработал мимо пути,
+    держат в истории `StartChildWorkflowExecutionInitiated`. Новый код на том же
+    месте планирует активность смены фазы — и реплей падает по недетерминизму.
+    Именно так на стенде встал воркфлоу Issue #11 после выкладки.
+    """
+    src = inspect.getsource(IssueLifecycle._analysis_requested)
+
+    assert 'workflow.patched("issue-lifecycle-analyze-recovers-failed")' in src, (
+        "новая ветка обязана быть под своим маркером патча")
+
+
 def test_linear_path_is_still_reachable():
     """Пока в проде есть прогоны прежнего поколения, линейный сценарий обязан
     оставаться в коде: реплей их истории идёт именно по нему."""

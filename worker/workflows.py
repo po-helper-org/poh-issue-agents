@@ -770,7 +770,15 @@ class IssueLifecycle:
         трогаем: соврать про состояние хуже, чем не отразить в нём разовый
         прогон.
         """
-        if lifecycle.can(self._phase, lifecycle.BUSINESS_ANALYSIS):
+        if lifecycle.can(self._phase, lifecycle.BUSINESS_ANALYSIS) and (
+                # Ход из `failed` появился позже самого цикла, и он меняет
+                # РЕШЕНИЕ, уже записанное в истории: у прогонов, где `/analyze`
+                # из `failed` однажды отработал мимо пути, на этом месте лежит
+                # `StartChildWorkflowExecutionInitiated`, а новый код планирует
+                # активность смены фазы. Без маркера реплей такой истории падает
+                # по недетерминизму — так на стенде встал воркфлоу Issue #11.
+                self._phase != lifecycle.FAILED
+                or workflow.patched("issue-lifecycle-analyze-recovers-failed")):
             return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
         await self._run_analysis_child(issue)
         return (self._phase, self._stage, False)
