@@ -21,6 +21,10 @@
 дорогую стадию запускает человек, а не догадка агента.
 """
 
+import json
+import os
+import re
+
 FAST = "fast"
 DEEP = "deep"
 MODES = (FAST, DEEP)
@@ -325,3 +329,100 @@ def render_deep_summary(repo: str, issue_number: int, files: list[str]) -> str:
         "уточнением: документ дополнится, уже принятые требования не "
         "перенумеруются."
     )
+
+
+# --- Прямые стадии: два вызова модели вместо агента ---
+#
+# `claude -p` стоит 356 МБ RSS на стадию — дороже, чем весь контейнер воркера, и
+# на тесном стенде это уже мешает. Но агентность нужна не всем стадиям: `index`
+# и `context` исследуют репозиторий, а `draft` получает готовый вход и пишет
+# один файл. Такую стадию можно выполнить прямыми вызовами модели из процесса
+# воркера — без второго процесса вовсе.
+#
+# Разбор на ДВА вызова не косметика. Одним ответом модель сворачивала каскад
+# (5 функциональных требований вместо 10) и недобирала якоря: собрать структуру
+# и оформить документ — разные задачи, и вторая вытесняет первую. Между вызовами
+# появляется место для программной проверки, ради которого всё и затевалось.
+#
+# Ориентиры полноты выведены из эталонного прогона `claude -p` по демо-задаче.
+# Это НИЖНЯЯ граница здравого смысла, а не догма: настраивается переменными,
+# и по-настоящему полноту задаёт покрытие источников (см. #78).
+CASCADE_FLOOR: dict[str, int] = {"БТ": 4, "ПТ": 5, "ИТ": 6, "ФТ": 10, "НФТ": 4}
+ANCHOR_FLOOR = 24
+
+CASCADE_SCHEMA = """{
+  "requirements": [
+    {"id": "БТ-1", "type": "БТ", "title": "…", "body": "…",
+     "related": ["ПТ-1", "ФТ-2"], "anchor": "po-statement.md:7"}
+  ],
+  "anchors": [
+    {"fact": "…", "source": "src/pricing.mjs:5-9", "rank": "R1", "kind": "Код"}
+  ]
+}"""
+
+
+def direct_stages() -> set[str]:
+    """Стадии, которые идут прямыми вызовами вместо `claude -p`.
+
+    Пусто (умолчание) — прежнее поведение целиком: ни одна стадия не меняет
+    исполнителя. Флаг перечисляет стадии поимённо, чтобы переключать их по одной
+    и сравнивать результат с агентом на той же задаче.
+    """
+    raw = os.environ.get("BFT_DIRECT_STAGES", "")
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def parse_cascade(text: str) -> dict:
+    """JSON каскада из ответа модели.
+
+    Модель охотно добавляет ```-обрамление и пояснения до и после — берём срез
+    от первой скобки до последней, а не доверяем формату ответа.
+    """
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < 0:
+        raise ValueError(f"в ответе нет JSON каскада: {text[:200]!r}")
+    return json.loads(text[start:end + 1])
+
+
+def cascade_gaps(cascade: dict, line_counts: dict[str, int]) -> list[str]:
+    """Чего каскаду не хватает — претензиями на языке добора.
+
+    `line_counts` — сколько строк в каждом файле исходников. Якорь ранга R1
+    обязан указывать на СУЩЕСТВУЮЩУЮ строку существующего файла: выдуманная
+    ссылка выглядит в документе ровно так же убедительно, как настоящая, и
+    проверить её может только код (#78).
+
+    Функция чистая: файловую систему читает вызывающий, сюда приходят уже
+    посчитанные длины.
+    """
+    gaps: list[str] = []
+
+    have: dict[str, int] = {}
+    for req in cascade.get("requirements") or []:
+        kind = req.get("type")
+        have[kind] = have.get(kind, 0) + 1
+    for kind, floor in CASCADE_FLOOR.items():
+        if have.get(kind, 0) < floor:
+            gaps.append(f"{kind}: {have.get(kind, 0)} из {floor} — "
+                        f"добавь {floor - have.get(kind, 0)} шт.")
+
+    anchors = cascade.get("anchors") or []
+    if len(anchors) < ANCHOR_FLOOR:
+        gaps.append(f"якорей {len(anchors)} из {ANCHOR_FLOOR} — "
+                    f"добавь {ANCHOR_FLOOR - len(anchors)} шт.")
+
+    for anchor in anchors:
+        if anchor.get("rank") != "R1":
+            continue  # R2/R3 ссылаются на постановку и решения, не на строки кода
+        source = str(anchor.get("source", ""))
+        match = re.match(r"([\w./-]+):(\d+)", source)
+        if not match:
+            gaps.append(f"якорь R1 «{source}» без номера строки — укажи файл:строки")
+            continue
+        path, line = match.group(1), int(match.group(2))
+        if path not in line_counts:
+            gaps.append(f"якорь R1 ссылается на {path} — такого файла во входе нет")
+        elif line > line_counts[path]:
+            gaps.append(f"якорь R1 «{source}»: в файле {line_counts[path]} строк, "
+                        f"строки {line} не существует")
+    return gaps

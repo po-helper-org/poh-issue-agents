@@ -7,6 +7,7 @@ GITHUB_EVENT_PATH и вызова через subprocess-CLI-скрипт — о�
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -1931,6 +1932,157 @@ async def prepare_bft_workspace(req: BftRequest) -> None:
     await _run_with_heartbeat(_build_bft_workspace, req, label="bft-preparing")
 
 
+# Скиллы и команды bft-writer лежат в ПОЛЬЗОВАТЕЛЬСКОМ ~/.claude образа воркера
+# (см. worker/Dockerfile): `claude -p` запускается с cwd внутри клона чужого
+# репозитория, и проектный .claude там был бы чужим. Прямому вызову те же файлы
+# нужны из процесса — путь один и тот же.
+CLAUDE_HOME = Path(os.environ.get("CLAUDE_HOME", "/root/.claude"))
+
+# Исходники, на которые вешаются якоря ранга R1. Список задан явно: якорь обязан
+# указывать на строку файла, который модель ВИДЕЛА, иначе ссылка недоказуема.
+BFT_SOURCE_GLOBS = ("src/*", "*.md", "package.json")
+BFT_SOURCE_LIMIT_BYTES = 24_000  # крупные файлы в промпт не тащим
+
+
+def _bft_sources(clone_dir: str) -> dict[str, str]:
+    """Файлы репозитория для якорей R1 — путь → содержимое."""
+    root = Path(clone_dir)
+    out: dict[str, str] = {}
+    for pattern in BFT_SOURCE_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            if not path.is_file() or path.stat().st_size > BFT_SOURCE_LIMIT_BYTES:
+                continue
+            rel = path.relative_to(root).as_posix()
+            if rel.startswith(".bft/"):
+                continue  # артефакты пайплайна подаются отдельно, это не исходники
+            out[rel] = path.read_text(encoding="utf-8", errors="replace")
+    return out
+
+
+def _numbered(text: str) -> str:
+    """С номерами строк: якорь ранга R1 указывает на строку, а не на файл."""
+    return "\n".join(f"{i:4d}| {line}" for i, line in enumerate(text.splitlines(), 1))
+
+
+def _bft_stage_system(stage_name: str, role_tail: str) -> str:
+    """Системный промпт стадии — та же инструкция, что читает `claude -p`."""
+    parts = [
+        "Ты — исполнитель стадии пайплайна bft-writer. Ниже инструкция команды и "
+        "ресурсы скилла. Следуй им буквально: порядок разделов, типы требований, "
+        "якоря и запреты — проверяемые гейты, а не рекомендации.\n\n" + role_tail,
+    ]
+    command = CLAUDE_HOME / "commands" / f"bft-{stage_name}.md"
+    if command.exists():
+        parts.append(f"# Инструкция команды /bft-{stage_name}\n\n"
+                     + command.read_text(encoding="utf-8"))
+    skill = CLAUDE_HOME / "skills" / "bft-writer"
+    for rel in ("SKILL.md", "resources/bft_standards.md", "examples/ideal_bft.md",
+                "examples/golden_bft_example.md", "resources/anchor_rules.md",
+                "resources/catwoe.md", "resources/writing_style.md",
+                "resources/review_feedback.md"):
+        path = skill / rel
+        if path.exists():
+            parts.append(f"# {rel}\n\n{path.read_text(encoding='utf-8')}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _bft_stage_inputs(clone_dir: str, issue_number: int,
+                      sources: dict[str, str]) -> str:
+    """Вход стадии: артефакты предшественников плюс исходники с номерами строк.
+
+    Список шире, чем `requires` в `deep_stages`: там записан лишь артефакт, без
+    которого стадию нельзя начинать, а работает она по всем. Агент дочитывал
+    остальное сам — прямому вызову эту зависимость надо назвать (#78, находка D).
+    """
+    root = Path(clone_dir)
+    parts = []
+    for name in ("po-statement.md", "bft-context-pack.md", "problem.md", "concept.md"):
+        path = root / bft.artefacts_dir(issue_number) / name
+        if path.exists():
+            parts.append(f"# Вход: {name}\n\n{path.read_text(encoding='utf-8')}")
+    for rel, body in sources.items():
+        parts.append(f"# Исходник: {rel} (с номерами строк)\n\n"
+                     f"```\n{_numbered(body)}\n```")
+    return "\n\n---\n\n".join(parts)
+
+
+def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
+    """Стадия `draft` двумя вызовами модели вместо агента.
+
+    Первый вызов собирает каскад требований и якоря структурой, второй рендерит
+    из них документ. Между ними — программная проверка полноты и якорей: ради
+    неё разбиение и сделано, одним ответом проверять нечего.
+    """
+    model = os.environ.get("BFT_DIRECT_MODEL", "glm-4.6")
+    sources = _bft_sources(clone_dir)
+    line_counts = {rel: len(body.splitlines()) for rel, body in sources.items()}
+    inputs = _bft_stage_inputs(clone_dir, req.issue_number, sources)
+    issue = req.issue_number
+
+    system = _bft_stage_system(
+        "draft", "СЕЙЧАС ты собираешь ТОЛЬКО каскад требований и таблицу якорей. "
+                 "Документ не пишешь — его соберёт следующий шаг.")
+    cascade_task = (
+        f"{inputs}\n\n---\n\n# Задание\n\n"
+        f"Собери каскад требований БФТ для эпика issue-{issue} и таблицу якорей.\n\n"
+        "Разворачивай, а не сворачивай: каждый пункт TOBE из problem.md, каждое "
+        "уточнение постановки, каждая ветка сценария демонстрации, каждый экран "
+        "актора, каждая измеримая характеристика — отдельное требование.\n\n"
+        "Якоря: As-Is-факт → `файл:строки` из исходников выше (ранг R1, тип "
+        "«Код»); требование постановки → `po-statement.md:N` (R2, «Постановка»); "
+        "решение концепта → `concept.md` (R2, «Решение»). To-Be на код НЕ "
+        "якорится.\n\n"
+        "Нижняя граница: "
+        + ", ".join(f"{k} ≥ {v}" for k, v in bft.CASCADE_FLOOR.items())
+        + f", якорей ≥ {bft.ANCHOR_FLOOR}.\n\n"
+        f"Верни ТОЛЬКО JSON по схеме:\n{bft.CASCADE_SCHEMA}")
+
+    cascade = bft.parse_cascade(llm.complete(system, cascade_task, model=model))
+    for _ in range(BFT_TOP_UP_ATTEMPTS):
+        gaps = bft.cascade_gaps(cascade, line_counts)
+        if not gaps:
+            break
+        logger.info("БФТ %s#%s: добор каскада — %s", req.repo, issue, "; ".join(gaps))
+        top_up = (f"{inputs}\n\n---\n\n# Уже собрано\n\n```json\n"
+                  + json.dumps(cascade, ensure_ascii=False, indent=1) + "\n```\n\n"
+                  "# Чего не хватает\n\n- " + "\n- ".join(gaps) + "\n\n"
+                  "Верни ПОЛНЫЙ JSON той же схемы: собранное дословно плюс "
+                  "недостающее. Ничего не удаляй и не переформулируй.")
+        cascade = bft.parse_cascade(llm.complete(system, top_up, model=model))
+
+    left = bft.cascade_gaps(cascade, line_counts)
+    if left:
+        # Не падаем: неполный каскад — это плохой документ, а не сорванный
+        # прогон, и человеку полезнее увидеть его с честной пометкой в логе,
+        # чем не увидеть ничего. Полнота проверяется стадией `validate`.
+        logger.warning("БФТ %s#%s: каскад неполон после добора — %s",
+                       req.repo, issue, "; ".join(left))
+
+    system2 = _bft_stage_system(
+        "draft", "СЕЙЧАС ты рендеришь документ из УТВЕРЖДЁННОГО каскада. "
+                 "Требования и якоря уже собраны: переносишь их все, ничего не "
+                 "теряя и не добавляя новых идентификаторов.")
+    render_task = (
+        f"{inputs}\n\n---\n\n# Утверждённый каскад\n\n```json\n"
+        + json.dumps(cascade, ensure_ascii=False, indent=1) + "\n```\n\n"
+        f"# Задание\n\nСобери чистовик БФТ issue-{issue} по корп-шаблону. Все "
+        "требования каскада обязаны попасть в свои разделы, все якоря — в раздел "
+        "«Якоря истины» таблицей `Факт | Источник | Ранг | Тип`.\n\n"
+        "Файловых инструментов нет: ты не записываешь файл, а выводишь его "
+        "содержимое целиком.\n\n"
+        f"YAML-шапка ровно такая:\n```\n---\nEpic: issue-{issue}\n"
+        "Название: <название>\nСтатус: Черновик\nДата: <сегодня>\n"
+        "Автор: bft-draft\nВерсия: 1.0\n---\n```\n\n"
+        "Заголовки разделов — только `##`. Ответ начинается со строки `---` и "
+        "заканчивается последней строкой таблицы якорей, без обрамляющих "
+        "```-блоков и без фраз до или после.")
+
+    return llm.complete(system2, render_task, model=model)
+
+
+BFT_TOP_UP_ATTEMPTS = 2
+
+
 @activity.defn
 async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
     """Одна стадия канонического пайплайна БФТ — отдельный `claude -p`.
@@ -1941,7 +2093,18 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
     """
     prompt, expected, requires = bft.deep_stage(stage_name, req.issue_number)
     clone_dir = _require_bft_workspace(req, requires)
-    await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=f"bft:{stage_name}")
+    if stage_name in bft.direct_stages() and expected:
+        # Стадия без исследования репозитория: вход готов, выход — один файл.
+        # Агент здесь стоит 356 МБ RSS и ничего не добавляет, кроме способности
+        # дочитать файл, который мы и так подаём (#77).
+        document = await _run_with_heartbeat(
+            _bft_direct_draft, req, clone_dir, label=f"bft:{stage_name}")
+        path = Path(clone_dir) / expected
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(document, encoding="utf-8")
+    else:
+        await _run_with_heartbeat(_run_claude, prompt, clone_dir,
+                                  label=f"bft:{stage_name}")
     artifact: str | None = None
     size = 0
     if expected:
