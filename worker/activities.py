@@ -1543,6 +1543,12 @@ BFT_THREAD_CHARS = 40_000
 
 BFT_STAGE_TIMEOUT_SEC = 900
 
+# Текстовые форматы, которые пишет пайплайн БФТ: документ и отчёты (md), таблицы
+# требований и персон (csv), диаграммы плана демонстрации (puml). Список — не
+# запрет на новое, а граница возможностей транспорта: Contents API принимает
+# текст, и всё, что им не является, обязано быть отброшено громко.
+BFT_TEXT_SUFFIXES = frozenset({".md", ".csv", ".puml", ".txt", ".json", ".yaml", ".yml"})
+
 # Заголовок письма — он же признак прежней редакции. Считать редакции по метке
 # нельзя: метка снимается, а комментарии остаются, и именно они образуют историю
 # переработок, которую человек видит в треде.
@@ -1766,14 +1772,32 @@ def _collect_bft_artifacts(clone_dir: str, issue_number: int) -> dict[str, str]:
 
     Забираем каталогом, а не списком имён: состав артефактов задаёт скилл, и
     зашитый перечень разъехался бы с ним при первом же его обновлении, молча
-    теряя файлы.
+    теряя файлы. По той же причине берём не один `*.md`: помимо документа скилл
+    пишет csv с требованиями и персонами и выносит диаграммы в `.puml` — забрав
+    только markdown, мы опубликовали бы документ со ссылками в никуда.
+
+    Расширение всё же проверяем: публикация идёт через Contents API, который
+    принимает ТЕКСТ, и попытка прочитать бинарь (png, docx) упала бы на
+    UnicodeDecodeError посреди уже начатой публикации. Такой файл пропускаем
+    громко — тихо потерянный артефакт как раз и есть то, от чего этот код
+    защищает.
     """
     root = Path(clone_dir) / bft.epic_dir(issue_number)
     files: dict[str, str] = {}
     if not root.is_dir():
         return files
-    for path in sorted(root.rglob("*.md")):
-        files[str(path.relative_to(clone_dir))] = path.read_text(encoding="utf-8")
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in BFT_TEXT_SUFFIXES:
+            logger.warning("артефакт БФТ %s пропущен: не текстовый формат", path.name)
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError) as exc:
+            logger.warning("артефакт БФТ %s не прочитан: %s", path.name, exc)
+            continue
+        files[str(path.relative_to(clone_dir))] = content
     return files
 
 

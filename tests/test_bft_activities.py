@@ -347,19 +347,40 @@ async def test_cleanup_of_a_missing_workspace_is_not_an_error(deep_env):
 
 def test_artifacts_are_collected_by_directory_not_by_a_hardcoded_list(tmp_path):
     """Состав артефактов задаёт скилл. Зашитый перечень разъехался бы с ним при
-    первом же обновлении, молча теряя файлы."""
+    первом же обновлении, молча теряя файлы — включая csv с требованиями и
+    диаграммы, на которые ссылается сам документ."""
     clone = tmp_path / "repo"
     epic = clone / bft.epic_dir(42)
     (epic / "artefacts").mkdir(parents=True)
     (epic / "issue-42.md").write_text("документ")
     (epic / "artefacts" / "problem.md").write_text("диагноз")
+    (epic / "artefacts" / "requirements.csv").write_text("ID,ASIS\nБТ-1,нет")
     (epic / "artefacts" / "diagram.puml").write_text("@startuml")
 
     files = acts._collect_bft_artifacts(str(clone), 42)
 
     assert bft.document_path(42) in files
     assert f"{bft.artefacts_dir(42)}/problem.md" in files
-    assert not any(p.endswith(".puml") for p in files), "забираем markdown-артефакты"
+    assert f"{bft.artefacts_dir(42)}/requirements.csv" in files
+    assert f"{bft.artefacts_dir(42)}/diagram.puml" in files
+
+
+def test_a_binary_artifact_is_skipped_loudly_not_silently(tmp_path, caplog):
+    """Contents API принимает текст. Бинарь уронил бы уже начатую публикацию на
+    UnicodeDecodeError, а тихо выброшенный артефакт — ровно то, от чего этот
+    сбор и защищает."""
+    clone = tmp_path / "repo"
+    epic = clone / bft.epic_dir(42)
+    epic.mkdir(parents=True)
+    (epic / "issue-42.md").write_text("документ")
+    (epic / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+
+    with caplog.at_level("WARNING"):
+        files = acts._collect_bft_artifacts(str(clone), 42)
+
+    assert bft.document_path(42) in files
+    assert not any(p.endswith(".png") for p in files)
+    assert "diagram.png" in caplog.text
 
 
 async def test_publish_refuses_to_report_an_empty_run(monkeypatch, tmp_path, gh):
