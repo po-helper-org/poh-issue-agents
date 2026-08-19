@@ -1897,7 +1897,7 @@ class IssuePrFix:
     """
 
     @workflow.run
-    async def run(self, repo: str, pr_number: int, round_number: int):
+    async def run(self, repo: str, pr_number: int, round_number: int) -> bool | str:
         """`True` — правки внесены и запрошена перепроверка. Строка — правок не
         потребовалось, и это её разбор.
 

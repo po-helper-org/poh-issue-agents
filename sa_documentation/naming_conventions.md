@@ -13,7 +13,9 @@
 | Приоритизация | `score_priority` (`worker/activities.py:230`) | Извлечение атрибутов LLM + детерминированная формула |
 | Research-пайплайн | `run_research_pipeline` (`worker/activities.py:265`) | **Не реализовано** (`NotImplementedError`). Форвард-цепочка po-helper → Repowise → Blueprint → deb8flow → SA-helper |
 | Bug-пайплайн | `run_bug_pipeline` (`worker/activities.py:276`) | **Не реализовано** (`NotImplementedError`). Диагностика бага (SA-helper) |
-| Резолвер разработки | `trigger_openhands_resolver` (`worker/activities.py:282`) | **Не реализовано**; OpenHands остаётся отдельным сервисом |
+| Стадия разработки | `IssueDevelopment` (`worker/workflows.py`) | Дочерний воркфлоу, id `develop-<repo>-<n>`; шаги — активности `dev_begin`/`dev_prepare`/`dev_announce`/`dev_run_agent`/`dev_followups`/`dev_tests`/`dev_publish`, у каждого своя политика ретраев |
+| Круг правок по ревью | `IssuePrFix` (`worker/workflows.py`) | Дочерний воркфлоу, id `prfix-<repo>-<pr>-<round>`; один прогон на круг — круги разделены ожиданием доклада ревью |
+| Резолвер разработки (прежний путь) | `trigger_openhands_resolver` (`worker/activities.py`) | Вся стадия одной активностью. Сохранён ради реплея прогонов, начатых до маркера `issue-lifecycle-develop-child`, и ради `_run_linear` |
 | Скилл (навык) | po-helper / SA-helper Claude Code skill | Набор инструкций для `claude -p`; вызывается тяжёлыми стадиями |
 | Сигнал решения человека | `human_decision` signal (`worker/workflows.py:34`) | Лейблы `research-me`/`bug-me`/`build-me` как Temporal-сигналы |
 | Бэкенд-модель (skills) | z.ai Anthropic-эндпоинт | `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` (`.env.example:20-21`) |

@@ -373,23 +373,45 @@ Temporal недостижим либо авторизация не настро�
   `duplicate`, `failed`, `agents-off`. Припаркованный прогон теперь отличим от
   зависшего.
 
-### Отслеживание прогона OpenHands (Develop)
+### Отслеживание работ по Issue
+
+Операционная история Issue восстанавливается **по идентификаторам прогонов**, а
+не по дереву в Temporal UI. Причина: родитель делает continue-as-new при 800
+событиях истории (`HISTORY_EVENT_THRESHOLD`), после чего меняется RunId, а
+дочерние прогоны остаются привязаны к прежнему. Дерево — приятное следствие,
+пока родитель не перезапустился; полноту даёт идентификатор.
+
+| Прогон | Идентификатор | Что показывает |
+|---|---|---|
+| Родитель Issue | `issue-<repo>-<n>` | фаза, решения человека, сигналы, парковки |
+| Аналитика (`/analyze`) | `analysis-<repo>-<n>` | цепочка FNR по стадиям |
+| Оценка (`/estimate`) | `estimate-<repo>-<n>-<marker>` | расчёт трудоёмкости |
+| Разработка (OpenHands) | `develop-<repo>-<n>` | клон, прогон агента, находки, тесты, публикация |
+| Круг правок по ревью | `prfix-<repo>-<pr>-<round>` | одна итерация доводки PR |
+
+Все форматы собираются в `shared/workflow_ids.py` — второго места нет намеренно,
+иначе выборка по префиксу молча стала бы неполной.
+
+```bash
+docker exec <temporal-контейнер> temporal workflow list
+docker exec <temporal-контейнер> temporal workflow show --workflow-id develop-<repo>-<n>
+```
+
+`show` по стадии разработки даёт шаги событиями `ActivityTaskScheduled`:
+`dev_begin` → `dev_prepare` → `dev_announce` → `dev_run_agent` → `dev_followups`
+→ `dev_tests` → `dev_publish`. У каждого шага своя политика ретраев: агент и
+тесты идут в одну попытку, остальное — в три. Ради этого стадию и разрезали:
+срыв публикации повторяет публикацию, а не двадцатиминутный прогон агента.
+
+Переключение обеих стадий на дочерние прогоны стоит под маркерами патча
+(`issue-lifecycle-develop-child`, `issue-lifecycle-prfix-child`). Прогоны,
+начатые до выкладки, идут прежним путём — активностью внутри родителя, без
+отдельной строки в списке. Отличить их можно по `TemporalChangeVersion` в
+`describe`: нет маркера — прогон прежнего поколения.
 
 Код пишет OpenHands — одноразовым контейнером на своём сервере (режим `local`,
 умолчание) либо в GitHub Actions (`dispatch`); режим и все константы —
-`shared/develop.py`. В режиме `local` прогон виден на четырёх поверхностях
-разом, они дополняют друг друга:
-
-- **Temporal — на какой стадии стоит прогон.** Активность
-  `trigger_openhands_resolver` (`worker/activities.py`) шлёт heartbeat каждые
-  `HEARTBEAT_INTERVAL_SEC` (30с) через стадии `dev:prepare` → `dev:agent` →
-  `dev:tests` → `dev:publish`:
-  ```bash
-  docker exec <temporal-контейнер> temporal workflow list
-  docker exec <temporal-контейнер> temporal workflow describe --workflow-id <id>
-  ```
-  `Pending Activities` в выводе `describe` показывает застрявшую стадию и число
-  попыток (Temporal повторяет активность до трёх раз).
+`shared/develop.py`. Помимо Temporal прогон виден ещё на трёх поверхностях:
 
 - **Логи воркера — вывод самого агента.** `_dev_run_agent` логирует хвост
   stdout/stderr **на любом исходе прогона, не только при ошибке** — иначе
