@@ -16,7 +16,7 @@ import urllib.parse
 import jwt
 import requests
 
-from shared.agent_comment import sign
+from shared.agent_comment import is_agent_comment, sign
 from shared.labels import ORIGIN_AGENT
 
 _log = logging.getLogger("github_client")
@@ -574,7 +574,11 @@ def review_text(repo: str, number: int, limit: int = 12000) -> str:
             if (item.get("user") or {}).get("type") != "Bot":
                 continue
             body = (item.get("body") or "").strip()
-            if body:
+            # Комментарии контура — тоже от бота: он ходит в GitHub как App.
+            # Без этого фильтра на втором круге агент читал собственную просьбу
+            # «внёс правки, прошу перепроверить» как часть замечаний и правил по
+            # ней — то есть спорил сам с собой вместо ревьюера.
+            if body and not is_agent_comment(body):
                 parts.append(body)
 
     text = "\n\n".join(parts)
