@@ -131,3 +131,46 @@ def test_audit_failure_does_not_break_the_response(make_client, monkeypatch):
     monkeypatch.setattr(fake, "start_workflow", boom)
 
     assert _post(app_client, _opened("other/thing")).status_code == 200
+
+
+# --- Повторная доставка не должна быть ошибкой ---
+
+def test_repeated_opened_delivery_is_not_an_error(monkeypatch):
+    """GitHub ретраит доставку, если не дождался ответа, и оба раза просит
+    одного и того же. 500 здесь хуже, чем бесполезен: на нём GitHub ретраит
+    снова, каждый ретрай снова падает, и так до отказа от доставки.
+
+    Поймано на стенде: Issue #12 приехал дважды, вебхук ответил 500."""
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    import main as webhook_main
+
+    calls: list[str] = []
+
+    class _Client:
+        async def start_workflow(self, *args, **kwargs):
+            calls.append(kwargs.get("id", ""))
+            raise WorkflowAlreadyStartedError("уже идёт", "IssueLifecycle")
+
+    async def _client():
+        return _Client()
+
+    monkeypatch.setattr(webhook_main, "get_temporal_client", _client)
+    monkeypatch.setattr(webhook_main, "verify_signature", lambda body, sig: None)
+    monkeypatch.setenv("ISSUE_AGENT_REPOS", "o/r")
+
+    from fastapi.testclient import TestClient
+
+    payload = {
+        "action": "opened",
+        "repository": {"full_name": "o/r"},
+        "issue": {"number": 12, "title": "t", "body": "b",
+                  "user": {"login": "u", "type": "User"}},
+        "sender": {"login": "u", "type": "User"},
+    }
+    resp = TestClient(webhook_main.app).post(
+        "/webhook", json=payload,
+        headers={"X-GitHub-Event": "issues", "X-Hub-Signature-256": "sha256=x"})
+
+    assert resp.status_code == 200, resp.text
+    assert calls, "старт цикла всё-таки должен быть попыткой"

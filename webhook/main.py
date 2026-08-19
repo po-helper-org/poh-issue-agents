@@ -361,13 +361,25 @@ async def github_webhook(
         wf_id = workflow_id_for(repo, issue_number)
 
         if action == "opened":
-            await client.start_workflow(
-                "IssueLifecycle",  # имя workflow строкой — worker зарегистрирует класс под этим именем
-                _issue_input(payload, interactive=True),
-                id=wf_id,
-                task_queue="issue-lifecycle",
-                search_attributes=_search_attributes(repo, payload, issue_number),
-            )
+            try:
+                await client.start_workflow(
+                    "IssueLifecycle",  # имя workflow строкой — worker зарегистрирует класс под этим именем
+                    _issue_input(payload, interactive=True),
+                    id=wf_id,
+                    task_queue="issue-lifecycle",
+                    search_attributes=_search_attributes(repo, payload, issue_number),
+                )
+            except WorkflowAlreadyStartedError:
+                # Повторная доставка того же события — норма, а не сбой: GitHub
+                # ретраит, если не дождался ответа, и оба раза просит одного и
+                # того же. Цикл по этому Issue уже существует, то есть нужное
+                # состояние достигнуто.
+                #
+                # 500 здесь был хуже, чем бесполезен: GitHub на нём ретраит
+                # снова, каждый ретрай снова падает, и вебхук отвечает ошибкой
+                # на штатную ситуацию, пока доставка не будет брошена насовсем.
+                _log.info("цикл %s#%s уже запущен — повторная доставка",
+                          repo, issue_number)
 
         elif action == "closed":
             # Закрытый Issue не ждут. Голый signal, а НЕ signal-with-start:
