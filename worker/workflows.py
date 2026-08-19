@@ -110,7 +110,19 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
                 args=[analyze, stage_name],
                 start_to_close_timeout=timedelta(seconds=1200),  # claude до 900 + буфер
                 heartbeat_timeout=timedelta(seconds=300),
-                retry_policy=RetryPolicy(maximum_attempts=1),
+                # Сбой самой стадии не повторяется: прогон недетерминирован,
+                # мутирует файлы и стоит денег — повтор инициирует человек. Но
+                # heartbeat timeout не её сбой: воркер перезапустили (выкладкой,
+                # рестартом Docker), активность оборвалась, и ничего произведено
+                # не было. Без второй попытки любая выкладка посреди прогона
+                # убивала анализ целиком — так встал Issue #11 на стенде.
+                #
+                # Граница по типу: всё, что стадия поднимает сама, — RuntimeError.
+                # Таймауты и потеря воркера в этот тип не попадают.
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2,
+                    non_retryable_error_types=["RuntimeError"],
+                ),
             )
         await workflow.execute_activity(
             activities.publish_analysis,

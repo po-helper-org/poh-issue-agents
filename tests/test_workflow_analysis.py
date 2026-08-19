@@ -169,3 +169,61 @@ async def test_cleanup_failure_does_not_mask_success():
     assert "cleanup" in calls       # cleanup вызывался
     assert "error" not in calls     # успех НЕ превратился в ошибку
     assert "finish:analyze:ok" in calls
+
+
+@pytest.mark.asyncio
+async def test_stage_retries_infrastructure_failure_but_not_its_own():
+    """Смерть воркера и сбой стадии — разные вещи, и политика ретраев обязана их
+    различать.
+
+    Стадия `claude -p` не повторяется намеренно: она недетерминирована, мутирует
+    файлы и стоит денег. Но heartbeat timeout — не её сбой: воркер перезапустили
+    (например, выкладкой), активность оборвалась, и ничего произведено не было.
+    Без второй попытки любая выкладка посреди прогона убивала анализ целиком —
+    так и случилось на стенде с Issue #11: контейнер воркера пересобран в
+    04:44:31, «activity Heartbeat timeout» пришёл в 04:49:39, ровно через
+    heartbeat_timeout.
+
+    Инфраструктурный сбой изображается `ConnectionError`: как и таймаут, он не
+    RuntimeError, то есть попадает в ту же (повторяемую) половину политики.
+    """
+    attempts: list[str] = []
+    calls: list[str] = []
+
+    @activity.defn(name="ack_command")
+    async def ack(analyze: AnalyzeInput) -> None: ...
+
+    @activity.defn(name="prepare_workspace")
+    async def prepare(analyze: AnalyzeInput) -> None: ...
+
+    @activity.defn(name="run_fnr_stage")
+    async def stage(analyze: AnalyzeInput, stage_name: str) -> dict:
+        attempts.append(stage_name)
+        if stage_name == "concept" and attempts.count("concept") == 1:
+            raise ConnectionError("воркер перезапущен")
+        if stage_name == "debate":
+            raise RuntimeError("claude -p exit 1")
+        return {"stage": stage_name, "artifact": None, "bytes": 0}
+
+    @activity.defn(name="publish_analysis")
+    async def publish(analyze: AnalyzeInput) -> str:
+        return "b"
+
+    @activity.defn(name="cleanup_workspace")
+    async def cleanup(analyze: AnalyzeInput) -> None: ...
+
+    @activity.defn(name="publish_analysis_error")
+    async def publish_error(analyze: AnalyzeInput, reason: str) -> None:
+        calls.append("error")
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq, workflows=[IssueAnalysis],
+                          activities=[ack, prepare, stage, publish, cleanup, publish_error,
+                                      _finish_stub(calls), protocol_default]):
+            await env.client.execute_workflow(
+                IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
+
+    assert attempts.count("concept") == 2, "инфраструктурный сбой не переспросили"
+    assert attempts.count("debate") == 1, "сбой самой стадии не должен повторяться"
+    assert "error" in calls
