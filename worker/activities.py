@@ -1211,6 +1211,42 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     )
 
 
+async def _dev_resolve_branch(issue: IssueInput) -> str:
+    """Выключатель разработки + ветка аналитики — общий вход в стадию.
+
+    Раньше — две дословные копии, в `trigger_openhands_resolver` и в
+    `dev_begin`: правка формата ветки или условия выключателя попала бы в
+    одну и была бы забыта в другой, и линейный путь молча разошёлся бы с
+    путём через дочерний воркфлоу.
+    """
+    if not develop.enabled():
+        raise RuntimeError(
+            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
+
+    branch = f"research/issue-{issue.issue_number}"
+    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
+        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
+        # агент работает от тела Issue, но знать об этом должен явно.
+        branch = ""
+    return branch
+
+
+async def _dev_dispatch_and_announce(issue: IssueInput, branch: str) -> None:
+    """Режим `dispatch`: запуск в GitHub Actions + объявление человеку.
+
+    Раньше — две дословные копии, в `trigger_openhands_resolver` и в
+    `dev_dispatch`: правка аргументов `dispatch_inputs` или текста объявления
+    попала бы в одну и была бы забыта в другой.
+    """
+    await asyncio.to_thread(
+        github_client.dispatch_workflow,
+        issue.repo, develop.workflow_file(), develop.workflow_ref(),
+        develop.dispatch_inputs(issue.issue_number, branch=branch),
+    )
+    await _dev_announce(issue, branch,
+                        where="запустил OpenHands Resolver в GitHub Actions")
+
+
 @activity.defn
 async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
     """Активность Develop: разработка по подготовленному Issue.
@@ -1222,23 +1258,10 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
     Возвращает номер PR (режим `local`) либо None (`dispatch`: результат
     придёт событием `pr-open`, прогон идёт на чужой стороне).
     """
-    if not develop.enabled():
-        raise RuntimeError(
-            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
-
-    branch = f"research/issue-{issue.issue_number}"
-    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
-        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
-        # агент работает от тела Issue, но знать об этом должен явно.
-        branch = ""
+    branch = await _dev_resolve_branch(issue)
 
     if develop.mode() == develop.DISPATCH:
-        await asyncio.to_thread(
-            github_client.dispatch_workflow,
-            issue.repo, develop.workflow_file(), develop.workflow_ref(),
-            develop.dispatch_inputs(issue.issue_number, branch=branch),
-        )
-        await _dev_announce(issue, branch, where="запустил OpenHands Resolver в GitHub Actions")
+        await _dev_dispatch_and_announce(issue, branch)
         return None
 
     # Порядок не косметический: сначала клон и постановка — они единственные
@@ -1282,16 +1305,7 @@ async def dev_begin(issue: IssueInput) -> DevelopPlan:
     детерминированным при реплее. Один вызов вместо трёх ещё и делает вход в
     стадию одной строкой в истории.
     """
-    if not develop.enabled():
-        raise RuntimeError(
-            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
-
-    branch = f"research/issue-{issue.issue_number}"
-    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
-        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
-        # агент работает от тела Issue, но знать об этом должен явно.
-        branch = ""
-
+    branch = await _dev_resolve_branch(issue)
     return DevelopPlan(mode=develop.mode(), branch=branch)
 
 
@@ -1302,13 +1316,7 @@ async def dev_dispatch(issue: IssueInput, branch: str) -> None:
     Своих шагов на этой стороне нет — отсюда и один вызов вместо цепочки.
     Результат придёт событием `pr-open` от внешнего агента.
     """
-    await asyncio.to_thread(
-        github_client.dispatch_workflow,
-        issue.repo, develop.workflow_file(), develop.workflow_ref(),
-        develop.dispatch_inputs(issue.issue_number, branch=branch),
-    )
-    await _dev_announce(issue, branch,
-                        where="запустил OpenHands Resolver в GitHub Actions")
+    await _dev_dispatch_and_announce(issue, branch)
 
 
 async def collect_dev_followups(issue: IssueInput) -> list[int]:
