@@ -259,6 +259,10 @@ class IssueLifecycle:
         self._priority_tier = ""
         self._classification_label: str | None = None
         self._analysis_done = False
+        # Задача — часть чужого плана: подзадача декомпозиции. Ни своей
+        # декомпозиции, ни своей разработки у неё нет — и то и другое ведёт
+        # родитель, одним прогоном на весь объём MVP.
+        self._plan_member = False
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -543,6 +547,7 @@ class IssueLifecycle:
             self._priority_tier = carried.priority_tier
             self._classification_label = carried.classification_label
             self._analysis_done = carried.analysis_done
+            self._plan_member = carried.plan_member
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -568,6 +573,7 @@ class IssueLifecycle:
             priority_tier=self._priority_tier,
             classification_label=self._classification_label,
             analysis_done=self._analysis_done,
+            plan_member=self._plan_member,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -901,6 +907,12 @@ class IssueLifecycle:
                 )
                 return (lifecycle.ESCALATED, "escalated", True)
 
+            # Признак «часть чужого плана» — провенанс агента ВМЕСТЕ с ключом
+            # цепочки. Одного `origin:agent` мало: его носят и самостоятельные
+            # находки агента разработки, у которых родителя нет и которые обязаны
+            # идти своим путём целиком.
+            self._plan_member = state.origin_agent and state.root_issue is not None
+
             classification: ClassificationResult | None = None
             if not state.origin_agent:
                 gate = await workflow.execute_activity(
@@ -1112,7 +1124,10 @@ class IssueLifecycle:
         задачу как раньше, и это хуже, чем с планом, но лучше, чем ничего.
         """
         branch = f"research/issue-{issue.issue_number}"
-        if self._decompose:
+        # Подзадача чужого плана своего плана не получает: разбирать её значило
+        # бы пустить цепочку на второй круг, а там правило R7 отправит каждую
+        # внучатую задачу человеку — вместо плана вышла бы очередь к людям.
+        if self._decompose and not self._plan_member:
             try:
                 plan = await workflow.execute_activity(
                     activities.decompose_issue,
@@ -1147,7 +1162,12 @@ class IssueLifecycle:
         ставится (`_phase_handoff` отработал раньше) — она сообщает состояние
         задачи, а не то, кто именно её возьмёт.
         """
-        if deadlines.develop_autostart:
+        # Автостарт — только у задачи, которая владеет своим планом. Подзадачи
+        # исполняет РОДИТЕЛЬ: один прогон агента на весь объём MVP и один PR на
+        # фичу. Дай автостарт каждой подзадаче — и на одном репозитории
+        # одновременно работают N агентов: конфликты, N PR вместо одного и N
+        # ревью, ни одно из которых не про целую фичу.
+        if deadlines.develop_autostart and not self._plan_member:
             return await self._start_development(issue)
 
         decision = await self._wait_for_signal(await self._park(

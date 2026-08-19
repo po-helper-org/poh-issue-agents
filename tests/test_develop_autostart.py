@@ -319,3 +319,52 @@ async def test_bug_skips_analysis_but_still_reaches_development():
 
     assert "phase:business-analysis" not in calls
     assert "develop" in calls
+
+
+# --- Подзадача плана не начинает свою разработку ---
+
+@pytest.mark.timeout(120)
+async def test_subissue_of_a_plan_does_not_start_its_own_development():
+    """Подзадача декомпозиции доходит до `ready-for-dev` и там останавливается.
+
+    Разработку по плану ведёт РОДИТЕЛЬ: агент берёт весь объём MVP за один
+    прогон и открывает один PR. Если каждая подзадача при автостарте заводит
+    свою разработку, на одном репозитории одновременно работают N агентов, и
+    они пишут в него по очереди наперегонки — конфликты, N PR вместо одного и
+    N ревью, из которых ни одно не про целую фичу.
+
+    Признак «часть чужого плана» — `origin:agent` вместе с ключом цепочки
+    `root-issue: #N` в теле. Одного `origin:agent` мало: его носят и
+    самостоятельные находки агента разработки, у которых родителя нет.
+    """
+    _calls.clear()
+
+    @activity.defn(name="read_protocol_state")
+    async def subissue_state(repo: str, issue_number: int) -> ProtocolState:
+        return ProtocolState(origin_agent=True, root_issue=13)
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, subissue_state,
+                                      _deadlines(True, research=True), gate, classify,
+                                      duplicate, score, post_priority, mark_running,
+                                      finish, ack, prepare, stage_ok, publish, cleanup,
+                                      publish_error, ready, develop, decompose,
+                                      publish_plan, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            for _ in range(200):
+                if "ready-for-dev" in _calls and _calls[-1] == "awaiting":
+                    break
+                if "develop" in _calls:
+                    break
+                await asyncio.sleep(0.05)
+            await handle.terminate()
+
+    assert "ready-for-dev" in _calls, "подзадача не доехала до передачи"
+    assert "develop" not in _calls, "подзадача завела собственную разработку"
+    assert "decompose" not in _calls, (
+        "подзадача разбирается на свои подзадачи — цепочка идёт на второй круг, "
+        "и R7 отправит каждую внучатую задачу человеку")

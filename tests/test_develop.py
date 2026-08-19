@@ -307,3 +307,23 @@ def test_run_timeout_falls_back_on_garbage(monkeypatch):
     monkeypatch.setenv("DEVELOP_TIMEOUT_SEC", "скоро")
 
     assert develop.run_timeout() == develop.DEFAULT_RUN_TIMEOUT_SEC
+
+
+def test_worker_image_carries_the_binary_the_runner_is_launched_with():
+    """Одноразовый контейнер поднимает сам воркер — значит клиент Docker обязан
+    лежать в его образе.
+
+    Сокет демона воркеру уже смонтирован, и по конфигу всё выглядит рабочим:
+    том на месте, образ раннера собран, `DEVELOP_MODE=local`. Но команда
+    запуска — `docker run ...`, а бинаря `docker` в образе воркера не было, и
+    прогон падал на FileNotFoundError ещё до первой строки кода агента. Снаружи
+    это `phase:failed` на самом дорогом шаге, причём одинаковый и для «агент не
+    справился», и для «агента не запускали вовсе».
+    """
+    binary = develop.runner_command("slug", image="i", volume="v", mount="/m")[0]
+    dockerfile = (pathlib.Path(__file__).resolve().parents[1]
+                  / "worker" / "Dockerfile").read_text(encoding="utf-8")
+
+    assert binary == "docker"
+    assert "docker-ce-cli" in dockerfile, (
+        "воркер запускает раннер через docker, но клиента в его образе нет")

@@ -12,6 +12,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && npm install -g @anthropic-ai/claude-code repomix \
     && rm -rf /var/lib/apt/lists/*
 
+# Только КЛИЕНТ Docker (`docker-ce-cli`), без демона: одноразовый контейнер
+# агента разработки поднимает сам воркер через смонтированный сокет хоста.
+#
+# Сокет без клиента не даёт ничего, и по конфигу это незаметно: том на месте,
+# образ раннера собран, `DEVELOP_MODE=local`. А `docker run` падал на
+# FileNotFoundError ещё до первой строки кода агента — снаружи `phase:failed`
+# на самом дорогом шаге, одинаковый и для «агент не справился», и для «агента
+# не запускали вовсе».
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg \
+        -o /usr/share/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && rm -rf /var/lib/apt/lists/*
+
 # TODO: установка deb8flow — подставь реальный способ (pip/бинарь/build).
 
 # Скиллы и FNR-команды SA-helper кладём в ПОЛЬЗОВАТЕЛЬСКИЙ ~/.claude, а не в
