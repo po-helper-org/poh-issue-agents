@@ -6,6 +6,7 @@
 несёт канонический id и переживает завершение родителя.
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -112,6 +113,14 @@ async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None: ...
 @activity.defn(name="dev_begin")
 async def begin_local(issue: IssueInput) -> DevelopPlan:
     return DevelopPlan(mode="local", branch="research/issue-39")
+
+
+@activity.defn(name="dev_begin")
+async def begin_never_returns(issue: IssueInput) -> DevelopPlan:
+    """Никогда не завершается — держит канонический id «занятым» весь тест,
+    как держал бы его чужой прогон `IssueDevelopment`, переживший terminate
+    своего родителя (`ParentClosePolicy.ABANDON`)."""
+    await asyncio.Event().wait()
 
 
 @activity.defn(name="dev_dispatch")
@@ -235,3 +244,51 @@ async def test_the_development_child_survives_the_parent():
     assert [c.parent_close_policy for c in develop_children] == [
         ProtoParentClosePolicy.PARENT_CLOSE_POLICY_ABANDON
     ], "дочерний прогон разработки погибнет вместе с родителем"
+
+
+@pytest.mark.timeout(120)
+async def test_a_collision_with_an_orphaned_run_parks_instead_of_spinning():
+    """Находка 2: чужой прогон занял канонический id — второй `IssueLifecycle`
+    не должен вращаться вхолостую.
+
+    Сценарий: человек терминировал зависший `IssueLifecycle`, пока его
+    дочерний `develop-*` ещё жив (`ParentClosePolicy.ABANDON` его сохраняет).
+    Новый цикл по тому же Issue доходит до автостарта и натыкается на
+    `WorkflowAlreadyStartedError` — здесь это смоделировано прогоном
+    `IssueDevelopment`, который занимает канонический id напрямую и никогда
+    не возвращается (как и держал бы его настоящий осиротевший дочерний
+    прогон).
+
+    Раньше обработчик возвращал ТЕКУЩУЮ фазу (`ready-for-dev`), что для
+    автостарта означало немедленный повторный заход в `_start_development` на
+    следующем же витке цикла — без единой парковки между попытками. Здесь это
+    было бы видно как фаза, застрявшая на `ready-for-dev` (или полное
+    исчерпание таймаута теста на попытках повторного `start_child_workflow`),
+    а не честный переход в `in-development`.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        acts = [begin_never_returns if a is begin_local else a for a in ALL_ACTIVITIES]
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
+                          activities=acts):
+            # Занимаем канонический id НАПРЯМУЮ — как будто прежний
+            # `IssueLifecycle` его уже запустил и был снят человеком.
+            await env.client.start_workflow(
+                IssueDevelopment.run, _issue(),
+                id=development_workflow_id(REPO, ISSUE), task_queue=tq)
+
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await _await_phase(env, handle, lifecycle.CLASSIFIED)
+            await handle.signal(IssueLifecycle.human_decision, "bug-me")
+            phase = await _await_phase(env, handle, lifecycle.IN_DEVELOPMENT)
+
+    assert phase == lifecycle.IN_DEVELOPMENT, (
+        f"второй прогон наткнулся на WorkflowAlreadyStarted, но не признал, что "
+        f"разработка уже идёт где-то ещё — застрял на {phase!r}"
+    )
+    assert "publish" not in _calls, (
+        "второй прогон не должен был запустить СВОЙ прогон разработки")

@@ -80,24 +80,47 @@ SEEN_EVENTS_KEPT = 50
 HISTORY_EVENT_THRESHOLD = 800
 
 
+# Потолок разворота `.cause` в `_failure_reason`. Сегодняшняя цепочка стадии
+# разработки — три уровня (ChildWorkflowError → ActivityError →
+# ApplicationError), но число — не память самой длинной ожидаемой цепочки, а
+# защита от зацикливания: `.cause` — обычный settable-атрибут, и ничто не
+# мешает ему сослаться само на себя или на предка. Без потолка такая цепочка
+# крутила бы разворот вечно вместо того, чтобы вернуть хоть какую-то причину.
+_MAX_CAUSE_UNWRAP = 10
+
+
 def _failure_reason(e: BaseException) -> str:
     """"ExcType: message" из ПЕРВОПРИЧИНЫ для тегов/группировки Sentry.
 
-    catch-ветки ловят обёртку Temporal (ActivityError «Activity task failed»),
-    а не исходное исключение activity. Разворачиваем `.cause`: у ApplicationError
-    есть `.type` = имя исходного класса (RuntimeError/ValidationError/…), это и
-    даёт осмысленный fingerprint вместо единственного «ActivityError» на всё.
-    Чистые операции над атрибутами — детерминированы, безопасны в workflow-коде.
+    catch-ветки ловят обёртку Temporal, а не исходное исключение activity —
+    но глубина обёртки зависит от того, ЧТО сорвалось. Активность внутри
+    воркфлоу даёт `ActivityError`; с тех пор как дорогие стадии стали
+    дочерними воркфлоу, тот же сбой активности ВНУТРИ ребёнка приходит уже
+    как `ChildWorkflowError` поверх `ActivityError`. Разворачиваем `.cause` В
+    ЦИКЛЕ, а не один раз: единственный разворот `ChildWorkflowError` даёт
+    `ActivityError`, у которого своего `.type` нет — наружу уходило бы одно
+    и то же «ActivityError: Activity task failed» на любую причину сбоя
+    разработки (выключенный DEVELOP_ENABLED, код 137, отказ пуша, красные
+    тесты — всё в одном ведре без текста причины). Останавливаемся на первом
+    `ApplicationError` (у него есть `.type` = имя исходного класса) либо на
+    исключении без дальнейшей причины. Чистые операции над атрибутами —
+    детерминированы, безопасны в workflow-коде.
     """
     cause = getattr(e, "cause", None) or e
-    exc_type = getattr(cause, "type", None)
-    # `.type` — имя класса ТОЛЬКО у ApplicationError. У TimeoutError то же имя
-    # атрибута занято перечислением TimeoutType, и его значение — число: в
-    # Sentry уезжал тег `exc_type: 1` и fingerprint по этой единице
-    # (ISSUE-AGENT-B). Всё, что не строка, для группировки бесполезно.
-    if not isinstance(exc_type, str):
-        exc_type = type(cause).__name__
-    return f"{exc_type}: {cause}"
+    for _ in range(_MAX_CAUSE_UNWRAP):
+        exc_type = getattr(cause, "type", None)
+        # `.type` — имя класса ТОЛЬКО у ApplicationError. У TimeoutError то же
+        # имя атрибута занято перечислением TimeoutType, и его значение —
+        # число: в Sentry уезжал тег `exc_type: 1` и fingerprint по этой
+        # единице (ISSUE-AGENT-B). Всё, что не строка, для группировки
+        # бесполезно — разворачиваем глубже в поисках настоящего типа.
+        if isinstance(exc_type, str):
+            return f"{exc_type}: {cause}"
+        deeper = getattr(cause, "cause", None)
+        if deeper is None:
+            break
+        cause = deeper
+    return f"{type(cause).__name__}: {cause}"
 
 
 async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
@@ -1386,11 +1409,28 @@ class IssueLifecycle:
                 )
         except WorkflowAlreadyStartedError:
             # Разработка по этому Issue уже идёт — второй дорогой прогон не
-            # нужен. Результата отсюда не видно (это чужой прогон), поэтому
-            # фазу не двигаем: её сдвинет тот, кто прогон и запускал.
+            # нужен. Но вернуть ТЕКУЩУЮ фазу здесь нельзя: `_enter` на той же
+            # фазе — короткое замыкание без единого await (ни активности, ни
+            # таймера, см. начало метода), а автостарт вызывает этот метод
+            # СНОВА на следующем же витке `while True`, без парковки между
+            # попытками. Получался бы спин на скорости round-trip к серверу:
+            # WorkflowAlreadyStarted на каждой попытке, история распухает до
+            # continue-as-new и после него — по новой, потому что причина
+            # (чужой прогон всё ещё жив) никуда не делась.
+            #
+            # Разработка ПО ФАКТУ идёт — иначе не было бы этой ошибки, просто
+            # ведёт её не этот прогон (человек снял зависший `IssueLifecycle`,
+            # а дочерний `develop-*` пережил его благодаря ParentClosePolicy.
+            # ABANDON). Честная фаза — `in-development`, тот же исход, что и
+            # у режима `dispatch` ниже: результат придёт событием, а не
+            # прямым возвратом. Переход `ready-for-dev -> in-development`
+            # уже есть в таблице `shared/lifecycle.py` (инициатор `human`, но
+            # `transition()` не проверяет, кто зовёт). Дальше фаза уходит в
+            # `_phase_park` и честно ждёт сигнала — спин обрывается самим
+            # устройством цикла, а не таймаутом.
             workflow.logger.info("development already running for %s#%s",
                                  issue.repo, issue.issue_number)
-            return (self._phase, self._stage, False)
+            return (lifecycle.IN_DEVELOPMENT, "in-development", True)
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.

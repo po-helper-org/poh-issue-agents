@@ -50,6 +50,14 @@ async def agent_ok(issue: IssueInput) -> None:
     _calls.append("agent")
 
 
+@activity.defn(name="dev_run_agent")
+async def agent_fails_once(issue: IssueInput) -> None:
+    """Всегда падает — дефект #39 в чистом виде, если у этого шага когда-нибудь
+    заведутся ретраи по ошибке (`cheap` вместо `once`)."""
+    _calls.append("agent")
+    raise RuntimeError("прогон агента разработки завершился с кодом 137")
+
+
 @activity.defn(name="dev_followups")
 async def followups_ok(issue: IssueInput) -> list[int]:
     _calls.append("followups")
@@ -62,6 +70,12 @@ async def checks_ok(issue: IssueInput) -> None:
     # функцию (по умолчанию `python_functions` матчит любой префикс "test") и
     # роняет сбор с "fixture 'issue' not found" — это активность, а не тест.
     _calls.append("tests")
+
+
+@activity.defn(name="dev_tests")
+async def checks_fail_once(issue: IssueInput) -> None:
+    _calls.append("tests")
+    raise RuntimeError("проверки не прошли (код 1): red")
 
 
 @activity.defn(name="dev_publish")
@@ -132,6 +146,50 @@ async def test_a_failed_push_retries_only_the_push():
     assert _calls.count("publish") == 3, "публикация не повторилась"
     assert _calls.count("agent") == 1, "агент прогнан заново — ровно дефект #39"
     assert _calls.count("announce") == 1, "контур объявил о передаче дважды"
+
+
+@pytest.mark.timeout(60)
+async def test_a_failed_agent_run_is_not_retried():
+    """Находка 4: `test_a_failed_push_retries_only_the_push` доказывает, что
+    публикация повторяется, но стаб агента там ни разу не падает — замена
+    `once` на `cheap` у `dev_run_agent` вернула бы дефект #39 (двадцать минут
+    прогона трижды подряд) и осталась бы незамеченной этим набором.
+
+    Здесь падает сам агент: он обязан быть вызван РОВНО один раз, а не три —
+    ретрай такого шага инициирует человек, а не политика ретраев.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await _run(env, tq, [begin_local, dispatch_stub, prepare_ok,
+                                 announce_ok, agent_fails_once, followups_ok,
+                                 checks_ok, publish_ok])
+
+    assert _calls.count("agent") == 1, "прогон агента повторился — вернулся дефект #39"
+    # Два уровня обёртки: WorkflowFailureError.cause — ActivityError
+    # («Activity task failed», без текста причины), причина — уровнем глубже,
+    # в его собственном .cause (ApplicationError от RuntimeError активности).
+    assert "137" in str(exc_info.value.cause.cause)
+    assert "publish" not in _calls, "до публикации после срыва агента доходить не должны"
+
+
+@pytest.mark.timeout(60)
+async def test_a_failed_test_run_is_not_retried():
+    """Того же заслуживает шаг тестов (находка 4): он тоже недетерминирован и
+    стоит времени, а ретраить красный прогон — значит просто ждать того же
+    результата ещё раз."""
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        with pytest.raises(WorkflowFailureError):
+            await _run(env, tq, [begin_local, dispatch_stub, prepare_ok,
+                                 announce_ok, agent_ok, followups_ok,
+                                 checks_fail_once, publish_ok])
+
+    assert _calls.count("tests") == 1, "прогон тестов повторился"
+    assert _calls.count("agent") == 1, "агент перезапущен из-за срыва тестов"
+    assert "publish" not in _calls, "до публикации после красных тестов доходить не должны"
 
 
 @pytest.mark.timeout(60)

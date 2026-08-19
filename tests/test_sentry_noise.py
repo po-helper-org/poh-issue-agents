@@ -156,3 +156,59 @@ def test_failure_reason_keeps_the_application_error_type():
 
     assert _failure_reason(FakeActivityError(FakeApplicationError())) == (
         "ValidationError: поле не заполнено")
+
+
+def test_failure_reason_unwraps_through_a_child_workflow_wrapper():
+    """Находка 3: стадия разработки стала дочерним воркфлоу, и цепочка
+    удлинилась на уровень — `ChildWorkflowError` поверх `ActivityError`.
+
+    Один разворот `.cause` останавливался на `ActivityError`, у которого
+    своего `.type` нет, и наружу уходило одно и то же «ActivityError: Activity
+    task failed» на ЛЮБУЮ причину сбоя разработки — выключенный
+    DEVELOP_ENABLED, агент с кодом 137, отказ пуша, красные тесты — тот же
+    дефект ISSUE-AGENT-B, вернувшийся с другой стороны (см. docstring
+    `_failure_reason`).
+    """
+    from workflows import _failure_reason
+
+    class FakeApplicationError(Exception):
+        type = "RuntimeError"
+
+        def __str__(self):
+            return "git push → код 1: protected branch"
+
+    class FakeActivityError(Exception):
+        def __init__(self, cause):
+            self.cause = cause
+
+        def __str__(self):
+            return "Activity task failed"
+
+    class FakeChildWorkflowError(Exception):
+        def __init__(self, cause):
+            self.cause = cause
+
+        def __str__(self):
+            return "Child workflow execution failed"
+
+    reason = _failure_reason(
+        FakeChildWorkflowError(FakeActivityError(FakeApplicationError())))
+
+    assert reason == "RuntimeError: git push → код 1: protected branch"
+
+
+def test_failure_reason_does_not_hang_on_a_self_referencing_cause():
+    """`.cause` — обычный атрибут, и ничто не мешает ему сослаться само на
+    себя. Разворот обязан оборваться потолком, а не зависнуть — воркфлоу,
+    который завис на разборе ПРИЧИНЫ сбоя, отладить нечем: он сам ничего не
+    сообщает."""
+    from workflows import _failure_reason
+
+    class FakeLoop(Exception):
+        def __str__(self):
+            return "loop"
+
+    loop = FakeLoop()
+    loop.cause = loop  # цепочка длиной в саму себя
+
+    assert _failure_reason(loop) == "FakeLoop: loop"
