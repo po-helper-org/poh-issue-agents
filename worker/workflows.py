@@ -84,7 +84,13 @@ def _failure_reason(e: BaseException) -> str:
     Чистые операции над атрибутами — детерминированы, безопасны в workflow-коде.
     """
     cause = getattr(e, "cause", None) or e
-    exc_type = getattr(cause, "type", None) or type(cause).__name__
+    exc_type = getattr(cause, "type", None)
+    # `.type` — имя класса ТОЛЬКО у ApplicationError. У TimeoutError то же имя
+    # атрибута занято перечислением TimeoutType, и его значение — число: в
+    # Sentry уезжал тег `exc_type: 1` и fingerprint по этой единице
+    # (ISSUE-AGENT-B). Всё, что не строка, для группировки бесполезно.
+    if not isinstance(exc_type, str):
+        exc_type = type(cause).__name__
     return f"{exc_type}: {cause}"
 
 

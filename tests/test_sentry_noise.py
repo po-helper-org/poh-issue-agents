@@ -108,3 +108,51 @@ def test_client_disconnect_answers_quietly():
         webhook_main._client_disconnect(_Req(), ClientDisconnect()))
 
     assert response.status_code == 204
+
+
+# --- Причина сбоя, по которой группируются события ---
+
+def test_failure_reason_names_the_class_when_type_is_not_a_string():
+    """ISSUE-AGENT-B: в Sentry уезжал тег `exc_type: 1`.
+
+    У `ApplicationError` атрибут `.type` — имя исходного класса, и по нему
+    строится fingerprint. У `TimeoutError` то же имя занято перечислением
+    `TimeoutType`, чьё значение — число: группировка шла по единице.
+    """
+    import enum
+
+    from workflows import _failure_reason
+
+    class TimeoutType(enum.IntEnum):
+        START_TO_CLOSE = 1
+
+    class FakeTimeout(Exception):
+        type = TimeoutType.START_TO_CLOSE
+
+        def __str__(self):
+            return "activity StartToClose timeout"
+
+    class FakeActivityError(Exception):
+        def __init__(self, cause):
+            self.cause = cause
+
+    reason = _failure_reason(FakeActivityError(FakeTimeout()))
+
+    assert reason == "FakeTimeout: activity StartToClose timeout"
+
+
+def test_failure_reason_keeps_the_application_error_type():
+    from workflows import _failure_reason
+
+    class FakeApplicationError(Exception):
+        type = "ValidationError"
+
+        def __str__(self):
+            return "поле не заполнено"
+
+    class FakeActivityError(Exception):
+        def __init__(self, cause):
+            self.cause = cause
+
+    assert _failure_reason(FakeActivityError(FakeApplicationError())) == (
+        "ValidationError: поле не заполнено")
