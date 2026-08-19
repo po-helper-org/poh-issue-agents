@@ -143,3 +143,59 @@ def test_exhausted_comment_blames_the_code_not_the_reviewer():
     body = pr_closing.exhausted_comment(3)
 
     assert "проблема в самом коде" in body
+
+
+def test_pr_branch_is_cloned_for_the_fix_round(monkeypatch, tmp_path):
+    """Круг правок клонирует ВЕТКУ PR, а не основную.
+
+    Вызов был `_clone_repo(repo, dest, branch=branch)`, а такого параметра у
+    клонирования не было вовсе: круг падал на первой же строке с
+    `TypeError: _clone_repo() got an unexpected keyword argument 'branch'`.
+    На живом прогоне #19 это выглядело так: ревью опубликовано, через двенадцать
+    секунд «пройдено 3 кругов правок» и задача у человека — при том что ни один
+    круг не начинался.
+    """
+    import pathlib
+
+    import activities as activities_module
+
+    monkeypatch.setenv("DEVELOP_WORKSPACE_MOUNT", str(tmp_path))
+    commands: list[list[str]] = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(activities_module.github_client, "auth_token", lambda repo: "t")
+
+    def fake_run(cmd, **kw):
+        commands.append(cmd)
+        if "clone" in cmd:
+            pathlib.Path(cmd[-1]).mkdir(parents=True, exist_ok=True)  # как настоящий clone
+        return _Done()
+
+    monkeypatch.setattr(activities_module.subprocess, "run", fake_run)
+
+    activities_module._prfix_prepare("o/r", 28, "feature/19-openhands", "постановка")
+
+    clone = next(c for c in commands if "clone" in c)
+    assert "--branch" in clone, f"клонируется не ветка PR: {clone}"
+    assert clone[clone.index("--branch") + 1] == "feature/19-openhands"
+
+
+def test_exhausted_comment_does_not_claim_rounds_that_never_ran():
+    """Сообщение обязано различать «три круга не сошлись» и «круг сорвался».
+
+    Оно печатало потолок вместо пройденного, и на живом прогоне #19 получилось
+    «пройдено 3 кругов правок» через двенадцать секунд после ревью — при том что
+    первый же круг упал на TypeError и ни один не начинался. Человек, читающий
+    такое, идёт разбирать несуществующий спор с ревьюером.
+    """
+    broke = pr_closing.exhausted_comment(3, rounds_done=1)
+    real = pr_closing.exhausted_comment(3, rounds_done=3)
+
+    assert "3 кругов" not in broke
+    assert "сорвался" in broke or "прервал" in broke
+    assert "3 кругов" in real
+    assert "проблема в самом коде" in real

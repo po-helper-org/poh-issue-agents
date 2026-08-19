@@ -140,3 +140,54 @@ def test_a_failed_issue_does_not_lose_the_rest(tmp_path, monkeypatch):
     asyncio.run(activities_module.collect_dev_followups(_issue()))
 
     assert created == ["вторая"]
+
+
+# --- Постановка не уезжает в PR ---
+
+def test_task_statement_is_not_committed(tmp_path, monkeypatch):
+    """`.task.md` — вход контура, а не часть правки.
+
+    Файл лежит в рабочем дереве, и `git add -A` забирает его вместе с кодом. На
+    живом прогоне #19 это дало PR из одного файла на 1721 строку — нашей же
+    постановки, — и заодно спрятало главное: агент не изменил НИ ОДНОГО файла.
+    Гвард «изменений нет — открывать нечего» видел дифф и молчал.
+    """
+    monkeypatch.setenv("DEVELOP_WORKSPACE_MOUNT", str(tmp_path))
+    clone = tmp_path / develop.task_slug("o/r", 19) / "repo"
+    clone.mkdir(parents=True)
+    (clone / ".task.md").write_text("постановка", encoding="utf-8")
+    captured = {}
+
+    def fake_publish(repo, clone_dir, branch, *, title, body, message):
+        captured["task_md_exists"] = (pathlib.Path(clone_dir) / ".task.md").exists()
+        return 28
+
+    monkeypatch.setattr(activities_module.github_client, "publish_worktree", fake_publish)
+
+    number = activities_module._dev_publish(_issue(19), "research/issue-19")
+
+    assert number == 28
+    assert captured["task_md_exists"] is False, "постановка уехала в коммит"
+    assert not (clone / ".task.md").exists()
+
+
+def test_agent_output_reaches_the_log(tmp_path, monkeypatch, caplog):
+    """Вывод агента виден и на успешном прогоне.
+
+    Он логировался только в тексте исключения, то есть при ненулевом коде.
+    Прогон, который отработал 21 минуту и ничего не сделал, не оставлял ни
+    строки — разбираться было не с чем.
+    """
+    monkeypatch.setenv("DEVELOP_WORKSPACE_MOUNT", str(tmp_path))
+
+    class _Done:
+        returncode = 0
+        stdout = "AGENT-SAID-THIS"
+        stderr = ""
+
+    monkeypatch.setattr(activities_module.subprocess, "run", lambda cmd, **kw: _Done())
+
+    with caplog.at_level("INFO", logger="activities"):
+        activities_module._dev_run_agent(_issue(19))
+
+    assert "AGENT-SAID-THIS" in caplog.text

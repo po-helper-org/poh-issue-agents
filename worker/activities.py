@@ -709,9 +709,13 @@ def _require_workspace(analyze: AnalyzeInput, requires: str | None) -> str:
     return clone_dir
 
 
-def _clone_repo(repo: str, dest: str) -> None:
+def _clone_repo(repo: str, dest: str, branch: str | None = None) -> None:
     """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
     реальный код (`файл:строка`), одного текста Issue недостаточно.
+
+    `branch` нужен кругу правок: он работает поверх ветки PR, а не основной, —
+    иначе правки ложились бы не на то, что видел ревьюер. Пусто — ветка по
+    умолчанию, как для анализа и разработки.
 
     Токен идёт через credential.helper в env, а НЕ вклеен в URL: argv команды
     целиком рендерится в текст subprocess.CalledProcessError/TimeoutExpired,
@@ -727,8 +731,11 @@ def _clone_repo(repo: str, dest: str) -> None:
         "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
         "GH_CLONE_TOKEN": github_client.auth_token(repo),
     }
+    command = ["git", "clone", "--depth", "1"]
+    if branch:
+        command += ["--branch", branch]
     subprocess.run(
-        ["git", "clone", "--depth", "1", url, dest],
+        [*command, url, dest],
         env=env, check=True, capture_output=True, text=True, timeout=CLONE_TIMEOUT_SEC,
     )
 
@@ -1101,6 +1108,11 @@ def _dev_run_agent(issue: IssueInput) -> str:
         raise RuntimeError(
             f"прогон агента разработки завершился с кодом {result.returncode}: "
             f"{tail[-1500:]}")
+    # Логируем и на успехе. Раньше вывод жил только в тексте исключения, то есть
+    # при ненулевом коде, — и прогон, который отработал двадцать минут и не
+    # тронул ни одного файла, не оставлял ни строки. Разбираться было не с чем.
+    logger.info("Develop %s#%s: вывод агента\n%s",
+                issue.repo, issue.issue_number, tail or "(пусто)")
     return tail
 
 
@@ -1130,6 +1142,12 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     контуру. Возвращает номер PR либо None, если агент ничего не изменил.
     """
     _, clone_dir = _dev_paths(issue)
+    # Постановка — вход контура, а не часть правки. Она лежит в рабочем дереве, и
+    # `git add -A` забирает её вместе с кодом: на живом прогоне это дало PR из
+    # одного файла на 1721 строку — нашей же постановки. Хуже того, дифф из неё
+    # обманывал гвард «изменений нет — открывать нечего», и PR открывался по
+    # прогону, в котором агент не тронул ни одного файла.
+    (clone_dir / ".task.md").unlink(missing_ok=True)
     work = develop.work_branch(issue.issue_number)
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
@@ -1435,8 +1453,9 @@ async def finish_pr_fixing(repo: str, pr_number: int, rounds: int, settled: bool
         await asyncio.to_thread(github_client.post_comment, repo, pr_number,
                                 pr_closing.settled_comment(rounds, verdict))
         return
-    await asyncio.to_thread(github_client.post_comment, repo, pr_number,
-                            pr_closing.exhausted_comment(pr_closing.max_rounds()))
+    await asyncio.to_thread(
+        github_client.post_comment, repo, pr_number,
+        pr_closing.exhausted_comment(pr_closing.max_rounds(), rounds_done=rounds))
     await asyncio.to_thread(github_client.add_label, repo, pr_number,
                             pr_closing.NEEDS_HUMAN_PR)
 
