@@ -9,6 +9,7 @@
 
 import asyncio
 import pathlib
+import re
 
 import pytest
 
@@ -327,3 +328,23 @@ def test_worker_image_carries_the_binary_the_runner_is_launched_with():
     assert binary == "docker"
     assert "docker-ce-cli" in dockerfile, (
         "воркер запускает раннер через docker, но клиента в его образе нет")
+
+
+def test_worker_and_runner_agree_on_the_node_version():
+    """Проверки проекта гоняет воркер, код проекта исполняет раннер — Node у них
+    обязан быть один.
+
+    Воркер прогоняет `DEVELOP_TEST_COMMAND` до пуша, ту же строку, что и CI. На
+    живом прогоне #13 это дало `Could not find 'tests/*.test.mjs'`: команда
+    репозитория — `node --test "tests/*.test.mjs"`, glob раскрывает сам Node
+    (с 22), а в образе воркера стоял 20. Красный шаг разработки на зелёном коде.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1]
+
+    def node_major(dockerfile: str) -> str:
+        text = (root / dockerfile).read_text(encoding="utf-8")
+        found = re.search(r"deb\.nodesource\.com/setup_(\d+)\.x", text)
+        assert found, f"{dockerfile}: не нашёл установку Node"
+        return found.group(1)
+
+    assert node_major("worker/Dockerfile") == node_major("openhands/Dockerfile")
