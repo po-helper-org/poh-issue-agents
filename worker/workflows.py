@@ -262,6 +262,10 @@ class IssueLifecycle:
         # Номер PR по этой задаче. Известен из доклада внешнего агента либо от
         # локального прогона разработки; нужен фазе доведения.
         self._pr_number: int | None = None
+        # Разбивать ли задачу на подзадачи перед передачей в разработку.
+        # Значение приезжает активностью вместе со сроками — по той же причине,
+        # что и остальные тумблеры: оно обязано лежать в истории.
+        self._decompose = True
         # Ключи уже учтённых событий агентов: один факт двигает фазу один раз.
         self._seen_agent_events: list[str] = []
         # Чего Issue ждёт прямо сейчас. None — работа идёт, ожидания нет.
@@ -770,6 +774,9 @@ class IssueLifecycle:
             start_to_close_timeout=timedelta(seconds=30),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+        # Тумблеры едут вместе со сроками: значение обязано лежать в истории,
+        # иначе переключённый посреди прогона уронил бы реплей недетерминизмом.
+        self._decompose = deadlines.decompose_enabled
         while True:
             if self._closed_by is not None and not lifecycle.is_terminal(self._phase):
                 # Issue закрыт на GitHub: любая парковка потеряла смысл. Одна
@@ -1066,7 +1073,37 @@ class IssueLifecycle:
         return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
 
     async def _phase_handoff(self, issue: IssueInput) -> tuple | None:
-        """Фаза `system-requirements`: передача разработчику (H1)."""
+        """Фаза `system-requirements`: декомпозиция и передача разработчику (H1).
+
+        Разбиение идёт ЗДЕСЬ, до `ready-for-dev`: агент разработки должен
+        получить план исполнения, а не задачу целиком. Иначе он сам решает, с
+        чего начать и что считать достаточным, — а это решение принимается до
+        кода.
+
+        Сбой декомпозиции не отменяет передачу. План — это улучшение переданной
+        задачи, а не условие её существования: без него разработчик получит
+        задачу как раньше, и это хуже, чем с планом, но лучше, чем ничего.
+        """
+        branch = f"research/issue-{issue.issue_number}"
+        if self._decompose:
+            try:
+                plan = await workflow.execute_activity(
+                    activities.decompose_issue,
+                    args=[issue, branch],
+                    start_to_close_timeout=timedelta(seconds=600),
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+                await workflow.execute_activity(
+                    activities.publish_decomposition,
+                    args=[issue, plan, branch],
+                    start_to_close_timeout=timedelta(seconds=600),
+                    # Повтор создал бы дубли подзадач: часть уже заведена.
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            except Exception as e:
+                workflow.logger.warning("декомпозиция не выполнена: %s",
+                                        _failure_reason(e))
+
         await workflow.execute_activity(
             activities.mark_ready_for_dev,
             args=[issue, self._priority_tier, f"research/issue-{issue.issue_number}"],

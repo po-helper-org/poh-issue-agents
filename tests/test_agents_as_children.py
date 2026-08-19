@@ -55,7 +55,10 @@ async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
 
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
-    return Deadlines()
+    # Декомпозиция выключена намеренно: тест про запуск агентов дочерними
+    # прогонами, а не про разбиение задачи. С включённой фаза передачи уходила
+    # бы в разбор, и проверялся бы уже не тот путь.
+    return Deadlines(decompose_enabled=False)
 
 
 @activity.defn(name="set_phase")

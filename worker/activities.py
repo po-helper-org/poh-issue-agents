@@ -23,7 +23,7 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import develop, labels, lifecycle, pr_closing, sentry_setup
+from shared import decomposition, develop, labels, lifecycle, pr_closing, sentry_setup
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
@@ -261,6 +261,7 @@ def read_deadlines() -> Deadlines:
         side_state_hours=_hours("PARK_SIDE_STATE_HOURS", 168),
         develop_autostart=_flag("DEVELOP_AUTOSTART"),
         research_autostart=_flag("RESEARCH_AUTOSTART"),
+        decompose_enabled=decomposition.enabled(),
         pr_fix_enabled=pr_closing.enabled(),
         pr_fix_max_rounds=pr_closing.max_rounds(),
     )
@@ -1147,6 +1148,88 @@ async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:
         except Exception as exc:
             logger.warning("Develop %s#%s: %s не проставлен (%s) — прогон уже идёт",
                            issue.repo, issue.issue_number, step, exc)
+
+
+# --- Декомпозиция задачи на подзадачи и релизы ---
+
+class DecomposedItem(BaseModel):
+    title: str
+    body_markdown: str = ""
+    release: str = Field(description="mvp | grow | support")
+    depends_on: list[int] = []
+    rationale: str = ""
+
+
+class DecompositionExtraction(BaseModel):
+    summary: str
+    items: list[DecomposedItem]
+
+
+@activity.defn
+def decompose_issue(issue: IssueInput, branch: str) -> dict:
+    """Разбор задачи на подзадачи с раскладкой по релизам.
+
+    Требования читаются из ветки аналитики: разбивать по одному телу Issue —
+    значит делить намерение, а не работу. Если аналитики не было, разбор идёт
+    от тела, и это честнее, чем притворяться, будто требования есть.
+    """
+    context = [f"Заголовок: {issue.title}", "", "Описание:", issue.body or "(пусто)"]
+    if branch:
+        for name in ("system_requirements.md", "concept.md"):
+            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
+            if text:
+                context += ["", f"--- {name} ---", text]
+
+    result = llm.extract(
+        _load_prompt("system_decompose_issue.md"),
+        "\n".join(context)[:60000],
+        DecompositionExtraction,
+        model=llm.MODEL_CLASSIFY,
+    )
+    items = decomposition.validate([i.model_dump() for i in result.items])
+    return {"summary": result.summary, "items": items}
+
+
+@activity.defn
+def publish_decomposition(issue: IssueInput, plan: dict, branch: str) -> list[int]:
+    """Создаёт подзадачи и публикует план в родителе.
+
+    Порядок важен: сначала все подзадачи, потом сводка. Сводка ссылается на
+    номера, которых до создания не существует, а план с битыми ссылками хуже
+    отсутствующего — по нему пойдут и упрутся.
+
+    Зависимости проставляются вторым проходом по той же причине: подзадача
+    может зависеть от той, что создаётся позже.
+    """
+    items = plan["items"]
+    numbers: dict[int, int] = {}
+
+    for index, item in enumerate(items):
+        number = github_client.create_issue(
+            issue.repo, item["title"],
+            decomposition.subissue_body(item, parent=issue.issue_number,
+                                        numbers=numbers, index=index),
+            labels=[labels.ORIGIN_AGENT, decomposition.release_label(item["release"])],
+        )
+        numbers[index] = number
+
+    # Второй проход: тела с зависимостями, которые теперь известны номерами.
+    for index, item in enumerate(items):
+        if not item["depends_on"]:
+            continue
+        try:
+            github_client.update_issue_body(
+                issue.repo, numbers[index],
+                decomposition.subissue_body(item, parent=issue.issue_number,
+                                            numbers=numbers, index=index))
+        except Exception as exc:
+            logger.warning("не дописал зависимости в #%s: %s", numbers[index], exc)
+
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        decomposition.parent_summary(items, numbers, summary=plan.get("summary", ""),
+                                     branch=branch))
+    return [numbers[i] for i in sorted(numbers)]
 
 
 # --- Доведение PR по замечаниям ревью (H3→H4) ---

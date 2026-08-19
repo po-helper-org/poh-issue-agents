@@ -613,3 +613,12 @@ def push_fixes(repo: str, clone_dir: str, branch: str, message: str) -> bool:
     git("commit", "-m", message)
     git("push", "origin", f"HEAD:{branch}")
     return True
+
+
+def update_issue_body(repo: str, issue_number: int, body: str) -> None:
+    if _dry_run():
+        _log.info("[DRY_RUN] update body %s#%s", repo, issue_number)
+        return
+    resp = requests.patch(f"https://api.github.com/repos/{repo}/issues/{issue_number}",
+                          headers=_auth_headers(repo), json={"body": body}, timeout=30)
+    resp.raise_for_status()
