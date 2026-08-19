@@ -1292,11 +1292,32 @@ async def collect_dev_followups(issue: IssueInput) -> list[int]:
 
 
 async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:
-    """Метка и комментарий о начале работы — best-effort.
+    """Метка и комментарий о начале работы — best-effort и ОДИН раз на задачу.
 
     Прогон к этому моменту начался; падать из-за непоставленной метки значило
     бы отправить в `failed` задачу, которая на самом деле в работе.
+
+    Повторный вход в передачу (перезапуск активности, второе решение человека)
+    не должен давать второго объявления: на живом прогоне #39 их набралось три
+    штуки подряд, и по треду нельзя было понять, идёт одна работа или три.
+    Признак — метка `in-development`: её ставит эта же функция строкой ниже, и
+    снимает смена фазы (`set_phase`), то есть она держится ровно столько,
+    сколько длится передача.
     """
+    try:
+        already = await asyncio.to_thread(
+            github_client.get_issue, issue.repo, issue.issue_number)
+        names = [label["name"] for label in already.get("labels", [])]
+        if develop.IN_DEVELOPMENT_LABEL in names:
+            logger.info("Develop %s#%s: объявление уже сделано — повторно не пишу",
+                        issue.repo, issue.issue_number)
+            return
+    except Exception as exc:
+        # Не прочитали состояние — объявляем. Лишний комментарий хуже молчания
+        # ровно настолько, насколько молчание хуже дубля: человек должен знать,
+        # что работа идёт.
+        logger.warning("Develop %s#%s: не прочитал метки (%s) — объявляю",
+                       issue.repo, issue.issue_number, exc)
     for step, call in (
         ("метка", lambda: github_client.add_label(
             issue.repo, issue.issue_number, develop.IN_DEVELOPMENT_LABEL)),
