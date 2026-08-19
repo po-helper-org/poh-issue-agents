@@ -26,6 +26,15 @@ def estimate_workflow_id(repo_full_name: str, issue_number: int,
     return f"estimate-{repo_full_name}-{issue_number}-{marker}"
 
 
+def bft_workflow_id(repo_full_name: str, issue_number: int, mode: str) -> str:
+    # Режим входит в id, а лишних различителей нет. Два режима — разные прогоны,
+    # и глубокий не должен упираться в идущий быстрый. Внутри режима id
+    # фиксирован: повторная команда при идущем прогоне упирается в
+    # WorkflowAlreadyStarted вместо второго прогона, а после завершения id
+    # свободен — и следующая команда с новыми уточнениями честно новый прогон.
+    return f"bft-{mode}-{repo_full_name}-{issue_number}"
+
+
 def comment_ack_workflow_id(repo_full_name: str, comment_id: int) -> str:
     # Ключ — id комментария: повторная доставка того же события упирается в
     # WorkflowAlreadyStarted, и второй реакции GitHub не просят. Номер issue в

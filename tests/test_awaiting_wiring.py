@@ -66,12 +66,12 @@ async def gate_ok(issue: IssueInput, thread: list[str]) -> GateResult:
 
 
 @activity.defn(name="classify_issue")
-async def classify_bug(issue: IssueInput) -> ClassificationResult:
+async def classify_bug(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:bug", answer="ok")
 
 
 @activity.defn(name="classify_issue")
-async def classify_answers(issue: IssueInput) -> ClassificationResult:
+async def classify_answers(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:consultation", answer="вот ответ")
 
 
@@ -207,7 +207,7 @@ async def test_a_failed_run_stands_in_the_queue_instead_of_vanishing():
     _labels.clear()
 
     @activity.defn(name="classify_issue")
-    async def classify_breaks(issue: IssueInput) -> ClassificationResult:
+    async def classify_breaks(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
         raise RuntimeError("модель недоступна")
 
     @activity.defn(name="post_error_label")
@@ -277,7 +277,7 @@ async def test_resumed_work_leaves_the_human_queue():
     _labels.clear()
 
     @activity.defn(name="classify_issue")
-    async def classify_breaks(issue: IssueInput) -> ClassificationResult:
+    async def classify_breaks(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
         raise RuntimeError("модель недоступна")
 
     @activity.defn(name="post_error_label")

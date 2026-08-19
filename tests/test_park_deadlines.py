@@ -111,7 +111,7 @@ async def ask(issue: IssueInput, questions: str) -> None:
 
 
 @activity.defn(name="classify_issue")
-async def classify(issue: IssueInput) -> ClassificationResult:
+async def classify(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:feature-request", answer="ok")
 
 

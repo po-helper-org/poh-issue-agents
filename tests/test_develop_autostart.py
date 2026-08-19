@@ -78,7 +78,7 @@ async def gate(issue: IssueInput, thread: list[str]) -> GateResult:
 
 
 @activity.defn(name="classify_issue")
-async def classify(issue: IssueInput) -> ClassificationResult:
+async def classify(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:feature-request", answer="ok")
 
 
@@ -279,7 +279,7 @@ async def _run_closed_loop(classification: str) -> list[str]:
     """Оба тумблера включены: от заявки до передачи в разработку без человека."""
 
     @activity.defn(name="classify_issue")
-    async def classify_as(issue: IssueInput) -> ClassificationResult:
+    async def classify_as(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
         return ClassificationResult(label=classification, answer="ok")
 
     _calls.clear()

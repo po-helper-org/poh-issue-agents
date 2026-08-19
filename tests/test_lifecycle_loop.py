@@ -71,18 +71,18 @@ async def gate_sufficient(issue: IssueInput, thread: list[str]) -> GateResult:
 
 
 @activity.defn(name="classify_issue")
-async def classify_feature(issue: IssueInput) -> ClassificationResult:
+async def classify_feature(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     _calls.append("classify")
     return ClassificationResult(label="advisor:feature-request", answer="ok")
 
 
 @activity.defn(name="classify_issue")
-async def classify_consultation(issue: IssueInput) -> ClassificationResult:
+async def classify_consultation(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:consultation", answer="вот ответ")
 
 
 @activity.defn(name="classify_issue")
-async def classify_fails_once(issue: IssueInput) -> ClassificationResult:
+async def classify_fails_once(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     """Первый прогон срывается, второй проходит: так проверяется именно
     перезапуск обработки, а не бесконечный круг `created → failed → created`."""
     _calls.append("classify")
