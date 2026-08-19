@@ -1283,7 +1283,12 @@ class IssueLifecycle:
         # MVP одним прогоном. Человеку по ней делать нечего, а выборка
         # `needs-human:*` обязана быть полной очередью к людям — восемь подзадач
         # одной фичи в ней означают, что на саму выборку перестанут смотреть.
-        if self._plan_member:
+        # Под маркером патча: вид ожидания решает, будет ли вызов метки очереди
+        # перед таймером, а прежняя история идёт к таймеру напрямую. Реплей без
+        # маркера падает `Timer machine does not handle ActivityTaskScheduled` —
+        # так легли подзадачи #20–#27 на стенде.
+        if self._plan_member and workflow.patched(
+                "issue-lifecycle-plan-member-waits-for-parent"):
             kind = awaiting_mod.EXTERNAL_AGENT
             who = "контур: прогон разработки по родительской задаче"
             reason = (f"исполнение в составе плана задачи #{self._root_issue}"
