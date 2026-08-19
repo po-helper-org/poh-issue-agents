@@ -45,6 +45,14 @@ with workflow.unsafe.imports_passed_through():
 
 MAX_CLARIFICATION_ROUNDS = 2
 
+# Потолок кругов уточнения ПОСЛЕ аналитики. Вопросы здесь другие, чем на входе:
+# входной гейт спрашивает «что вообще нужно», аналитика — «чего не хватает,
+# чтобы решение было однозначным». Потолок тот же по причине той же: вопрос, на
+# который не отвечают, не должен держать задачу вечно — по исчерпании круги
+# кончаются, вопросы уезжают в чеклист готовности, и решение принимает тот, кто
+# возьмёт задачу.
+MAX_ANALYSIS_CLARIFY_ROUNDS = 2
+
 # Запрос на прогон аналитики, доставленный в общую очередь сигналов. Префикс —
 # та же схема, что у `__comment__:`: одна очередь, разные виды событий, и
 # обработчик фазы решает, что с ними делать.
@@ -267,6 +275,10 @@ class IssueLifecycle:
         # своей ветки анализа у неё нет, и ссылка на `research/issue-<своё>`
         # была бы битой.
         self._root_issue: int | None = None
+        # Сколько кругов уточнения ПОСЛЕ аналитики уже потрачено. Потолок нужен
+        # затем же, что и на входе: вопрос, на который не отвечают, не должен
+        # держать задачу вечно.
+        self._clarify_rounds = 0
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -554,6 +566,7 @@ class IssueLifecycle:
             self._plan_member = carried.plan_member
             self._root_issue = carried.root_issue
             self._pr_number = carried.pr_number
+            self._clarify_rounds = carried.clarify_rounds
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -582,6 +595,7 @@ class IssueLifecycle:
             plan_member=self._plan_member,
             root_issue=self._root_issue,
             pr_number=self._pr_number,
+            clarify_rounds=self._clarify_rounds,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -838,7 +852,7 @@ class IssueLifecycle:
             elif self._phase == lifecycle.BUSINESS_ANALYSIS:
                 nxt = await self._phase_analysis(issue)
             elif self._phase == lifecycle.SYSTEM_REQUIREMENTS:
-                nxt = await self._phase_handoff(issue)
+                nxt = await self._phase_handoff(issue, deadlines)
             elif self._phase == lifecycle.READY_FOR_DEV:
                 nxt = await self._phase_await_build(issue, deadlines)
             elif self._phase == lifecycle.PR_REVIEW:
@@ -1131,7 +1145,7 @@ class IssueLifecycle:
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
 
-    async def _phase_handoff(self, issue: IssueInput) -> tuple | None:
+    async def _phase_handoff(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `system-requirements`: декомпозиция и передача разработчику (H1).
 
         Разбиение идёт ЗДЕСЬ, до `ready-for-dev`: агент разработки должен
@@ -1147,6 +1161,17 @@ class IssueLifecycle:
         # у неё нет, и ссылка на `research/issue-<своё>` вела бы в пустоту.
         source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
         branch = f"research/issue-{source}"
+
+        # Круг уточнения ПОСЛЕ аналитики. Она разобрала код и знает, чего в
+        # постановке не хватает для однозначного решения. Раньше такие места
+        # только перечислялись в чеклисте готовности — то есть решение по ним
+        # доставалось агенту разработки, и он выбирал за человека молча.
+        #
+        # Подзадачу плана не спрашиваем: вопросы по фиче задаются один раз, у
+        # родителя, иначе один и тот же вопрос прилетит человеку N раз.
+        clarify = await self._clarify_open_questions(issue, deadlines, branch)
+        if clarify is not None:
+            return clarify
         # Подзадача чужого плана своего плана не получает: разбирать её значило
         # бы пустить цепочку на второй круг, а там правило R7 отправит каждую
         # внучатую задачу человеку — вместо плана вышла бы очередь к людям.
@@ -1176,6 +1201,67 @@ class IssueLifecycle:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
+
+    async def _clarify_open_questions(self, issue: IssueInput, deadlines,
+                                      branch: str) -> tuple | None:
+        """Спросить и подождать. `None` — идти дальше, передавать задачу.
+
+        Ответ не оформляется командой: повторный прогон аналитики читает
+        обсуждение Issue, поэтому обычный комментарий и есть способ закрыть
+        вопрос — тем же путём, которым он возник.
+
+        Под маркером патча: прогоны, уже прошедшие передачу без этого шага,
+        держат в истории другую последовательность.
+        """
+        if not workflow.patched("issue-lifecycle-clarify-after-analysis"):
+            return None
+        if self._plan_member or self._clarify_rounds >= MAX_ANALYSIS_CLARIFY_ROUNDS:
+            return None
+
+        try:
+            questions = await workflow.execute_activity(
+                activities.read_open_questions,
+                args=[issue.repo, branch],
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as e:
+            # Круг уточнения улучшает переданную задачу, но не является условием
+            # её существования: не прочитали артефакты — передаём как раньше.
+            # Иначе сбой чтения ветки останавливал бы готовую работу.
+            workflow.logger.warning("не прочитал открытые вопросы: %s", _failure_reason(e))
+            return None
+        if not questions:
+            return None
+
+        self._clarify_rounds += 1
+        await workflow.execute_activity(
+            activities.ask_open_questions,
+            args=[issue, questions, self._clarify_rounds],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        timeout = await self._park(
+            awaiting_mod.HUMAN_DECISION,
+            who="человек: автор Issue или дежурный по триажу",
+            reason=f"ответ на {len(questions)} незакрытых вопроса аналитики",
+            hours=deadlines.clarification_hours)
+        while True:
+            signal = await self._wait_for_signal(timeout)
+            if signal is None:
+                # Срок вышел — задачу всё равно передаём: вопросы уедут в чеклист
+                # готовности, и решение примет тот, кто её возьмёт. Держать
+                # готовую аналитику в ожидании неделями хуже.
+                return None
+            if isinstance(signal, AgentEvent):
+                return await self._agent_event(signal)
+            if signal == AGENT_ANALYZE:
+                return await self._analysis_requested(issue)
+            if isinstance(signal, str) and signal.startswith("__comment__:"):
+                # Ответ получен. В анализ заново: он прочитает обсуждение и
+                # закроет вопрос — переписывать артефакты руками некому.
+                return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+            # Посторонний сигнал ответом не считается и круга не тратит.
 
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
