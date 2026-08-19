@@ -42,7 +42,7 @@ flowchart TD
         DupCheck["gh search open+closed issue/PR<br/>+ вероятность дубликата"]
         DupCheck -->|>=85%| DupClose["Закрыт, ссылка на оригинал<br/>+ ссылка на ветку с готовым контекстом"]
         DupCheck -->|50-85%| DupMaybe["Лейбл possible-duplicate"]
-        DupCheck -->|<50%| DupCache["Кандидаты сохранены —<br/>переиспользуются Repowise"]
+        DupCheck -->|<50%| DupCache["Кандидаты сохранены —<br/>читает стадия repowise"]
     end
 
     DupMaybe --> Priority

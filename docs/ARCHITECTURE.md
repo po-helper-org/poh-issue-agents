@@ -81,8 +81,10 @@ Instructor поверх OpenAI-совместимого эндпоинта z.ai.
 7. `post_priority_comment`.
 8. **Ожидание сигнала** `human_decision`.
 9. Человек ставит `research-me` → сигнал.
-10. `run_research_pipeline` (po-helper → Repowise → Blueprint → deb8flow →
-    SA-helper) — до 60 мин, durable.
+10. Конвейер аналитики постадийно (`prepare_workspace` → `run_fnr_stage`
+    по каждой стадии → `publish_analysis`) — до 60 мин, durable.
+    Стадии: `repowise` (сбор контекста из индекса кода) → `task` →
+    `concept` → `debate` → `sysreq` → `validate`.
 11. **Ожидание сигнала** `human_decision`.
 12. Человек ставит `build-me` → `trigger_openhands_resolver`.
 
@@ -137,5 +139,8 @@ config/priority-weights.toml                 # веса и пороги прио
 - OpenHands resolver (стадия 8) — отдельный сервис, свой sandboxing.
 - deb8flow — CLI внутри worker-контейнера, но сам инструмент авторский,
   устанавливается отдельно (TODO в Dockerfile).
-- Repowise MCP (Confluence/Jira) — подключение к headless-среде worker'а
-  ещё не решено.
+- Repowise MCP — постоянный индекс кода отдельным сервисом, доступ через
+  прокси по HTTP с токеном (`shared/repowise.py`). Прокси ведёт журнал
+  обмена и рендерит из него артефакт `repowise-dialog.md`: транскрипт
+  получается механически, а не записью силами модели. Сервис живёт в
+  `po-helper-org/poh-infra`.
