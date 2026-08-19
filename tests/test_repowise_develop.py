@@ -148,3 +148,19 @@ def test_publication_skipped_when_integration_disabled(monkeypatch):
                         lambda *a, **k: called.append("comment"))
     activities._publish_dev_dialog_sync(_issue(), "")
     assert called == []
+
+
+# --- Правила обращения к индексу в постановке (FR-19) ---
+
+def test_rules_tell_agent_to_ask_before_and_when_stuck():
+    text = activities._DEV_REPOWISE_RULES
+    assert "До начала работы" in text
+    assert "При затруднении" in text
+    # Недоступный индекс не должен читаться агентом как повод остановиться.
+    assert "штатный режим" in text
+
+
+def test_rules_do_not_ask_agent_to_retell_the_dialog():
+    # Транскрипт ведёт прокси. Просьба пересказать его вернула бы ровно тот
+    # класс отказов, ради которого журнал и вынесен наружу.
+    assert "пересказывать" in activities._DEV_REPOWISE_RULES
