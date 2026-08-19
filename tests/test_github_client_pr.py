@@ -57,3 +57,38 @@ def test_review_text_skips_the_harness_own_comments(monkeypatch):
     assert "вынести порог в константу" in text
     assert "внёс правки" not in text, "агент кормится своей же просьбой"
     assert "и так нравится" not in text, "реплика человека — не замечание ревью"
+
+
+def test_git_trusts_the_worktree_the_runner_owned(monkeypatch, tmp_path):
+    """Коммит идёт от root в каталоге, которым владеет раннер.
+
+    Каталог задачи передаётся раннеру (uid 10001), а коммит и пуш делает воркер
+    от root. Git на такое отвечает `fatal: detected dubious ownership in
+    repository` и отказывается работать — то есть готовая работа агента не
+    доезжает до PR. `safe.directory` объявляет каталог доверенным для этой
+    команды, не трогая глобальный конфиг.
+    """
+    import github_client as gc
+
+    class _Done:
+        returncode = 0  # «диффа нет» — до пуша не доходим, нам нужен только env
+        stdout = ""
+        stderr = ""
+
+    captured: dict = {}
+
+    def fake_run(cmd, **kw):
+        captured.setdefault("env", kw.get("env"))
+        return _Done()
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc.subprocess, "run", fake_run)
+
+    gc.publish_worktree("o/r", str(tmp_path), "feature/1-x",
+                        title="t", body="b", message="m")
+
+    env = captured["env"]
+    keys = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(int(env["GIT_CONFIG_COUNT"]))}
+    assert keys.get("safe.directory") == str(tmp_path)
