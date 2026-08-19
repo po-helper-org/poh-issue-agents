@@ -553,6 +553,7 @@ class IssueLifecycle:
             self._analysis_done = carried.analysis_done
             self._plan_member = carried.plan_member
             self._root_issue = carried.root_issue
+            self._pr_number = carried.pr_number
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -580,6 +581,7 @@ class IssueLifecycle:
             analysis_done=self._analysis_done,
             plan_member=self._plan_member,
             root_issue=self._root_issue,
+            pr_number=self._pr_number,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )

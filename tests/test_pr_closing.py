@@ -65,6 +65,21 @@ def test_round_comment_asks_for_recheck():
     assert pr_closing.REVIEW_COMMAND in body
 
 
+def test_recheck_command_is_the_first_line():
+    """Команда — ПЕРВОЙ строкой, иначе триггер её не увидит.
+
+    Ревью запускается по `startsWith(comment.body, '/review')` — той же
+    конвенцией, что и команды в Issue (`shared/commands.parse_command`: команда
+    в первой непустой строке). Команда в конце текста читается человеком как
+    просьба, а автоматикой — никак: круг вносил правки и ждал перепроверки,
+    которая не начиналась.
+    """
+    body = pr_closing.round_comment(9, round_number=2, max_rounds_=3,
+                                    verdict="принято: добавил тест границы")
+
+    assert body.splitlines()[0].strip() == pr_closing.REVIEW_COMMAND
+
+
 def test_exhausted_comment_says_what_to_do_next():
     body = pr_closing.exhausted_comment(3)
 
