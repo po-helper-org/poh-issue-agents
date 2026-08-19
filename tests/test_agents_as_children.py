@@ -53,6 +53,12 @@ async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
     return ProtocolState()
 
 
+@activity.defn(name="read_open_questions")
+async def no_open_questions(repo: str, branch: str) -> list[str]:
+    """Аналитика не оставила незакрытых вопросов — круг уточнения не нужен."""
+    return []
+
+
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
     # Декомпозиция выключена намеренно: тест про запуск агентов дочерними
@@ -174,7 +180,7 @@ ALL_ACTIVITIES = [prefilter_ok, protocol_default, deadlines_stub, set_phase_stub
                   gate_ok, classify_feature, duplicate_none, score_p1, post_priority,
                   escalate, post_error, ack, prepare, stage_ok, publish, cleanup,
                   publish_error, finish_labels, ready, ack_estimate, collect, facts,
-                  compute, post_estimate, post_estimate_err]
+                  compute, post_estimate, post_estimate_err, no_open_questions]
 
 
 def _issue() -> IssueInput:
@@ -291,8 +297,12 @@ async def test_analyze_on_a_parked_issue_runs_without_faking_the_phase():
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await _await_phase(env, handle, lifecycle.CLASSIFIED)
-            await handle.signal(IssueLifecycle.human_decision, "bug-me")
-            await _await_phase(env, handle, lifecycle.READY_FOR_DEV)
+            # Именно `research-me`: задача классифицирована как feature-request,
+            # и `bug-me` по ней фазу не двигает — с ним Issue оставался бы в
+            # `classified`, а тест проверял бы не то, что заявлено.
+            await handle.signal(IssueLifecycle.human_decision, "research-me")
+            assert await _await_phase(env, handle, lifecycle.READY_FOR_DEV) \
+                == lifecycle.READY_FOR_DEV
             _calls.clear()
 
             await handle.signal(IssueLifecycle.analyze_requested, 777)

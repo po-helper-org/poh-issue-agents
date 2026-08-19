@@ -306,6 +306,39 @@ def _open_questions(repo: str, branch: str) -> list[str]:
 
 
 @activity.defn
+def read_open_questions(repo: str, branch: str) -> list[str]:
+    """Незакрытые вопросы из артефактов анализа — отдельным чтением.
+
+    Аналитика разобрала код и знает, чего в постановке не хватает для
+    однозначного решения; такие места она помечает `[УТОЧНИТЬ]`. Раньше они
+    только перечислялись в чеклисте готовности — то есть решение по ним
+    перекладывалось на агента разработки, и он выбирал за человека молча.
+    """
+    return _open_questions(repo, branch)
+
+
+@activity.defn
+def ask_open_questions(issue: IssueInput, questions: list[str],
+                       round_number: int) -> None:
+    """Вопросы аналитики — комментарием, чтобы на них можно было ответить.
+
+    Ответ не надо оформлять командой: повторный прогон аналитики читает
+    обсуждение Issue, поэтому обычный комментарий и есть способ закрыть вопрос.
+    """
+    listed = "\n".join(f"- {q}" for q in questions)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        f"## ❓ Нужен ответ, чтобы идти дальше (круг {round_number})\n\n"
+        "Аналитика разобрала код и упёрлась в то, чего в постановке нет. Пока "
+        "это не закрыто, план исполнения строить не на чем — решение выбрал бы "
+        "агент разработки, и выбрал бы молча.\n\n"
+        f"{listed}\n\n"
+        "Ответь обычным комментарием — этого достаточно: повторный прогон "
+        "аналитики читает обсуждение задачи и закроет вопрос сам.",
+    )
+
+
+@activity.defn
 def mark_ready_for_dev(issue: IssueInput, priority_tier: str, branch: str) -> None:
     """Точка передачи задачи разработчику (H1 протокола).
 
@@ -1055,23 +1088,41 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     return task
 
 
-_DEV_FALLBACK_RULES = """## Как работать
+_DEV_FALLBACK_RULES = f"""## Как работать
 
 Правила репозитория — в `AGENTS.md` и `CLAUDE.md`, они обязательны.
 
 1. **MVP первым.** Кратчайший путь к тому, что просят. Не углубляйся в
    надёжность и редкие ветки, пока основное не работает.
-2. **Edge-кейс — не в эту ветку.** Найденное по дороге заводи отдельным
-   SubIssue и продолжай MVP.
+2. **Edge-кейс — не в эту ветку.** Найденное по дороге не чини здесь, а запиши
+   в `{develop.FOLLOWUPS_FILE}` в корне рабочего каталога — по одному разделу
+   `## <кратко что не учтено>` на находку, в теле: где (файл:строка), чем
+   грозит, при каких условиях всплывёт. Issue по ним заведёт контур: `gh` и
+   токена у тебя нет намеренно. Ничего не нашёл — файл не создавай.
 3. **Тесты.** Прогоняй проверки проекта; красный прогон в PR не отдаём.
 4. **Коммитить самому не надо** — коммит, пуш и PR делает контур после тебя.
 """
 
 
+def _reap_runner(slug: str) -> None:
+    """Снять контейнер прошлой попытки, если он пережил своего запускателя.
+
+    Temporal повторяет активность до трёх раз. Умерший вместе с воркером прогон
+    контейнер за собой не убирает (`--rm` срабатывает только на нормальном
+    выходе), и вторая попытка либо упирается в занятое имя, либо запускает
+    второго агента в тот же рабочий каталог. На стенде остаток жил полчаса и
+    доедал память, из-за которой следующая задача еле ползла.
+    """
+    subprocess.run(develop.reap_command(slug), capture_output=True, text=True,
+                   timeout=60, check=False)
+
+
 def _dev_run_agent(issue: IssueInput) -> str:
     """Прогон одноразового контейнера. Возвращает хвост вывода."""
+    slug = develop.task_slug(issue.repo, issue.issue_number)
+    _reap_runner(slug)
     command = develop.runner_command(
-        develop.task_slug(issue.repo, issue.issue_number),
+        slug,
         image=develop.runner_image(),
         volume=develop.workspace_volume(),
         mount=develop.workspace_mount(),
@@ -1164,12 +1215,71 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
     await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
 
     await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    # Находки собираются ДО тестов и публикации: файл находок обязан исчезнуть
+    # из рабочего дерева раньше коммита, иначе он уедет в PR — в ревью как мусор,
+    # а на следующем круге правок агент прочитает свои прошлые находки как новые.
+    await collect_dev_followups(issue)
     await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
     number = await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
 
     if number is None:
         raise RuntimeError("агент не изменил ни одного файла — открывать нечего")
     return number
+
+
+async def collect_dev_followups(issue: IssueInput) -> list[int]:
+    """Edge-кейсы агента разработки — в бэклог, руками воркера.
+
+    Агент оставляет находки файлом: `gh` и GITHUB_TOKEN ему не дают, и это не
+    упущение, а весь смысл его изоляции — он исполняет чужой код. Issue по
+    находкам заводит воркер, у которого токен уже есть.
+
+    Best-effort по каждой находке: прогон разработки состоялся, и невзятая
+    находка не должна отменять остальные, а тем более ронять шаг целиком. Зато
+    файл снимается всегда — даже если ни один Issue не удалось завести, в PR он
+    не уедет.
+    """
+    _, clone_dir = _dev_paths(issue)
+    path = clone_dir / develop.FOLLOWUPS_FILE
+    if not path.exists():
+        return []  # «не нашёл» — законный исход, комментировать нечего
+
+    try:
+        items = develop.parse_followups(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 — разбор находок не ломает разработку
+        logger.warning("не разобрал %s по %s#%s: %s",
+                       develop.FOLLOWUPS_FILE, issue.repo, issue.issue_number, exc)
+        items = []
+    path.unlink(missing_ok=True)
+    if not items:
+        return []
+
+    numbers: list[int] = []
+    for item in items:
+        try:
+            numbers.append(await asyncio.to_thread(
+                github_client.create_issue, issue.repo, item["title"],
+                develop.followup_body(item, parent=issue.issue_number),
+                [labels.ORIGIN_AGENT]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("не завёл находку %r по %s#%s: %s",
+                           item["title"], issue.repo, issue.issue_number, exc)
+    if not numbers:
+        return []
+
+    links = "\n".join(f"- #{n} — {i['title']}"
+                       for n, i in zip(numbers, items))
+    try:
+        await asyncio.to_thread(
+            github_client.post_comment, issue.repo, issue.issue_number,
+            "## 🔍 Найдено по дороге\n\n"
+            "Агент разработки нашёл это, реализуя задачу, и намеренно не чинил "
+            "в её ветке — MVP это не блокирует. Каждую находку контур разберёт "
+            "сам, как обычный Issue:\n\n" + links)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("не опубликовал сводку находок в %s#%s: %s",
+                       issue.repo, issue.issue_number, exc)
+    return numbers
 
 
 async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:
@@ -1317,8 +1427,10 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     await _run_with_heartbeat(_prfix_prepare, repo, pr_number, branch, task,
                               label="prfix:prepare")
 
+    slug = pr_closing.task_slug(repo, pr_number)
+    await asyncio.to_thread(_reap_runner, slug)
     command = develop.runner_command(
-        pr_closing.task_slug(repo, pr_number), image=develop.runner_image(),
+        slug, image=develop.runner_image(),
         volume=develop.workspace_volume(), mount=develop.workspace_mount())
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),

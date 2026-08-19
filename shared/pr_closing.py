@@ -107,12 +107,18 @@ def build_task(pr_number: int, *, review: str, round_number: int, max_rounds_: i
 
 def round_comment(pr_number: int, *, round_number: int, max_rounds_: int,
                   verdict: str = "") -> str:
-    body = (f"🔧 Внёс правки по замечаниям ревью (круг {round_number} из "
+    # Команда ПЕРВОЙ строкой — это не оформление, а условие срабатывания:
+    # перепроверка запускается по `startsWith(comment.body, '/review')`, той же
+    # конвенцией, что и команды в Issue (`shared/commands.parse_command`).
+    # Команда в конце текста читается человеком как просьба, а автоматикой — никак:
+    # круг вносил правки и ждал ревью, которое не начиналось.
+    body = (f"{REVIEW_COMMAND}\n\n"
+            f"🔧 Внёс правки по замечаниям ревью (круг {round_number} из "
             f"{max_rounds_}) и прошу перепроверить.")
     if verdict.strip():
         body += ("\n\n<details><summary>Разбор замечаний</summary>\n\n"
                  f"{verdict.strip()}\n\n</details>")
-    return f"{body}\n\n{REVIEW_COMMAND}"
+    return body
 
 
 def settled_comment(round_number: int, verdict: str = "") -> str:

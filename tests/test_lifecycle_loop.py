@@ -432,3 +432,25 @@ async def test_history_of_the_new_generation_replays_cleanly():
             history = await handle.fetch_history()
 
     await Replayer(workflows=[IssueLifecycle]).replay_workflow(history)
+
+
+def test_snapshot_carries_everything_the_later_phases_read():
+    """Состояние, которое читают фазы ПОСЛЕ перезапуска, обязано быть в снимке.
+
+    Проверяется механически, а не перечислением: поле, добавленное в цикл и
+    забытое в снимке, теряется молча. Так и было с номером PR — фаза доведения
+    без него не знает, что доводить, и вместо круга правок молча уходит в
+    парковку: PR открыт, ревью прошло, замечания не исправляются, и снаружи это
+    выглядит как «агент доведения не работает».
+    """
+    from shared.workflow_types import LifecycleState
+
+    carried = set(vars(LifecycleState()))
+    # Что цикл читает у себя после восстановления. `_awaiting` и `_issue`
+    # восстанавливаются иначе (первое описывается заново на парковке, второе
+    # приезжает аргументом), поэтому в снимке им места нет.
+    needed = {"phase", "stage", "priority_tier", "classification_label",
+              "analysis_done", "phase_since_epoch", "plan_member", "root_issue",
+              "pr_number"}
+
+    assert needed <= carried, f"снимок потеряет: {sorted(needed - carried)}"
