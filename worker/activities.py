@@ -676,7 +676,11 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     ]
 
 
-FNR_STAGE_NAMES = ("repowise", "task", "concept", "debate", "sysreq", "validate")
+# Имя стадии сбора контекста — константой: на него ссылается ветвь деградации,
+# и разъехавшийся литерал означал бы стадию, которая деградировать не умеет.
+REPOWISE_STAGE = "repowise"
+
+FNR_STAGE_NAMES = (REPOWISE_STAGE, "task", "concept", "debate", "sysreq", "validate")
 
 # Входной артефакт каждой стадии — что уже должно лежать в рабочем каталоге,
 # чтобы стадия имела смысл (используется guard'ом _require_workspace).
@@ -1009,6 +1013,42 @@ def _write_repowise_config(analyze: AnalyzeInput, clone_dir: str) -> None:
         json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _degrade_repowise_stage(analyze: AnalyzeInput, clone_dir: str,
+                            expected: str | None) -> dict | None:
+    """Артефакт-заглушка, если источник недоступен. None — источник на месте.
+
+    Модификация M1 вердикта дебатов (`sa_documentation/FNR/FNR_5/concept.md`).
+    Без неё прокси становится обязательной зависимостью на пути, который
+    сегодня остановить нечему: `_build_workspace` зависит только от `git` и
+    `repomix` внутри того же контейнера.
+
+    Артефакт создаётся ВСЕГДА, поэтому guard стадии `task` остаётся без
+    изменений и по-прежнему ловит молчаливый пропуск. Дорогой процесс диалога
+    при этом не запускается — платить за заведомо недоступный источник незачем.
+    """
+    if not repowise.enabled():
+        reason = "REPOWISE_PROXY_URL не задан — интеграция выключена"
+    elif not repowise.available(timeout=repowise.PROBE_TIMEOUT_SEC):
+        reason = "прокси не отвечает на проверку живости"
+    else:
+        return None
+
+    path = Path(clone_dir) / expected
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        repowise.unavailable_artifact(
+            analyze.repo, analyze.issue_number, repowise.ANALYSIS, reason),
+        encoding="utf-8",
+    )
+    # WARNING, а не ERROR: это штатная деградация, а не отказ. Считать её долю
+    # положено снаружи (FR-9), и ошибкой в Sentry она быть не должна — иначе
+    # выключенная интеграция превратится в поток ложных сбоев.
+    logger.warning("стадия %s деградировала (%s#%s): %s", REPOWISE_STAGE,
+                analyze.repo, analyze.issue_number, reason)
+    return {"stage": REPOWISE_STAGE, "artifact": expected,
+            "bytes": path.stat().st_size, "outcome": "degraded"}
+
+
 @activity.defn
 async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
@@ -1028,6 +1068,10 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
     _write_repowise_config(analyze, clone_dir)
+    if stage_name == REPOWISE_STAGE:
+        degraded = await asyncio.to_thread(_degrade_repowise_stage, analyze, clone_dir, expected)
+        if degraded is not None:
+            return degraded
     await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
     artifact: str | None = None
     size = 0
@@ -1037,7 +1081,7 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
             raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
         artifact = expected
         size = path.stat().st_size
-    return {"stage": stage_name, "artifact": artifact, "bytes": size}
+    return {"stage": stage_name, "artifact": artifact, "bytes": size, "outcome": "ok"}
 
 
 @activity.defn

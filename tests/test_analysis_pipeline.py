@@ -252,7 +252,8 @@ def test_stage_without_expected_artifact_reports_none(stage_env):
     asyncio.run(activities.run_fnr_stage(a, "task"))
     asyncio.run(activities.run_fnr_stage(a, "concept"))
     result = asyncio.run(activities.run_fnr_stage(a, "debate"))  # debate: артефакта нет
-    assert result == {"stage": "debate", "artifact": None, "bytes": 0}
+    assert result == {"stage": "debate", "artifact": None, "bytes": 0,
+                      "outcome": "ok"}
 
 
 def test_stage_missing_expected_artifact_raises(stage_env, monkeypatch):
