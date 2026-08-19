@@ -154,3 +154,26 @@ def test_estimate_error_without_comment_skips_reaction(monkeypatch):
 
     activities.post_estimate_error(
         EstimateRequest(repo="o/r", issue_number=5), "расчёт", "RuntimeError: boom")
+
+
+def test_success_clears_the_previous_failure_label(monkeypatch):
+    """Повторный прогон после сбоя обязан снять `failed:*`.
+
+    `done:analyze` рядом с `failed:analyze` — противоречие, а не история:
+    по меткам нельзя сказать, чем кончился последний прогон, и выборка
+    `label:failed:*` показывает уже починенные задачи.
+    """
+    calls = _spy(monkeypatch)
+
+    asyncio.run(activities.finish_command_labels("o/r", 7, ANALYZE, True))
+
+    assert ("-", "o/r", 7, "failed:analyze") in calls
+
+
+def test_failure_clears_the_previous_success_label(monkeypatch):
+    """Симметрично: сорвавшийся повтор не оставляет старый `done:*`."""
+    calls = _spy(monkeypatch)
+
+    asyncio.run(activities.finish_command_labels("o/r", 7, ANALYZE, False))
+
+    assert ("-", "o/r", 7, "done:analyze") in calls

@@ -274,6 +274,34 @@ async def test_reopen_after_failure_runs_the_triage_again():
             assert _calls.count("classify") == 2, "триаж не пошёл заново"
 
 
+@pytest.mark.timeout(90)
+async def test_analyze_after_a_failed_run_returns_the_issue_to_analysis():
+    """`/analyze` по сорвавшемуся анализу — второй заход на ту же стадию.
+
+    Без перехода `failed → business-analysis` команда выполнялась, ветка с
+    требованиями появлялась, а фаза оставалась `failed`: задача навсегда
+    стояла в очереди к человеку с готовыми требованиями на руках. Ровно это
+    и случилось на стенде с #10 и #11.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, *TRIAGE_ACTIVITIES,
+                                      *ANALYSIS_ACTIVITIES, classify_fails_once]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await _await_phase(env, handle, lifecycle.FAILED)
+
+            await handle.signal(IssueLifecycle.analyze_requested, None)
+
+            assert await _await_phase(env, handle, lifecycle.READY_FOR_DEV) \
+                == lifecycle.READY_FOR_DEV
+            assert any(c.startswith("ready:") for c in _calls), \
+                "передача разработчику не состоялась"
+
+
 # --- continue-as-new ---
 
 @pytest.mark.timeout(120)

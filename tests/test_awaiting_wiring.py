@@ -261,3 +261,71 @@ def test_every_parking_point_fills_the_waiting():
             unparked.append(node.name)
 
     assert not unparked, f"парковка без описания ожидания: {sorted(set(unparked))}"
+
+
+@pytest.mark.timeout(120)
+async def test_resumed_work_leaves_the_human_queue():
+    """Агент снова работает — метка очереди к людям обязана уйти.
+
+    После сбоя задача стоит в очереди (`failure-recovery`). `/analyze`
+    возвращает её в анализ, и дальше до самого PR цикл нигде не паркуется на
+    человека: метка снималась бы только на следующей парковке, которой нет.
+    В итоге выборка `label:needs-human:*` показывала бы задачу, по которой
+    человеку делать нечего, — то есть врала бы ровно там, где обязана быть
+    полной.
+    """
+    _labels.clear()
+
+    @activity.defn(name="classify_issue")
+    async def classify_breaks(issue: IssueInput) -> ClassificationResult:
+        raise RuntimeError("модель недоступна")
+
+    @activity.defn(name="post_error_label")
+    async def post_error(issue: IssueInput, reason: str) -> None: ...
+
+    @activity.defn(name="mark_command_running")
+    async def mark_running(repo: str, issue_number: int, command: str) -> None: ...
+
+    @activity.defn(name="finish_command_labels")
+    async def finish_labels(repo: str, n: int, command: str, ok: bool) -> None: ...
+
+    @activity.defn(name="ack_command")
+    async def ack(analyze) -> None: ...
+
+    @activity.defn(name="prepare_workspace")
+    async def prepare(analyze) -> None: ...
+
+    @activity.defn(name="run_fnr_stage")
+    async def stage_ok(analyze, stage_name: str) -> dict:
+        return {"stage": stage_name, "artifact": None, "bytes": 0}
+
+    @activity.defn(name="publish_analysis")
+    async def publish(analyze) -> str:
+        return "research/issue-7"
+
+    @activity.defn(name="cleanup_workspace")
+    async def cleanup(analyze) -> None: ...
+
+    @activity.defn(name="publish_analysis_error")
+    async def publish_error(analyze, reason: str) -> None: ...
+
+    @activity.defn(name="mark_ready_for_dev")
+    async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None: ...
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[*BASE, classify_breaks, post_error, mark_running,
+                                      finish_labels, ack, prepare, stage_ok, publish,
+                                      cleanup, publish_error, ready]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await _await_phase(env, handle, lifecycle.FAILED)
+            assert f"queue:on:{aw.FAILURE_RECOVERY}" in _labels
+
+            await handle.signal(IssueLifecycle.analyze_requested, None)
+            await _await_phase(env, handle, lifecycle.BUSINESS_ANALYSIS)
+
+    assert _labels[-1] == "queue:off", \
+        f"метка очереди к людям осталась висеть на работающем агенте: {_labels}"

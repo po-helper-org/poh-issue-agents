@@ -651,10 +651,17 @@ class IssueLifecycle:
         lifecycle.transition(self._phase, phase)
         self._phase = phase
         self._stage = stage
-        # Прежнее ожидание закрыто самим фактом перехода. Метку здесь не
+        # Прежнее ожидание закрыто самим фактом перехода. Метку обычно не
         # трогаем: следующая точка парковки опишет новое ожидание и приведёт
-        # метку в порядок одним вызовом.
+        # метку в порядок одним вызовом — снимать и ставить её на каждом
+        # переходе значило бы мигать ею в таймлайне Issue.
         self._awaiting = None
+        # Исключение — фазы, в которых цикл работает и не паркуется вовсе: там
+        # следующего вызова просто не будет, и метка очереди к людям осталась бы
+        # висеть на задаче, которую ведёт агент.
+        if (workflow.patched("issue-lifecycle-clear-queue-on-work")
+                and phase in awaiting_mod.WORKED_BY_AGENT):
+            await self._publish_awaiting()
         # Отсчёт срока парковки начинается здесь и только здесь.
         self._phase_since = workflow.now()
         if write_label and self._issue is not None:

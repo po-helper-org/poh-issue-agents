@@ -153,6 +153,22 @@ KIND_BY_PHASE: dict[str, str] = {
     lifecycle.SKIPPED: HUMAN_DECISION,
 }
 
+# Фазы, в которых цикл РАБОТАЕТ, а не ждёт: у них нет точки парковки вовсе.
+#
+# Метка очереди к людям снимается на парковке — но если следующей парковки нет,
+# снимать её некому, и задача, которую прямо сейчас ведёт агент, остаётся в
+# выборке `label:needs-human:*`. Раньше это было незаметно: до `business-analysis`
+# доходили только из `classified`, где метки и не было. Переход `failed →
+# business-analysis` (повторный `/analyze`) сделал путь достижимым из фазы, где
+# метка висит.
+#
+# Список короткий намеренно. `ready-for-dev` сюда не входит: без автостарта он
+# честно ждёт человека, а `_enter` не знает, включён ли автостарт, — и снятая
+# здесь метка тут же вернулась бы парковкой.
+WORKED_BY_AGENT: frozenset[str] = frozenset({
+    lifecycle.CREATED, lifecycle.BUSINESS_ANALYSIS, lifecycle.SYSTEM_REQUIREMENTS,
+})
+
 WHO_BY_KIND: dict[str, str] = {
     HUMAN_DECISION: "человек: автор Issue или дежурный по триажу",
     APPROVAL: "разработчик из очереди `ready-for-dev`",

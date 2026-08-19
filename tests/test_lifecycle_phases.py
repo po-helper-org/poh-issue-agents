@@ -217,3 +217,17 @@ def test_phase_query_derives_from_stage_for_older_runs():
 
     wf._stage = "analysis"
     assert wf.phase() == lc.BUSINESS_ANALYSIS
+
+
+# --- возврат из сбоя ---
+
+def test_failed_can_go_back_to_analysis():
+    """`/analyze` по сорвавшемуся анализу обязан вернуть Issue в анализ.
+
+    Сбой прогона — не приговор задаче: повторный запуск это ровно тот способ,
+    которым сбой и разбирается. Без этого перехода команда выполняется, артефакты
+    появляются, а фаза остаётся `failed` — задача навсегда стоит в очереди к
+    человеку с готовыми требованиями на руках.
+    """
+    assert lc.can(lc.FAILED, lc.BUSINESS_ANALYSIS)
+    assert lc.initiator(lc.FAILED, lc.BUSINESS_ANALYSIS) == lc.HUMAN

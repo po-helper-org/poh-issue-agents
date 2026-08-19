@@ -141,6 +141,17 @@ async def develop(issue: IssueInput) -> None:
     _calls.append("develop")
 
 
+@activity.defn(name="decompose_issue")
+async def decompose(issue: IssueInput, branch: str) -> dict:
+    _calls.append("decompose")
+    return {"items": [], "summary": ""}
+
+
+@activity.defn(name="publish_decomposition")
+async def publish_plan(issue: IssueInput, plan: dict, branch: str) -> list[int]:
+    return []
+
+
 def _deadlines(autostart: bool, research: bool = False):
     @activity.defn(name="read_deadlines")
     async def stub() -> Deadlines:
@@ -164,13 +175,18 @@ async def _run_until_parked(autostart: bool) -> None:
                                       _deadlines(autostart), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
-                                      ready, develop, phase_stub]):
+                                      ready, develop, decompose, publish_plan, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
-            for _ in range(100):
-                if "develop" in _calls or _calls.count("awaiting") >= 2:
+            # Условие выхода — по СОБЫТИЮ, а не по числу обращений к метке
+            # ожидания: счётчик считал не то, что проверяется, и любой новый
+            # вызов `mark_awaiting` по дороге обрывал прогон раньше времени.
+            for _ in range(200):
+                if "develop" in _calls:
                     break
+                if "ready-for-dev" in _calls and _calls[-1] == "awaiting":
+                    break  # передали разработчику и встали ждать человека
                 await asyncio.sleep(0.05)
             await handle.terminate()
 

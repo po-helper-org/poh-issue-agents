@@ -430,12 +430,17 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     должен превращать успешный анализ в проваленный. Ошибка уходит в лог, но
     наружу не пробрасывается — activity зовётся из терминальных веток воркфлоу.
     """
-    for stale in running_labels(command):
+    outcome = done_label(command) if ok else failed_label(command)
+    # Исход ПРЕДЫДУЩЕГО прогона снимается вместе с «идёт»: `done:analyze` рядом
+    # с `failed:analyze` — противоречие, а не история. По такой паре нельзя
+    # сказать, чем кончился последний прогон, и выборка `label:failed:*`
+    # показывает задачи, которые давно починены повторным запуском.
+    previous = failed_label(command) if ok else done_label(command)
+    for stale in (*running_labels(command), previous):
         try:
             await asyncio.to_thread(github_client.remove_label, repo, issue_number, stale)
         except Exception as exc:
             logger.warning("не снял метку %s с %s#%s: %s", stale, repo, issue_number, exc)
-    outcome = done_label(command) if ok else failed_label(command)
     try:
         await asyncio.to_thread(github_client.add_label, repo, issue_number, outcome)
     except Exception as exc:
