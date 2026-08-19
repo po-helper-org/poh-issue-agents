@@ -23,7 +23,8 @@ import hmac
 import logging
 import os
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from starlette.requests import ClientDisconnect
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
@@ -54,6 +55,21 @@ sentry_setup.configure("webhook")  # no-op без SENTRY_DSN; FastAPI инстр
 _log = logging.getLogger("webhook")
 
 app = FastAPI()
+
+
+@app.exception_handler(ClientDisconnect)
+async def _client_disconnect(request: Request, exc: ClientDisconnect):
+    """Отправитель ушёл, не дослав тело.
+
+    Отвечать 500 некому: соединения уже нет, а событие уезжает в Sentry как
+    сбой вебхука (ISSUE-AGENT-8, пять штук за один разрыв связи с прокси).
+    Доставка не потеряна — GitHub ретраит её сам, так что здесь нечего чинить
+    и не о чем будить. 204 закрывает запрос тихо и оставляет след в логе.
+    """
+    _log.info("отправитель разорвал соединение до конца тела (%s) — доставка будет повторена",
+              request.headers.get("x-github-delivery", "без id"))
+    return Response(status_code=204)
+
 
 HUMAN_DECISION_LABELS = {"research-me", "bug-me", "build-me"}
 

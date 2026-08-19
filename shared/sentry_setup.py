@@ -56,8 +56,39 @@ def _scrub_mapping(d) -> None:
             d[k] = v[:_MAX_VALUE_LEN] + "…[truncated]"
 
 
+# Отказы чужой стороны, на которые контур повлиять не может: лимит запросов и
+# таймауты шлюза z.ai, обрыв связи отправителем вебхука. Их видно в Sentry как
+# `handled: no` с уровнем error — вперемешку с настоящими багами, и каждая
+# новая формулировка сообщения провайдера заводит ещё одно issue (за 12 дней
+# 429-х набралось 15 событий, 524-х — 30).
+#
+# Не отбрасываем: аутейдж провайдера — причина половины сорванных прогонов, и
+# слепота тут дороже шума. Понижаем до warning и склеиваем по типу, чтобы
+# внешнее было отличимо от своего с одного взгляда на список.
+_EXTERNAL_FAILURES = {
+    "RateLimitError",       # 429 от z.ai — один ключ на все стадии контура
+    "APITimeoutError",      # провайдер не ответил в срок
+    "APIConnectionError",   # до провайдера не дошли
+    "InternalServerError",  # 5xx и 524 от шлюза
+    "ClientDisconnect",     # отправитель вебхука ушёл, не дослав тело
+}
+
+
+def _classify_external(event: dict) -> None:
+    """Пометить отказ чужой стороны: level=warning и общий fingerprint."""
+    values = (event.get("exception") or {}).get("values") or []
+    if not values:
+        return
+    exc_type = values[-1].get("type")
+    if exc_type in _EXTERNAL_FAILURES:
+        event["level"] = "warning"
+        event["fingerprint"] = ["external_failure", exc_type]
+        event.setdefault("tags", {})["failure_side"] = "external"
+
+
 def _scrub_event(event: dict, hint=None) -> Optional[dict]:
     """before_send: вычистить секреты из кадров стека, request и extra."""
+    _classify_external(event)
     for value in (event.get("exception") or {}).get("values") or []:
         for frame in (value.get("stacktrace") or {}).get("frames") or []:
             _scrub_mapping(frame.get("vars"))

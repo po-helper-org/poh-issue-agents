@@ -830,6 +830,19 @@ def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) ->
     )
 
 
+def _swallow_after_cancel(task: "asyncio.Task") -> None:
+    """Забрать исключение задачи, брошенной отменой, и сказать это в лог.
+
+    Молча глотать нельзя: поток мог упасть по настоящей причине, и она —
+    единственный след того, чем закончилась оборванная стадия.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.info("стадия оборвана отменой, поток завершился ошибкой: %s", exc)
+
+
 async def _run_with_heartbeat(fn, *args, label: str):
     """Гоняет блокирующий fn в потоке и шлёт heartbeat каждые
     HEARTBEAT_INTERVAL_SEC, пока он не завершится.
@@ -841,11 +854,22 @@ async def _run_with_heartbeat(fn, *args, label: str):
     loop, но сам по себе не бьёт — поэтому бьём здесь, пока поток занят.
     """
     task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
-    while True:
-        done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SEC)
-        if task in done:
-            return task.result()  # переброс исключения из потока, если было
-        activity.heartbeat(label)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL_SEC)
+            if task in done:
+                return task.result()  # переброс исключения из потока, если было
+            activity.heartbeat(label)
+    except asyncio.CancelledError:
+        # Отмена активности (terminate воркфлоу, таймаут) обрывает ожидание, но
+        # НЕ поток: `to_thread` не прерывается, docker-прогон доигрывает и
+        # кладёт исключение в задачу, которую уже никто не ждёт. asyncio на
+        # сборке такой задачи пишет «Task exception was never retrieved»
+        # уровнем ERROR — и это уезжает в Sentry как сбой контура
+        # (ISSUE-AGENT-C: код 137 у контейнера агента, снятого намеренно).
+        # Колбэк забирает исключение, поэтому предупреждения не будет.
+        task.add_done_callback(_swallow_after_cancel)
+        raise
 
 
 def _truncate(text: str, limit: int) -> str:
