@@ -497,9 +497,11 @@ git commit -m "feat(repowise): контракт клиента MCP-прокси"
 
 - [ ] **Шаг 2: Проверить, что промпт читается существующим загрузчиком**
 
+`PROMPTS_DIR` — константа `Path("/app/prompts")` (`worker/activities.py:54`) без переопределения из окружения: локально её подменяют, как это делают тесты.
+
 Команда:
 ```bash
-.venv/bin/python -c "import sys; sys.path.insert(0,'worker'); import activities; print(len(activities._load_prompt('system_repowise_dialog.md')))"
+.venv/bin/python -c "import sys, pathlib; sys.path.insert(0,'worker'); import activities; activities.PROMPTS_DIR = pathlib.Path('prompts'); print(len(activities._load_prompt('system_repowise_dialog.md')))"
 ```
 Ожидается: число больше 500.
 
