@@ -24,6 +24,7 @@ from workflows import (
     IssueDevelopment,
     IssueEstimation,
     IssueLifecycle,
+    IssuePrFix,
     OrphanAgentEvent,
     WebhookAudit,
 )
@@ -54,7 +55,8 @@ async def main() -> None:
         client,
         task_queue="issue-lifecycle",
         workflows=[IssueLifecycle, IssueAnalysis, IssueDevelopment, IssueEstimation,
-                   ConsolidationWorkflow, WebhookAudit, OrphanAgentEvent, CommentAck],
+                   IssuePrFix, ConsolidationWorkflow, WebhookAudit, OrphanAgentEvent,
+                   CommentAck],
         activities=[
             activities.prefilter_bot_and_security,
             activities.read_protocol_state,

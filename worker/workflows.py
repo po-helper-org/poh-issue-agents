@@ -30,6 +30,7 @@ with workflow.unsafe.imports_passed_through():
         analysis_workflow_id,
         development_workflow_id,
         estimate_workflow_id,
+        pr_fix_workflow_id,
     )
     from shared import agent_events, awaiting as awaiting_mod
     from shared.agent_events import AgentEvent
@@ -1432,15 +1433,26 @@ class IssueLifecycle:
         while rounds < deadlines.pr_fix_max_rounds:
             rounds += 1
             try:
-                outcome = await workflow.execute_activity(
-                    activities.run_pr_fix_round,
-                    args=[issue.repo, self._pr_number, rounds],
-                    start_to_close_timeout=timedelta(seconds=3600),
-                    heartbeat_timeout=timedelta(seconds=300),
-                    # Круг недетерминирован и стоит денег: повтор инициирует
-                    # следующая итерация, а не политика ретраев.
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
+                if workflow.patched("issue-lifecycle-prfix-child"):
+                    outcome = await workflow.execute_child_workflow(
+                        IssuePrFix.run,
+                        args=[issue.repo, self._pr_number, rounds],
+                        id=pr_fix_workflow_id(issue.repo, self._pr_number, rounds),
+                        # Круг идёт до 45 минут: завершение родителя не должно
+                        # обрывать начатую доводку PR.
+                        parent_close_policy=ParentClosePolicy.ABANDON,
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
+                else:
+                    outcome = await workflow.execute_activity(
+                        activities.run_pr_fix_round,
+                        args=[issue.repo, self._pr_number, rounds],
+                        start_to_close_timeout=timedelta(seconds=3600),
+                        heartbeat_timeout=timedelta(seconds=300),
+                        # Круг недетерминирован и стоит денег: повтор инициирует
+                        # следующая итерация, а не политика ретраев.
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
             except Exception as e:
                 workflow.logger.warning("круг правок сорвался: %s", _failure_reason(e))
                 break
@@ -1872,6 +1884,35 @@ class IssueDevelopment:
         if number is None:
             raise ApplicationError("агент не изменил ни одного файла — открывать нечего")
         return number
+
+
+@workflow.defn(name="IssuePrFix")
+class IssuePrFix:
+    """Один круг правок по замечаниям ревью — дочерний прогон цикла.
+
+    Отдельный воркфлоу на КАЖДЫЙ круг, а не на цикл целиком: круги разделены
+    ожиданием внешнего доклада ревью, и объединение их в один прогон дало бы
+    воркфлоу, большую часть жизни простаивающий в ожидании чужого сигнала.
+    Ожиданием по-прежнему управляет родитель — он владеет состоянием задачи.
+    """
+
+    @workflow.run
+    async def run(self, repo: str, pr_number: int, round_number: int):
+        """`True` — правки внесены и запрошена перепроверка. Строка — правок не
+        потребовалось, и это её разбор.
+
+        Разные типы возврата намеренно: «сделали» и «не потребовалось» — разные
+        исходы, и сводить их к булеву значению значило бы потерять объяснение.
+        """
+        return await workflow.execute_activity(
+            activities.run_pr_fix_round,
+            args=[repo, pr_number, round_number],
+            start_to_close_timeout=timedelta(seconds=3600),
+            heartbeat_timeout=timedelta(seconds=300),
+            # Круг недетерминирован и стоит денег: повтор инициирует следующая
+            # итерация родителя, а не политика ретраев.
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
 
 
 @workflow.defn(name="IssueAnalysis")
