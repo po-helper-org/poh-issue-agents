@@ -1054,6 +1054,7 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
 
     task = "\n".join(parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
+    _handover_to_runner(clone_dir)
     return task
 
 
@@ -1071,6 +1072,27 @@ _DEV_FALLBACK_RULES = f"""## Как работать
 3. **Тесты.** Прогоняй проверки проекта; красный прогон в PR не отдаём.
 4. **Коммитить самому не надо** — коммит, пуш и PR делает контур после тебя.
 """
+
+
+def _handover_to_runner(path: Path) -> None:
+    """Передать каталог задачи раннеру: он работает не от root.
+
+    Падаем громко. Молча оставленный каталог root'а — рабочее место, в которое
+    агент не может писать: он не сообщает об отказе, а уходит писать в /tmp и
+    докладывает об успехе. Прогон отрабатывает целиком и не оставляет ни одной
+    правки — отказ, который снаружи выглядит как исправная работа.
+    """
+    try:
+        for current, dirs, files in os.walk(path):
+            os.chown(current, develop.RUNNER_UID, develop.RUNNER_GID)
+            for name in (*dirs, *files):
+                os.chown(os.path.join(current, name),
+                         develop.RUNNER_UID, develop.RUNNER_GID)
+    except OSError as exc:
+        raise RuntimeError(
+            f"не передал рабочий каталог раннеру (uid {develop.RUNNER_UID}): {exc}. "
+            "Без этого агент не сможет писать в него и молча уйдёт в /tmp."
+        ) from exc
 
 
 def _reap_runner(slug: str) -> None:
@@ -1383,6 +1405,7 @@ def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(repo, str(clone_dir), branch=branch)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
+    _handover_to_runner(clone_dir)
 
 
 @activity.defn

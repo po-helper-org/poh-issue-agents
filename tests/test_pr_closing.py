@@ -176,6 +176,8 @@ def test_pr_branch_is_cloned_for_the_fix_round(monkeypatch, tmp_path):
         return _Done()
 
     monkeypatch.setattr(activities_module.subprocess, "run", fake_run)
+    # Передача каталога раннеру требует root — в тесте её проверяет test_develop.
+    monkeypatch.setattr(activities_module, "_handover_to_runner", lambda path: None)
 
     activities_module._prfix_prepare("o/r", 28, "feature/19-openhands", "постановка")
 
