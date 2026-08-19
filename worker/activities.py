@@ -1135,6 +1135,40 @@ DEV_CLONE_TIMEOUT_SEC = 300
 DEV_TESTS_TIMEOUT_SEC = 900
 
 
+def _runner_home(slug: str) -> str:
+    """Домашний каталог раннера — каталог задачи, но только при живой интеграции.
+
+    Агент ищет конфигурацию MCP в `$HOME/.openhands/mcp.json` (спайк FR-16), а
+    общий том смонтирован в другом месте. Переставить HOME дешевле, чем
+    оборачивать ENTRYPOINT образа.
+
+    Интеграция выключена — возвращаем пусто, и HOME остаётся тем, что задан
+    образом: поведение прогонов без Repowise не меняется вовсе.
+    """
+    if not repowise.enabled():
+        return ""
+    return f"{develop.workspace_mount()}/{slug}"
+
+
+def _write_runner_mcp_config(issue: IssueInput, root: Path) -> None:
+    """Конфигурация MCP в каталог задачи, откуда её прочитает раннер.
+
+    Каталог лежит на общем томе и виден обоим контейнерам; права выставляются
+    вместе с остальным содержимым каталога задачи — раннер работает от
+    непривилегированного пользователя и в чужой каталог писать не сможет.
+    """
+    if not repowise.enabled():
+        return
+    config_dir = root / develop.MCP_CONFIG_DIR
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / develop.MCP_CONFIG_NAME).write_text(
+        json.dumps(repowise.openhands_mcp_config(
+            issue.repo, issue.issue_number, repowise.DEVELOP),
+            ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
     """Каталог задачи в общем томе и клон внутри него.
 
@@ -1157,6 +1191,7 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(issue.repo, str(clone_dir))
+    _write_runner_mcp_config(issue, root)
 
     parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
              "", f"## {issue.title}", "", issue.body or "(тело пустое)", ""]
@@ -1241,6 +1276,8 @@ def _dev_run_agent(issue: IssueInput) -> str:
         image=develop.runner_image(),
         volume=develop.workspace_volume(),
         mount=develop.workspace_mount(),
+        network=develop.proxy_network(),
+        home=_runner_home(slug),
     )
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""),
@@ -1579,7 +1616,8 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     await asyncio.to_thread(_reap_runner, slug)
     command = develop.runner_command(
         slug, image=develop.runner_image(),
-        volume=develop.workspace_volume(), mount=develop.workspace_mount())
+        volume=develop.workspace_volume(), mount=develop.workspace_mount(),
+        network=develop.proxy_network(), home=_runner_home(slug))
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),
         os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6")}
