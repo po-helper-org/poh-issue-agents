@@ -99,6 +99,20 @@ def _labeled_payload(label: str) -> dict:
     }
 
 
+def _bft_run(fake) -> dict | None:
+    """Старт прогона БФТ среди всех поднятых воркфлоу.
+
+    Ищем по сигналу, а не по индексу: комментарий поднимает ещё и `CommentAck`
+    (реакция 👀 на любую реплику), и он идёт первым. Проверка «БФТ — нулевой
+    старт» ломалась бы от каждого следующего воркфлоу, добавленного в обработку
+    комментария, хотя к самому БФТ это отношения не имеет.
+    """
+    for call in fake.started:
+        if call.get("start_signal") == "bft_requested":
+            return call
+    return None
+
+
 def test_bft_command_carries_its_corrections_into_the_run(client_and_app):
     """Хвост команды — замечания человека. Потеряв их, прогон пересобрал бы то
     же самое и человек получил бы тот же текст в ответ на правку."""
@@ -107,9 +121,9 @@ def test_bft_command_carries_its_corrections_into_the_run(client_and_app):
     assert _post(app_client, _comment_payload("/bft поправь цель"),
                  "issue_comment").status_code == 200
 
-    call = fake.started[0]
+    call = _bft_run(fake)
+    assert call is not None, "прогон БФТ не запущен"
     assert call["workflow"] == "IssueLifecycle"
-    assert call["start_signal"] == "bft_requested"
     req = call["start_signal_args"][0]
     assert req.mode == "fast"
     assert req.instructions == "поправь цель"
@@ -122,7 +136,7 @@ def test_bft_deep_command_routes_to_the_deep_mode(client_and_app):
     assert _post(app_client, _comment_payload("/bft-deep 1. курс ЦБ\n2. да"),
                  "issue_comment").status_code == 200
 
-    req = fake.started[0]["start_signal_args"][0]
+    req = _bft_run(fake)["start_signal_args"][0]
     assert req.mode == "deep"
     assert req.instructions == "1. курс ЦБ\n2. да"
 
@@ -142,8 +156,8 @@ def test_bft_labels_start_the_same_run(client_and_app):
 
     assert _post(app_client, _labeled_payload("run:bft-deep"), "issues").status_code == 200
 
-    call = fake.started[0]
-    assert call["start_signal"] == "bft_requested"
+    call = _bft_run(fake)
+    assert call is not None, "прогон БФТ не запущен"
     req = call["start_signal_args"][0]
     assert req.mode == "deep"
     # Триггер — метка: реагировать не на что, аргументов нет.
@@ -165,10 +179,15 @@ def test_outcome_labels_do_not_start_anything(client_and_app):
 
 
 def test_an_unauthorized_login_cannot_spend_the_budget(client_and_app, monkeypatch):
-    """Дорогую стадию запускает не всякий, у кого есть права на репозиторий."""
+    """Дорогую стадию запускает не всякий, у кого есть права на репозиторий.
+
+    Гейт стоит на прогоне, а не на подтверждении приёма: реакция 👀 бесплатна и
+    честна — комментарий действительно доехал. Молчание вместо неё означало бы,
+    что человек не отличает «не хватило прав» от «вебхук не работает».
+    """
     monkeypatch.setenv("AGENT_TRIGGER_ALLOWLIST", "bob")
     fake, app_client = client_and_app
 
     assert _post(app_client, _comment_payload("/bft-deep"),
                  "issue_comment").status_code == 200
-    assert fake.started == []
+    assert _bft_run(fake) is None, "прогон БФТ запущен без прав"

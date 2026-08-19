@@ -139,6 +139,19 @@ class OrphanEventInput:
 
 
 @dataclass
+class CommentAckInput:
+    """Комментарий, приём которого надо подтвердить реакцией.
+
+    Отдельный вход, а не поле в `IssueInput`: подтверждение приёма не знает ни
+    заголовка, ни тела, ни автора — оно ставится по факту доставки и ничем не
+    гейтится.
+    """
+    repo: str
+    issue_number: int
+    comment_id: int
+
+
+@dataclass
 class ProtocolState:
     """Состояние Issue по протоколу агентов, прочитанное ОДИН раз на старте.
 

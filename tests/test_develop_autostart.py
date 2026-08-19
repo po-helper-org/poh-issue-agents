@@ -418,3 +418,48 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
     assert phase == "ready-for-dev"
     assert "ready-for-dev:research/issue-13" in _calls, (
         "подзадача не доехала до готовности со ссылкой на требования родителя")
+
+
+# --- Сорванная передача не повторяет прогон агента ---
+
+@activity.defn(name="trigger_openhands_resolver")
+async def develop_failing(issue: IssueInput) -> None:
+    """Падение на последнем шаге активности — как пуш на живом прогоне #39.
+
+    Ретрай повторил бы её ЦЕЛИКОМ: объявление о передаче, прогон агента,
+    тесты. Именно так контур трижды объявил о работе и трижды прогнал агента.
+    """
+    _calls.append("develop")
+    raise RuntimeError("git push → код 1: remote: Permission denied")
+
+
+@activity.defn(name="post_error_label")
+async def error_label(issue: IssueInput, reason: str = "") -> None:
+    _calls.append(f"error:{reason[:40]}")
+
+
+@pytest.mark.timeout(120)
+async def test_failed_handoff_runs_the_agent_once_and_reports():
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, protocol_default,
+                                      _deadlines(True), gate, classify, duplicate,
+                                      score, post_priority, mark_running, finish, ack,
+                                      prepare, stage_ok, publish, cleanup, publish_error,
+                                      ready, develop_failing, decompose, publish_plan,
+                                      phase_stub, error_label]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal(IssueLifecycle.human_decision, "research-me")
+            for _ in range(300):
+                if any(c.startswith("error:") for c in _calls):
+                    break
+                await asyncio.sleep(0.05)
+            await handle.terminate()
+
+    assert _calls.count("develop") == 1, (
+        f"прогон агента повторился: {_calls.count('develop')} раз(а)")
+    assert any(c.startswith("error:") for c in _calls), "срыв передачи остался молчаливым"

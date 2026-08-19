@@ -19,6 +19,7 @@ from consolidation_workflow import ConsolidationWorkflow
 from shared import sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import (
+    CommentAck,
     IssueAnalysis,
     IssueBft,
     IssueEstimation,
@@ -36,7 +37,7 @@ async def main() -> None:
         client,
         task_queue="issue-lifecycle",
         workflows=[IssueLifecycle, IssueAnalysis, IssueBft, IssueEstimation,
-                   ConsolidationWorkflow, WebhookAudit, OrphanAgentEvent],
+                   ConsolidationWorkflow, WebhookAudit, OrphanAgentEvent, CommentAck],
         activities=[
             activities.prefilter_bot_and_security,
             activities.read_protocol_state,
@@ -52,6 +53,7 @@ async def main() -> None:
             activities.close_as_spam,
             activities.escalate_to_human,
             activities.post_error_label,
+            activities.ack_comment_seen,
             activities.mark_analyzing,
             activities.mark_command_running,
             activities.finish_command_labels,

@@ -104,8 +104,9 @@ def test_estimate_command_goes_through_the_live_cycle(webhook):
 
     assert _post(app_client, _comment("/estimate")).status_code == 200
 
-    assert [c["workflow"] for c in fake.started] == ["IssueLifecycle"]
-    call = fake.started[0]
+    # Подтверждение приёма идёт ПЕРВЫМ, до разбора команды.
+    assert [c["workflow"] for c in fake.started] == ["CommentAck", "IssueLifecycle"]
+    call = fake.started[1]
     assert call["id"] == "issue-acme/widgets-7"
     assert call["start_signal"] == "estimate_requested"
     assert call["start_signal_args"] == [555]
@@ -129,8 +130,8 @@ def test_analyze_command_goes_through_the_live_cycle(webhook):
 
     assert _post(app_client, _comment("/analyze")).status_code == 200
 
-    assert [c["workflow"] for c in fake.started] == ["IssueLifecycle"]
-    cycle = fake.started[0]
+    assert [c["workflow"] for c in fake.started] == ["CommentAck", "IssueLifecycle"]
+    cycle = fake.started[1]
     assert cycle["id"] == "issue-acme/widgets-7"
     assert cycle["start_signal"] == "analyze_requested"
     assert cycle["start_signal_args"] == [555]
@@ -147,7 +148,8 @@ def test_analyze_falls_back_to_a_root_run_for_an_old_cycle(webhook):
 
     # Голого signal() на этом пути больше нет — только signal-with-start.
     assert fake.signals == []
-    assert {c["workflow"] for c in fake.started} == {"IssueLifecycle", "IssueAnalysis"}
+    assert {c["workflow"] for c in fake.started} == {
+        "CommentAck", "IssueLifecycle", "IssueAnalysis"}
     analysis = next(c for c in fake.started if c["workflow"] == "IssueAnalysis")
     assert analysis["id"] == "analysis-acme/widgets-7"
     assert analysis["arg"].comment_id == 555
@@ -172,7 +174,7 @@ def test_plain_comment_feeds_the_clarification_loop(webhook):
 
     assert _post(app_client, _comment("да, речь про мобильный клиент")).status_code == 200
 
-    assert fake.started == []
+    assert [c["workflow"] for c in fake.started] == ["CommentAck"]
     assert fake.signals[0] == "issue-acme/widgets-7"
     assert ("user_comment", ("да, речь про мобильный клиент",)) in fake.signals
 
@@ -182,6 +184,58 @@ def test_comment_after_workflow_finished_is_not_an_error(webhook):
     fake, app_client = webhook(signal_fails=True)
 
     assert _post(app_client, _comment("обычный текст")).status_code == 200
+
+
+def test_any_human_comment_is_acknowledged_first(webhook):
+    """Реакция «увидел» не ветвится ни на чём: она заказывается до разбора
+    команды, до гейта прав и до всякого пайплайна."""
+    fake, app_client = webhook()
+
+    assert _post(app_client, _comment("просто мысль вслух")).status_code == 200
+
+    ack = fake.started[0]
+    assert ack["workflow"] == "CommentAck"
+    # Ключ по id комментария: ретрай доставки не просит вторую реакцию.
+    assert ack["id"] == "comment-ack-acme/widgets-555"
+    assert (ack["arg"].repo, ack["arg"].issue_number, ack["arg"].comment_id) == (
+        "acme/widgets", 7, 555)
+
+
+def test_repeated_delivery_does_not_ask_for_a_second_reaction(webhook):
+    fake, app_client = webhook(already={"CommentAck"})
+
+    assert _post(app_client, _comment("обычный текст")).status_code == 200
+
+    assert not any(c["workflow"] == "CommentAck" for c in fake.started)
+    # Обработка самого комментария при этом идёт своим чередом.
+    assert ("user_comment", ("обычный текст",)) in fake.signals
+
+
+def test_comment_is_processed_even_if_the_reaction_fails(webhook, monkeypatch):
+    """Подтверждение приёма — украшение основного пути, а не условие его работы."""
+    fake, app_client = webhook()
+    original = fake.start_workflow
+
+    async def flaky(workflow, arg, **kwargs):
+        if workflow == "CommentAck":
+            raise RuntimeError("Temporal недоступен")
+        return await original(workflow, arg, **kwargs)
+
+    monkeypatch.setattr(fake, "start_workflow", flaky)
+
+    assert _post(app_client, _comment("обычный текст")).status_code == 200
+    assert ("user_comment", ("обычный текст",)) in fake.signals
+
+
+def test_command_from_a_forbidden_user_is_still_acknowledged(webhook, monkeypatch):
+    """Гейт прав отсекает дорогую стадию, но не факт приёма: человек должен
+    видеть разницу между «не увидели» и «увидели и отказали»."""
+    monkeypatch.setenv("AGENT_TRIGGER_ALLOWLIST", "bob")
+    fake, app_client = webhook()
+
+    assert _post(app_client, _comment("/analyze")).status_code == 200
+
+    assert [c["workflow"] for c in fake.started] == ["CommentAck"]
 
 
 def test_bot_comments_are_ignored(webhook):
@@ -208,5 +262,5 @@ def test_quoted_command_does_not_run(webhook):
 
     assert _post(app_client, _comment("> /analyze\n\nсогласен")).status_code == 200
 
-    assert fake.started == []
+    assert [c["workflow"] for c in fake.started] == ["CommentAck"]
     assert ("user_comment", ("> /analyze\n\nсогласен",)) in fake.signals

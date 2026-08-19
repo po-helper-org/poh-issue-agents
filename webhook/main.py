@@ -48,7 +48,11 @@ from shared.authz import may_trigger, trigger_allowlist
 from shared.labels import parse_root_issue
 from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
-from shared.workflow_ids import estimate_workflow_id, issue_workflow_id
+from shared.workflow_ids import (
+    comment_ack_workflow_id,
+    estimate_workflow_id,
+    issue_workflow_id,
+)
 
 _log = logging.getLogger("webhook")
 
@@ -215,6 +219,34 @@ async def _audit_dropped_delivery(payload: dict, event: str, delivery_id: str | 
         pass  # ретрай той же доставки — запись уже есть
     except Exception as exc:
         _log.warning("не удалось записать аудит отброшенной доставки: %s", exc)
+
+
+async def _ack_comment_seen(client, repo: str, issue_number: int,
+                            comment_id: int) -> None:
+    """Реакция `eyes` на принятый комментарий — отдельным прогоном.
+
+    Ставит её воркер, а не вебхук: GitHub-клиента здесь нет намеренно (см.
+    `_may_start_expensive`), и заводить его ради реакции значило бы дать
+    смотрящему наружу процессу право писать в Issue. Вебхук лишь просит.
+
+    Сбой самого запроса не должен ронять обработку комментария: подтверждение
+    приёма дороже своей стоимости только пока оно бесплатно для основного пути.
+    """
+    from shared.workflow_types import CommentAckInput
+
+    try:
+        await client.start_workflow(
+            "CommentAck",
+            CommentAckInput(repo=repo, issue_number=issue_number,
+                            comment_id=comment_id),
+            id=comment_ack_workflow_id(repo, comment_id),
+            task_queue="issue-lifecycle",
+        )
+    except WorkflowAlreadyStartedError:
+        pass  # повторная доставка того же комментария — реакция уже заказана
+    except Exception as exc:
+        _log.warning("не удалось подтвердить приём комментария %s#%s (%s): %s",
+                     repo, issue_number, comment_id, exc)
 
 
 def verify_agent_signature(body: bytes, signature_header: str | None) -> None:
@@ -491,6 +523,13 @@ async def github_webhook(
 
         repo = payload["repository"]["full_name"]
         issue_number = payload["issue"]["number"]
+
+        # Подтверждение приёма — ДО разбора команды и до любого пайплайна.
+        # Всё, что ниже, ветвится и гейтится (права, живой цикл, лимиты LLM);
+        # реакция не ветвится ни на чём: комментарий доставлен, значит система
+        # его увидела, и это должно быть видно человеку сразу.
+        await _ack_comment_seen(client, repo, issue_number,
+                                payload["comment"]["id"])
 
         # Единственная точка ветвления «команда против обычного комментария»:
         # команда НЕ уходит в user_comment, иначе её съел бы цикл уточнений

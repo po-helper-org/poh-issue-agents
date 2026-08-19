@@ -60,6 +60,14 @@ class AgentEvent:
     ref: str
     root_issue: int | None = None
     detail: str = ""
+    # Ревизия, о которой факт: коммит, по которому шло ревью или прогон CI.
+    # Входит в ключ идемпотентности — без неё каждый круг правок докладывал одну
+    # и ту же тройку `(ref, phase, status)`, и второй доклад отбрасывался как
+    # повторная доставка. Круг правок физически не мог пройти дважды.
+    #
+    # Необязательна намеренно: соседи со своим релизным циклом её не присылают, и
+    # для них ключ остаётся прежним.
+    revision: str = ""
     # Заполняется корреляцией, а не отправителем: как именно опознали Issue.
     # Нужно человеку, когда он разбирает спорный случай.
     correlation: str = field(default="", compare=False)
@@ -72,7 +80,8 @@ class AgentEvent:
         начало ревью потерялось бы как «повторная доставка открытия». Статуса
         мало: `started` сопровождает каждый шаг пути.
         """
-        return f"{self.ref}:{self.phase}:{self.status}"
+        base = f"{self.ref}:{self.phase}:{self.status}"
+        return f"{base}:{self.revision}" if self.revision else base
 
 
 def parse_event(payload: dict) -> AgentEvent:
@@ -118,6 +127,7 @@ def parse_event(payload: dict) -> AgentEvent:
         ref=str(payload["ref"]).strip(),
         root_issue=root,
         detail=str(payload.get("detail") or ""),
+        revision=str(payload.get("revision") or "").strip(),
     )
 
 

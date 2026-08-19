@@ -231,3 +231,33 @@ def test_next_phase_with_the_same_status_is_a_different_fact():
                         status=STARTED, ref="42")
 
     assert opened.key() != review.key()
+
+
+def test_next_round_of_review_is_not_a_duplicate_delivery():
+    """Ревью следующего круга — новый факт, а не повторная доставка старого.
+
+    Ключ считался по `(ref, phase, status)`, и у каждого круга правок эта тройка
+    одинакова: `pr-review/started` по тому же PR. Первый доклад проходил, второй
+    отбрасывался как дубль — цикл после первого круга ждал 30 минут и сдавался.
+    Круг правок физически не мог пройти больше одного раза.
+
+    Разделитель — коммит, по которому шло ревью: повтор доставки того же ревью
+    остаётся дублем, а ревью новой ревизии проходит.
+    """
+    first = AgentEvent(repo="o/r", agent="pr-agent", phase="pr-review",
+                       status="started", ref="35", revision="aaa111")
+    retry = AgentEvent(repo="o/r", agent="pr-agent", phase="pr-review",
+                       status="started", ref="35", revision="aaa111")
+    after_fixes = AgentEvent(repo="o/r", agent="pr-agent", phase="pr-review",
+                             status="started", ref="35", revision="bbb222")
+
+    assert first.key() == retry.key(), "повторная доставка перестала быть дублем"
+    assert first.key() != after_fixes.key(), "ревью нового коммита отброшено как дубль"
+
+
+def test_event_without_revision_keeps_the_old_key():
+    """Соседи со своим релизным циклом ревизию не присылают — ключ обязан
+    остаться прежним, иначе их события начнут дублироваться."""
+    event = AgentEvent(repo="o/r", agent="ci", phase="pr-open", status="failed", ref="35")
+
+    assert event.key() == "35:pr-open:failed"

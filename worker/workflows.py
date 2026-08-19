@@ -38,6 +38,7 @@ with workflow.unsafe.imports_passed_through():
         AnalyzeInput,
         BftRequest,
         ClassificationResult,
+        CommentAckInput,
         EstimateRequest,
         EstimateResult,
         IssueInput,
@@ -260,6 +261,29 @@ class OrphanAgentEvent:
             orphan.repo, orphan.reason,
         )
         return orphan.reason
+
+
+@workflow.defn(name="CommentAck")
+class CommentAck:
+    """Подтверждение приёма комментария — отдельным прогоном, до всего остального.
+
+    Отдельный workflow, а не шаг цикла: комментарий приходит и туда, где цикла
+    нет (issue старше установки App, прогон уже закрыт), а поднимать ради
+    реакции полный `IssueLifecycle` — это веер LLM-прогонов на тысяче старых
+    issue. Реакция обязана стоять во всех исходах одинаково.
+
+    Ретраи с потолком: rate limit GitHub проходит сам, а 404 (комментарий уже
+    удалили) не пройдёт никогда — держать ради него бесконечный прогон незачем.
+    """
+
+    @workflow.run
+    async def run(self, ack: CommentAckInput) -> None:
+        await workflow.execute_activity(
+            activities.ack_comment_seen,
+            ack,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
 
 
 @workflow.defn(name="IssueLifecycle")
@@ -1436,19 +1460,32 @@ class IssueLifecycle:
                 # счёл бы активность мёртвой на первой же долгой стадии.
                 start_to_close_timeout=timedelta(seconds=3600),
                 heartbeat_timeout=timedelta(seconds=300),
-                # Явный потолок попыток обязателен. С политикой по умолчанию
-                # (бесконечные ретраи) отсутствующий workflow в репозитории-цели
-                # не давал бы ошибки вовсе: цикл висел бы на await, `except`
-                # ниже не сработал бы никогда, и Issue остался бы без владельца
-                # решения. Три попытки закрывают сетевой сбой и упираются в
-                # видимый `failed` на всём остальном.
-                retry_policy=RetryPolicy(maximum_attempts=3),
+                # ОДНА попытка, как у круга правок: активность недетерминирована,
+                # идёт десятками минут и стоит денег, а её побочные эффекты
+                # видны человеку — комментарий о передаче, ветка, PR.
+                #
+                # Три попытки выглядели дешёвой страховкой от сетевого сбоя, но
+                # ретрай повторяет активность ЦЕЛИКОМ, включая прогон агента.
+                # На живом прогоне #39 пуш падал на последнем шаге — уже после
+                # работы агента, — и контур трижды объявил о передаче задачи и
+                # трижды прогнал агента заново. Сбой сети на фоне такой цены
+                # ничтожен: повтор инициирует человек, а не политика ретраев.
+                retry_policy=RetryPolicy(maximum_attempts=1),
             )
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.
-            workflow.logger.warning("передача в разработку не выполнена: %s",
-                                    _failure_reason(e))
+            reason = _failure_reason(e)
+            workflow.logger.warning("передача в разработку не выполнена: %s", reason)
+            # Отчёт человеку, а не только метка фазы: до этого срыв передачи был
+            # виден лишь как `phase:failed` в списке — отличить его от «ещё
+            # работает» можно было только чтением логов контейнера.
+            await workflow.execute_activity(
+                activities.post_error_label,
+                args=[issue, reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=5),
+            )
             return (lifecycle.FAILED, "failed", True)
         if pr_number is None:
             # Режим `dispatch`: работа идёт на чужой стороне, и о её исходе
@@ -1819,7 +1856,9 @@ class IssueLifecycle:
                 activities.trigger_openhands_resolver,
                 issue,
                 start_to_close_timeout=timedelta(seconds=90),
-                retry_policy=RetryPolicy(maximum_attempts=3),
+                # Одна попытка — по той же причине, что и на основном пути
+                # (`_start_development`): ретрай прогоняет агента заново.
+                retry_policy=RetryPolicy(maximum_attempts=1),
             )
         self._stage = "done"
 

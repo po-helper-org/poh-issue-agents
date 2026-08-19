@@ -5,7 +5,7 @@
 import os
 
 from shared import sentry_setup
-from shared.workflow_types import EstimateRequest, IssueInput
+from shared.workflow_types import AnalyzeInput, EstimateRequest, IssueInput
 
 
 # --- Скраббер ---
@@ -71,6 +71,34 @@ def test_capture_helpers_are_noop_when_disabled(monkeypatch):
     monkeypatch.setattr(sentry_setup, "_configured", False)
     issue = IssueInput(repo="o/r", issue_number=7, title="t", body="b",
                        author_login="u", author_type="User")
+    analyze = AnalyzeInput(repo="o/r", issue_number=7, title="t", body="b")
     req = EstimateRequest(repo="o/r", issue_number=7, comment_id=99)
-    sentry_setup.capture_pipeline_failure(issue, "RuntimeError", "boom")
-    sentry_setup.capture_estimate_failure(req, "расчёт", "ValueError", "bad")
+    assert sentry_setup.capture_pipeline_failure(issue, "RuntimeError", "boom") is None
+    assert sentry_setup.capture_analysis_failure(analyze, "RuntimeError", "boom") is None
+    assert sentry_setup.capture_estimate_failure(req, "расчёт", "ValueError", "bad") is None
+
+
+# --- Ссылка на событие для комментария в Issue ---
+
+def test_event_url_needs_the_org_slug(monkeypatch):
+    # Из DSN слаг не выводится: там числовой id организации.
+    monkeypatch.delenv("SENTRY_ORG", raising=False)
+    assert sentry_setup.event_url("abc123") is None
+
+
+def test_event_url_points_at_the_event(monkeypatch):
+    monkeypatch.setenv("SENTRY_ORG", "poh-orgranization")
+    assert sentry_setup.event_url("abc123") == (
+        "https://poh-orgranization.sentry.io/issues/?query=abc123")
+
+
+def test_debug_reference_is_empty_without_an_event(monkeypatch):
+    # Sentry выключен — обещать ссылку, за которой ничего нет, нельзя.
+    monkeypatch.setenv("SENTRY_ORG", "poh-orgranization")
+    assert sentry_setup.debug_reference(None) == ""
+
+
+def test_debug_reference_falls_back_to_the_bare_event_id(monkeypatch):
+    monkeypatch.delenv("SENTRY_ORG", raising=False)
+    reference = sentry_setup.debug_reference("abc123")
+    assert "abc123" in reference and "https://" not in reference

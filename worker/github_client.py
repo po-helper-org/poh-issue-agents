@@ -457,6 +457,39 @@ def dispatch_workflow(repo: str, workflow_file: str, ref: str, inputs: dict) -> 
             f"({resp.status_code}): {resp.text.strip()[:300]}")
 
 
+class GitCommandError(RuntimeError):
+    """Отказ git с сохранённой причиной.
+
+    `subprocess.run(check=True)` бросает `CalledProcessError`, чей текст — только
+    команда и код возврата: stderr остаётся в проглоченном `capture_output`. На
+    живом прогоне #39 это дало три одинаковых «returned non-zero exit status 1»
+    в истории Temporal и ни слова о том, ЧТО отверг GitHub.
+    """
+
+
+def _git_runner(clone_dir: str, env: dict):
+    """git по рабочему дереву задачи, с видимой причиной отказа.
+
+    Токен живёт в окружении (`GH_PUSH_TOKEN`), а не в argv, и в stderr git его
+    не печатает — но текст ошибки уезжает в историю Temporal и в комментарий
+    Issue, поэтому подстраховка стоит дешевле разбирательства.
+    """
+    token = env.get("GH_PUSH_TOKEN") or ""
+
+    def git(*args: str, check: bool = True):
+        proc = subprocess.run(["git", "-C", clone_dir, *args], env=env,
+                              capture_output=True, text=True, timeout=300)
+        if check and proc.returncode:
+            detail = (proc.stderr or proc.stdout or "").strip()[:800]
+            if token:
+                detail = detail.replace(token, "[Filtered]")
+            raise GitCommandError(
+                f"git {' '.join(args)} → код {proc.returncode}: {detail}")
+        return proc
+
+    return git
+
+
 def publish_worktree(repo: str, clone_dir: str, branch: str, *,
                      title: str, body: str, message: str) -> int | None:
     """Коммит рабочего дерева в ветку и PR. None — изменений нет.
@@ -492,9 +525,7 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
         "GH_PUSH_TOKEN": token,
     }
 
-    def git(*args: str, check: bool = True):
-        return subprocess.run(["git", "-C", clone_dir, *args], env=env,
-                              capture_output=True, text=True, check=check, timeout=300)
+    git = _git_runner(clone_dir, env)
 
     git("checkout", "-B", branch)
     git("add", "-A")
@@ -616,9 +647,7 @@ def push_fixes(repo: str, clone_dir: str, branch: str, message: str) -> bool:
         "GH_PUSH_TOKEN": auth_token(repo),
     }
 
-    def git(*args: str, check: bool = True):
-        return subprocess.run(["git", "-C", clone_dir, *args], env=env,
-                              capture_output=True, text=True, check=check, timeout=300)
+    git = _git_runner(clone_dir, env)
 
     git("add", "-A")
     if git("diff", "--cached", "--quiet", check=False).returncode == 0:
