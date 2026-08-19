@@ -23,13 +23,14 @@ from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     GateResult,
     IssueInput,
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
+from workflows import IssueAnalysis, IssueDevelopment, IssueEstimation, IssueLifecycle
 
 _calls: list[str] = []
 
@@ -139,6 +140,50 @@ async def develop(issue: IssueInput) -> int | None:
     return 42
 
 
+# Разработка ушла в дочерний воркфлоу `IssueDevelopment` (#FNR-6):
+# `_start_development` под маркером патча (в тесте он всегда взведён) зовёт
+# его вместо `trigger_openhands_resolver` напрямую. Незарегистрированный
+# дочерний воркфлоу не даёт быстрой ошибки — родитель просто ждёт исполнителя,
+# которого нет, и тест висит до таймаута. Режим "local" и отметку «develop» на
+# прогоне агента воспроизводят прежнее поведение стаба (PR открыт сразу).
+@activity.defn(name="dev_begin")
+async def dev_begin_local(issue: IssueInput) -> DevelopPlan:
+    return DevelopPlan(mode="local", branch=f"research/issue-{issue.issue_number}")
+
+
+@activity.defn(name="dev_dispatch")
+async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
+
+
+@activity.defn(name="dev_prepare")
+async def dev_prepare_ok(issue: IssueInput, branch: str) -> int: return 1780
+
+
+@activity.defn(name="dev_announce")
+async def dev_announce_ok(issue: IssueInput, branch: str) -> None: ...
+
+
+@activity.defn(name="dev_run_agent")
+async def dev_agent_ok(issue: IssueInput) -> None:
+    _calls.append("develop")
+
+
+@activity.defn(name="dev_followups")
+async def dev_followups_ok(issue: IssueInput) -> list[int]: return []
+
+
+@activity.defn(name="dev_tests")
+async def dev_checks_ok(issue: IssueInput) -> None: ...
+
+
+@activity.defn(name="dev_publish")
+async def dev_publish_ok(issue: IssueInput, branch: str) -> int | None: return 42
+
+
+DEV_STEPS = [dev_begin_local, dev_dispatch_stub, dev_prepare_ok, dev_announce_ok,
+             dev_agent_ok, dev_followups_ok, dev_checks_ok, dev_publish_ok]
+
+
 @activity.defn(name="decompose_issue")
 async def decompose(issue: IssueInput, branch: str) -> dict:
     _calls.append("decompose")
@@ -171,7 +216,7 @@ def _questions_then_none():
 BASE = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub, phase_stub,
         gate_ok, classify_feature, duplicate_none, score_p1, post_priority, escalate,
         mark_running, finish, ack, prepare, stage_ok, publish, cleanup, publish_error,
-        ready, develop, decompose, publish_plan, ask]
+        ready, develop, decompose, publish_plan, ask, *DEV_STEPS]
 
 
 async def _await_phase(env, handle, expected: str, tries: int = 300) -> str:
@@ -189,7 +234,8 @@ async def test_open_question_stops_the_handoff_and_is_asked():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[*BASE, _questions_then_none()]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
@@ -215,7 +261,8 @@ async def test_answer_closes_the_round_and_the_task_moves_on():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[*BASE, _questions_then_none()]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)

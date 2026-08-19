@@ -26,7 +26,11 @@ from temporalio.workflow import ParentClosePolicy
 with workflow.unsafe.imports_passed_through():
     from shared import lifecycle
     from shared.commands import ANALYZE, ESTIMATE
-    from shared.workflow_ids import analysis_workflow_id, estimate_workflow_id
+    from shared.workflow_ids import (
+        analysis_workflow_id,
+        development_workflow_id,
+        estimate_workflow_id,
+    )
     from shared import agent_events, awaiting as awaiting_mod
     from shared.agent_events import AgentEvent
     from shared.awaiting import Awaiting
@@ -1353,26 +1357,39 @@ class IssueLifecycle:
         входов молча остался бы со старым поведением.
         """
         try:
-            pr_number = await workflow.execute_activity(
-                activities.trigger_openhands_resolver,
-                issue,
-                # Прогон агента идёт десятками минут, поэтому потолок общий на
-                # весь шаг, а живость сообщается heartbeat'ом: без него сервер
-                # счёл бы активность мёртвой на первой же долгой стадии.
-                start_to_close_timeout=timedelta(seconds=3600),
-                heartbeat_timeout=timedelta(seconds=300),
-                # ОДНА попытка, как у круга правок: активность недетерминирована,
-                # идёт десятками минут и стоит денег, а её побочные эффекты
-                # видны человеку — комментарий о передаче, ветка, PR.
-                #
-                # Три попытки выглядели дешёвой страховкой от сетевого сбоя, но
-                # ретрай повторяет активность ЦЕЛИКОМ, включая прогон агента.
-                # На живом прогоне #39 пуш падал на последнем шаге — уже после
-                # работы агента, — и контур трижды объявил о передаче задачи и
-                # трижды прогнал агента заново. Сбой сети на фоне такой цены
-                # ничтожен: повтор инициирует человек, а не политика ретраев.
-                retry_policy=RetryPolicy(maximum_attempts=1),
-            )
+            if workflow.patched("issue-lifecycle-develop-child"):
+                # Дочерний прогон: у стадии появляется свой WorkflowId, а
+                # значит строка в `workflow list` и след, переживающий её
+                # завершение. Одна попытка на уровне стадии — ретраи живут
+                # внутри, на отдельных шагах.
+                pr_number = await workflow.execute_child_workflow(
+                    IssueDevelopment.run, issue,
+                    id=development_workflow_id(issue.repo, issue.issue_number),
+                    # Прогон агента идёт до 45 минут. Ни continue-as-new
+                    # родителя, ни его завершение не должны его убивать.
+                    parent_close_policy=ParentClosePolicy.ABANDON,
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            else:
+                pr_number = await workflow.execute_activity(
+                    activities.trigger_openhands_resolver,
+                    issue,
+                    # Прогон агента идёт десятками минут, поэтому потолок общий
+                    # на весь шаг, а живость сообщается heartbeat'ом.
+                    start_to_close_timeout=timedelta(seconds=3600),
+                    heartbeat_timeout=timedelta(seconds=300),
+                    # Ретрай повторяет активность ЦЕЛИКОМ, включая прогон
+                    # агента: на прогоне #39 контур трижды объявил о передаче
+                    # задачи и трижды прогнал агента заново.
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+        except WorkflowAlreadyStartedError:
+            # Разработка по этому Issue уже идёт — второй дорогой прогон не
+            # нужен. Результата отсюда не видно (это чужой прогон), поэтому
+            # фазу не двигаем: её сдвинет тот, кто прогон и запускал.
+            workflow.logger.info("development already running for %s#%s",
+                                 issue.repo, issue.issue_number)
+            return (self._phase, self._stage, False)
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.

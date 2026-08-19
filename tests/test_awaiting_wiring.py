@@ -19,13 +19,14 @@ from shared import lifecycle
 from shared.workflow_types import (
     ClassificationResult,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     GateResult,
     IssueInput,
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
+from workflows import IssueAnalysis, IssueDevelopment, IssueEstimation, IssueLifecycle
 
 _labels: list[str] = []
 
@@ -98,9 +99,24 @@ async def escalate(issue: IssueInput, reason: str = "") -> None: ...
 async def trigger_build(issue: IssueInput) -> None: ...
 
 
+# Разработка ушла в дочерний воркфлоу `IssueDevelopment` (#FNR-6):
+# `_start_development` под маркером патча (в тесте он всегда взведён) зовёт
+# его вместо `trigger_openhands_resolver` напрямую. Незарегистрированный
+# дочерний воркфлоу не даёт быстрой ошибки — родитель просто ждёт исполнителя,
+# которого нет, и тест висит до таймаута. Режим "dispatch" воспроизводит
+# прежнее поведение стаба (`None` → работа ушла на чужую сторону).
+@activity.defn(name="dev_begin")
+async def dev_begin_dispatch(issue: IssueInput) -> DevelopPlan:
+    return DevelopPlan(mode="dispatch", branch="")
+
+
+@activity.defn(name="dev_dispatch")
+async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
+
+
 BASE = [mark_awaiting_spy, prefilter_ok, protocol_default, deadlines_stub,
         set_phase_stub, gate_ok, duplicate_none, score_p1, post_priority,
-        escalate, trigger_build]
+        escalate, trigger_build, dev_begin_dispatch, dev_dispatch_stub]
 
 
 def _issue() -> IssueInput:
@@ -110,7 +126,8 @@ def _issue() -> IssueInput:
 
 def _worker(env, tq, classify=classify_bug):
     return Worker(env.client, task_queue=tq,
-                  workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                  workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                             IssueDevelopment],
                   activities=[*BASE, classify])
 
 
