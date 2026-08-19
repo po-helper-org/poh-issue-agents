@@ -56,6 +56,21 @@ DEFAULT_WORKSPACE_MOUNT = "/workspaces"
 # держать задачу в неопределённости дороже, чем оборвать и сказать об этом.
 DEFAULT_RUN_TIMEOUT_SEC = 2700
 
+# Находки агента разработки — ФАЙЛОМ в рабочем каталоге, а не через `gh`.
+#
+# Правило работы «edge-кейс не в эту ветку, а отдельным SubIssue» в режиме
+# `dispatch` агент исполнял сам: в Actions есть и `gh`, и GITHUB_TOKEN. У
+# одноразового контейнера нет ни того, ни другого — и это не упущение, а весь
+# смысл его изоляции: он исполняет чужой код, токена ему не дают. Поэтому агент
+# оставляет находки файлом, а Issue по ним заводит воркер своими руками. Файл
+# снимается до коммита: он постановка для контура, а не часть правки.
+FOLLOWUPS_FILE = ".followups.md"
+
+# Потолок находок за прогон. Тридцать «надо бы потом учесть» — это не бэклог, а
+# способ не делать основную работу; и каждый такой Issue контур обработает
+# рекурсивно, то есть за них ещё и заплатит.
+MAX_FOLLOWUPS = 8
+
 
 def mode() -> str:
     """`local` по умолчанию: стенд самодостаточен, пока явно не сказано иначе."""
@@ -171,6 +186,48 @@ def pr_body(issue_number: int, *, branch: str) -> str:
         "ветке не чинились.\n\n"
         f"<sub>origin: agent · root-issue: #{issue_number}</sub>\n"
     )
+
+
+def parse_followups(text: str) -> list[dict]:
+    """Находки из файла агента: заголовок `## …` — название, остальное — тело.
+
+    Проза без заголовков находкой не считается. Без заголовка не понять, где
+    кончается одна находка и начинается следующая, а Issue с телом вместо
+    названия хуже, чем ненайденный edge-кейс: он живёт в бэклоге и его читают.
+    """
+    items: list[dict] = []
+    title: str | None = None
+    body: list[str] = []
+
+    def flush() -> None:
+        if title:
+            items.append({"title": title, "body": "\n".join(body).strip()})
+
+    for raw in (text or "").splitlines():
+        if raw.startswith("## "):
+            flush()
+            if len(items) >= MAX_FOLLOWUPS:
+                return items[:MAX_FOLLOWUPS]
+            title = raw[3:].strip()
+            body = []
+            continue
+        if title is not None:
+            body.append(raw)
+    flush()
+    return items[:MAX_FOLLOWUPS]
+
+
+def followup_body(item: dict, *, parent: int) -> str:
+    """Тело SubIssue по находке. Ключ цепочки первой строкой — по нему контур
+    отличает свой выход от входа и считает глубину (правила R6, R7)."""
+    return "\n".join([
+        f"root-issue: #{parent}",
+        "",
+        f"Найдено агентом разработки по задаче #{parent} и намеренно не "
+        "исправлено в её ветке: MVP это не блокирует.",
+        "",
+        item.get("body") or "(без описания)",
+    ])
 
 
 def quote(command: list[str]) -> str:
