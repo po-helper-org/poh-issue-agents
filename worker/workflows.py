@@ -263,6 +263,10 @@ class IssueLifecycle:
         # декомпозиции, ни своей разработки у неё нет — и то и другое ведёт
         # родитель, одним прогоном на весь объём MVP.
         self._plan_member = False
+        # Номер родителя плана. Нужен подзадаче, чтобы сослаться на требования:
+        # своей ветки анализа у неё нет, и ссылка на `research/issue-<своё>`
+        # была бы битой.
+        self._root_issue: int | None = None
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -548,6 +552,7 @@ class IssueLifecycle:
             self._classification_label = carried.classification_label
             self._analysis_done = carried.analysis_done
             self._plan_member = carried.plan_member
+            self._root_issue = carried.root_issue
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -574,6 +579,7 @@ class IssueLifecycle:
             classification_label=self._classification_label,
             analysis_done=self._analysis_done,
             plan_member=self._plan_member,
+            root_issue=self._root_issue,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -912,6 +918,7 @@ class IssueLifecycle:
             # находки агента разработки, у которых родителя нет и которые обязаны
             # идти своим путём целиком.
             self._plan_member = state.origin_agent and state.root_issue is not None
+            self._root_issue = state.root_issue
 
             classification: ClassificationResult | None = None
             if not state.origin_agent:
@@ -1053,6 +1060,17 @@ class IssueLifecycle:
             label = self._classification_label
             if label == "advisor:bug":
                 return (lifecycle.READY_FOR_DEV, "bug", True)
+            # Подзадача плана аналитику не заказывает: требования по фиче уже
+            # написаны — они в ветке анализа РОДИТЕЛЯ, и сама подзадача выведена
+            # из них. Полная цепочка FNR по каждой выводила бы выведенное: на
+            # фиче из четырёх подзадач это четыре прогона по восемь минут,
+            # четыре ветки `research/issue-N` и счёт впятеро больше — ради
+            # текста, который ничего не добавляет.
+            # Под маркером патча: у подзадач, уже уехавших в аналитику, этот
+            # выбор записан в историю, и другой на реплее — недетерминизм.
+            if self._plan_member and workflow.patched(
+                    "issue-lifecycle-plan-member-skips-analysis"):
+                return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
             if label is None or label == "advisor:feature-request":
                 return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
             # Консультация и «уже реализовано» закрываются ответом, а не кодом:
@@ -1123,7 +1141,10 @@ class IssueLifecycle:
         задачи, а не условие её существования: без него разработчик получит
         задачу как раньше, и это хуже, чем с планом, но лучше, чем ничего.
         """
-        branch = f"research/issue-{issue.issue_number}"
+        # Подзадача плана ссылается на требования РОДИТЕЛЯ: своей ветки анализа
+        # у неё нет, и ссылка на `research/issue-<своё>` вела бы в пустоту.
+        source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
         # Подзадача чужого плана своего плана не получает: разбирать её значило
         # бы пустить цепочку на второй круг, а там правило R7 отправит каждую
         # внучатую задачу человеку — вместо плана вышла бы очередь к людям.
@@ -1148,7 +1169,7 @@ class IssueLifecycle:
 
         await workflow.execute_activity(
             activities.mark_ready_for_dev,
-            args=[issue, self._priority_tier, f"research/issue-{issue.issue_number}"],
+            args=[issue, self._priority_tier, branch],
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )

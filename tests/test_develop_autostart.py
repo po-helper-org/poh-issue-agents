@@ -133,7 +133,7 @@ async def publish_error(analyze: AnalyzeInput, reason: str) -> None: ...
 
 @activity.defn(name="mark_ready_for_dev")
 async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None:
-    _calls.append("ready-for-dev")
+    _calls.append(f"ready-for-dev:{branch}")
 
 
 @activity.defn(name="trigger_openhands_resolver")
@@ -185,7 +185,7 @@ async def _run_until_parked(autostart: bool) -> None:
             for _ in range(200):
                 if "develop" in _calls:
                     break
-                if "ready-for-dev" in _calls and _calls[-1] == "awaiting":
+                if any(c.startswith("ready-for-dev") for c in _calls) and _calls[-1] == "awaiting":
                     break  # передали разработчику и встали ждать человека
                 await asyncio.sleep(0.05)
             await handle.terminate()
@@ -198,14 +198,14 @@ async def test_autostart_sends_the_task_to_development_itself():
     assert "develop" in _calls
     # Метка передачи ставится всё равно: она сообщает состояние задачи, а не то,
     # кто именно её возьмёт.
-    assert _calls.index("ready-for-dev") < _calls.index("develop")
+    assert _calls.index("ready-for-dev:research/issue-7") < _calls.index("develop")
 
 
 @pytest.mark.timeout(120)
 async def test_without_autostart_the_task_waits_for_a_human():
     await _run_until_parked(autostart=False)
 
-    assert "ready-for-dev" in _calls
+    assert "ready-for-dev:research/issue-7" in _calls
     assert "develop" not in _calls
 
 
@@ -252,7 +252,7 @@ async def test_own_run_label_does_not_start_a_second_analysis():
             for _ in range(3):
                 await handle.signal(IssueLifecycle.analyze_requested, None)
             for _ in range(100):
-                if "ready-for-dev" in _calls:
+                if any(c.startswith("ready-for-dev") for c in _calls):
                     break
                 await asyncio.sleep(0.05)
             await handle.terminate()
@@ -308,7 +308,7 @@ async def test_feature_goes_all_the_way_without_a_human():
     calls = await _run_closed_loop("advisor:feature-request")
 
     assert "phase:business-analysis" in calls   # аналитика запустилась сама
-    assert "ready-for-dev" in calls
+    assert any(c.startswith("ready-for-dev") for c in calls)
     assert "develop" in calls
 
 
@@ -356,15 +356,65 @@ async def test_subissue_of_a_plan_does_not_start_its_own_development():
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
-                if "ready-for-dev" in _calls and _calls[-1] == "awaiting":
+                if any(c.startswith("ready-for-dev") for c in _calls) and _calls[-1] == "awaiting":
                     break
                 if "develop" in _calls:
                     break
                 await asyncio.sleep(0.05)
             await handle.terminate()
 
-    assert "ready-for-dev" in _calls, "подзадача не доехала до передачи"
+    assert "ready-for-dev:research/issue-13" in _calls, (
+        "чеклист готовности подзадачи обязан ссылаться на требования РОДИТЕЛЯ: "
+        "своей ветки анализа у неё нет, и ссылка на research/issue-7 была бы битой")
     assert "develop" not in _calls, "подзадача завела собственную разработку"
     assert "decompose" not in _calls, (
         "подзадача разбирается на свои подзадачи — цепочка идёт на второй круг, "
         "и R7 отправит каждую внучатую задачу человеку")
+
+
+@pytest.mark.timeout(120)
+async def test_subissue_of_a_plan_skips_its_own_business_analysis():
+    """Подзадача плана не заказывает аналитику заново.
+
+    Требования по фиче уже написаны — они лежат в ветке аналитики РОДИТЕЛЯ, и
+    подзадача создана из них же. Прогонять по каждой полную цепочку FNR значит
+    выводить то, что уже выведено: на фиче из четырёх подзадач это четыре
+    прогона `claude -p` по восемь минут, четыре ветки `research/issue-N` и
+    счёт впятеро больше — ради текста, который ничего не добавляет.
+
+    Обработка подзадачи «в пределах своего контекста» — это триаж и приоритет,
+    а не второй заход на постановку.
+    """
+    _calls.clear()
+
+    @activity.defn(name="read_protocol_state")
+    async def subissue_state(repo: str, issue_number: int) -> ProtocolState:
+        return ProtocolState(origin_agent=True, root_issue=13)
+
+    @activity.defn(name="run_fnr_stage")
+    async def stage_forbidden(analyze: AnalyzeInput, stage_name: str) -> dict:
+        raise AssertionError("подзадача заказала свою аналитику")
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, subissue_state,
+                                      _deadlines(True, research=True), gate, classify,
+                                      duplicate, score, post_priority, mark_running,
+                                      finish, ack, prepare, stage_forbidden, publish,
+                                      cleanup, publish_error, ready, develop, decompose,
+                                      publish_plan, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            for _ in range(200):
+                if any(c.startswith("ready-for-dev") for c in _calls) and _calls[-1] == "awaiting":
+                    break
+                await asyncio.sleep(0.05)
+            phase = await handle.query(IssueLifecycle.phase)
+            await handle.terminate()
+
+    assert "phase:business-analysis" not in _calls, "подзадача ушла в аналитику"
+    assert phase == "ready-for-dev"
+    assert "ready-for-dev:research/issue-13" in _calls, (
+        "подзадача не доехала до готовности со ссылкой на требования родителя")

@@ -85,6 +85,10 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
         Transition(BUSINESS_ANALYSIS, HUMAN, "run:analyze / research-me"),
         # Путь бага: аналитика не нужна, задача готова к разработке сразу.
         Transition(READY_FOR_DEV, HUMAN, "bug-me"),
+        # Путь подзадачи плана: требования уже есть — в ветке анализа родителя,
+        # из них она и выведена. Своей аналитики ей не нужно, но фазу «требования
+        # есть» она проходит честно: чеклист готовности ссылается на них.
+        Transition(SYSTEM_REQUIREMENTS, AGENT, "требования готовы у родителя плана"),
         Transition(DUPLICATE, AGENT, "duplicate-check"),
         Transition(ANSWERED, AGENT, "advisor:consultation / existing-functionality"),
         Transition(ESCALATED, AGENT, "дедлайн парковки истёк"),
