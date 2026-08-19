@@ -39,6 +39,7 @@ from shared.workflow_types import (
     ClassificationResult,
     CommentAckInput,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     EstimateRequest,
     EstimateResult,
@@ -1258,6 +1259,56 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
     if number is None:
         raise RuntimeError("агент не изменил ни одного файла — открывать нечего")
     return number
+
+
+# --- Разработка дочерним воркфлоу: шаги как отдельные активности ---
+#
+# Прежде вся разработка была ОДНОЙ активностью, и её ретрай повторял четыре
+# внутренних шага целиком. На прогоне #39 падал только `git push` — уже после
+# работы агента, — а заново шёл весь прогон, и контур трижды объявил о передаче
+# задачи. Лечение снижением до одной попытки отменяло ретраи и там, где они
+# уместны. Разрезав стадию на активности, ретраи возвращаются туда, где дёшевы.
+#
+# Приватные `_dev_*` НЕ трогаем: по ним идёт `trigger_openhands_resolver`, а по
+# нему — реплей прогонов, начатых до выкладки, и прежний линейный сценарий.
+
+
+@activity.defn
+async def dev_begin(issue: IssueInput) -> DevelopPlan:
+    """Решения входа в стадию: работаем ли вообще, в каком режиме и от чего.
+
+    Собрано в один шаг намеренно. Выключатель и наличие ветки читаются из
+    окружения и из GitHub — в воркфлоу так нельзя, там решение обязано быть
+    детерминированным при реплее. Один вызов вместо трёх ещё и делает вход в
+    стадию одной строкой в истории.
+    """
+    if not develop.enabled():
+        raise RuntimeError(
+            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
+
+    branch = f"research/issue-{issue.issue_number}"
+    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
+        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
+        # агент работает от тела Issue, но знать об этом должен явно.
+        branch = ""
+
+    return DevelopPlan(mode=develop.mode(), branch=branch)
+
+
+@activity.defn
+async def dev_dispatch(issue: IssueInput, branch: str) -> None:
+    """Режим `dispatch`: прогон уезжает в GitHub Actions.
+
+    Своих шагов на этой стороне нет — отсюда и один вызов вместо цепочки.
+    Результат придёт событием `pr-open` от внешнего агента.
+    """
+    await asyncio.to_thread(
+        github_client.dispatch_workflow,
+        issue.repo, develop.workflow_file(), develop.workflow_ref(),
+        develop.dispatch_inputs(issue.issue_number, branch=branch),
+    )
+    await _dev_announce(issue, branch,
+                        where="запустил OpenHands Resolver в GitHub Actions")
 
 
 async def collect_dev_followups(issue: IssueInput) -> list[int]:
