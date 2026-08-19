@@ -139,7 +139,12 @@ def runner_command(slug: str, *, image: str, volume: str, mount: str) -> list[st
     и открывает PR воркер, а не агент.
     """
     return [
-        "docker", "run", "--rm",
+        # Имя, а не случайное: воркер запускает контейнер и ждёт, но если воркер
+        # умер (выкладка, рестарт, terminate воркфлоу), клиент исчезает, а
+        # контейнер остаётся работать — с ключом модели, минутами CPU и памятью.
+        # `--rm` тут не спасает: он убирает контейнер только после нормального
+        # выхода. По имени прогон находится и снимается перед новой попыткой.
+        "docker", "run", "--rm", "--name", slug,
         "-v", f"{volume}:{mount}",
         "-w", f"{mount}/{slug}/repo",
         "-e", "LLM_API_KEY",
@@ -147,6 +152,12 @@ def runner_command(slug: str, *, image: str, volume: str, mount: str) -> list[st
         "-e", "LLM_MODEL",
         image,
     ]
+
+
+def reap_command(slug: str) -> list[str]:
+    """Снять остаток прошлой попытки. Нет такого контейнера — команда просто
+    вернёт ненулевой код, и это штатно."""
+    return ["docker", "rm", "-f", slug]
 
 
 def runner_env(api_key: str, base_url: str, model: str) -> dict[str, str]:

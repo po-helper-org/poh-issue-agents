@@ -1066,10 +1066,25 @@ _DEV_FALLBACK_RULES = f"""## Как работать
 """
 
 
+def _reap_runner(slug: str) -> None:
+    """Снять контейнер прошлой попытки, если он пережил своего запускателя.
+
+    Temporal повторяет активность до трёх раз. Умерший вместе с воркером прогон
+    контейнер за собой не убирает (`--rm` срабатывает только на нормальном
+    выходе), и вторая попытка либо упирается в занятое имя, либо запускает
+    второго агента в тот же рабочий каталог. На стенде остаток жил полчаса и
+    доедал память, из-за которой следующая задача еле ползла.
+    """
+    subprocess.run(develop.reap_command(slug), capture_output=True, text=True,
+                   timeout=60, check=False)
+
+
 def _dev_run_agent(issue: IssueInput) -> str:
     """Прогон одноразового контейнера. Возвращает хвост вывода."""
+    slug = develop.task_slug(issue.repo, issue.issue_number)
+    _reap_runner(slug)
     command = develop.runner_command(
-        develop.task_slug(issue.repo, issue.issue_number),
+        slug,
         image=develop.runner_image(),
         volume=develop.workspace_volume(),
         mount=develop.workspace_mount(),
@@ -1374,8 +1389,10 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     await _run_with_heartbeat(_prfix_prepare, repo, pr_number, branch, task,
                               label="prfix:prepare")
 
+    slug = pr_closing.task_slug(repo, pr_number)
+    await asyncio.to_thread(_reap_runner, slug)
     command = develop.runner_command(
-        pr_closing.task_slug(repo, pr_number), image=develop.runner_image(),
+        slug, image=develop.runner_image(),
         volume=develop.workspace_volume(), mount=develop.workspace_mount())
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),

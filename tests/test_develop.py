@@ -348,3 +348,46 @@ def test_worker_and_runner_agree_on_the_node_version():
         return found.group(1)
 
     assert node_major("worker/Dockerfile") == node_major("openhands/Dockerfile")
+
+
+def test_runner_container_has_a_deterministic_name():
+    """У прогона должно быть имя, по которому его можно найти и снять.
+
+    Контейнер живёт своей жизнью: воркер запускает его и ждёт, но если воркер
+    умер (выкладка, рестарт, terminate воркфлоу), клиент исчезает, а контейнер
+    остаётся работать — с ключом модели, минутами CPU и памятью. На стенде так
+    и вышло: прогон сняли, а раннер жил ещё полчаса и доедал память, из-за
+    которой следующая задача еле ползла. Без имени найти его нечем: `--rm`
+    убирает контейнер только после нормального выхода.
+    """
+    slug = develop.task_slug("o/r", 7)
+    command = develop.runner_command(slug, image="i", volume="v", mount="/m")
+
+    assert "--name" in command
+    assert command[command.index("--name") + 1] == slug
+
+
+def test_leftover_run_is_reaped_before_a_new_attempt(monkeypatch):
+    """Новая попытка начинается с чистого места.
+
+    Temporal повторяет активность разработки до трёх раз. Если предыдущая
+    попытка умерла вместе с воркером, её контейнер остался работать — и вторая
+    попытка либо упирается в занятое имя, либо запускает второго агента в тот же
+    рабочий каталог. Оба исхода хуже, чем снять остаток.
+    """
+    commands: list[list[str]] = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(activities_module.subprocess, "run",
+                        lambda cmd, **kw: commands.append(cmd) or _Done())
+
+    activities_module._dev_run_agent(_issue(7))
+
+    slug = develop.task_slug("o/r", 7)
+    assert commands[0] == ["docker", "rm", "-f", slug], (
+        f"перед прогоном не сняли остаток: {commands[0]}")
+    assert commands[1][:2] == ["docker", "run"]
