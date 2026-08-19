@@ -62,6 +62,7 @@
 | Дорожная карта | `docs/ROADMAP.md` |
 | План работ | `specs/implementation-spec.md` |
 | Спайк FR-1 (headless, сеть, провайдер) | `docs/spikes/2026-08-19-repowise-headless.md` |
+| Спайк FR-16 (конфигурация MCP у OpenHands) | `docs/spikes/2026-08-19-openhands-mcp-config.md` |
 | Дизайн сервиса (инфраструктура) | `../poh-infra/docs/superpowers/specs/2026-08-19-repowise-mcp-service-design.md` |
 | Текущий образ Repowise | `../poh-infra/mcp/poh-org/servers/repowise.yaml` |
 | Compose контура | `../poh-infra/harness/docker-compose.yml` |
@@ -897,6 +898,8 @@ endif
 2. При отсутствии поддержки открыта отдельная запись, а требования FR-17 — FR-19 переведены в состояние заблокированных.
 
 **Зависимости.** Нет.
+
+**Статус: выполнено 19.08.2026.** Поддержка есть: `openhands mcp add <имя> --transport http --header "Authorization: Bearer <токен>" <url>`, версия пакета `1.16.0`. Конфигурация лежит в `/home/agent/.openhands/mcp.json` — в домашнем каталоге раннера, а НЕ в каталоге задачи, поэтому FR-17 монтирует файл, а не кладёт его рядом с постановкой. Отчёт: `docs/spikes/2026-08-19-openhands-mcp-config.md`.
 
 #### 4.3.2 FR-17. Сетевой доступ одноразового контейнера к прокси
 
