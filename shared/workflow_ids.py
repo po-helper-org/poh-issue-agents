@@ -26,6 +26,13 @@ def estimate_workflow_id(repo_full_name: str, issue_number: int,
     return f"estimate-{repo_full_name}-{issue_number}-{marker}"
 
 
+def comment_ack_workflow_id(repo_full_name: str, comment_id: int) -> str:
+    # Ключ — id комментария: повторная доставка того же события упирается в
+    # WorkflowAlreadyStarted, и второй реакции GitHub не просят. Номер issue в
+    # ключе не нужен — id комментария уникален в пределах репозитория.
+    return f"comment-ack-{repo_full_name}-{comment_id}"
+
+
 def analysis_workflow_id(repo_full_name: str, issue_number: int) -> str:
     # Фиксированный id (без comment_id): повторный /analyze при идущем прогоне
     # упирается в WorkflowAlreadyStarted вместо второго дорогого прогона.

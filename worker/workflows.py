@@ -33,6 +33,7 @@ with workflow.unsafe.imports_passed_through():
     from shared.workflow_types import (
         AnalyzeInput,
         ClassificationResult,
+        CommentAckInput,
         EstimateRequest,
         EstimateResult,
         IssueInput,
@@ -250,6 +251,29 @@ class OrphanAgentEvent:
             orphan.repo, orphan.reason,
         )
         return orphan.reason
+
+
+@workflow.defn(name="CommentAck")
+class CommentAck:
+    """Подтверждение приёма комментария — отдельным прогоном, до всего остального.
+
+    Отдельный workflow, а не шаг цикла: комментарий приходит и туда, где цикла
+    нет (issue старше установки App, прогон уже закрыт), а поднимать ради
+    реакции полный `IssueLifecycle` — это веер LLM-прогонов на тысяче старых
+    issue. Реакция обязана стоять во всех исходах одинаково.
+
+    Ретраи с потолком: rate limit GitHub проходит сам, а 404 (комментарий уже
+    удалили) не пройдёт никогда — держать ради него бесконечный прогон незачем.
+    """
+
+    @workflow.run
+    async def run(self, ack: CommentAckInput) -> None:
+        await workflow.execute_activity(
+            activities.ack_comment_seen,
+            ack,
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
 
 
 @workflow.defn(name="IssueLifecycle")
@@ -1341,8 +1365,17 @@ class IssueLifecycle:
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.
-            workflow.logger.warning("передача в разработку не выполнена: %s",
-                                    _failure_reason(e))
+            reason = _failure_reason(e)
+            workflow.logger.warning("передача в разработку не выполнена: %s", reason)
+            # Отчёт человеку, а не только метка фазы: до этого срыв передачи был
+            # виден лишь как `phase:failed` в списке — отличить его от «ещё
+            # работает» можно было только чтением логов контейнера.
+            await workflow.execute_activity(
+                activities.post_error_label,
+                args=[issue, reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=5),
+            )
             return (lifecycle.FAILED, "failed", True)
         if pr_number is None:
             # Режим `dispatch`: работа идёт на чужой стороне, и о её исходе

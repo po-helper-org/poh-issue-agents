@@ -138,7 +138,9 @@ def test_stranger_cannot_start_estimate_by_command(webhook):
     fake, app_client = webhook("kibarik")
 
     assert _post(app_client, _commented("/estimate", "stranger"), "issue_comment").status_code == 200
-    assert fake.started == []
+    # Подтверждение приёма гейтом не закрыто: оно ничего не стоит и отличает
+    # «не увидели» от «увидели и отказали». Дорогой стадии при этом нет.
+    assert [c["workflow"] for c in fake.started] == ["CommentAck"]
 
 
 def test_stranger_cannot_start_heavy_stage_by_research_me(webhook):

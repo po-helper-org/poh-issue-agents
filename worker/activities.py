@@ -37,6 +37,7 @@ from shared.commands import (
 from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
+    CommentAckInput,
     Deadlines,
     DuplicateResult,
     EstimateRequest,
@@ -421,16 +422,22 @@ def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
 
 @activity.defn
 def post_error_label(issue: IssueInput, reason: str = "") -> None:
-    github_client.post_comment(
-        issue.repo, issue.issue_number,
-        "⚠️ Автоматическая обработка не удалась. Ожидай ручного разбора.",
-    )
-    github_client.add_label(issue.repo, issue.issue_number, "advisor:error")
+    # Sentry ПЕРЕД комментарием, а не после: id события уезжает в тот же
+    # комментарий ссылкой, иначе человек видит «не удалось» и не знает, где
+    # смотреть, — а логи контейнера ему недоступны.
+    #
     # `reason` = "ExcType: message" из catch-ветки workflow'а (workflows.py).
     # Без него (прямой вызов/старые тесты) exc_type пуст — событие всё равно
     # уходит, просто с менее точной группировкой.
     exc_type, _, message = reason.partition(": ")
-    sentry_setup.capture_pipeline_failure(issue, exc_type or "unknown", message or reason)
+    event_id = sentry_setup.capture_pipeline_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Автоматическая обработка не удалась. Ожидай ручного разбора."
+        + sentry_setup.debug_reference(event_id),
+    )
+    github_client.add_label(issue.repo, issue.issue_number, "advisor:error")
 
 
 @activity.defn
@@ -1491,6 +1498,26 @@ async def finish_pr_fixing(repo: str, pr_number: int, rounds: int, settled: bool
                             pr_closing.NEEDS_HUMAN_PR)
 
 
+# --- Приём комментария: реакция раньше любой работы ---
+
+@activity.defn
+async def ack_comment_seen(ack: CommentAckInput) -> None:
+    """«Система увидела комментарий» — реакция `eyes` до разбора и до пайплайнов.
+
+    Ставится на КАЖДЫЙ человеческий комментарий, а не только на команду: с
+    телефона иначе не отличить «не доехало» от «думает». Дальше вход может
+    оказаться командой, репликой в цикл уточнений или ничем (живого цикла нет —
+    комментарий best-effort и тихо теряется, webhook/main.py); реакция стоит в
+    любом из этих исходов.
+
+    Реакция идемпотентна на стороне GitHub: повторная доставка того же
+    комментария упирается в тот же workflow id, а совпавший гонкой второй POST
+    возвращает 200 на уже поставленную реакцию.
+    """
+    await asyncio.to_thread(
+        github_client.add_reaction, ack.repo, ack.comment_id, "eyes")
+
+
 # --- Слой C: аналитика по запросу (команда /analyze) ---
 
 @activity.defn
@@ -1533,13 +1560,18 @@ async def ack_command(analyze: AnalyzeInput) -> None:
 async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
     """Не молчать при провале: прогон дорогой и долгий, тихое падение
     неотличимо от «ещё работает»."""
+    exc_type, _, message = reason.partition(": ")
+    event_id = await asyncio.to_thread(
+        sentry_setup.capture_analysis_failure,
+        analyze, exc_type or "unknown", message or reason)
     await asyncio.to_thread(
         github_client.post_comment,
         analyze.repo,
         analyze.issue_number,
         f"⚠️ Автономный анализ не удался: {reason}\n\n"
         "Прогон не повторяется автоматически (он недетерминирован и дорог). "
-        "Запустить заново — командой `/analyze`.",
+        "Запустить заново — командой `/analyze`."
+        + sentry_setup.debug_reference(event_id),
     )
 
 
@@ -1686,13 +1718,15 @@ def post_estimate_comment(req: EstimateRequest, result: EstimateResult) -> None:
 
 @activity.defn
 def post_estimate_error(req: EstimateRequest, stage: str, reason: str = "") -> None:
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_estimate_failure(
+        req, stage, exc_type or "unknown", message or reason)
     github_client.post_comment(
         req.repo,
         req.issue_number,
         f"⚠️ Оценка не удалась на стадии «{stage}». Повтори `/estimate` позже — "
-        f"подробности прогона видны в Temporal UI.",
+        f"подробности прогона видны в Temporal UI."
+        + sentry_setup.debug_reference(event_id),
     )
     if req.comment_id is not None:
         github_client.add_reaction(req.repo, req.comment_id, "confused")
-    exc_type, _, message = reason.partition(": ")
-    sentry_setup.capture_estimate_failure(req, stage, exc_type or "unknown", message or reason)

@@ -109,15 +109,47 @@ def configure(service: str) -> bool:
     return True
 
 
-def capture_pipeline_failure(issue, exc_type: str, message: str) -> None:
+def event_url(event_id: Optional[str]) -> Optional[str]:
+    """Ссылка на конкретное событие в Sentry — по id и слагу организации.
+
+    Слаг из DSN не выводится (там только числовой id организации), поэтому
+    берётся из `SENTRY_ORG`. Без него ссылки нет — остаётся сам id события,
+    по которому оно ищется в UI руками.
+    """
+    org = os.environ.get("SENTRY_ORG", "").strip()
+    if not event_id or not org:
+        return None
+    # Поиск по id события в списке issue: Sentry разворачивает его в само
+    # событие. Прямой ссылки на событие без известного issue_id у API нет.
+    return f"https://{org}.sentry.io/issues/?query={event_id}"
+
+
+def debug_reference(event_id: Optional[str]) -> str:
+    """Строка для комментария в Issue: куда смотреть, чтобы разобрать сбой.
+
+    Пустая, если Sentry выключен: обещать человеку ссылку, за которой ничего
+    нет, хуже, чем не обещать ничего.
+    """
+    if not event_id:
+        return ""
+    url = event_url(event_id)
+    if url:
+        return f"\n\n🔎 Подробности сбоя: [событие в Sentry]({url}) — `{event_id}`."
+    return (f"\n\n🔎 Подробности сбоя: событие Sentry `{event_id}` "
+            "(найти по этому id в интерфейсе Sentry).")
+
+
+def capture_pipeline_failure(issue, exc_type: str, message: str) -> Optional[str]:
     """Workflow триажа (IssueLifecycle) поймал исключение и поставил лейбл
     `advisor:error` (workflows.py) — эскалация в Sentry.
 
     fingerprint по (pipeline_failure, exc_type): аутейдж z.ai даёт одно issue с
     сотней событий, а не сотню отдельных по одному на каждую issue.
+
+    Возвращает id события: он уезжает в комментарий Issue ссылкой на отладку.
     """
     if not _configured:
-        return
+        return None
     import sentry_sdk
 
     with sentry_sdk.new_scope() as scope:
@@ -126,20 +158,44 @@ def capture_pipeline_failure(issue, exc_type: str, message: str) -> None:
         scope.set_tag("exc_type", exc_type)
         scope.set_extra("message", message)
         scope.fingerprint = ["pipeline_failure", exc_type]
-        sentry_sdk.capture_message(
+        return sentry_sdk.capture_message(
             f"pipeline failed: {getattr(issue, 'repo', '?')}"
             f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
             level="error")
 
 
-def capture_estimate_failure(req, stage: str, exc_type: str, message: str) -> None:
+def capture_analysis_failure(analyze, exc_type: str, message: str) -> Optional[str]:
+    """Workflow `/analyze` (IssueAnalysis) не довёл прогон до артефактов.
+
+    fingerprint по (analysis_failure, exc_type): прогон дорогой и падает обычно
+    не по своей вине (лимит z.ai, обрыв claude -p), и группировать такие сбои
+    по issue значило бы получить новую группу на каждую задачу.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(analyze, "repo", None))
+        scope.set_tag("issue", str(getattr(analyze, "issue_number", None)))
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["analysis_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"analysis failed: {getattr(analyze, 'repo', '?')}"
+            f"#{getattr(analyze, 'issue_number', '?')} ({exc_type})",
+            level="error")
+
+
+def capture_estimate_failure(req, stage: str, exc_type: str,
+                             message: str) -> Optional[str]:
     """Workflow /estimate (IssueEstimation) упал на стадии `stage`.
 
     fingerprint по (estimate_failure, stage): группируем по стадии сбоя
     (сбор контекста / извлечение фактов / …), а не по issue.
     """
     if not _configured:
-        return
+        return None
     import sentry_sdk
 
     with sentry_sdk.new_scope() as scope:
@@ -149,7 +205,7 @@ def capture_estimate_failure(req, stage: str, exc_type: str, message: str) -> No
         scope.set_tag("exc_type", exc_type)
         scope.set_extra("message", message)
         scope.fingerprint = ["estimate_failure", stage]
-        sentry_sdk.capture_message(
+        return sentry_sdk.capture_message(
             f"estimate failed at «{stage}»: {getattr(req, 'repo', '?')}"
             f"#{getattr(req, 'issue_number', '?')} ({exc_type})",
             level="error")
