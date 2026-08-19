@@ -109,13 +109,22 @@ def _failure_reason(e: BaseException) -> str:
     cause = getattr(e, "cause", None) or e
     for _ in range(_MAX_CAUSE_UNWRAP):
         exc_type = getattr(cause, "type", None)
-        # `.type` — имя класса ТОЛЬКО у ApplicationError. У TimeoutError то же
-        # имя атрибута занято перечислением TimeoutType, и его значение —
-        # число: в Sentry уезжал тег `exc_type: 1` и fingerprint по этой
-        # единице (ISSUE-AGENT-B). Всё, что не строка, для группировки
-        # бесполезно — разворачиваем глубже в поисках настоящего типа.
+        # `.type` — имя класса ТОЛЬКО у ApplicationError. Оно и есть искомая
+        # первопричина: дальше разворачивать нечего.
         if isinstance(exc_type, str):
             return f"{exc_type}: {cause}"
+        # `.type` есть, но не строка — это TimeoutError: там тем же именем
+        # занято перечисление TimeoutType, и его значение число. В Sentry
+        # уезжал тег `exc_type: 1` и fingerprint по этой единице
+        # (ISSUE-AGENT-B), поэтому число как тип не годится.
+        #
+        # Но и разворачивать глубже НЕЛЬЗЯ. Temporal кладёт причиной таймаута
+        # сбой ПОСЛЕДНЕЙ попытки, и на шаге с тремя попытками «упал один раз,
+        # потом встал» доложилось бы тем первым падением: человек в Issue и
+        # отпечаток в Sentry указывали бы на ошибку, которая на самом деле
+        # была пережита, а настоящая причина — таймаут — исчезала бы.
+        if exc_type is not None:
+            break
         deeper = getattr(cause, "cause", None)
         if deeper is None:
             break

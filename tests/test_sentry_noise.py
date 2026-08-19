@@ -141,6 +141,48 @@ def test_failure_reason_names_the_class_when_type_is_not_a_string():
     assert reason == "FakeTimeout: activity StartToClose timeout"
 
 
+def test_failure_reason_does_not_look_past_a_timeout():
+    """Таймаут — сам по себе причина, и подменять его пережитой ошибкой нельзя.
+
+    Разворот `.cause` в цикле завели ради дочерних воркфлоу, где настоящая
+    причина лежит на уровень глубже. Но Temporal кладёт причиной таймаута сбой
+    ПОСЛЕДНЕЙ попытки: на шаге с тремя попытками прогон «упал один раз, потом
+    встал и не уложился в срок» доложился бы тем первым падением. Человек в
+    Issue и отпечаток в Sentry указывали бы на ошибку, которая на самом деле
+    была пережита, а настоящая причина — таймаут — исчезала бы.
+    """
+    import enum
+
+    from workflows import _failure_reason
+
+    class TimeoutType(enum.IntEnum):
+        START_TO_CLOSE = 1
+
+    class FakeApplicationError(Exception):
+        type = "RuntimeError"
+
+        def __str__(self):
+            return "проверки не прошли (код 1)"
+
+    class FakeTimeout(Exception):
+        type = TimeoutType.START_TO_CLOSE
+
+        def __init__(self, cause):
+            self.cause = cause
+
+        def __str__(self):
+            return "activity StartToClose timeout"
+
+    class FakeActivityError(Exception):
+        def __init__(self, cause):
+            self.cause = cause
+
+    reason = _failure_reason(FakeActivityError(FakeTimeout(FakeApplicationError())))
+
+    assert reason == "FakeTimeout: activity StartToClose timeout", (
+        "разворот прошёл сквозь таймаут и доложил пережитую ошибку")
+
+
 def test_failure_reason_keeps_the_application_error_type():
     from workflows import _failure_reason
 
