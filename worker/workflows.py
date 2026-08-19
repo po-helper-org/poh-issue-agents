@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -34,6 +34,7 @@ with workflow.unsafe.imports_passed_through():
         AnalyzeInput,
         ClassificationResult,
         CommentAckInput,
+        DevelopPlan,
         EstimateRequest,
         EstimateResult,
         IssueInput,
@@ -1761,6 +1762,99 @@ class IssueLifecycle:
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
         self._stage = "done"
+
+
+@workflow.defn(name="IssueDevelopment")
+class IssueDevelopment:
+    """Разработка по подготовленному Issue — дочерний прогон цикла.
+
+    Отдельным воркфлоу, а не активностью, по двум причинам сразу.
+
+    Первая — видимость. Активность внутри родителя не имеет своего
+    WorkflowId: в `workflow list` строки нет, а после завершения не остаётся
+    и следа — операционная история собиралась логами контейнера и `docker ps`.
+
+    Вторая — ретраи. Одна активность на четыре шага повторялась целиком: на
+    прогоне #39 падал только `git push`, уже после работы агента, а заново шёл
+    весь прогон, и контур трижды объявил о передаче задачи. Здесь у каждого
+    шага своя политика: дорогие и недетерминированные (агент, тесты) идут в
+    одну попытку, дешёвые и повторяемые (клон, публикация) — в три.
+
+    Идентификатор фиксирован (`develop-<repo>-<n>`), поэтому повторный запуск
+    при идущем прогоне упирается в WorkflowAlreadyStarted, а не поднимает
+    второго агента в тот же рабочий каталог.
+    """
+
+    @workflow.run
+    async def run(self, issue: IssueInput) -> int | None:
+        """Возвращает номер PR (`local`) либо None (`dispatch`).
+
+        `None` родитель читает как «работа идёт на чужой стороне, жди события
+        `pr-open`», а не как отказ.
+        """
+        cheap = RetryPolicy(maximum_attempts=3)
+        # Одна попытка там, где шаг недетерминирован, идёт десятками минут и
+        # стоит денег. Повтор такого инициирует человек, а не политика ретраев.
+        once = RetryPolicy(maximum_attempts=1)
+
+        plan = await workflow.execute_activity(
+            activities.dev_begin, issue,
+            start_to_close_timeout=timedelta(seconds=120),
+            retry_policy=cheap,
+        )
+
+        if plan.mode == "dispatch":
+            await workflow.execute_activity(
+                activities.dev_dispatch, args=[issue, plan.branch],
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=cheap,
+            )
+            return None
+
+        # Порядок не косметический: сначала клон и постановка — они
+        # единственные могут не состояться до того, как что-либо сказано
+        # человеку.
+        await workflow.execute_activity(
+            activities.dev_prepare, args=[issue, plan.branch],
+            start_to_close_timeout=timedelta(seconds=600),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=cheap,
+        )
+        await workflow.execute_activity(
+            activities.dev_announce, args=[issue, plan.branch],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=cheap,
+        )
+        await workflow.execute_activity(
+            activities.dev_run_agent, issue,
+            start_to_close_timeout=timedelta(seconds=3600),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=once,
+        )
+        # Находки — ДО тестов и публикации: файл находок обязан исчезнуть из
+        # рабочего дерева раньше коммита, иначе уедет в PR как мусор, а на
+        # следующем круге правок агент прочитает свои прошлые находки как новые.
+        await workflow.execute_activity(
+            activities.dev_followups, issue,
+            start_to_close_timeout=timedelta(seconds=300),
+            retry_policy=cheap,
+        )
+        await workflow.execute_activity(
+            activities.dev_tests, issue,
+            start_to_close_timeout=timedelta(seconds=1800),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=once,
+        )
+        number = await workflow.execute_activity(
+            activities.dev_publish, args=[issue, plan.branch],
+            start_to_close_timeout=timedelta(seconds=600),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=cheap,
+        )
+
+        if number is None:
+            raise ApplicationError("агент не изменил ни одного файла — открывать нечего")
+        return number
 
 
 @workflow.defn(name="IssueAnalysis")
