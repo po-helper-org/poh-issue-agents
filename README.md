@@ -373,6 +373,54 @@ Temporal недостижим либо авторизация не настро�
   `duplicate`, `failed`, `agents-off`. Припаркованный прогон теперь отличим от
   зависшего.
 
+### Отслеживание прогона OpenHands (Develop)
+
+Код пишет OpenHands — одноразовым контейнером на своём сервере (режим `local`,
+умолчание) либо в GitHub Actions (`dispatch`); режим и все константы —
+`shared/develop.py`. В режиме `local` прогон виден на четырёх поверхностях
+разом, они дополняют друг друга:
+
+- **Temporal — на какой стадии стоит прогон.** Активность
+  `trigger_openhands_resolver` (`worker/activities.py`) шлёт heartbeat каждые
+  `HEARTBEAT_INTERVAL_SEC` (30с) через стадии `dev:prepare` → `dev:agent` →
+  `dev:tests` → `dev:publish`:
+  ```bash
+  docker exec <temporal-контейнер> temporal workflow list
+  docker exec <temporal-контейнер> temporal workflow describe --workflow-id <id>
+  ```
+  `Pending Activities` в выводе `describe` показывает застрявшую стадию и число
+  попыток (Temporal повторяет активность до трёх раз).
+
+- **Логи воркера — вывод самого агента.** `_dev_run_agent` логирует хвост
+  stdout/stderr **на любом исходе прогона, не только при ошибке** — иначе
+  прогон, отработавший 20 минут и не тронувший ни одного файла, не оставляет ни
+  строки при падении на следующем шаге:
+  ```bash
+  docker logs -f <worker-контейнер> | grep "Develop"
+  ```
+
+- **Контейнер-раннер — живой прогон агента.** Имя детерминировано:
+  `develop.task_slug()` → `dev-<owner>__<repo>-<issue>`:
+  ```bash
+  docker logs -f dev-<owner>__<repo>-<issue>
+  ```
+  `--rm` только на нормальном выходе; потолок `DEVELOP_TIMEOUT_SEC` (умолчание
+  2700с / 45 мин) — превышение это не «агент думает», а «агент застрял».
+
+- **Sentry** (см. «Наблюдаемость — Sentry» ниже) — что упало молча; тег `stage`
+  отличает падение на `dev:*` от прочих активностей.
+
+Человеку в Issue видно без захода в контейнер: метка `in-development`
+(`_dev_announce`, best-effort — непоставленная метка не роняет уже начавшийся
+прогон) и комментарий-хендофф с веткой и способом запуска. По завершении — PR
+с `Closes #issue`, либо, если агент нашёл edge-кейсы (`collect_dev_followups`,
+файл `.followups.md` в рабочем каталоге), комментарий «🔍 Найдено по дороге» со
+ссылками на заведённые SubIssue.
+
+Живая проверка пути целиком, включая Develop, — `scripts/demo_e2e.py`: заводит
+Issue и ждёт `in-development`/PR по каждой стадии с таймаутом, отдельно от
+`e2e_live.py` выше (тот Develop не гоняет).
+
 ## Фазы жизненного цикла Issue
 
 `shared/lifecycle.py` — единственный источник правды о состоянии Issue: перечень
