@@ -69,7 +69,7 @@ async def gate_ok(issue: IssueInput, thread: list[str]) -> GateResult:
 
 
 @activity.defn(name="classify_issue")
-async def classify_feature(issue: IssueInput) -> ClassificationResult:
+async def classify_feature(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:feature-request", answer="ok")
 
 
