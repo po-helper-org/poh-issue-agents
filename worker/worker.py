@@ -29,6 +29,20 @@ from workflows import (
 
 sentry_setup.configure("worker")  # no-op без SENTRY_DSN
 
+# Шаги разработки — списком, а не россыпью в конструкторе Worker: этот же
+# список проверяет тест регистрации. Незарегистрированный шаг не вызовется из
+# воркфлоу, и обнаружилось бы это на живом прогоне.
+DEVELOP_ACTIVITIES = [
+    activities.dev_begin,
+    activities.dev_dispatch,
+    activities.dev_prepare,
+    activities.dev_announce,
+    activities.dev_run_agent,
+    activities.dev_followups,
+    activities.dev_tests,
+    activities.dev_publish,
+]
+
 
 async def main() -> None:
     client = await connect_temporal()
@@ -72,6 +86,7 @@ async def main() -> None:
             activities.publish_analysis_error,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,
+            *DEVELOP_ACTIVITIES,
             activities.ack_estimate_command,
             activities.collect_estimation_context,
             activities.extract_estimation_facts,

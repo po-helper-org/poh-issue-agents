@@ -1319,6 +1319,73 @@ async def dev_dispatch(issue: IssueInput, branch: str) -> None:
     await _dev_dispatch_and_announce(issue, branch)
 
 
+@activity.defn
+async def dev_prepare(issue: IssueInput, branch: str) -> int:
+    """Шаг 1: свежий клон и постановка файлом. Возвращает длину постановки.
+
+    Длину, а не текст: постановка уже лежит в `.task.md` в общем томе, и
+    дублировать её в payload Temporal незачем. В лог она уходит целиком — там
+    её и смотрят, когда разбираются «почему агент сделал не то».
+    """
+    task = await _run_with_heartbeat(_dev_prepare, issue, branch, label="dev:prepare")
+    logger.info("Develop %s#%s: постановка (%d симв.)\n%s",
+                issue.repo, issue.issue_number, len(task), task[:2000])
+    return len(task)
+
+
+@activity.defn
+async def dev_announce(issue: IssueInput, branch: str) -> None:
+    """Шаг 2: метка и комментарий о начале работы — best-effort.
+
+    Отдельным шагом, а не частью прогона: объявление обязано случиться ПОСЛЕ
+    успешного клона (иначе контур скажет о работе, которая не началась) и ДО
+    прогона агента (иначе человек двадцать минут не знает, что задача в работе).
+    """
+    await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
+
+
+@activity.defn
+async def dev_run_agent(issue: IssueInput) -> None:
+    """Шаг 3: прогон одноразового контейнера агента.
+
+    Возврата нет: хвост вывода уходит в лог воркера на любом исходе
+    (`_dev_run_agent`), а в историю воркфлоу ему не место — это килобайты
+    текста на прогон.
+    """
+    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+
+
+@activity.defn
+async def dev_followups(issue: IssueInput) -> list[int]:
+    """Шаг 4: находки агента — отдельными SubIssue.
+
+    Идёт ДО тестов и публикации: файл находок обязан исчезнуть из рабочего
+    дерева раньше коммита, иначе он уедет в PR — в ревью как мусор, а на
+    следующем круге правок агент прочитает свои прошлые находки как новые.
+    """
+    return await collect_dev_followups(issue)
+
+
+@activity.defn
+async def dev_tests(issue: IssueInput) -> None:
+    """Шаг 5: проверки проекта — до пуша.
+
+    Красный код не должен доезжать до PR, а на PR от агента CI может и не
+    запуститься: события от токена Actions не порождают прогонов.
+    """
+    await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
+
+
+@activity.defn
+async def dev_publish(issue: IssueInput, branch: str) -> int | None:
+    """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
+
+    `None` — агент не изменил ни одного файла. Это не сбой шага, а его
+    результат; решение, что делать с пустым прогоном, принимает воркфлоу.
+    """
+    return await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+
+
 async def collect_dev_followups(issue: IssueInput) -> list[int]:
     """Edge-кейсы агента разработки — в бэклог, руками воркера.
 
