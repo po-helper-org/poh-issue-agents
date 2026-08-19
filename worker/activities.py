@@ -843,10 +843,22 @@ def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
 def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) -> str:
     base = f"https://github.com/{analyze.repo}/blob/{branch}"
     links = "\n".join(f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})" for path in sorted(files))
+    # Артефакт диалога называется отдельно: без пояснения он выглядит служебным
+    # мусором рядом с документами FNR, а это источник, из которого выведена
+    # часть постановки, — и повод перечитать её критически, если диалог пуст.
+    dialog = ""
+    if any(p.endswith("repowise-dialog.md") for p in files):
+        dialog = (
+            "\n`repowise-dialog.md` — диалог с **Repowise**, постоянным индексом кода: "
+            "что уже было известно о затронутых компонентах до постановки задачи. "
+            "Пустой диалог означает, что индекс был недоступен, и остальные документы "
+            "написаны без него.\n"
+        )
     return (
         "## 🤖 Автономный анализ (SA-helper)\n\n"
         f"Прогнал полную цепочку FNR по этой задаче. Артефакты — в ветке `{branch}`:\n\n"
-        f"{links}\n\n"
+        f"{links}\n"
+        f"{dialog}\n"
         "Начни с `system_requirements.md` — это ответ на вопрос «как реализовать эту "
         "задачу»: разбор текущего поведения на код-доказательствах, план миграции с "
         "откатами, задачи с критериями приёмки и риски с митигацией.\n\n"

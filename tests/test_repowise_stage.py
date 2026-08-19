@@ -139,3 +139,31 @@ def test_degradation_does_not_burn_stage_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)
     asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
     assert seen["timeout"] <= repowise_module.PROBE_TIMEOUT_SEC
+
+
+# --- Публикация артефакта диалога (FR-15) ---
+#
+# Диалог публикуется тем же путём, что и остальные артефакты FNR: комментарием
+# со ссылками и пушем в ветку. Второй путь публикации был бы дешевле в моменте
+# и дороже потом — он разъедется с первым ровно тогда, когда его перестанут
+# трогать.
+
+def test_dialog_reaches_branch_and_summary(tmp_path):
+    clone = _clone(tmp_path)
+    fnr = clone / activities.FNR_DIR
+    (fnr / "repowise-dialog.md").write_text("# Диалог\n\nход 1\n", encoding="utf-8")
+    (fnr / "system_requirements.md").write_text("# СТ\n", encoding="utf-8")
+
+    files = activities._collect_fnr_artifacts(str(clone))
+    assert f"{activities.FNR_DIR}/repowise-dialog.md" in files
+
+    summary = activities._build_summary(_analyze(), "research/issue-42", files)
+    assert "repowise-dialog.md" in summary
+
+
+def test_summary_names_the_dialog_as_context_source():
+    # Человеку, открывшему Issue, из сводки должно быть понятно, откуда взялся
+    # дополнительный контекст, — иначе артефакт выглядит служебным мусором.
+    files = {f"{activities.FNR_DIR}/repowise-dialog.md": "# Диалог\n"}
+    summary = activities._build_summary(_analyze(), "research/issue-42", files)
+    assert "Repowise" in summary
