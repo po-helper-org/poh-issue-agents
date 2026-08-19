@@ -30,6 +30,7 @@ import logging
 
 from shared.workflow_ids import (
     analysis_workflow_id,
+    bft_workflow_id,
     estimate_workflow_id,
     issue_workflow_id,
 )
@@ -40,6 +41,7 @@ TASK_QUEUE = "issue-lifecycle"
 
 ANALYSIS_WORKFLOW = "IssueAnalysis"
 ESTIMATION_WORKFLOW = "IssueEstimation"
+BFT_WORKFLOW = "IssueBft"
 
 # Режимы — возвращаются вызывающему для лога и тестов.
 CHILD = "child"    # работу ведёт цикл дочерним прогоном
@@ -90,6 +92,42 @@ async def request_analysis(client, issue_input, analyze, *,
         # Прогон по этому Issue уже идёт: пользователь видел ack первого
         # запуска, второй ack был бы шумом. Webhook — чистый транспорт.
         _log.info("analysis already running for %s#%s", repo, issue_number)
+    return ROOT
+
+
+async def request_bft(client, issue_input, req, *, search_attributes=None) -> str:
+    """`/bft`, `/bft-deep` или метка `run:bft*` — собрать БФТ по Issue.
+
+    БФТ фазу не двигает: быстрый проход формулирует запрос, глубокий кладёт
+    артефакты в свою ветку. Цикл поднимает прогон дочерним и продолжает ждать
+    своё — ровно как с оценкой.
+    """
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    repo, issue_number = req.repo, req.issue_number
+    handle = await client.start_workflow(
+        "IssueLifecycle",
+        issue_input,
+        id=issue_workflow_id(repo, issue_number),
+        task_queue=TASK_QUEUE,
+        search_attributes=search_attributes,
+        start_signal="bft_requested",
+        start_signal_args=[req],
+    )
+    if await _cycle_handles_agents(handle, repo, issue_number):
+        return CHILD
+
+    try:
+        await client.start_workflow(
+            BFT_WORKFLOW, req,
+            id=bft_workflow_id(repo, issue_number, req.mode),
+            task_queue=TASK_QUEUE,
+            search_attributes=search_attributes,
+        )
+    except WorkflowAlreadyStartedError:
+        # Прогон в этом режиме уже идёт: пользователь видел подтверждение
+        # первого запуска, второе было бы шумом. Вебхук — чистый транспорт.
+        _log.info("bft %s already running for %s#%s", req.mode, repo, issue_number)
     return ROOT
 
 

@@ -9,13 +9,25 @@
 import pytest
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared.agent_launcher import CHILD, ROOT, request_analysis, request_estimate
+from shared.agent_launcher import (
+    CHILD,
+    ROOT,
+    request_analysis,
+    request_bft,
+    request_estimate,
+)
 from shared.workflow_ids import (
+    bft_workflow_id,
     analysis_workflow_id,
     estimate_workflow_id,
     issue_workflow_id,
 )
-from shared.workflow_types import AnalyzeInput, EstimateRequest, IssueInput
+from shared.workflow_types import (
+    AnalyzeInput,
+    BftRequest,
+    EstimateRequest,
+    IssueInput,
+)
 
 REPO = "acme/widgets"
 
@@ -154,3 +166,52 @@ async def test_unavailable_query_prefers_the_cycle():
 
     assert mode == CHILD
     assert [c["workflow"] for c in client.started] == ["IssueLifecycle"]
+
+
+# --- БФТ ---
+
+def _bft(mode: str = "fast") -> BftRequest:
+    return BftRequest(repo=REPO, issue_number=7, title="t", body="b",
+                      mode=mode, comment_id=555)
+
+
+async def test_bft_goes_to_the_live_cycle_as_a_child():
+    """Живой цикл ведёт прогон сам — второй, самостоятельный, был бы платой за
+    ту же работу дважды."""
+    client = FakeClient(answer=True)
+
+    assert await request_bft(client, _issue(), _bft()) == CHILD
+
+    assert len(client.started) == 1
+    call = client.started[0]
+    assert call["workflow"] == "IssueLifecycle"
+    assert call["id"] == issue_workflow_id(REPO, 7)
+    assert call["start_signal"] == "bft_requested"
+    assert call["start_signal_args"][0].mode == "fast"
+
+
+async def test_bft_falls_back_to_a_root_run_for_an_old_cycle():
+    """Прогон прежнего поколения сигнала не понимает: команда была бы принята и
+    потеряна, поэтому лаунчер поднимает прогон сам."""
+    client = FakeClient(answer=False)
+
+    assert await request_bft(client, _issue(), _bft("deep")) == ROOT
+
+    assert [c["workflow"] for c in client.started] == ["IssueLifecycle", "IssueBft"]
+    assert client.started[1]["id"] == bft_workflow_id(REPO, 7, "deep")
+
+
+async def test_a_running_bft_is_not_started_twice():
+    """Повторная доставка того же вебхука не должна платить второй раз."""
+    client = FakeClient(answer=False, already={"IssueBft"})
+
+    assert await request_bft(client, _issue(), _bft()) == ROOT  # без исключения
+
+
+async def test_the_two_bft_modes_get_different_ids():
+    """Иначе заказ полного документа упирался бы в идущую переформулировку."""
+    fast, deep = FakeClient(answer=False), FakeClient(answer=False)
+    await request_bft(fast, _issue(), _bft("fast"))
+    await request_bft(deep, _issue(), _bft("deep"))
+
+    assert fast.started[1]["id"] != deep.started[1]["id"]

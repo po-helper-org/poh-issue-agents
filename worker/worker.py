@@ -20,6 +20,7 @@ from shared import sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import (
     IssueAnalysis,
+    IssueBft,
     IssueEstimation,
     IssueLifecycle,
     OrphanAgentEvent,
@@ -34,8 +35,8 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
-        workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation, ConsolidationWorkflow,
-                   WebhookAudit, OrphanAgentEvent],
+        workflows=[IssueLifecycle, IssueAnalysis, IssueBft, IssueEstimation,
+                   ConsolidationWorkflow, WebhookAudit, OrphanAgentEvent],
         activities=[
             activities.prefilter_bot_and_security,
             activities.read_protocol_state,
@@ -57,6 +58,13 @@ async def main() -> None:
         activities.run_pr_fix_round,
         activities.finish_pr_fixing,
             activities.classify_issue,
+            activities.ack_bft_command,
+            activities.run_bft_fast,
+            activities.prepare_bft_workspace,
+            activities.run_bft_stage,
+            activities.publish_bft_deep,
+            activities.cleanup_bft_workspace,
+            activities.publish_bft_error,
             activities.duplicate_check,
             activities.score_priority,
             activities.post_priority_comment,

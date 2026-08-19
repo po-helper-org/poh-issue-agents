@@ -23,10 +23,12 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import decomposition, develop, labels, lifecycle, pr_closing, sentry_setup
+from shared import bft, decomposition, develop, labels, lifecycle, pr_closing, sentry_setup
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
+    BFT,
+    BFT_DEEP,
     ESTIMATE,
     done_label,
     failed_label,
@@ -36,6 +38,7 @@ from shared.commands import (
 )
 from shared.workflow_types import (
     AnalyzeInput,
+    BftRequest,
     ClassificationResult,
     Deadlines,
     DuplicateResult,
@@ -254,6 +257,10 @@ def read_deadlines() -> Deadlines:
     def _flag(name: str) -> bool:
         return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
+    def _flag_on_by_default(name: str) -> bool:
+        raw = os.environ.get(name, "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
     return Deadlines(
         human_decision_hours=_hours("PARK_DECISION_HOURS", 72),
         clarification_hours=_hours("PARK_CLARIFICATION_HOURS", 48),
@@ -264,6 +271,11 @@ def read_deadlines() -> Deadlines:
         decompose_enabled=decomposition.enabled(),
         pr_fix_enabled=pr_closing.enabled(),
         pr_fix_max_rounds=pr_closing.max_rounds(),
+        # Включён по умолчанию: БФТ на триаже — это НОВЫЙ формат ответа вместо
+        # прежнего свободного, а не дополнительная стадия. Тумблер существует
+        # ради возможности откатиться, поэтому и читается наоборот — выключение
+        # требует явного BFT_ON_TRIAGE=0.
+        bft_on_triage=_flag_on_by_default("BFT_ON_TRIAGE"),
     )
 
 
@@ -450,7 +462,23 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
 # --- Классификация ---
 
 @activity.defn
-def classify_issue(issue: IssueInput) -> ClassificationResult:
+def classify_issue(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
+    """Тип запроса плюс ответ advisor комментарием.
+
+    `bft_on_triage=True` глушит публикацию ответа РОВНО для запроса функционала:
+    на него отвечает БФТ, и два комментария подряд означали бы, что первый
+    неактуален уже в момент публикации. Для бага, консультации и «уже
+    реализовано» ответ публикуется как прежде — БФТ по ним не собирается, и
+    молчание оставило бы Issue вообще без содержательного комментария.
+
+    Решение принимается ЗДЕСЬ, а не отдельной активностью публикации, потому что
+    зависит от категории — а категорию знает только эта активность. Развести их
+    значило бы гонять текст ответа через воркфлоу ради условия, которое здесь
+    уже вычислено.
+
+    Аргумент со значением по умолчанию, а не новая activity: прогоны прежнего
+    поколения зовут её одним аргументом и обязаны получить прежнее поведение.
+    """
     capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
         if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
     user_message = f"Заголовок: {issue.title}\n\nОписание:\n{issue.body}\n\nИзвестный функционал:\n{capabilities}"
@@ -469,7 +497,8 @@ def classify_issue(issue: IssueInput) -> ClassificationResult:
     # category is now carried structurally, so strip that marker line before
     # posting — it must not appear in the user-facing comment.
     answer = re.sub(r"^\s*\[\[[^\]]+\]\]\s*", "", result.answer)
-    github_client.post_comment(issue.repo, issue.issue_number, answer)
+    if not (bft_on_triage and label == "advisor:feature-request"):
+        github_client.post_comment(issue.repo, issue.issue_number, answer)
     github_client.add_label(issue.repo, issue.issue_number, label)
     return ClassificationResult(label=label, answer=answer)
 
@@ -676,9 +705,15 @@ def _require_workspace(analyze: AnalyzeInput, requires: str | None) -> str:
     return clone_dir
 
 
-def _clone_repo(repo: str, dest: str) -> None:
+def _clone_repo(repo: str, dest: str, branch: str | None = None) -> None:
     """Shallow-клон целевого репозитория: артефакты FNR обязаны опираться на
     реальный код (`файл:строка`), одного текста Issue недостаточно.
+
+    `branch` — ветка, которую надо получить вместо дефолтной. Нужна повторному
+    прогону БФТ: он дорабатывает уже лежащий там документ, а не пишет второй
+    рядом. Вызывающий обязан убедиться, что ветка существует, — клон
+    несуществующей ветки падает, и падать он должен на понятной проверке, а не
+    внутри git.
 
     Токен идёт через credential.helper в env, а НЕ вклеен в URL: argv команды
     целиком рендерится в текст subprocess.CalledProcessError/TimeoutExpired,
@@ -694,8 +729,11 @@ def _clone_repo(repo: str, dest: str) -> None:
         "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
         "GH_CLONE_TOKEN": github_client.auth_token(repo),
     }
+    args = ["git", "clone", "--depth", "1"]
+    if branch:
+        args += ["--branch", branch]
     subprocess.run(
-        ["git", "clone", "--depth", "1", url, dest],
+        [*args, url, dest],
         env=env, check=True, capture_output=True, text=True, timeout=CLONE_TIMEOUT_SEC,
     )
 
@@ -1378,6 +1416,325 @@ async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
         f"⚠️ Автономный анализ не удался: {reason}\n\n"
         "Прогон не повторяется автоматически (он недетерминирован и дорог). "
         "Запустить заново — командой `/analyze`.",
+    )
+
+
+# --- БФТ: быстрый проход (/bft) и глубокая проработка (/bft-deep) ---
+
+# Полный тред уезжает в модель намеренно (постановка задачи: «когда речь идёт о
+# БФТ, в ИИ-агента должен уходить полный контекст всей переписки Issue»).
+# Потолки всё равно нужны — окно модели конечно, а тред активного Issue растёт
+# без ограничений, — но они на порядок шире, чем у брифа `/analyze`.
+BFT_THREAD_COMMENTS = 60
+BFT_COMMENT_CHARS = 4000
+BFT_THREAD_CHARS = 40_000
+
+BFT_STAGE_TIMEOUT_SEC = 900
+
+# Заголовок письма — он же признак прежней редакции. Считать редакции по метке
+# нельзя: метка снимается, а комментарии остаются, и именно они образуют историю
+# переработок, которую человек видит в треде.
+BFT_LETTER_HEADING = "## 📋 БФТ (быстрый проход)"
+
+
+class BftRequirementExtraction(BaseModel):
+    id: str = Field(description="БТ-1 | ПТ-1 | ИТ-1 | ФТ-1 | НФТ-1, без ведущих нулей")
+    as_is: str = Field(description="как сейчас; не озвучено — [ASIS не озвучен]")
+    to_be: str = Field(description="как должно стать")
+    related: str = Field(default="", description="ID связанных требований или пусто")
+    source: str = Field(description="дословная цитата из Issue или комментария")
+
+
+class BftPersonaExtraction(BaseModel):
+    name: str
+    role: str = Field(default="[роль не подтверждена]")
+    unit: str = Field(default="[не указано]")
+
+
+class BftLetterExtraction(BaseModel):
+    goal: str = Field(description="1-2 предложения, WHY вперёд")
+    how_to_demo: list[str] = Field(default_factory=list, description="шаги E2E-приёмки")
+    open_questions: list[str] = Field(default_factory=list,
+                                      description="вопрос/блокер/решение, владелец в скобках")
+    scope: str = Field(default="", description="in-scope (out-of-scope — не входит в зону БФТ)")
+    documentation: list[str] = Field(default_factory=list)
+    requirements: list[BftRequirementExtraction] = Field(default_factory=list)
+    personas: list[BftPersonaExtraction] = Field(default_factory=list)
+
+
+def _bft_thread(req: BftRequest) -> tuple[str, int]:
+    """Вся переписка Issue текстом плюс число прежних редакций БФТ.
+
+    В отличие от брифа `/analyze`, комментарии сервиса НЕ отсеиваются: прошлая
+    редакция БФТ и есть то, что человек правит командой `/bft`, и без неё
+    замечание «во втором пункте не так» повисает в воздухе. По той же причине
+    остаются и командные комментарии — в них лежат сами уточнения.
+
+    Сбой чтения не роняет прогон: БФТ соберётся по заголовку и телу Issue, и это
+    честнее, чем не собраться вовсе.
+    """
+    try:
+        comments = github_client.list_comments(
+            req.repo, req.issue_number, limit=BFT_THREAD_COMMENTS
+        )
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for bft #%s: %s", req.issue_number, exc)
+        return "", 1
+
+    revision = 1
+    blocks: list[str] = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        if BFT_LETTER_HEADING in body:
+            revision += 1
+        user = (comment.get("user") or {}).get("login", "?")
+        date = (comment.get("created_at") or "")[:10]
+        blocks.append(f"**@{user} ({date}):**\n{_truncate(body, BFT_COMMENT_CHARS)}")
+
+    # Обрезаем от САМЫХ СТАРЫХ: свежие реплики — это и есть правки, ради которых
+    # прогон запущен, и терять их, сохраняя первый комментарий полугодовой
+    # давности, было бы ровно наоборот.
+    while blocks and len("\n\n".join(blocks)) > BFT_THREAD_CHARS:
+        blocks = blocks[1:]
+    return "\n\n".join(blocks), revision
+
+
+def _bft_user_message(req: BftRequest, thread: str) -> str:
+    parts = [f"# Issue {req.repo}#{req.issue_number}: {req.title}", "",
+             "## Описание", "", req.body.strip() or "(тело пустое)"]
+    if req.instructions.strip():
+        parts += ["", "## Замечания и уточнения к этой редакции", "",
+                  "> Правки человека к БФТ. Сильнее и текста Issue, и прежней "
+                  "редакции: человек уточняет собственный запрос.", "",
+                  req.instructions.strip()]
+    if thread:
+        parts += ["", "## Вся переписка Issue", "", thread]
+    return "\n".join(parts)
+
+
+@activity.defn
+async def ack_bft_command(req: BftRequest) -> None:
+    """Видимое подтверждение приёма БФТ-команды ДО работы.
+
+    Реакция «глаза» на комментарий-триггер — та же механика, что у `/analyze`, и
+    по той же причине best-effort: комментарий могли удалить, а rate limit никто
+    не отменял, и декорация не должна ронять приём команды.
+
+    Комментарий пишется только для глубокого прогона и запуска меткой: быстрый
+    проход по команде отвечает письмом через считанные секунды, и «взял в работу»
+    прямо перед ним было бы шумом.
+
+    Метку `run:*` вешает на себя ТОЛЬКО глубокий прогон. Метка возвращается
+    вебхуком как событие `issues.labeled`, то есть как новая команда, — и на
+    многоминутном прогоне это безобидно (второй старт упирается в занятый id),
+    а на быстром, длящемся секунды, эхо успело бы прилететь уже после
+    завершения и запустить второй прогон с дублирующим комментарием. Для
+    быстрого прохода подтверждением служит реакция на комментарий-триггер.
+    """
+    command = BFT_DEEP if req.mode == bft.DEEP else BFT
+    if req.mode == bft.DEEP:
+        await asyncio.to_thread(
+            github_client.add_label, req.repo, req.issue_number, run_label(command)
+        )
+        trigger = f"`/{command}`" if req.comment_id is not None else f"`{run_label(command)}`"
+        await asyncio.to_thread(
+            github_client.post_comment, req.repo, req.issue_number,
+            f"📚 Взял {trigger} в работу — собираю полный БФТ по канону bft-writer.\n\n"
+            "Прогон занимает несколько минут: артефакты появятся в ветке "
+            f"`{bft.branch(req.issue_number)}`, а сводка — следующим комментарием.",
+        )
+    elif req.comment_id is None:
+        await asyncio.to_thread(
+            github_client.post_comment, req.repo, req.issue_number,
+            f"📋 Взял `{run_label(command)}` в работу — пересобираю БФТ быстрого прохода.",
+        )
+    if req.comment_id is not None:
+        try:
+            await asyncio.to_thread(
+                github_client.add_reaction, req.repo, req.comment_id, "eyes")
+        except Exception:
+            pass  # best-effort: декорация не должна ронять ack или весь прогон
+
+
+@activity.defn
+async def run_bft_fast(req: BftRequest) -> str:
+    """Быстрый проход: письмо БФТ комментарием в Issue.
+
+    Один вызов модели, без клона и без claude-code: формат `/bft-fast` — это
+    структурирование уже сказанного, а не исследование кода. Клонировать
+    репозиторий ради него значило бы платить минутами за то, что нужно секундами.
+
+    Возвращает опубликованный текст — он же уходит в историю Temporal, поэтому
+    разбор «что именно агент отписал» не требует лезть в GitHub.
+    """
+    thread, revision = await asyncio.to_thread(_bft_thread, req)
+    letter = await asyncio.to_thread(
+        llm.extract,
+        _load_prompt("system_bft_fast.md"),
+        _bft_user_message(req, thread),
+        BftLetterExtraction,
+        llm.MODEL_CLASSIFY,
+    )
+    body = bft.render_letter(
+        goal=letter.goal,
+        how_to_demo=letter.how_to_demo,
+        open_questions=letter.open_questions,
+        scope=letter.scope,
+        documentation=letter.documentation,
+        requirements=[r.model_dump() for r in letter.requirements],
+        personas=[p.model_dump() for p in letter.personas],
+        revision=revision,
+    )
+    await asyncio.to_thread(
+        github_client.post_comment, req.repo, req.issue_number, body)
+    return body
+
+
+def _bft_workspace_dir(req: BftRequest) -> Path:
+    """Каталог глубокого прогона. Отдельный от каталога `/analyze`: команды
+    могут идти одновременно, и общий каталог означал бы, что подготовка одной
+    сносит рабочее дерево другой посреди стадии."""
+    root = os.environ.get("ANALYSIS_WORKSPACE_ROOT") or tempfile.gettempdir()
+    slug = f"bft-{req.repo.replace('/', '__')}-{req.issue_number}"
+    return Path(root) / slug
+
+
+def _bft_clone_dir(req: BftRequest) -> str:
+    return str(_bft_workspace_dir(req) / "repo")
+
+
+def _build_bft_workspace(req: BftRequest) -> str:
+    """Клон + repomix + постановка файлом.
+
+    Ветка артефактов забирается, если уже есть: повторный `/bft-deep` — это
+    доработка существующего документа, а не второй документ рядом. Пайплайн сам
+    распознаёт режим по наличию файлов, и всё, что нужно от подготовки, — дать
+    ему увидеть прошлый прогон.
+    """
+    shutil.rmtree(_bft_workspace_dir(req), ignore_errors=True)
+    clone_dir = _bft_clone_dir(req)
+    branch = bft.branch(req.issue_number)
+    _clone_repo(req.repo, clone_dir,
+                branch=branch if github_client.branch_exists(req.repo, branch) else None)
+    _run_repomix(clone_dir)
+
+    # Конфиг пайплайна — свой, поверх любого чужого: разъехавшийся `docs_path`
+    # увёл бы артефакты туда, где публикация их не ищет.
+    (Path(clone_dir) / "bft-config.md").write_text(bft.render_config(),
+                                                   encoding="utf-8")
+
+    thread, _ = _bft_thread(req)
+    statement = Path(clone_dir) / bft.statement_path(req.issue_number)
+    statement.parent.mkdir(parents=True, exist_ok=True)
+    statement.write_text(
+        bft.render_statement(title=req.title, body=req.body, thread=thread,
+                             instructions=req.instructions,
+                             issue_number=req.issue_number, repo=req.repo),
+        encoding="utf-8",
+    )
+    return clone_dir
+
+
+def _require_bft_workspace(req: BftRequest, requires: str | None) -> str:
+    """Guard стадии — тот же приём, что и в цепочке FNR: потерянный каталог
+    останавливает прогон с внятным сообщением вместо пере-клона, который дал бы
+    свежий репозиторий без единого артефакта прежних стадий."""
+    clone_dir = _bft_clone_dir(req)
+    if not (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists():
+        raise RuntimeError("рабочий каталог потерян (рестарт воркера?) — повтори /bft-deep")
+    if requires and not (Path(clone_dir) / requires).exists():
+        raise RuntimeError(
+            f"нет входа {requires} (стадия-предшественник не отработала?) — повтори /bft-deep"
+        )
+    return clone_dir
+
+
+def _collect_bft_artifacts(clone_dir: str, issue_number: int) -> dict[str, str]:
+    """Всё, что пайплайн положил в каталог эпика: документ и служебные артефакты.
+
+    Забираем каталогом, а не списком имён: состав артефактов задаёт скилл, и
+    зашитый перечень разъехался бы с ним при первом же его обновлении, молча
+    теряя файлы.
+    """
+    root = Path(clone_dir) / bft.epic_dir(issue_number)
+    files: dict[str, str] = {}
+    if not root.is_dir():
+        return files
+    for path in sorted(root.rglob("*.md")):
+        files[str(path.relative_to(clone_dir))] = path.read_text(encoding="utf-8")
+    return files
+
+
+@activity.defn
+async def prepare_bft_workspace(req: BftRequest) -> None:
+    """Стадия 0 глубокого прогона: клон (с веткой прошлого БФТ, если есть),
+    repomix и постановка файлом. Идемпотентна — сносит остаток и строит заново."""
+    await _run_with_heartbeat(_build_bft_workspace, req, label="bft-preparing")
+
+
+@activity.defn
+async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
+    """Одна стадия канонического пайплайна БФТ — отдельный `claude -p`.
+
+    Разложено по стадиям ровно затем же, зачем разложена цепочка FNR: одной
+    активностью весь пайплайн был бы одним баром в Event History на десятки
+    минут, и застрявшая стадия не называла бы себя.
+    """
+    prompt, expected, requires = bft.deep_stage(stage_name, req.issue_number)
+    clone_dir = _require_bft_workspace(req, requires)
+    await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=f"bft:{stage_name}")
+    artifact: str | None = None
+    size = 0
+    if expected:
+        path = Path(clone_dir) / expected
+        if not path.exists():
+            raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
+        artifact = expected
+        size = path.stat().st_size
+    return {"stage": stage_name, "artifact": artifact, "bytes": size}
+
+
+@activity.defn
+async def publish_bft_deep(req: BftRequest) -> str:
+    """Финал глубокого прогона: артефакты в ветку, сводка комментарием."""
+    clone_dir = _require_bft_workspace(req, None)
+    files = await asyncio.to_thread(
+        _collect_bft_artifacts, clone_dir, req.issue_number)
+    if not files:
+        raise RuntimeError("пайплайн БФТ не произвёл ни одного артефакта")
+    branch = bft.branch(req.issue_number)
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        req.repo, branch, files,
+        f"docs(bft): БФТ по issue #{req.issue_number}",
+    )
+    await asyncio.to_thread(
+        github_client.post_comment, req.repo, req.issue_number,
+        bft.render_deep_summary(req.repo, req.issue_number, list(files)),
+    )
+    return branch
+
+
+@activity.defn
+async def cleanup_bft_workspace(req: BftRequest) -> None:
+    """Best-effort снос рабочего каталога прогона."""
+    await asyncio.to_thread(
+        shutil.rmtree, str(_bft_workspace_dir(req)), ignore_errors=True)
+
+
+@activity.defn
+async def publish_bft_error(req: BftRequest, reason: str) -> None:
+    """Не молчать при сбое — требование постановки, а не вежливость.
+
+    Молчащий сбой неотличим от «ещё думает»: человек ждёт БФТ, которого уже не
+    будет, и узнаёт об этом, только когда сам придёт спрашивать.
+    """
+    what = "/bft-deep" if req.mode == bft.DEEP else "/bft"
+    await asyncio.to_thread(
+        github_client.post_comment, req.repo, req.issue_number,
+        f"⚠️ БФТ не собрался: {reason}\n\n"
+        f"Прогон не повторяется автоматически. Запустить заново — командой `{what}` "
+        "(можно сразу с уточнениями в том же комментарии).",
     )
 
 
