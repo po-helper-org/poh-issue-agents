@@ -67,9 +67,9 @@ async def test_orchestrates_all_stages_in_order():
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
 
-    assert calls == ["ack", "prepare", "stage:task", "stage:concept", "stage:debate",
-                     "stage:sysreq", "stage:validate", "publish", "finish:analyze:ok",
-                     "cleanup"]
+    assert calls == ["ack", "prepare", "stage:repowise", "stage:task", "stage:concept",
+                     "stage:debate", "stage:sysreq", "stage:validate", "publish",
+                     "finish:analyze:ok", "cleanup"]
 
 
 @pytest.mark.asyncio
@@ -114,7 +114,8 @@ async def test_stage_failure_publishes_error_and_cleans_up():
             await env.client.execute_workflow(
                 IssueAnalysis.run, _analyze(), id=f"analysis-{uuid.uuid4()}", task_queue=tq)
 
-    assert calls[:6] == ["ack", "prepare", "stage:task", "stage:concept", "stage:debate", "stage:sysreq"]
+    assert calls[:7] == ["ack", "prepare", "stage:repowise", "stage:task",
+                         "stage:concept", "stage:debate", "stage:sysreq"]
     assert "stage:validate" not in calls          # остановились на sysreq
     assert "publish" not in calls
     assert "error" in calls and "boom-sysreq" in reported["reason"]

@@ -196,7 +196,7 @@ async def test_research_me_label_surfaces_pipeline_failure():
     assert _research_state["attempts"] == [1], "дорогой прогон не должен ретраиться"
     assert "boom-research-me" in _research_state["reason"]
     # Остановились на сорвавшейся стадии и не пошли дальше по цепочке.
-    assert _research_state["stages"] == ["task", "concept"]
+    assert _research_state["stages"] == ["repowise", "task", "concept"]
     assert "published" not in _research_state
     # Каталог прогона снимается на обоих путях.
     assert _research_state["cleaned"] is True

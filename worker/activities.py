@@ -7,6 +7,7 @@ GITHUB_EVENT_PATH и вызова через subprocess-CLI-скрипт — о�
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -23,7 +24,15 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import decomposition, develop, labels, lifecycle, pr_closing, sentry_setup
+from shared import (
+    decomposition,
+    develop,
+    labels,
+    lifecycle,
+    pr_closing,
+    repowise,
+    sentry_setup,
+)
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
@@ -632,7 +641,8 @@ def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: Dupl
 # --- Пайплайн SA-helper (FNR) ---
 
 FNR_DIR = "sa_documentation/FNR/FNR_1"
-ARTIFACT_FILES = ("task.md", "concept.md", "system_requirements.md", "validation.md")
+ARTIFACT_FILES = ("repowise-dialog.md", "task.md", "concept.md",
+                  "system_requirements.md", "validation.md")
 CLAUDE_STAGE_TIMEOUT_SEC = 900
 REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
@@ -650,8 +660,13 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
 
     У `debate` и `validate` ожидаемого файла нет: дебаты дописываются в
     concept.md, а валидация может остаться отчётом в выводе.
+
+    `repowise` идёт ПЕРВОЙ: её результат — вход для постановки задачи, и
+    обращаться к индексу после написания task.md уже поздно.
     """
     return [
+        ("repowise", f"/repowise-context {description}",
+         f"{FNR_DIR}/repowise-dialog.md"),
         ("task", f"/fnr-new-task {description}", f"{FNR_DIR}/task.md"),
         ("concept", f"/fnr-concept {FNR_DIR}/task.md", f"{FNR_DIR}/concept.md"),
         ("debate", f"/fnr-debate {FNR_DIR}/concept.md", None),
@@ -661,12 +676,17 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     ]
 
 
-FNR_STAGE_NAMES = ("task", "concept", "debate", "sysreq", "validate")
+FNR_STAGE_NAMES = ("repowise", "task", "concept", "debate", "sysreq", "validate")
 
 # Входной артефакт каждой стадии — что уже должно лежать в рабочем каталоге,
 # чтобы стадия имела смысл (используется guard'ом _require_workspace).
+#
+# У `task` вход — артефакт диалога: пропустить сбор контекста незаметно нельзя.
+# Артефакт создаётся и при недоступном Repowise (деградация, см. run_fnr_stage),
+# поэтому guard не превращает сервис в обязательную зависимость конвейера.
 _FNR_STAGE_REQUIRES = {
-    "task": None,
+    "repowise": None,
+    "task": f"{FNR_DIR}/repowise-dialog.md",
     "concept": f"{FNR_DIR}/task.md",
     "debate": f"{FNR_DIR}/concept.md",
     "sysreq": f"{FNR_DIR}/concept.md",
@@ -973,6 +993,22 @@ async def prepare_workspace(analyze: AnalyzeInput) -> None:
     await _run_with_heartbeat(_build_workspace, analyze, label="preparing")
 
 
+def _write_repowise_config(analyze: AnalyzeInput, clone_dir: str) -> None:
+    """Конфигурация MCP в рабочий каталог прогона.
+
+    Не в образ: адрес прокси и идентификатор сессии зависят от Issue, и вшить
+    их в образ нельзя. Пишется на КАЖДОЙ стадии, а не однажды: каталог прогона
+    пересоздаётся стадией 0 (`_build_workspace`), и файл, положенный до неё,
+    молча исчезнет — а выглядело бы это как агент, забывший про индекс.
+    """
+    if not repowise.enabled():
+        return
+    config = repowise.claude_mcp_config(
+        analyze.repo, analyze.issue_number, repowise.ANALYSIS)
+    (Path(clone_dir) / ".mcp.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @activity.defn
 async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
@@ -991,6 +1027,7 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     )
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
+    _write_repowise_config(analyze, clone_dir)
     await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
     artifact: str | None = None
     size = 0
@@ -1632,6 +1669,7 @@ MAX_ARTIFACTS_TOTAL_CHARS = 60_000
 # Пути артефактов из модели данных (docs/ARCHITECTURE.md). Отсутствующий
 # файл — штатная ситуация: research-пайплайн мог не дойти до этой стадии.
 ARTIFACT_PATHS = (
+    "docs/research/issue-{n}-repowise-dialog.md",
     "docs/bft/issue-{n}-blueprint.md",
     "docs/bft/issue-{n}-debate.md",
     "docs/bft/issue-{n}-recommendations.md",
