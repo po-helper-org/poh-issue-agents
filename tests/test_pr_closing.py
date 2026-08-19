@@ -201,3 +201,48 @@ def test_exhausted_comment_does_not_claim_rounds_that_never_ran():
     assert "сорвался" in broke or "прервал" in broke
     assert "3 кругов" in real
     assert "проблема в самом коде" in real
+
+
+def test_round_does_not_commit_its_own_task_statement(monkeypatch, tmp_path):
+    """Постановка круга не уезжает в коммит — иначе «правок нет» недостижимо.
+
+    `.task.md` пишется в клон ветки PR и попадает под `git add -A`. Он меняется
+    на КАЖДОМ круге (номер круга, накопленный текст ревью), поэтому пуш всегда
+    видит дифф и всегда докладывает «правки внесены». Исход «замечаний нет, PR
+    готов к merge» становится недостижим: цикл сжигает все три круга и отдаёт PR
+    человеку, а настоящий вердикт агента — «нечего исправлять» — теряется.
+
+    На живом прогоне PR #35 оба круга закоммитили ровно один файл — свою же
+    постановку. `.verdict.md` при этом снимался, `.task.md` забыли.
+    """
+    import asyncio
+    import pathlib
+
+    import activities as activities_module
+
+    monkeypatch.setenv("DEVELOP_WORKSPACE_MOUNT", str(tmp_path))
+    root = tmp_path / pr_closing.task_slug("o/r", 35)
+    clone = root / "repo"
+    clone.mkdir(parents=True)
+    seen: dict = {}
+
+    def fake_push(repo, clone_dir, branch, message):
+        seen["task_md"] = (pathlib.Path(clone_dir) / ".task.md").exists()
+        return False  # правок нет — круг заканчивается
+
+    monkeypatch.setattr(activities_module.github_client, "get_pull",
+                        lambda repo, n: {"head": {"ref": "feature/29-openhands"}})
+    monkeypatch.setattr(activities_module.github_client, "review_text",
+                        lambda repo, n: "PR Reviewer Guide")
+    monkeypatch.setattr(activities_module.github_client, "push_fixes", fake_push)
+    monkeypatch.setattr(activities_module, "_prfix_prepare",
+                        lambda repo, n, branch, task:
+                            (clone / ".task.md").write_text(task, encoding="utf-8"))
+    monkeypatch.setattr(activities_module, "_reap_runner", lambda slug: None)
+    monkeypatch.setattr(activities_module.subprocess, "run",
+                        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "",
+                                                         "stderr": ""})())
+
+    asyncio.run(activities_module.run_pr_fix_round("o/r", 35, 2))
+
+    assert seen["task_md"] is False, "постановка круга уехала в коммит"

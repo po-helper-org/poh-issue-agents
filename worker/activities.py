@@ -1451,8 +1451,16 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     _, clone_dir = _prfix_paths(repo, pr_number)
     verdict_path = clone_dir / pr_closing.VERDICT_FILE
     verdict = verdict_path.read_text(encoding="utf-8") if verdict_path.exists() else ""
-    # Разбор не должен уехать в коммит: он живёт в комментарии PR, а не в коде.
+    # Ни разбор, ни постановка круга не уезжают в коммит: они живут в
+    # комментарии PR, а не в коде.
+    #
+    # Постановка опаснее разбора. Она меняется на КАЖДОМ круге — номер круга,
+    # накопленный текст ревью, — поэтому пуш всегда видел дифф и всегда
+    # докладывал «правки внесены». Исход «замечаний нет, PR готов к merge»
+    # становился недостижим: цикл сжигал все три круга и отдавал PR человеку, а
+    # настоящий вердикт агента терялся.
     verdict_path.unlink(missing_ok=True)
+    (clone_dir / ".task.md").unlink(missing_ok=True)
 
     pushed = await _run_with_heartbeat(
         github_client.push_fixes, repo, str(clone_dir), branch,
