@@ -1299,6 +1299,61 @@ def _dev_run_agent(issue: IssueInput) -> str:
     return tail
 
 
+DEV_DIALOG_PATH = "docs/research/issue-{n}-repowise-dialog.md"
+
+
+def _collect_dev_dialog(repo: str, issue_number: int, run_failed: bool) -> str:
+    """Транскрипт сессии разработки. Забирает ВОРКЕР, а не раннер.
+
+    Раннер к этому моменту уже мёртв — в этом и смысл: артефакт переживает
+    прогон, включая аварийный, а диалог полезен ровно тогда, когда разбирают
+    неудачу.
+
+    Пустая сессия даёт артефакт с отметкой, а не отсутствие артефакта:
+    «агент не обращался к индексу» — это факт, который надо видеть, а не
+    пробел, который надо угадывать.
+    """
+    session = repowise.session_id(repo, issue_number, repowise.DEVELOP)
+    text = repowise.transcript(session)
+    if text:
+        return text
+    failed = " (прогон завершился аварийно)" if run_failed else ""
+    return (
+        f"---\nissue: {repo}#{issue_number}\nsession: {session}\n"
+        f"agent: {repowise.DEVELOP}\noutcome: no-turns\nturns: 0\n---\n\n"
+        f"# Итог\n\nЗа время прогона обращений к индексу не было{failed}.\n\n"
+        f"Причины бывают три: индекс был недоступен, задача не потребовала "
+        f"дополнительного контекста, либо агент не воспользовался им, хотя "
+        f"стоило. Первую отличают по артефакту аналитики того же Issue.\n"
+    )
+
+
+def _publish_dev_dialog_sync(issue: IssueInput, branch: str) -> None:
+    """Опубликовать диалог разработки. Best-effort: исход прогона не подменяет.
+
+    Сбой публикации артефакта не должен выглядеть как сбой разработки — иначе
+    разбор начнут не с того места.
+    """
+    if not repowise.enabled():
+        return
+    text = _collect_dev_dialog(issue.repo, issue.issue_number, run_failed=False)
+    path = DEV_DIALOG_PATH.format(n=issue.issue_number)
+    try:
+        if branch:
+            github_client.push_artifacts_to_branch(
+                issue.repo, branch, {path: text},
+                f"docs(repowise): диалог разработки по issue #{issue.issue_number}")
+        github_client.post_comment(
+            issue.repo, issue.issue_number,
+            f"## 🧭 Контекст из Repowise (разработка)\n\n"
+            f"Диалог агента разработки с индексом кода — `{path}`"
+            f"{f' в ветке `{branch}`' if branch else ''}.\n\n"
+            f"<details><summary>Показать</summary>\n\n{text[:20000]}\n\n</details>")
+    except Exception as exc:
+        logger.warning("диалог разработки не опубликован (%s#%s): %s",
+                       issue.repo, issue.issue_number, exc)
+
+
 def _dev_tests(issue: IssueInput) -> str:
     """Прогон проверок проекта. Пусто в конфиге — шаг пропускается.
 
@@ -1377,7 +1432,12 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
                 issue.repo, issue.issue_number, len(task), task[:2000])
     await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
 
-    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    try:
+        await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    finally:
+        # В finally, а не после: диалог полезнее всего при разборе упавшего
+        # прогона, и терять его ровно в этом случае было бы худшим из исходов.
+        await asyncio.to_thread(_publish_dev_dialog_sync, issue, branch)
     # Находки собираются ДО тестов и публикации: файл находок обязан исчезнуть
     # из рабочего дерева раньше коммита, иначе он уедет в PR — в ревью как мусор,
     # а на следующем круге правок агент прочитает свои прошлые находки как новые.

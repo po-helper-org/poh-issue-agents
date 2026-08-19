@@ -77,3 +77,74 @@ def test_runner_still_gets_no_github_token():
     joined = " ".join(command)
     assert "GITHUB" not in joined
     assert "GH_TOKEN" not in joined
+
+
+# --- Забор транскрипта воркером (FR-18) ---
+#
+# Забор возложен на воркер, а не на раннер, именно потому, что раннер к этому
+# моменту мёртв: файл, записанный им, при аварийном завершении был бы потерян —
+# а диалог полезен ровно тогда, когда разбирают неудачный прогон.
+
+import activities
+from shared.workflow_types import IssueInput
+
+
+def _issue(number: int = 42) -> IssueInput:
+    return IssueInput(repo="o/r", issue_number=number, title="t", body="b",
+                      author_login="u", author_type="User", interactive=True)
+
+
+def test_transcript_fetched_by_session_of_develop_agent(monkeypatch):
+    fetched = []
+
+    def fake_transcript(session):
+        fetched.append(session)
+        return "# Диалог\n\nход 1\n"
+
+    monkeypatch.setattr(activities.repowise, "transcript", fake_transcript)
+    text = activities._collect_dev_dialog("o/r", 42, run_failed=True)
+    assert fetched == [repowise.session_id("o/r", 42, repowise.DEVELOP)]
+    assert "ход 1" in text
+
+
+def test_empty_session_yields_marked_artifact(monkeypatch):
+    monkeypatch.setattr(activities.repowise, "transcript", lambda session: None)
+    text = activities._collect_dev_dialog("o/r", 42, run_failed=False)
+    assert "обращений к индексу не было" in text
+    assert "o/r#42" in text
+
+
+def test_failed_run_is_named_in_empty_artifact(monkeypatch):
+    # Разбирающему прогон важно отличить «агент не спросил» от «агент упал
+    # раньше, чем успел спросить».
+    monkeypatch.setattr(activities.repowise, "transcript", lambda session: None)
+    text = activities._collect_dev_dialog("o/r", 42, run_failed=True)
+    assert "аварийно" in text
+
+
+def test_publication_never_masks_agent_failure(monkeypatch):
+    """Публикация диалога — best-effort и не подменяет собой исход прогона.
+
+    Иначе сбой публикации артефакта выглядел бы как сбой разработки, и разбор
+    начинали бы не с того места.
+    """
+    monkeypatch.setattr(activities.repowise, "enabled", lambda: True)
+    monkeypatch.setattr(activities.repowise, "transcript", lambda session: "# Диалог\n")
+
+    def boom(*a, **k):
+        raise RuntimeError("GitHub недоступен")
+
+    monkeypatch.setattr(activities.github_client, "post_comment", boom)
+    monkeypatch.setattr(activities.github_client, "push_artifacts_to_branch", boom)
+
+    # Не поднимает — значит исход прогона агента останется тем, чем был.
+    activities._publish_dev_dialog_sync(_issue(), "research/issue-42")
+
+
+def test_publication_skipped_when_integration_disabled(monkeypatch):
+    monkeypatch.setattr(activities.repowise, "enabled", lambda: False)
+    called = []
+    monkeypatch.setattr(activities.github_client, "post_comment",
+                        lambda *a, **k: called.append("comment"))
+    activities._publish_dev_dialog_sync(_issue(), "")
+    assert called == []
