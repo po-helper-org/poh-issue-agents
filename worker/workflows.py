@@ -1385,12 +1385,30 @@ class IssueLifecycle:
         if deadlines.develop_autostart and not self._plan_member:
             return await self._start_development(issue)
 
+        # Подзадача плана ждёт РОДИТЕЛЯ, а не человека: тот исполняет весь объём
+        # MVP одним прогоном. Человеку по ней делать нечего, а выборка
+        # `needs-human:*` обязана быть полной очередью к людям — восемь подзадач
+        # одной фичи в ней означают, что на саму выборку перестанут смотреть.
+        # Под маркером патча: вид ожидания решает, будет ли вызов метки очереди
+        # перед таймером, а прежняя история идёт к таймеру напрямую. Реплей без
+        # маркера падает `Timer machine does not handle ActivityTaskScheduled` —
+        # так легли подзадачи #20–#27 на стенде.
+        if self._plan_member and workflow.patched(
+                "issue-lifecycle-plan-member-waits-for-parent"):
+            kind = awaiting_mod.EXTERNAL_AGENT
+            who = "контур: прогон разработки по родительской задаче"
+            reason = (f"исполнение в составе плана задачи #{self._root_issue}"
+                      if self._root_issue else "исполнение в составе плана родителя")
+        else:
+            kind = awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV)
+            who = awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV)
+            reason = awaiting_mod.reason_for_phase(lifecycle.READY_FOR_DEV)
         decision = await self._wait_for_signal(await self._park(
-            awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV),
-            who=awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV),
-            reason=awaiting_mod.reason_for_phase(lifecycle.READY_FOR_DEV),
-            hours=awaiting_mod.deadline_hours(awaiting_mod.APPROVAL,
-                                              deadlines.build_decision_hours)))
+            kind, who=who, reason=reason,
+            hours=awaiting_mod.deadline_hours(kind,
+                                              deadlines.build_decision_hours
+                                              if kind in awaiting_mod.BLOCKED_ON_HUMAN
+                                              else None)))
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди

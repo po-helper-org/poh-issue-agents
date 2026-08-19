@@ -329,3 +329,52 @@ async def test_resumed_work_leaves_the_human_queue():
 
     assert _labels[-1] == "queue:off", \
         f"метка очереди к людям осталась висеть на работающем агенте: {_labels}"
+
+
+@pytest.mark.timeout(120)
+async def test_plan_subissue_waits_for_its_parent_not_for_a_human():
+    """Подзадача плана в очередь к людям не встаёт.
+
+    Исполняет её родитель — одним прогоном на весь объём MVP. Человеку по ней
+    делать нечего, а `needs-human:*` обязана быть ПОЛНОЙ очередью к людям: восемь
+    подзадач одной фичи в ней означают, что на саму выборку перестанут смотреть.
+    """
+    _labels.clear()
+
+    @activity.defn(name="read_protocol_state")
+    async def subissue_state(repo: str, issue_number: int) -> ProtocolState:
+        return ProtocolState(origin_agent=True, root_issue=13)
+
+    @activity.defn(name="read_deadlines")
+    async def autostart() -> Deadlines:
+        return Deadlines(research_autostart=True, develop_autostart=True)
+
+    @activity.defn(name="read_open_questions")
+    async def no_questions(repo: str, branch: str) -> list[str]:
+        return []
+
+    @activity.defn(name="mark_ready_for_dev")
+    async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None: ...
+
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[mark_awaiting_spy, prefilter_ok, subissue_state,
+                                      autostart, set_phase_stub, gate_ok, classify_bug,
+                                      duplicate_none, score_p1, post_priority, escalate,
+                                      trigger_build, no_questions, ready]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await _await_phase(env, handle, lifecycle.READY_FOR_DEV)
+            for _ in range(200):
+                if _labels:
+                    break
+                await env.sleep(1)
+            waiting = await handle.query(IssueLifecycle.awaiting)
+
+    assert waiting is not None, "фаза ожидания без заполненного Awaiting"
+    assert waiting.kind == aw.EXTERNAL_AGENT, (
+        f"подзадача ждёт {waiting.kind}, а исполняет её родитель")
+    assert not any(l.startswith("queue:on") for l in _labels), (
+        f"подзадача попала в очередь к людям: {_labels}")

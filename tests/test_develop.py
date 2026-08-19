@@ -391,3 +391,46 @@ def test_leftover_run_is_reaped_before_a_new_attempt(monkeypatch):
     assert commands[0] == ["docker", "rm", "-f", slug], (
         f"перед прогоном не сняли остаток: {commands[0]}")
     assert commands[1][:2] == ["docker", "run"]
+
+
+def test_runner_uid_matches_the_image():
+    """Uid раннера объявлен в одном месте и совпадает с образом.
+
+    Воркер готовит каталог задачи от root, а раннер работает непривилегированным
+    пользователем. Разъехались числа — каталог остаётся недоступным на запись, и
+    это САМЫЙ дорогой из возможных отказов: агент не падает, а молча уходит
+    писать в /tmp и докладывает об успехе. На живом прогоне #19 так потерялись
+    21 минута работы, а PR открылся пустым.
+    """
+    dockerfile = (pathlib.Path(__file__).resolve().parents[1]
+                  / "openhands" / "Dockerfile").read_text(encoding="utf-8")
+
+    found = re.search(r"useradd\s+-m\s+-u\s+(\d+)", dockerfile)
+    assert found, "не нашёл создание пользователя в образе раннера"
+    assert int(found.group(1)) == develop.RUNNER_UID
+
+
+def test_workspace_is_handed_over_to_the_runner(tmp_path, monkeypatch):
+    """Каталог задачи передаётся раннеру пригодным для записи."""
+    chowned: list[tuple[str, int]] = []
+    monkeypatch.setattr(activities_module.os, "chown",
+                        lambda path, uid, gid: chowned.append((str(path), uid)))
+
+    activities_module._handover_to_runner(tmp_path)
+
+    assert (str(tmp_path), develop.RUNNER_UID) in chowned
+
+
+def test_failed_handover_is_loud(tmp_path, monkeypatch):
+    """Не смогли передать — падаем здесь.
+
+    Молча оставить каталог root'а значит отдать агенту рабочее место, в которое
+    он не может писать, — и получить успешный прогон без единой правки.
+    """
+    def boom(path, uid, gid):
+        raise PermissionError("not root")
+
+    monkeypatch.setattr(activities_module.os, "chown", boom)
+
+    with pytest.raises(RuntimeError, match="раннер"):
+        activities_module._handover_to_runner(tmp_path)

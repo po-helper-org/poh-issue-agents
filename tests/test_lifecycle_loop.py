@@ -454,3 +454,18 @@ def test_snapshot_carries_everything_the_later_phases_read():
               "pr_number"}
 
     assert needed <= carried, f"снимок потеряет: {sorted(needed - carried)}"
+
+
+def test_plan_member_waiting_is_behind_a_patch_marker():
+    """Вид ожидания подзадачи меняет РЕШЕНИЕ, записанное в историю.
+
+    Ожидание человека вешает метку очереди, ожидание контура — снимает: это
+    лишний вызов активности там, где прежняя история идёт прямо к таймеру.
+    Реплей падает с `Timer machine does not handle this event:
+    ActivityTaskScheduled` — и прогон перестаёт отвечать на сигналы. Именно так
+    легли подзадачи #20–#27 на стенде после выкладки без маркера.
+    """
+    src = inspect.getsource(IssueLifecycle._phase_await_build)
+
+    assert "workflow.patched(" in src
+    assert '"issue-lifecycle-plan-member-waits-for-parent"' in src

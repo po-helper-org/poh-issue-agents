@@ -476,13 +476,19 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     token = auth_token(repo)
     env = {
         **os.environ,
-        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_COUNT": "4",
         "GIT_CONFIG_KEY_0": "credential.helper",
         "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
         "GIT_CONFIG_KEY_1": "user.name",
         "GIT_CONFIG_VALUE_1": "openhands-agent",
         "GIT_CONFIG_KEY_2": "user.email",
         "GIT_CONFIG_VALUE_2": "openhands-agent@users.noreply.github.com",
+        # Каталог задачи передан раннеру (uid 10001), а коммит и пуш делает воркер
+        # от root. Git на такое отвечает `fatal: detected dubious ownership` и
+        # отказывается работать — готовая работа агента не доехала бы до PR.
+        # Объявляем каталог доверенным для этой команды, не трогая общий конфиг.
+        "GIT_CONFIG_KEY_3": "safe.directory",
+        "GIT_CONFIG_VALUE_3": clone_dir,
         "GH_PUSH_TOKEN": token,
     }
 
@@ -597,13 +603,16 @@ def push_fixes(repo: str, clone_dir: str, branch: str, message: str) -> bool:
 
     env = {
         **os.environ,
-        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_COUNT": "4",
         "GIT_CONFIG_KEY_0": "credential.helper",
         "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
         "GIT_CONFIG_KEY_1": "user.name",
         "GIT_CONFIG_VALUE_1": "openhands-agent",
         "GIT_CONFIG_KEY_2": "user.email",
         "GIT_CONFIG_VALUE_2": "openhands-agent@users.noreply.github.com",
+        # См. publish_worktree: каталог круга правок тоже принадлежит раннеру.
+        "GIT_CONFIG_KEY_3": "safe.directory",
+        "GIT_CONFIG_VALUE_3": clone_dir,
         "GH_PUSH_TOKEN": auth_token(repo),
     }
 
