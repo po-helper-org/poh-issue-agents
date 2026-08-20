@@ -71,7 +71,7 @@ def test_degrades_when_proxy_unavailable(monkeypatch, tmp_path):
 
     ran = []
     monkeypatch.setattr(activities, "_run_claude",
-                        lambda prompt, cwd: ran.append(prompt))
+                        lambda prompt, cwd, mcp=None: ran.append(prompt))
 
     report = asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
 
@@ -87,26 +87,88 @@ def test_degrades_when_integration_disabled(monkeypatch, tmp_path):
     clone = _clone(tmp_path)
     monkeypatch.setattr(activities, "_require_workspace", lambda a, r: str(clone))
     monkeypatch.delenv("REPOWISE_PROXY_URL", raising=False)
-    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd, mcp=None: None)
 
     report = asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
     assert report["outcome"] == "degraded"
 
 
-def test_ok_outcome_when_proxy_available(monkeypatch, tmp_path):
-    clone = _clone(tmp_path)
+def _stage_env(monkeypatch, clone, transcript):
     monkeypatch.setattr(activities, "_require_workspace", lambda a, r: str(clone))
     monkeypatch.setattr(repowise_module, "enabled", lambda: True)
     monkeypatch.setattr(repowise_module, "available", lambda timeout=5.0: True)
+    monkeypatch.setattr(repowise_module, "transcript", lambda session: transcript)
 
-    def fake_claude(prompt, cwd):
+
+def test_ok_outcome_when_dialog_happened(monkeypatch, tmp_path):
+    """`ok` означает «в журнале прокси были ходы», а не «файл создан».
+
+    Разница принципиальная: файл может написать модель, ходы — только реальные
+    обращения. Исход стадии опирается на второе.
+    """
+    clone = _clone(tmp_path)
+    _stage_env(monkeypatch, clone, "# Диалог\n\n## Ход 1 · get_overview\n")
+
+    def fake_claude(prompt, cwd, mcp=None):
         (clone / activities.FNR_DIR / "repowise-dialog.md").write_text(
-            "# Диалог\n\nход 1\n", encoding="utf-8")
+            "# Итог\n\nчто узнали\n", encoding="utf-8")
 
     monkeypatch.setattr(activities, "_run_claude", fake_claude)
 
     report = asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
     assert report["outcome"] == "ok"
+    text = (clone / activities.FNR_DIR / "repowise-dialog.md").read_text(encoding="utf-8")
+    # Итог модели сохраняется, транскрипт дописывается под ним.
+    assert "что узнали" in text
+    assert "## Ход 1" in text
+
+
+def test_artifact_appears_even_if_model_forgot(monkeypatch, tmp_path):
+    """Регрессия первого живого прогона: модель файл не создала, стадия упала.
+
+    Артефакт не должен зависеть от того, вспомнила ли модель его записать:
+    транскрипт есть в журнале прокси, и его достаточно.
+    """
+    clone = _clone(tmp_path)
+    _stage_env(monkeypatch, clone, "# Диалог\n\n## Ход 1 · get_overview\n")
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd, mcp=None: None)
+
+    report = asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
+
+    assert report["outcome"] == "ok"
+    assert (clone / activities.FNR_DIR / "repowise-dialog.md").exists()
+
+
+def test_no_turns_is_distinguished_from_unavailable(monkeypatch, tmp_path):
+    # Сервис доступен, но агент к нему не обратился — это вопрос к агенту, а не
+    # к сервису, и различать их обязательно.
+    clone = _clone(tmp_path)
+    _stage_env(monkeypatch, clone, None)
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd, mcp=None: None)
+
+    report = asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
+
+    assert report["outcome"] == "no-turns"
+    text = (clone / activities.FNR_DIR / "repowise-dialog.md").read_text(encoding="utf-8")
+    assert "outcome: no-turns" in text
+
+
+def test_mcp_config_reaches_only_the_repowise_stage(monkeypatch, tmp_path):
+    # `claude -p` проектный .mcp.json сам не читает — путь передаётся явно.
+    # Остальным стадиям индекс не нужен: лишние инструменты это лишние деньги.
+    clone = _clone(tmp_path)
+    _stage_env(monkeypatch, clone, "# Диалог\n\n## Ход 1\n")
+    seen = {}
+    monkeypatch.setattr(activities, "_run_claude",
+                        lambda prompt, cwd, mcp=None: seen.update({prompt.split()[0]: mcp}))
+
+    asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
+    assert seen["/repowise-context"] and seen["/repowise-context"].endswith(".mcp.json")
+
+    (clone / activities.FNR_DIR / "repowise-dialog.md").write_text("x", encoding="utf-8")
+    (clone / activities.FNR_DIR / "task.md").write_text("x", encoding="utf-8")
+    asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
+    assert seen["/fnr-new-task"] is None
 
 
 def test_other_stages_report_outcome(monkeypatch, tmp_path):
@@ -115,7 +177,7 @@ def test_other_stages_report_outcome(monkeypatch, tmp_path):
     clone = _clone(tmp_path)
     monkeypatch.setattr(activities, "_require_workspace", lambda a, r: str(clone))
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         (clone / activities.FNR_DIR / "task.md").write_text("x", encoding="utf-8")
 
     monkeypatch.setattr(activities, "_run_claude", fake_claude)
@@ -136,7 +198,7 @@ def test_degradation_does_not_burn_stage_timeout(monkeypatch, tmp_path):
         return False
 
     monkeypatch.setattr(repowise_module, "available", probe)
-    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd, mcp=None: None)
     asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
     assert seen["timeout"] <= repowise_module.PROBE_TIMEOUT_SEC
 

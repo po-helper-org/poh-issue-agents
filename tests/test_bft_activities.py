@@ -281,7 +281,7 @@ def deep_env(monkeypatch, tmp_path, gh):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("<repo/>", encoding="utf-8")
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         state["prompts"].append(prompt)
         produced = {
             "/bft-context-gen": f"{bft.artefacts_dir(42)}/bft-context-pack.md",
@@ -321,7 +321,7 @@ async def test_a_stage_that_produced_nothing_is_a_failure(deep_env, monkeypatch)
     req = _req(mode=bft.DEEP)
     await acts.prepare_bft_workspace(req)
     await acts.run_bft_stage(req, "index")
-    monkeypatch.setattr(acts, "_run_claude", lambda prompt, cwd: None)
+    monkeypatch.setattr(acts, "_run_claude", lambda prompt, cwd, mcp=None: None)
 
     with pytest.raises(RuntimeError, match="не создан"):
         await acts.run_bft_stage(req, "context")

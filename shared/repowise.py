@@ -153,7 +153,10 @@ def available(timeout: float = PROBE_TIMEOUT_SEC) -> bool:
     падать из-за неверного токена, иначе отличить «прокси лежит» от «токен
     протух» станет нельзя.
     """
-    if not enabled():
+    # Проверяем АДРЕС, а не флаг: `enabled()` из него и выведен, но подменить
+    # в тесте можно флаг, оставив адрес пустым — и тогда urllib получит
+    # относительный URL и упадёт ValueError вместо честного «недоступен».
+    if not proxy_base():
         return False
     try:
         with urllib.request.urlopen(f"{proxy_base()}/health", timeout=timeout) as resp:
@@ -168,7 +171,7 @@ def transcript(session: str) -> str | None:
     None — не ошибка вызывающего: он подставит артефакт с отметкой о том, что
     обращений не было (см. забор транскрипта разработки в `worker/activities.py`).
     """
-    if not enabled():
+    if not proxy_base():
         return None
     request = urllib.request.Request(
         f"{proxy_base()}/sessions/{urllib.parse.quote(session)}/render",

@@ -171,7 +171,7 @@ def stage_env(monkeypatch, tmp_path):
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("<repo/>", encoding="utf-8")
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         state["claude_prompts"].append(prompt)
         fnr = Path(cwd) / activities.FNR_DIR
         fnr.mkdir(parents=True, exist_ok=True)
@@ -260,7 +260,7 @@ def test_stage_missing_expected_artifact_raises(stage_env, monkeypatch):
     a = _analyze()
     asyncio.run(activities.prepare_workspace(a))
     _seed_dialog(a)
-    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)  # ничего не пишет
+    monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd, mcp=None: None)  # ничего не пишет
     with pytest.raises(RuntimeError, match="task.md не создан"):
         asyncio.run(activities.run_fnr_stage(a, "task"))
 
@@ -285,7 +285,7 @@ def test_stage_heartbeats_during_long_claude(stage_env, monkeypatch):
     asyncio.run(activities.prepare_workspace(_analyze()))
     _seed_dialog(_analyze())
 
-    def slow_claude(prompt, cwd):
+    def slow_claude(prompt, cwd, mcp=None):
         time.sleep(0.05)
         fnr = Path(cwd) / activities.FNR_DIR
         fnr.mkdir(parents=True, exist_ok=True)
@@ -301,7 +301,7 @@ def test_stage_runs_claude_off_event_loop_thread(stage_env, monkeypatch):
     _seed_dialog(_analyze())
     seen = {}
 
-    def record(prompt, cwd):
+    def record(prompt, cwd, mcp=None):
         seen["thread"] = threading.current_thread()
         fnr = Path(cwd) / activities.FNR_DIR
         fnr.mkdir(parents=True, exist_ok=True)
