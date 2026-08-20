@@ -164,3 +164,38 @@ def test_rules_do_not_ask_agent_to_retell_the_dialog():
     # Транскрипт ведёт прокси. Просьба пересказать его вернула бы ровно тот
     # класс отказов, ради которого журнал и вынесен наружу.
     assert "пересказывать" in activities._DEV_REPOWISE_RULES
+
+
+# --- Права на HOME -----------------------------------------------------------
+#
+# Каталог задачи стал домашним каталогом раннера, и OpenHands держит там своё
+# состояние (`$HOME/.openhands/conversations`). Воркер создаёт этот каталог от
+# root, раннер работает от непривилегированного пользователя — и запись падает
+# `PermissionError`. Кода возврата это не меняет: прогон выходит с нулём, а
+# правок не оставляет ни одной. Снаружи такой отказ неотличим от исправной
+# работы, поэтому граница проверяется тестом, а не глазами на стенде.
+
+
+def test_home_directory_is_handed_over_to_runner(tmp_path, monkeypatch):
+    handed = []
+    monkeypatch.setattr(activities, "_handover_to_runner", handed.append)
+    monkeypatch.setattr(activities, "_clone_repo",
+                        lambda repo, dest, branch=None: __import__("os").makedirs(dest, exist_ok=True))
+    monkeypatch.setattr(activities.develop, "workspace_mount", lambda: str(tmp_path))
+    monkeypatch.setattr(activities.github_client, "get_file",
+                        lambda *a, **k: "")
+
+    issue = _issue(56)
+    activities._dev_prepare(issue, "research/issue-56")
+
+    root, _clone = activities._dev_paths(issue)
+    assert handed == [root], "раннеру передан не весь каталог задачи, а только клон"
+    assert (root / develop.MCP_CONFIG_DIR / develop.MCP_CONFIG_NAME).exists()
+
+
+def test_handover_covers_the_directory_used_as_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(activities.develop, "workspace_mount", lambda: str(tmp_path))
+    issue = _issue(56)
+    root, _clone = activities._dev_paths(issue)
+    slug = develop.task_slug(issue.repo, issue.issue_number)
+    assert activities._runner_home(slug) == str(root)

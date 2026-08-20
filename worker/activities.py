@@ -1405,7 +1405,7 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
 
     task = "\n".join(parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
-    _handover_to_runner(clone_dir)
+    _handover_to_runner(root)
     return task
 
 
@@ -1446,7 +1446,13 @@ _DEV_FALLBACK_RULES = f"""## Как работать
 
 
 def _handover_to_runner(path: Path) -> None:
-    """Передать каталог задачи раннеру: он работает не от root.
+    """Передать каталог задачи раннеру целиком: он работает не от root.
+
+    Передаётся ВЕСЬ каталог задачи, а не только клон. Каталог задачи — это
+    ещё и `$HOME` раннера (см. `_runner_home`), а OpenHands держит там своё
+    состояние: `$HOME/.openhands/conversations`. Оставленный за root'ом, он
+    даёт `PermissionError` на первом же шаге, но код возврата остаётся нулевым
+    — снаружи прогон выглядит как отработавший, а правок нет ни одной.
 
     Падаем громко. Молча оставленный каталог root'а — рабочее место, в которое
     агент не может писать: он не сообщает об отказе, а уходит писать в /tmp и
@@ -1859,7 +1865,7 @@ def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(repo, str(clone_dir), branch=branch)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
-    _handover_to_runner(clone_dir)
+    _handover_to_runner(root)
 
 
 @activity.defn
