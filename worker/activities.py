@@ -824,12 +824,41 @@ def _clone_dir(analyze: AnalyzeInput) -> str:
     return str(_workspace_dir(analyze) / "repo")
 
 
+def _existing_branch(repo: str, branch: str) -> str | None:
+    """Имя ветки, если она есть в origin, иначе None.
+
+    Проверка вспомогательная: её задача — подобрать артефакты прошлого прогона,
+    а не решить, состоится ли анализ. Недоступный GitHub (нет авторизации,
+    сеть, лимит) означает «продолжать не с чего», а не «прогон отменяется».
+    """
+    try:
+        return branch if github_client.branch_exists(repo, branch) else None
+    except Exception as exc:  # noqa: BLE001 — вспомогательная проверка
+        logger.warning("ветка %s не проверена (%s) — клон с дефолтной", branch, exc)
+        return None
+
+
 def _build_workspace(analyze: AnalyzeInput) -> str:
-    """Свежий каталог: снести остаток прежнего прогона, clone, repomix."""
+    """Свежий каталог: снести остаток прежнего прогона, clone, repomix.
+
+    Ветка артефактов забирается, если уже есть: повторный `/analyze` после
+    обрыва — это продолжение, а не второй анализ рядом. Стадия с готовым
+    артефактом тогда пропускается, и прогон не платит второй раз за уже
+    написанный документ. Без этого пропуск не сработал бы вовсе: в свежем
+    клоне дефолтной ветки прошлых артефактов нет.
+    """
     shutil.rmtree(_workspace_dir(analyze), ignore_errors=True)
     clone_dir = _clone_dir(analyze)
-    _clone_repo(analyze.repo, clone_dir)
+    previous = _existing_branch(analyze.repo, f"research/issue-{analyze.issue_number}")
+    # Аргумент передаём только когда ветка есть: вызов без него — прежний путь,
+    # и подменять его в тестах существующим способом по-прежнему можно.
+    if previous:
+        _clone_repo(analyze.repo, clone_dir, branch=previous)
+    else:
+        _clone_repo(analyze.repo, clone_dir)
     _run_repomix(clone_dir)
+    # Трекер диалога — до первой стадии: хуки живут в клоне, а он пересоздаётся.
+    _enable_entire(clone_dir)
     return clone_dir
 
 
@@ -1251,6 +1280,15 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     )
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
+    if expected:
+        ready = Path(clone_dir) / expected
+        if ready.is_file() and ready.stat().st_size > 0:
+            # Артефакт приехал с веткой прошлого прогона: стадия сделана, и
+            # повторять её — платить второй раз за тот же документ.
+            logger.info("FNR %s#%s: стадия %s уже сделана — пропускаю",
+                        analyze.repo, analyze.issue_number, stage_name)
+            return {"stage": stage_name, "artifact": expected,
+                    "bytes": ready.stat().st_size, "outcome": "skipped"}
     mcp_config = _write_repowise_config(analyze, clone_dir)
     if stage_name == REPOWISE_STAGE:
         degraded = await asyncio.to_thread(_degrade_repowise_stage, analyze, clone_dir, expected)
@@ -1302,6 +1340,50 @@ async def publish_analysis(analyze: AnalyzeInput) -> str:
         analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
     )
     return branch
+
+
+@activity.defn
+async def publish_analysis_partial(analyze: AnalyzeInput, reason: str) -> list[str]:
+    """Сорванный анализ отдаёт то, что успел собрать — как и БФТ.
+
+    Цепочка FNR стоит тех же денег и рвётся по тем же причинам: лимит
+    провайдера, 524, выкладка посреди прогона. Раньше это списывало всю работу:
+    артефакты жили в каталоге, который `cleanup_workspace` снимал на любом
+    исходе, а публикация случалась только после последней стадии.
+
+    Возвращает имена уцелевших артефактов: воркфлоу называет их человеку, а
+    следующий `/analyze` по ним понимает, какие стадии можно не повторять.
+    """
+    clone_dir = _workspace_dir(analyze) / "repo"
+    if not clone_dir.is_dir():
+        logger.warning("FNR %s#%s: каталог уже снят — публиковать нечего",
+                       analyze.repo, analyze.issue_number)
+        return []
+    files = await asyncio.to_thread(_collect_fnr_artifacts, str(clone_dir))
+    if not files:
+        return []
+    branch = f"research/issue-{analyze.issue_number}"
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        analyze.repo, branch, files,
+        f"docs(sa): частичный анализ issue #{analyze.issue_number}",
+    )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, str(clone_dir))
+    await asyncio.to_thread(_push_entire_branch, analyze.repo, str(clone_dir),
+                            session_branch)
+    links = "\n".join(
+        f"- [`{path.rsplit('/', 1)[-1]}`]"
+        f"(https://github.com/{analyze.repo}/blob/{branch}/{path})"
+        for path in sorted(files))
+    await asyncio.to_thread(
+        github_client.post_comment, analyze.repo, analyze.issue_number,
+        f"## ⏸ Анализ собран частично\n\nПрогон оборвался: {reason}\n\n"
+        f"Что успели — в ветке `{branch}`:\n\n{links}\n\n"
+        "Работа не потеряна: повторный `/analyze` поднимет эту ветку и продолжит "
+        "с места обрыва — готовые стадии заново не считаются."
+        + bft.render_session_hint(analyze.repo, session_id, session_branch),
+    )
+    return sorted(files)
 
 
 @activity.defn
@@ -2248,6 +2330,12 @@ def _build_bft_workspace(req: BftRequest) -> str:
     (Path(clone_dir) / "bft-config.md").write_text(bft.render_config(),
                                                    encoding="utf-8")
 
+    # Трекер диалога — до первой стадии: хуки ставятся в клон, а он создаётся
+    # заново на каждый прогон.
+    _enable_entire(clone_dir)
+    if req.session_id:
+        _resume_entire_session(req.repo, clone_dir, req.session_id)
+
     thread, _ = _bft_thread(req)
     statement = Path(clone_dir) / bft.statement_path(req.issue_number)
     statement.parent.mkdir(parents=True, exist_ok=True)
@@ -2389,6 +2477,129 @@ def _bft_stage_inputs(clone_dir: str, issue_number: int,
     return "\n\n---\n\n".join(parts)
 
 
+ENTIRE_TIMEOUT_SEC = 120
+
+
+def _entire(clone_dir: str, *args: str, check: bool = False):
+    """Вызов `entire` в каталоге задачи.
+
+    Трекер вспомогательный: его отказ не должен ронять прогон, который в
+    остальном идёт нормально. Поэтому по умолчанию `check=False`, а вызывающий
+    смотрит на `returncode`, если исход ему важен.
+    """
+    return subprocess.run(["entire", *args], cwd=clone_dir, capture_output=True,
+                          text=True, timeout=ENTIRE_TIMEOUT_SEC, check=check)
+
+
+def _enable_entire(clone_dir: str) -> None:
+    """Включить запись диалога стадий в клоне задачи.
+
+    `--agent claude-code` переводит команду в неинтерактивный режим: TTY в
+    контейнере нет, а без флага она ушла бы в диалоговый мастер и повисла до
+    таймаута. Хуки ставятся в клон, поэтому включать надо на каждый прогон —
+    каталог создаётся заново.
+
+    Флаг `--agent-help-skill` НЕ используем намеренно: он кладёт свой скилл по
+    тому же пути `.claude/skills/entire/SKILL.md` — но уже в КЛОН, а проектный
+    уровень перекрывает пользовательский. Наш скилл (`.claude/skills/entire/`
+    в образе) содержит то же указание читать `entire agent-help` плюс контекст
+    контура: когда трекер звать, что он не видит и чем чекпоинты отличаются от
+    артефактов. Их тринадцать строк это бы затёрли.
+
+    Молча продолжаем при любом отказе: без трекера прогон соберёт БФТ ровно так
+    же, просто без записи диалога. Менять исход из-за вспомогательного слоя
+    нельзя.
+    """
+    try:
+        result = _entire(clone_dir, "enable", "--agent", "claude-code")
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("entire не включён (%s) — прогон без записи диалога", exc)
+        return
+    if result.returncode != 0:
+        logger.warning("entire не включён (код %s): %s", result.returncode,
+                       (result.stderr or result.stdout or "").strip()[:300])
+
+
+def _entire_session(clone_dir: str) -> tuple[str, str]:
+    """(id сессии, ветка чекпоинтов) — то, чем человек продолжит прогон.
+
+    Пустые строки, если трекера нет или сессия не завелась: комментарий тогда
+    просто не обещает продолжения по id.
+    """
+    try:
+        listing = _entire(clone_dir, "session", "list")
+        refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)"],
+                              cwd=clone_dir, capture_output=True, text=True,
+                              timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("сессия entire не прочитана: %s", exc)
+        return "", ""
+    return (bft.parse_session_id(listing.stdout or ""),
+            bft.parse_session_branch(refs.stdout or ""))
+
+
+def _push_entire_branch(repo: str, clone_dir: str, session_branch: str) -> None:
+    """Ветка чекпоинтов уезжает в origin рядом с артефактами.
+
+    Иначе запись диалога живёт только в каталоге, который снимут вместе с
+    прогоном, — то есть ровно там, где её и теряли.
+    """
+    if not session_branch:
+        return
+    try:
+        token = github_client.auth_token(repo)
+        env = {
+            **os.environ,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0":
+                "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
+            "GIT_CONFIG_KEY_1": "safe.directory",
+            "GIT_CONFIG_VALUE_1": clone_dir,
+            "GH_PUSH_TOKEN": token,
+        }
+        result = subprocess.run(
+            ["git", "-C", clone_dir, "push", "-f", "origin",
+             f"{session_branch}:{session_branch}"],
+            env=env, capture_output=True, text=True, timeout=120, check=False)
+        if result.returncode != 0:
+            logger.warning("ветка сессии не отправлена: %s",
+                           (result.stderr or "").strip()[:300])
+    except Exception as exc:  # noqa: BLE001 — вспомогательный слой
+        logger.warning("ветка сессии не отправлена: %s", exc)
+
+
+def _resume_entire_session(repo: str, clone_dir: str, session_id: str) -> None:
+    """Поднять диалог прошлого прогона по id из `/bft-deep <id>`.
+
+    Ветку чекпоинтов забираем из origin, потому что писал её ДРУГОЙ прогон и в
+    свежем клоне её нет. Дальше `entire session resume` возвращает контекст той
+    сессии — стадии видят, о чём уже говорили, а не начинают знакомство заново.
+
+    Отказ не останавливает прогон: артефакты лежат в ветке БФТ, и без диалога
+    он соберётся — просто без памяти о прошлых рассуждениях. Сказать об этом в
+    лог обязательно, иначе «продолжение» тихо превратится в новый прогон.
+    """
+    try:
+        fetched = subprocess.run(
+            ["git", "-C", clone_dir, "fetch", "-q", "origin",
+             "+refs/heads/entire/*:refs/heads/entire/*"],
+            capture_output=True, text=True, timeout=120, check=False)
+        if fetched.returncode != 0:
+            logger.warning("ветки сессий не забраны: %s",
+                           (fetched.stderr or "").strip()[:200])
+        result = _entire(clone_dir, "session", "resume", session_id)
+        if result.returncode != 0:
+            logger.warning(
+                "сессия %s не поднята (код %s): %s — прогон пойдёт без её контекста",
+                session_id, result.returncode,
+                (result.stderr or result.stdout or "").strip()[:300])
+        else:
+            logger.info("БФТ %s: продолжаю сессию %s", repo, session_id)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("сессия %s не поднята: %s", session_id, exc)
+
+
 def _append_dialog(clone_dir: str, issue_number: int, entry: str) -> None:
     """Дописать строку в журнал прогона — best-effort.
 
@@ -2516,9 +2727,6 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
             # после срыва продолжает с места обрыва, а не начинает заново.
             logger.info("БФТ %s#%s: стадия %s уже сделана — пропускаю",
                         req.repo, req.issue_number, stage_name)
-            _append_dialog(clone_dir, req.issue_number, bft.render_dialog_entry(
-                stage=stage_name, actor="—", step="артефакт прошлого прогона",
-                outcome="пропущено", detail=expected))
             return {"stage": stage_name, "artifact": expected,
                     "bytes": done.stat().st_size, "skipped": True}
     if stage_name in bft.direct_stages() and expected:
@@ -2531,12 +2739,11 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(document, encoding="utf-8")
     else:
-        started = time.monotonic()
+        # Диалог этой стадии пишет entire: у `claude -p` есть сессия, за которую
+        # он цепляется хуками. Дублировать её журналом значит вести две записи
+        # одного и того же и обе поддерживать.
         await _run_with_heartbeat(_run_claude, prompt, clone_dir,
                                   label=f"bft:{stage_name}")
-        _append_dialog(clone_dir, req.issue_number, bft.render_dialog_entry(
-            stage=stage_name, actor="claude -p", step=prompt, outcome="готово",
-            elapsed=time.monotonic() - started))
     artifact: str | None = None
     size = 0
     if expected:
@@ -2562,9 +2769,12 @@ async def publish_bft_deep(req: BftRequest) -> str:
         req.repo, branch, files,
         f"docs(bft): БФТ по issue #{req.issue_number}",
     )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, clone_dir)
+    await asyncio.to_thread(_push_entire_branch, req.repo, clone_dir, session_branch)
     await asyncio.to_thread(
         github_client.post_comment, req.repo, req.issue_number,
-        bft.render_deep_summary(req.repo, req.issue_number, list(files)),
+        bft.render_deep_summary(req.repo, req.issue_number, list(files))
+        + bft.render_session_hint(req.repo, session_id, session_branch),
     )
     return branch
 
@@ -2608,10 +2818,13 @@ async def publish_bft_partial(req: BftRequest, reason: str) -> list[str]:
         req.repo, branch, files,
         f"docs(bft): частичный прогон по issue #{req.issue_number}",
     )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, clone_dir)
+    await asyncio.to_thread(_push_entire_branch, req.repo, clone_dir, session_branch)
     await asyncio.to_thread(
         github_client.post_comment, req.repo, req.issue_number,
         bft.render_partial_summary(req.repo, req.issue_number,
-                                   list(files), done, reason),
+                                   list(files), done, reason)
+        + bft.render_session_hint(req.repo, session_id, session_branch),
     )
     return done
 

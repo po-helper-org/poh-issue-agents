@@ -164,12 +164,26 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
         # exc — ActivityError с общим текстом; настоящая причина в exc.cause
         # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
         reason = str(getattr(exc, "cause", None) or exc)
-        await workflow.execute_activity(
-            activities.publish_analysis_error,
-            args=[analyze, reason[:500]],
-            start_to_close_timeout=timedelta(seconds=60),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
+        # Сначала спасаем сделанное, потом сообщаем о сбое: `cleanup` в
+        # `finally` снимет каталог, и после него публиковать будет нечего.
+        saved = []
+        try:
+            saved = await workflow.execute_activity(
+                activities.publish_analysis_partial,
+                args=[analyze, reason[:300]],
+                start_to_close_timeout=timedelta(seconds=300),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+        except Exception as partial_exc:
+            workflow.logger.warning(
+                "публикация частичного анализа не удалась: %s", partial_exc)
+        if not saved:
+            await workflow.execute_activity(
+                activities.publish_analysis_error,
+                args=[analyze, reason[:500]],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
         await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=False)
     finally:
         # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:

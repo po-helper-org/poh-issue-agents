@@ -159,14 +159,22 @@ def test_mcp_config_reaches_only_the_repowise_stage(monkeypatch, tmp_path):
     clone = _clone(tmp_path)
     _stage_env(monkeypatch, clone, "# Диалог\n\n## Ход 1\n")
     seen = {}
-    monkeypatch.setattr(activities, "_run_claude",
-                        lambda prompt, cwd, mcp=None: seen.update({prompt.split()[0]: mcp}))
+
+    def fake_claude(prompt, cwd, mcp=None):
+        command = prompt.split()[0]
+        seen[command] = mcp
+        # Артефакт пишет стадия, а не тест: заранее созданный файл означает
+        # «стадия уже сделана», и прогон её пропустит — продолжение с обрыва.
+        # Поэтому пишем ровно то, что положено этой стадии.
+        if command == "/fnr-new-task":
+            (clone / activities.FNR_DIR / "task.md").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(activities, "_run_claude", fake_claude)
 
     asyncio.run(activities.run_fnr_stage(_analyze(), "repowise"))
     assert seen["/repowise-context"] and seen["/repowise-context"].endswith(".mcp.json")
 
     (clone / activities.FNR_DIR / "repowise-dialog.md").write_text("x", encoding="utf-8")
-    (clone / activities.FNR_DIR / "task.md").write_text("x", encoding="utf-8")
     asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
     assert seen["/fnr-new-task"] is None
 

@@ -79,6 +79,7 @@ async def main() -> None:
             activities.publish_analysis,
             activities.cleanup_workspace,
             activities.ack_command,
+            activities.publish_analysis_partial,
             activities.publish_analysis_error,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,

@@ -200,7 +200,8 @@ def test_dialog_log_failure_does_not_break_the_stage(monkeypatch, tmp_path):
 
 
 @pytest.mark.timeout(30)
-async def test_agent_stage_records_itself_in_the_log(ready_workspace, monkeypatch):
+async def test_agent_stage_leaves_the_log_to_entire(ready_workspace, monkeypatch):
+    """У стадии агента есть сессия entire — вторая запись о ней не нужна."""
     def fake_claude(prompt, cwd, mcp=None):
         (ready_workspace / bft.document_path(41)).parent.mkdir(parents=True, exist_ok=True)
         (ready_workspace / bft.document_path(41)).write_text("документ")
@@ -209,17 +210,4 @@ async def test_agent_stage_records_itself_in_the_log(ready_workspace, monkeypatc
 
     await activities.run_bft_stage(_req(), "draft")
 
-    log = (ready_workspace / bft.dialog_log_path(41)).read_text()
-    assert "claude -p" in log and "/bft-draft" in log
-
-
-@pytest.mark.timeout(30)
-async def test_skipped_stage_is_visible_in_the_log(ready_workspace, monkeypatch):
-    document = ready_workspace / bft.document_path(41)
-    document.parent.mkdir(parents=True, exist_ok=True)
-    document.write_text("документ прошлого прогона")
-    monkeypatch.setattr(activities, "_run_claude", lambda *a, **kw: None)
-
-    await activities.run_bft_stage(_req(), "draft")
-
-    assert "пропущено" in (ready_workspace / bft.dialog_log_path(41)).read_text()
+    assert not (ready_workspace / bft.dialog_log_path(41)).exists()

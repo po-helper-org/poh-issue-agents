@@ -151,12 +151,18 @@ def build_bft_request(payload: dict, mode: str) -> BftRequest:
     issue = payload["issue"]
     comment = payload.get("comment") or {}
     body = comment.get("body") or ""
+    # `/bft-deep <id>` — продолжение оборванного прогона. Id отделяем от
+    # уточнений здесь, чтобы воркфлоу получал их порознь: иначе идентификатор
+    # уехал бы в постановку задачи как «ещё одно требование заказчика».
+    session_id, instructions = bft.split_session_arg(
+        parse_command_args(body) if comment else "")
     return BftRequest(
         repo=payload["repository"]["full_name"],
         issue_number=issue["number"],
         title=issue["title"],
         body=issue.get("body") or "",
         mode=mode,
-        instructions=parse_command_args(body) if comment else "",
+        instructions=instructions,
         comment_id=comment.get("id"),
+        session_id=session_id,
     )
