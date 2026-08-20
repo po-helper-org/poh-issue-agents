@@ -93,7 +93,7 @@ async def stub_gate_sufficient(issue: IssueInput, thread: list[str]) -> GateResu
 
 
 @activity.defn(name="classify_issue")
-async def stub_classify_feature(issue: IssueInput) -> ClassificationResult:
+async def stub_classify_feature(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:feature-request", answer="ok")
 
 

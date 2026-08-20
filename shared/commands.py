@@ -13,12 +13,19 @@ shared/ в образ.
 помечает.
 """
 
-from shared.workflow_types import AnalyzeInput
+from shared import bft
+from shared.workflow_types import AnalyzeInput, BftRequest
 
 ESTIMATE = "estimate"
 ANALYZE = "analyze"
+# БФТ двумя командами, а не одной с флагом: цена у них разная на два порядка
+# (один вызов модели против пайплайна в клоне репозитория), и человек обязан
+# видеть, что именно он запускает, ещё до запуска.
+BFT = "bft"
+BFT_DEEP = "bft-deep"
 
-_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE}
+_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE,
+             "/bft": BFT, "/bft-deep": BFT_DEEP}
 
 # Схема имён — namespace через двоеточие, как в протоколе агентов v1
 # (needs-human:*, origin:agent). `run:*` — идёт прогон, `done:*` — проработано,
@@ -63,13 +70,24 @@ def parse_label_command(label: str) -> str | None:
     return command if command in set(_COMMANDS.values()) else None
 
 
+def bft_mode(command: str) -> str:
+    """Режим прогона БФТ по имени команды.
+
+    Имена команд и имена режимов разведены намеренно: команда — то, что набирает
+    человек (`/bft-deep`), режим — то, чем оперирует пайплайн (`deep`). Свести их
+    в одну строку значило бы, что переименование команды молча меняет имя
+    стадии в Temporal и путь артефактов.
+    """
+    return bft.DEEP if command == BFT_DEEP else bft.FAST
+
+
 def parse_command(comment_body: str) -> str | None:
     """Имя команды, если комментарий — вызов команды, иначе None.
 
     Командой считается только комментарий, ПЕРВАЯ непустая строка которого
     начинается с самого вызова. Цитата (строка с '>') командой не считается:
     иначе ответ с процитированной командой запускал бы её повторно. Хвост
-    после имени команды игнорируется — аргументов в этой версии нет.
+    после имени команды здесь игнорируется — его достаёт `parse_command_args`.
     """
     for raw_line in comment_body.splitlines():
         line = raw_line.strip()
@@ -79,6 +97,30 @@ def parse_command(comment_body: str) -> str | None:
             return None
         return _COMMANDS.get(line.split()[0].lower())
     return None
+
+
+def parse_command_args(comment_body: str) -> str:
+    """Всё, что человек написал после имени команды, включая следующие строки.
+
+    У `/analyze` и `/estimate` аргументов нет, у БФТ есть: `/bft` несёт
+    замечания к формулировке, `/bft-deep` — ответы на открытые вопросы. Хвост
+    забирается целиком и многострочно, потому что ответы на пять вопросов в одну
+    строку не пишут.
+
+    Не команда — пустая строка: вызывающий уже знает про это из `parse_command`,
+    и второй способ сказать «это не команда» тут ни к чему.
+    """
+    lines = comment_body.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">") or _COMMANDS.get(line.split()[0].lower()) is None:
+            return ""
+        head = line.split(" ", 1)[1] if " " in line else ""
+        tail = "\n".join(lines[index + 1:])
+        return f"{head}\n{tail}".strip()
+    return ""
 
 
 def build_analyze_input(payload: dict) -> AnalyzeInput:
@@ -95,5 +137,26 @@ def build_analyze_input(payload: dict) -> AnalyzeInput:
         issue_number=issue["number"],
         title=issue["title"],
         body=issue.get("body") or "",
+        comment_id=comment.get("id"),
+    )
+
+
+def build_bft_request(payload: dict, mode: str) -> BftRequest:
+    """Вход воркфлоу БФТ из payload вебхука — один сборщик на оба триггера.
+
+    Аргументы есть только у команды в комментарии: запуск меткой ничего, кроме
+    самого факта запуска, не несёт, и `instructions` там пуст. Это не потеря —
+    метка и означает «пересобери по тому, что уже написано в Issue».
+    """
+    issue = payload["issue"]
+    comment = payload.get("comment") or {}
+    body = comment.get("body") or ""
+    return BftRequest(
+        repo=payload["repository"]["full_name"],
+        issue_number=issue["number"],
+        title=issue["title"],
+        body=issue.get("body") or "",
+        mode=mode,
+        instructions=parse_command_args(body) if comment else "",
         comment_id=comment.get("id"),
     )

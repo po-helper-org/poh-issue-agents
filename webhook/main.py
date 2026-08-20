@@ -4,12 +4,15 @@ Webhook receiver: единственная точка входа для GitHub. 
 - issues.opened            -> старт нового workflow (ID = repo-issue-N)
 - issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis и
                                через signal-with-start поднимает цикл-владелец
-                               состояния, `/estimate` — IssueEstimation; любой
+                               состояния, `/estimate` — IssueEstimation,
+                               `/bft` и `/bft-deep` — IssueBft (хвост команды
+                               уезжает в прогон как замечания/уточнения); любой
                                другой комментарий — сигнал уже идущему workflow
                                (используется циклом уточнений)
 - issues.labeled           -> `run:<команда>` запускает тот же воркфлоу, что и
                                команда в комментарии (run:analyze ->
-                               IssueAnalysis, run:estimate -> IssueEstimation);
+                               IssueAnalysis, run:estimate -> IssueEstimation,
+                               run:bft / run:bft-deep -> IssueBft);
                                точки решения человека (research-me / bug-me /
                                build-me) идут через signal-with-start: воркфлоу
                                триажа может не существовать, тогда он
@@ -31,13 +34,17 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from shared import sentry_setup
 from shared.commands import (
     ANALYZE,
+    BFT,
+    BFT_DEEP,
     ESTIMATE,
+    bft_mode,
     build_analyze_input,
+    build_bft_request,
     parse_command,
     parse_label_command,
 )
 from shared.agent_comment import is_agent_comment
-from shared.agent_launcher import request_analysis, request_estimate
+from shared.agent_launcher import request_analysis, request_bft, request_estimate
 from shared.authz import may_trigger, trigger_allowlist
 from shared.labels import parse_root_issue
 from shared.repos import allowed_specs, is_allowed
@@ -478,6 +485,20 @@ async def github_webhook(
                 )
                 return {"ok": True}
 
+            if command in (BFT, BFT_DEEP):
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                await request_bft(
+                    client,
+                    # Отвечать на уточняющий вопрос тут некому: триггер — метка.
+                    _issue_input(payload, interactive=False),
+                    # Без comment_id и без уточнений: метка несёт только сам факт
+                    # запуска, и это законно — «пересобери по тому, что в Issue».
+                    build_bft_request(payload, bft_mode(command)),
+                    search_attributes=_search_attributes(repo, payload, issue_number),
+                )
+                return {"ok": True}
+
             if label in HUMAN_DECISION_LABELS:
                 if not _may_start_expensive(payload, label, repo, issue_number):
                     return {"ok": True}
@@ -546,6 +567,17 @@ async def github_webhook(
             )
             return {"ok": True}
 
+        if command in (BFT, BFT_DEEP):
+            if not _may_start_expensive(payload, f"/{command}", repo, issue_number):
+                return {"ok": True}
+            await request_bft(
+                client,
+                _issue_input(payload, interactive=True),
+                build_bft_request(payload, bft_mode(command)),
+                search_attributes=_search_attributes(repo, payload, issue_number),
+            )
+            return {"ok": True}
+
         if command == ANALYZE:
             if not _may_start_expensive(payload, "/analyze", repo, issue_number):
                 return {"ok": True}
@@ -564,7 +596,8 @@ async def github_webhook(
         wf_id = workflow_id_for(repo, issue_number)
         handle = client.get_workflow_handle(wf_id)
         try:
-            await handle.signal("user_comment", payload["comment"]["body"])
+            await handle.signal("user_comment", args=[payload["comment"]["body"],
+                                                       payload["comment"]["id"]])
         except Exception:
             # Сознательное исключение из правила «сигнал поднимает цикл».
             # Команды (`/analyze`, `/estimate`, метки решения) идут через

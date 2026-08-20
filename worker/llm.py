@@ -51,3 +51,24 @@ def extract(system_prompt: str, user_message: str, response_model, model: str = 
             {"role": "user", "content": user_message},
         ],
     )
+
+
+def complete(system_prompt: str, user_message: str, *, model: str,
+             max_tokens: int = 16000, temperature: float = 0.2) -> str:
+    """Сырой ответ модели текстом — без Pydantic-схемы.
+
+    `extract` рядом требует response_model и годится для коротких структур.
+    Стадии БФТ возвращают либо большой JSON каскада, либо готовый markdown на
+    двадцать килобайт: схемой это не описать, а Instructor на таком объёме
+    только мешает ретраями по несоответствию.
+    """
+    resp = get_client().client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return resp.choices[0].message.content or ""

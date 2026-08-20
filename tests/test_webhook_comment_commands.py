@@ -23,10 +23,12 @@ class FakeHandle:
         self._fail = fail
         self._handles_agents = handles_agents
 
-    async def signal(self, name, *args):
+    async def signal(self, name, *args, **kwargs):
         if self._fail:
             raise RuntimeError("workflow уже завершён")
-        self._sink.append((name, args))
+        # Реальный хендл принимает и одиночный аргумент, и `args=[...]`: реплика
+        # человека едет вторым способом, вместе с ключом комментария.
+        self._sink.append((name, tuple(kwargs.get("args", args))))
 
     async def query(self, name, *args):
         """Ответ цикла на вопрос лаунчера «ведёшь ли ты агентов сам» (#37)."""
@@ -176,7 +178,7 @@ def test_plain_comment_feeds_the_clarification_loop(webhook):
 
     assert [c["workflow"] for c in fake.started] == ["CommentAck"]
     assert fake.signals[0] == "issue-acme/widgets-7"
-    assert ("user_comment", ("да, речь про мобильный клиент",)) in fake.signals
+    assert ("user_comment", ("да, речь про мобильный клиент", 555)) in fake.signals
 
 
 def test_comment_after_workflow_finished_is_not_an_error(webhook):
@@ -208,7 +210,7 @@ def test_repeated_delivery_does_not_ask_for_a_second_reaction(webhook):
 
     assert not any(c["workflow"] == "CommentAck" for c in fake.started)
     # Обработка самого комментария при этом идёт своим чередом.
-    assert ("user_comment", ("обычный текст",)) in fake.signals
+    assert ("user_comment", ("обычный текст", 555)) in fake.signals
 
 
 def test_comment_is_processed_even_if_the_reaction_fails(webhook, monkeypatch):
@@ -224,7 +226,7 @@ def test_comment_is_processed_even_if_the_reaction_fails(webhook, monkeypatch):
     monkeypatch.setattr(fake, "start_workflow", flaky)
 
     assert _post(app_client, _comment("обычный текст")).status_code == 200
-    assert ("user_comment", ("обычный текст",)) in fake.signals
+    assert ("user_comment", ("обычный текст", 555)) in fake.signals
 
 
 def test_command_from_a_forbidden_user_is_still_acknowledged(webhook, monkeypatch):
@@ -263,4 +265,4 @@ def test_quoted_command_does_not_run(webhook):
     assert _post(app_client, _comment("> /analyze\n\nсогласен")).status_code == 200
 
     assert [c["workflow"] for c in fake.started] == ["CommentAck"]
-    assert ("user_comment", ("> /analyze\n\nсогласен",)) in fake.signals
+    assert ("user_comment", ("> /analyze\n\nсогласен", 555)) in fake.signals

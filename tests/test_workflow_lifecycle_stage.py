@@ -86,12 +86,12 @@ async def error_label(issue: IssueInput, reason: str = "") -> None: ...
 
 
 @activity.defn(name="classify_issue")
-async def classify_feature(issue: IssueInput) -> ClassificationResult:
+async def classify_feature(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:feature-request", answer="ok")
 
 
 @activity.defn(name="classify_issue")
-async def classify_consultation(issue: IssueInput) -> ClassificationResult:
+async def classify_consultation(issue: IssueInput, bft_on_triage: bool = False) -> ClassificationResult:
     return ClassificationResult(label="advisor:consultation", answer="ответ")
 
 
