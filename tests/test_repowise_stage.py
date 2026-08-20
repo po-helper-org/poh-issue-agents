@@ -167,3 +167,33 @@ def test_summary_names_the_dialog_as_context_source():
     files = {f"{activities.FNR_DIR}/repowise-dialog.md": "# Диалог\n"}
     summary = activities._build_summary(_analyze(), "research/issue-42", files)
     assert "Repowise" in summary
+
+
+# --- Слэш-команды стадий существуют ---
+#
+# Стадия зовёт `claude -p "/<команда> …"`, а команды берутся из
+# `.claude/commands` образа воркера. Нет файла — команда уезжает в модель
+# обычным текстом, артефакт не создаётся, и стадия падает на guard'е «артефакт
+# не создан». Ровно этот промах нашёлся при подготовке демонстрации: промпт
+# стадии был написан, а команда — нет.
+
+def test_every_stage_has_its_command():
+    import pathlib
+    root = pathlib.Path(activities.__file__).resolve().parents[1]
+    missing = []
+    for name in activities.FNR_STAGE_NAMES:
+        prompt, _, _ = activities._fnr_stage(name, "описание")
+        command = prompt.split()[0].lstrip("/")
+        if not (root / ".claude" / "commands" / f"{command}.md").exists():
+            missing.append(f"{name} → /{command}")
+    assert not missing, f"стадии без файла команды: {missing}"
+
+
+def test_repowise_command_names_the_same_artifact():
+    # Имя артефакта в команде и в конвейере обязано совпадать: разъехались —
+    # стадия отработает, файл появится не там, и guard уронит прогон.
+    import pathlib
+    root = pathlib.Path(activities.__file__).resolve().parents[1]
+    text = (root / ".claude" / "commands" / "repowise-context.md").read_text(encoding="utf-8")
+    assert "repowise-dialog.md" in text
+    assert "get_overview" in text
