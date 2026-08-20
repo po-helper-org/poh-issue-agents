@@ -940,11 +940,17 @@ def _claude_anthropic_creds() -> tuple[str, str]:
     return token, base
 
 
-def _run_claude(prompt: str, cwd: str) -> None:
+def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None) -> None:
     """Одна стадия FNR — отдельный процесс `claude -p` с чистым контекстом.
 
     Креды берутся из ZAI_* (как в main) и прокидываются в claude-code через его
     ANTHROPIC_* — единый ключ z.ai, отдельную пару переменных заводить не нужно.
+
+    `mcp_config` — путь к файлу с описанием MCP-серверов. Передаётся ЯВНО, и это
+    не перестраховка: `claude -p` НЕ подхватывает проектный `.mcp.json` сам.
+    Положить файл в каталог прогона и надеяться — ровно то, что провалилось на
+    первом живом Issue: стадия отработала за минуту, вышла с нулём, инструментов
+    не увидела и артефакта не создала.
     """
     token, base = _claude_anthropic_creds()
     # Понятная ошибка вместо голого "exit 1", если z.ai не сконфигурирован:
@@ -954,11 +960,22 @@ def _run_claude(prompt: str, cwd: str) -> None:
             "claude -p не сконфигурирован: задай ZAI_API_KEY и ZAI_BASE_URL "
             "(или явные ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) в окружении воркера."
         )
+    # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
+    # работает от root, а тот флаг под root запрещён самим claude-code
+    # (проверено спайком, docs/spikes/2026-07-22-claude-p-zai-tool-calling.md).
+    command = ["claude", "-p", prompt, "--permission-mode", "acceptEdits"]
+    if mcp_config:
+        # --strict-mcp-config: брать ТОЛЬКО этот файл. Иначе в сессию могли бы
+        # затесаться серверы из окружения образа, и стадия ходила бы не туда,
+        # куда её послали.
+        #
+        # --allowedTools по имени сервера: без него вызов инструмента ждёт
+        # подтверждения, которого в неинтерактивном режиме не будет, и диалог
+        # молча не состоится.
+        command += ["--mcp-config", mcp_config, "--strict-mcp-config",
+                    "--allowedTools", f"mcp__{repowise.SERVER_NAME}"]
     result = subprocess.run(
-        # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
-        # работает от root, а тот флаг под root запрещён самим claude-code
-        # (проверено спайком, docs/spikes/2026-07-22-claude-p-zai-tool-calling.md).
-        ["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
+        command,
         cwd=cwd, capture_output=True, text=True,
         timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
         # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
@@ -1149,20 +1166,64 @@ async def prepare_workspace(analyze: AnalyzeInput) -> None:
     await _run_with_heartbeat(_build_workspace, analyze, label="preparing")
 
 
-def _write_repowise_config(analyze: AnalyzeInput, clone_dir: str) -> None:
-    """Конфигурация MCP в рабочий каталог прогона.
+def _write_repowise_config(analyze: AnalyzeInput, clone_dir: str) -> str | None:
+    """Конфигурация MCP в рабочий каталог прогона. Возвращает путь к файлу.
 
     Не в образ: адрес прокси и идентификатор сессии зависят от Issue, и вшить
     их в образ нельзя. Пишется на КАЖДОЙ стадии, а не однажды: каталог прогона
     пересоздаётся стадией 0 (`_build_workspace`), и файл, положенный до неё,
     молча исчезнет — а выглядело бы это как агент, забывший про индекс.
+
+    Путь возвращается, потому что файл надо ПЕРЕДАТЬ явно: `claude -p`
+    проектный `.mcp.json` сам не читает (см. `_run_claude`).
     """
     if not repowise.enabled():
-        return
+        return None
     config = repowise.claude_mcp_config(
         analyze.repo, analyze.issue_number, repowise.ANALYSIS)
-    (Path(clone_dir) / ".mcp.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = Path(clone_dir) / ".mcp.json"
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return str(path)
+
+
+def _ensure_dialog_artifact(analyze: AnalyzeInput, clone_dir: str,
+                            expected: str) -> str:
+    """Дописать артефакт диалога транскриптом из журнала прокси.
+
+    Артефакт НЕ должен зависеть от того, вспомнила ли модель его записать. На
+    первом живом прогоне она не вспомнила, стадия упала на guard'е, и весь
+    конвейер встал — при исправном сервисе и состоявшемся, возможно, диалоге.
+
+    Транскрипт берётся у прокси, как и для агента разработки: там журнал, и он
+    полон по построению. Модель отвечает только за «Итог» — если она его
+    написала, он сохраняется выше транскрипта.
+
+    Возвращает исход: `ok` — ходы были, `no-turns` — сервис отвечал, но агент
+    к нему не обратился.
+    """
+    session = repowise.session_id(analyze.repo, analyze.issue_number,
+                                 repowise.ANALYSIS)
+    transcript = repowise.transcript(session)
+    path = Path(clone_dir) / expected
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    written = path.read_text(encoding="utf-8") if path.exists() else ""
+    if transcript:
+        path.write_text(f"{written}\n\n{transcript}" if written else transcript,
+                        encoding="utf-8")
+        return "ok"
+
+    if not written:
+        path.write_text(
+            f"---\nissue: {analyze.repo}#{analyze.issue_number}\n"
+            f"session: {session}\nagent: {repowise.ANALYSIS}\n"
+            f"outcome: no-turns\nturns: 0\n---\n\n"
+            f"# Итог\n\nАгент не обратился к индексу ни разу, хотя сервис был "
+            f"доступен.\n\nЭто не отказ сервиса: постановка ниже написана без "
+            f"дополнительного контекста, и перечитать её стоит критически.\n",
+            encoding="utf-8")
+    return "no-turns"
 
 
 def _degrade_repowise_stage(analyze: AnalyzeInput, clone_dir: str,
@@ -1228,12 +1289,26 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
                         analyze.repo, analyze.issue_number, stage_name)
             return {"stage": stage_name, "artifact": expected,
                     "bytes": ready.stat().st_size, "outcome": "skipped"}
-    _write_repowise_config(analyze, clone_dir)
+    mcp_config = _write_repowise_config(analyze, clone_dir)
     if stage_name == REPOWISE_STAGE:
         degraded = await asyncio.to_thread(_degrade_repowise_stage, analyze, clone_dir, expected)
         if degraded is not None:
             return degraded
-    await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
+    # Конфигурация MCP передаётся ТОЛЬКО стадии сбора контекста: остальным
+    # стадиям индекс не нужен, а лишние инструменты в сессии — лишние соблазны
+    # и лишние деньги.
+    await _run_with_heartbeat(
+        _run_claude, prompt, clone_dir,
+        mcp_config if stage_name == REPOWISE_STAGE else None,
+        label=stage_name)
+
+    outcome = "ok"
+    if stage_name == REPOWISE_STAGE and expected:
+        # Артефакт дописывается транскриптом из журнала прокси и потому не
+        # зависит от того, вспомнила ли модель его записать.
+        outcome = await asyncio.to_thread(
+            _ensure_dialog_artifact, analyze, clone_dir, expected)
+
     artifact: str | None = None
     size = 0
     if expected:
@@ -1242,7 +1317,8 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
             raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
         artifact = expected
         size = path.stat().st_size
-    return {"stage": stage_name, "artifact": artifact, "bytes": size, "outcome": "ok"}
+    return {"stage": stage_name, "artifact": artifact, "bytes": size,
+            "outcome": outcome}
 
 
 @activity.defn
@@ -1411,24 +1487,33 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
 
     task = "\n".join(parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
-    _handover_to_runner(clone_dir)
+    _handover_to_runner(root)
     return task
 
 
 _DEV_REPOWISE_RULES = """
-## Индекс кода (MCP-сервер `repowise`)
+## Индекс кода (MCP-сервер `repowise`) — обращение обязательно
 
 Постоянный индекс репозиториев организации: граф символов, история git, blame,
 поиск, оценка риска правки, мёртвый код.
 
-1. **До начала работы** спроси про компоненты, которые собираешься менять, и
-   про их связи. Это дешевле, чем читать репозиторий целиком, и точнее, чем
-   догадываться по именам файлов.
+1. **До начала работы** — ПЕРВЫМ ДЕЙСТВИЕМ, до чтения файлов и до первой
+   правки — задай индексу не меньше одного вопроса о компонентах, которые
+   собираешься менять, и об их связях: `search_codebase`, `get_context`,
+   `get_symbol`, `get_answer`. Это дешевле, чем читать репозиторий целиком, и
+   точнее, чем догадываться по именам файлов.
+
+   «Задача выглядит простой», «требования и так подробные», «репозиторий
+   маленький» — НЕ основания пропустить шаг. Индекс знает то, чего нет ни в
+   требованиях, ни в файлах: кто ещё вызывает этот код, чем он был раньше и
+   почему устроен так. Пропуск шага — ошибка прогона, даже если правка вышла
+   верной.
 2. **При затруднении** спроси снова — вместо того чтобы продолжать вслепую.
-   Не понял, почему код устроен так — спроси про историю и решение, а не
-   переписывай.
+   Не понял, почему код устроен так — спроси про историю и решение
+   (`get_why`, `get_risk`), а не переписывай.
 3. **Индекс недоступен** — работай без него. Это штатный режим, а не повод
-   останавливаться.
+   останавливаться. Недоступен — значит вызов вернул ошибку; отсутствие
+   желания спрашивать недоступностью не считается.
 
 Весь диалог сохраняется автоматически и публикуется артефактом: пересказывать
 его в отчёте не нужно.
@@ -1452,7 +1537,13 @@ _DEV_FALLBACK_RULES = f"""## Как работать
 
 
 def _handover_to_runner(path: Path) -> None:
-    """Передать каталог задачи раннеру: он работает не от root.
+    """Передать каталог задачи раннеру целиком: он работает не от root.
+
+    Передаётся ВЕСЬ каталог задачи, а не только клон. Каталог задачи — это
+    ещё и `$HOME` раннера (см. `_runner_home`), а OpenHands держит там своё
+    состояние: `$HOME/.openhands/conversations`. Оставленный за root'ом, он
+    даёт `PermissionError` на первом же шаге, но код возврата остаётся нулевым
+    — снаружи прогон выглядит как отработавший, а правок нет ни одной.
 
     Падаем громко. Молча оставленный каталог root'а — рабочее место, в которое
     агент не может писать: он не сообщает об отказе, а уходит писать в /tmp и
@@ -1865,7 +1956,7 @@ def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(repo, str(clone_dir), branch=branch)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
-    _handover_to_runner(clone_dir)
+    _handover_to_runner(root)
 
 
 @activity.defn

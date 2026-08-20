@@ -143,7 +143,7 @@ async def test_empty_artifact_does_not_count_as_done(ready_workspace, monkeypatc
     document.write_text("")
     ran = []
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         ran.append(prompt)
         document.write_text("свежий документ")
 
@@ -202,7 +202,7 @@ def test_dialog_log_failure_does_not_break_the_stage(monkeypatch, tmp_path):
 @pytest.mark.timeout(30)
 async def test_agent_stage_leaves_the_log_to_entire(ready_workspace, monkeypatch):
     """У стадии агента есть сессия entire — вторая запись о ней не нужна."""
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         (ready_workspace / bft.document_path(41)).parent.mkdir(parents=True, exist_ok=True)
         (ready_workspace / bft.document_path(41)).write_text("документ")
 

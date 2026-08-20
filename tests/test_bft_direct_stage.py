@@ -168,7 +168,7 @@ async def test_stage_without_the_flag_still_goes_through_the_agent(
     monkeypatch.setenv("BFT_DIRECT_STAGES", "validate")  # draft НЕ включён
     called = []
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         called.append(prompt)
         (workspace / bft.document_path(41)).parent.mkdir(parents=True, exist_ok=True)
         (workspace / bft.document_path(41)).write_text("документ агента")

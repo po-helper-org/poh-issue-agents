@@ -208,7 +208,7 @@ def e2e(monkeypatch, tmp_path):
         "/validate-doc": "validation.md",
     }
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         fnr = Path(cwd) / activities_module.FNR_DIR
         fnr.mkdir(parents=True, exist_ok=True)
         name = produced.get(prompt.split()[0])

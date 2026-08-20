@@ -92,7 +92,7 @@ async def test_empty_artifact_does_not_count_as_done(workspace, monkeypatch):
     ready.write_text("")
     ran = []
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         ran.append(prompt)
         ready.write_text("свежий документ")
 
