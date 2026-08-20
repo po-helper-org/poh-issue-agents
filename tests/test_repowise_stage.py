@@ -259,3 +259,18 @@ def test_repowise_command_names_the_same_artifact():
     text = (root / ".claude" / "commands" / "repowise-context.md").read_text(encoding="utf-8")
     assert "repowise-dialog.md" in text
     assert "get_overview" in text
+
+
+def test_task_command_writes_into_the_occupied_dir():
+    """Постановка обязана писать в ту же папку, где лежит артефакт диалога.
+
+    Регрессия второго живого прогона: команда выбирала «следующий свободный
+    номер», FNR_1 был занят артефактом стадии repowise, и task.md уехал в
+    FNR_2 — а конвейер ждёт его в FNR_1 и падает на «артефакт не создан».
+    """
+    import pathlib
+    root = pathlib.Path(activities.__file__).resolve().parents[1]
+    text = (root / ".claude" / "commands" / "fnr-new-task.md").read_text(encoding="utf-8")
+    assert "task.md" in text and "ЗАНЯТОЙ" in text
+    # Прежняя формулировка, из-за которой конвейер и падал.
+    assert "уже есть — создать `FNR_2/`" not in text
