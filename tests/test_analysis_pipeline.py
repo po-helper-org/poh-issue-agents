@@ -1,4 +1,5 @@
 import asyncio
+import pathlib
 import subprocess
 import threading
 import time
@@ -104,8 +105,9 @@ def test_claude_creds_empty_when_nothing_set(monkeypatch):
 
 
 
-def test_fnr_stage_names_are_the_five_stages():
-    assert activities.FNR_STAGE_NAMES == ("task", "concept", "debate", "sysreq", "validate")
+def test_fnr_stage_names_are_the_six_stages():
+    assert activities.FNR_STAGE_NAMES == (
+        "repowise", "task", "concept", "debate", "sysreq", "validate")
 
 
 def test_fnr_stage_lookup_returns_prompt_expected_and_input():
@@ -115,9 +117,17 @@ def test_fnr_stage_lookup_returns_prompt_expected_and_input():
     assert requires == f"{activities.FNR_DIR}/task.md"
 
 
-def test_fnr_stage_task_has_no_required_input():
-    _, _, requires = activities._fnr_stage("task", "desc")
+def test_fnr_stage_repowise_has_no_required_input():
+    # Первая стадия конвейера: требовать от неё чего-либо на входе не с чего.
+    _, _, requires = activities._fnr_stage("repowise", "desc")
     assert requires is None
+
+
+def test_fnr_stage_task_requires_dialog_artifact():
+    # Пропустить сбор контекста незаметно нельзя. Артефакт создаётся и при
+    # недоступном Repowise, поэтому guard не делает сервис обязательным.
+    _, _, requires = activities._fnr_stage("task", "desc")
+    assert requires == f"{activities.FNR_DIR}/repowise-dialog.md"
 
 
 def test_fnr_stage_unknown_raises():
@@ -131,6 +141,17 @@ def test_fnr_stage_sources_stay_consistent():
     # _fnr_stage в сырой KeyError — ловим его здесь, а не в проде.
     names = {n for n, _, _ in activities._fnr_stages("desc")}
     assert names == set(activities.FNR_STAGE_NAMES) == set(activities._FNR_STAGE_REQUIRES)
+
+
+def _seed_dialog(analyze):
+    """Стадия repowise уже отработала: её артефакт — вход стадии `task`.
+
+    Тесты ниже начинают с `task`, а в живом прогоне к этому моменту диалог уже
+    состоялся либо деградировал — в обоих случаях файл на месте.
+    """
+    fnr = pathlib.Path(activities._clone_dir(analyze)) / activities.FNR_DIR
+    fnr.mkdir(parents=True, exist_ok=True)
+    (fnr / "repowise-dialog.md").write_text("# Диалог\n", encoding="utf-8")
 
 
 @pytest.fixture
@@ -155,6 +176,7 @@ def stage_env(monkeypatch, tmp_path):
         fnr = Path(cwd) / activities.FNR_DIR
         fnr.mkdir(parents=True, exist_ok=True)
         produced = {
+            "/repowise-context": "repowise-dialog.md",
             "/fnr-new-task": "task.md",
             "/fnr-concept": "concept.md",
             "/fnr-system-requirements": "system_requirements.md",
@@ -215,6 +237,7 @@ def test_prepare_workspace_builds_clone_and_repomix(stage_env):
 def test_stage_reports_stage_artifact_and_size(stage_env):
     a = _analyze()
     asyncio.run(activities.prepare_workspace(a))
+    _seed_dialog(a)
     result = asyncio.run(activities.run_fnr_stage(a, "task"))
     assert result["stage"] == "task"
     assert result["artifact"] == f"{activities.FNR_DIR}/task.md"
@@ -225,15 +248,18 @@ def test_stage_reports_stage_artifact_and_size(stage_env):
 def test_stage_without_expected_artifact_reports_none(stage_env):
     a = _analyze()
     asyncio.run(activities.prepare_workspace(a))
+    _seed_dialog(a)
     asyncio.run(activities.run_fnr_stage(a, "task"))
     asyncio.run(activities.run_fnr_stage(a, "concept"))
     result = asyncio.run(activities.run_fnr_stage(a, "debate"))  # debate: артефакта нет
-    assert result == {"stage": "debate", "artifact": None, "bytes": 0}
+    assert result == {"stage": "debate", "artifact": None, "bytes": 0,
+                      "outcome": "ok"}
 
 
 def test_stage_missing_expected_artifact_raises(stage_env, monkeypatch):
     a = _analyze()
     asyncio.run(activities.prepare_workspace(a))
+    _seed_dialog(a)
     monkeypatch.setattr(activities, "_run_claude", lambda prompt, cwd: None)  # ничего не пишет
     with pytest.raises(RuntimeError, match="task.md не создан"):
         asyncio.run(activities.run_fnr_stage(a, "task"))
@@ -257,6 +283,7 @@ def test_stage_without_input_artifact_fails_fast(stage_env):
 def test_stage_heartbeats_during_long_claude(stage_env, monkeypatch):
     monkeypatch.setattr(activities, "HEARTBEAT_INTERVAL_SEC", 0.01)
     asyncio.run(activities.prepare_workspace(_analyze()))
+    _seed_dialog(_analyze())
 
     def slow_claude(prompt, cwd):
         time.sleep(0.05)
@@ -271,6 +298,7 @@ def test_stage_heartbeats_during_long_claude(stage_env, monkeypatch):
 
 def test_stage_runs_claude_off_event_loop_thread(stage_env, monkeypatch):
     asyncio.run(activities.prepare_workspace(_analyze()))
+    _seed_dialog(_analyze())
     seen = {}
 
     def record(prompt, cwd):
@@ -334,6 +362,7 @@ def test_enriched_context_reaches_task_stage(monkeypatch, stage_env):
                         lambda repo, n, limit=20: [])
 
     asyncio.run(activities.prepare_workspace(_analyze()))
+    _seed_dialog(_analyze())
     asyncio.run(activities.run_fnr_stage(_analyze(), "task"))
 
     task_prompt = stage_env["claude_prompts"][0]

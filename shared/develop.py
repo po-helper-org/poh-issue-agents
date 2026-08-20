@@ -62,6 +62,13 @@ DEFAULT_WORKSPACE_MOUNT = "/workspaces"
 RUNNER_UID = 10001
 RUNNER_GID = 10001
 
+# Конфигурация MCP агента разработки. Пути сняты со спайка FR-16
+# (`docs/spikes/2026-08-19-openhands-mcp-config.md`): агент читает её из
+# `$HOME/.openhands/mcp.json`. Воркер кладёт файл в каталог задачи на общем
+# томе и переставляет раннеру HOME туда же — образ при этом не трогается.
+MCP_CONFIG_DIR = ".openhands"
+MCP_CONFIG_NAME = "mcp.json"
+
 # Потолок прогона. Больше часа — это не «агент думает», это агент застрял, и
 # держать задачу в неопределённости дороже, чем оборвать и сказать об этом.
 DEFAULT_RUN_TIMEOUT_SEC = 2700
@@ -138,7 +145,8 @@ def work_branch(issue_number: int) -> str:
     return f"feature/{issue_number}-openhands"
 
 
-def runner_command(slug: str, *, image: str, volume: str, mount: str) -> list[str]:
+def runner_command(slug: str, *, image: str, volume: str, mount: str,
+                   network: str = "", home: str = "") -> list[str]:
     """Команда запуска одноразового контейнера.
 
     `--rm` обязателен: контейнер существует ради одного прогона, и оставлять
@@ -147,8 +155,20 @@ def runner_command(slug: str, *, image: str, volume: str, mount: str) -> list[st
     Сеть агенту нужна: он ставит зависимости проекта. Секреты внутрь идут
     ровно два — ключ и адрес модели; GitHub-токена там нет, потому что пушит
     и открывает PR воркер, а не агент.
+
+    `network` — сеть, в которой раннеру виден MCP-прокси Repowise. Пусто —
+    раннер работает без индекса; это штатный режим, а не отказ.
+
+    `home` — куда переставить домашний каталог. Нужен ровно затем, чтобы агент
+    нашёл конфигурацию MCP: он читает её из `$HOME/.openhands/mcp.json`
+    (спайк FR-16), а общий том смонтирован в другом месте. Переставить одну
+    переменную дешевле, чем оборачивать ENTRYPOINT образа или монтировать
+    отдельный файл, путь которого на хосте воркеру неизвестен.
+
+    Пусто — HOME остаётся тем, что задан образом, и поведение раннера не
+    меняется вовсе.
     """
-    return [
+    command = [
         # Имя, а не случайное: воркер запускает контейнер и ждёт, но если воркер
         # умер (выкладка, рестарт, terminate воркфлоу), клиент исчезает, а
         # контейнер остаётся работать — с ключом модели, минутами CPU и памятью.
@@ -160,8 +180,22 @@ def runner_command(slug: str, *, image: str, volume: str, mount: str) -> list[st
         "-e", "LLM_API_KEY",
         "-e", "LLM_BASE_URL",
         "-e", "LLM_MODEL",
-        image,
     ]
+    if network:
+        command += ["--network", network]
+    if home:
+        command += ["-e", f"HOME={home}"]
+    command.append(image)
+    return command
+
+
+def proxy_network() -> str:
+    """Сеть docker, в которой раннеру виден MCP-прокси Repowise.
+
+    Пусто — раннер работает без индекса. Это штатный режим: интеграция может
+    быть не поднята вовсе, и разработка от этого останавливаться не должна.
+    """
+    return os.environ.get("REPOWISE_NETWORK", "").strip()
 
 
 def reap_command(slug: str) -> list[str]:

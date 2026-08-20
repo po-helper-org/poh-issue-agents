@@ -24,7 +24,16 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import bft, decomposition, develop, labels, lifecycle, pr_closing, sentry_setup
+from shared import (
+    bft,
+    decomposition,
+    develop,
+    labels,
+    lifecycle,
+    pr_closing,
+    repowise,
+    sentry_setup,
+)
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
@@ -737,7 +746,8 @@ def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: Dupl
 # --- Пайплайн SA-helper (FNR) ---
 
 FNR_DIR = "sa_documentation/FNR/FNR_1"
-ARTIFACT_FILES = ("task.md", "concept.md", "system_requirements.md", "validation.md")
+ARTIFACT_FILES = ("repowise-dialog.md", "task.md", "concept.md",
+                  "system_requirements.md", "validation.md")
 CLAUDE_STAGE_TIMEOUT_SEC = 900
 REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
@@ -755,8 +765,13 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
 
     У `debate` и `validate` ожидаемого файла нет: дебаты дописываются в
     concept.md, а валидация может остаться отчётом в выводе.
+
+    `repowise` идёт ПЕРВОЙ: её результат — вход для постановки задачи, и
+    обращаться к индексу после написания task.md уже поздно.
     """
     return [
+        ("repowise", f"/repowise-context {description}",
+         f"{FNR_DIR}/repowise-dialog.md"),
         ("task", f"/fnr-new-task {description}", f"{FNR_DIR}/task.md"),
         ("concept", f"/fnr-concept {FNR_DIR}/task.md", f"{FNR_DIR}/concept.md"),
         ("debate", f"/fnr-debate {FNR_DIR}/concept.md", None),
@@ -766,12 +781,21 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     ]
 
 
-FNR_STAGE_NAMES = ("task", "concept", "debate", "sysreq", "validate")
+# Имя стадии сбора контекста — константой: на него ссылается ветвь деградации,
+# и разъехавшийся литерал означал бы стадию, которая деградировать не умеет.
+REPOWISE_STAGE = "repowise"
+
+FNR_STAGE_NAMES = (REPOWISE_STAGE, "task", "concept", "debate", "sysreq", "validate")
 
 # Входной артефакт каждой стадии — что уже должно лежать в рабочем каталоге,
 # чтобы стадия имела смысл (используется guard'ом _require_workspace).
+#
+# У `task` вход — артефакт диалога: пропустить сбор контекста незаметно нельзя.
+# Артефакт создаётся и при недоступном Repowise (деградация, см. run_fnr_stage),
+# поэтому guard не превращает сервис в обязательную зависимость конвейера.
 _FNR_STAGE_REQUIRES = {
-    "task": None,
+    "repowise": None,
+    "task": f"{FNR_DIR}/repowise-dialog.md",
     "concept": f"{FNR_DIR}/task.md",
     "debate": f"{FNR_DIR}/concept.md",
     "sysreq": f"{FNR_DIR}/concept.md",
@@ -929,10 +953,22 @@ def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
 def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) -> str:
     base = f"https://github.com/{analyze.repo}/blob/{branch}"
     links = "\n".join(f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})" for path in sorted(files))
+    # Артефакт диалога называется отдельно: без пояснения он выглядит служебным
+    # мусором рядом с документами FNR, а это источник, из которого выведена
+    # часть постановки, — и повод перечитать её критически, если диалог пуст.
+    dialog = ""
+    if any(p.endswith("repowise-dialog.md") for p in files):
+        dialog = (
+            "\n`repowise-dialog.md` — диалог с **Repowise**, постоянным индексом кода: "
+            "что уже было известно о затронутых компонентах до постановки задачи. "
+            "Пустой диалог означает, что индекс был недоступен, и остальные документы "
+            "написаны без него.\n"
+        )
     return (
         "## 🤖 Автономный анализ (SA-helper)\n\n"
         f"Прогнал полную цепочку FNR по этой задаче. Артефакты — в ветке `{branch}`:\n\n"
-        f"{links}\n\n"
+        f"{links}\n"
+        f"{dialog}\n"
         "Начни с `system_requirements.md` — это ответ на вопрос «как реализовать эту "
         "задачу»: разбор текущего поведения на код-доказательствах, план миграции с "
         "откатами, задачи с критериями приёмки и риски с митигацией.\n\n"
@@ -1083,6 +1119,58 @@ async def prepare_workspace(analyze: AnalyzeInput) -> None:
     await _run_with_heartbeat(_build_workspace, analyze, label="preparing")
 
 
+def _write_repowise_config(analyze: AnalyzeInput, clone_dir: str) -> None:
+    """Конфигурация MCP в рабочий каталог прогона.
+
+    Не в образ: адрес прокси и идентификатор сессии зависят от Issue, и вшить
+    их в образ нельзя. Пишется на КАЖДОЙ стадии, а не однажды: каталог прогона
+    пересоздаётся стадией 0 (`_build_workspace`), и файл, положенный до неё,
+    молча исчезнет — а выглядело бы это как агент, забывший про индекс.
+    """
+    if not repowise.enabled():
+        return
+    config = repowise.claude_mcp_config(
+        analyze.repo, analyze.issue_number, repowise.ANALYSIS)
+    (Path(clone_dir) / ".mcp.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _degrade_repowise_stage(analyze: AnalyzeInput, clone_dir: str,
+                            expected: str | None) -> dict | None:
+    """Артефакт-заглушка, если источник недоступен. None — источник на месте.
+
+    Модификация M1 вердикта дебатов (`sa_documentation/FNR/FNR_5/concept.md`).
+    Без неё прокси становится обязательной зависимостью на пути, который
+    сегодня остановить нечему: `_build_workspace` зависит только от `git` и
+    `repomix` внутри того же контейнера.
+
+    Артефакт создаётся ВСЕГДА, поэтому guard стадии `task` остаётся без
+    изменений и по-прежнему ловит молчаливый пропуск. Дорогой процесс диалога
+    при этом не запускается — платить за заведомо недоступный источник незачем.
+    """
+    if not repowise.enabled():
+        reason = "REPOWISE_PROXY_URL не задан — интеграция выключена"
+    elif not repowise.available(timeout=repowise.PROBE_TIMEOUT_SEC):
+        reason = "прокси не отвечает на проверку живости"
+    else:
+        return None
+
+    path = Path(clone_dir) / expected
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        repowise.unavailable_artifact(
+            analyze.repo, analyze.issue_number, repowise.ANALYSIS, reason),
+        encoding="utf-8",
+    )
+    # WARNING, а не ERROR: это штатная деградация, а не отказ. Считать её долю
+    # положено снаружи (FR-9), и ошибкой в Sentry она быть не должна — иначе
+    # выключенная интеграция превратится в поток ложных сбоев.
+    logger.warning("стадия %s деградировала (%s#%s): %s", REPOWISE_STAGE,
+                analyze.repo, analyze.issue_number, reason)
+    return {"stage": REPOWISE_STAGE, "artifact": expected,
+            "bytes": path.stat().st_size, "outcome": "degraded"}
+
+
 @activity.defn
 async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
@@ -1101,6 +1189,11 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     )
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
+    _write_repowise_config(analyze, clone_dir)
+    if stage_name == REPOWISE_STAGE:
+        degraded = await asyncio.to_thread(_degrade_repowise_stage, analyze, clone_dir, expected)
+        if degraded is not None:
+            return degraded
     await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
     artifact: str | None = None
     size = 0
@@ -1110,7 +1203,7 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
             raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
         artifact = expected
         size = path.stat().st_size
-    return {"stage": stage_name, "artifact": artifact, "bytes": size}
+    return {"stage": stage_name, "artifact": artifact, "bytes": size, "outcome": "ok"}
 
 
 @activity.defn
@@ -1152,6 +1245,40 @@ DEV_CLONE_TIMEOUT_SEC = 300
 DEV_TESTS_TIMEOUT_SEC = 900
 
 
+def _runner_home(slug: str) -> str:
+    """Домашний каталог раннера — каталог задачи, но только при живой интеграции.
+
+    Агент ищет конфигурацию MCP в `$HOME/.openhands/mcp.json` (спайк FR-16), а
+    общий том смонтирован в другом месте. Переставить HOME дешевле, чем
+    оборачивать ENTRYPOINT образа.
+
+    Интеграция выключена — возвращаем пусто, и HOME остаётся тем, что задан
+    образом: поведение прогонов без Repowise не меняется вовсе.
+    """
+    if not repowise.enabled():
+        return ""
+    return f"{develop.workspace_mount()}/{slug}"
+
+
+def _write_runner_mcp_config(issue: IssueInput, root: Path) -> None:
+    """Конфигурация MCP в каталог задачи, откуда её прочитает раннер.
+
+    Каталог лежит на общем томе и виден обоим контейнерам; права выставляются
+    вместе с остальным содержимым каталога задачи — раннер работает от
+    непривилегированного пользователя и в чужой каталог писать не сможет.
+    """
+    if not repowise.enabled():
+        return
+    config_dir = root / develop.MCP_CONFIG_DIR
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / develop.MCP_CONFIG_NAME).write_text(
+        json.dumps(repowise.openhands_mcp_config(
+            issue.repo, issue.issue_number, repowise.DEVELOP),
+            ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
     """Каталог задачи в общем томе и клон внутри него.
 
@@ -1174,6 +1301,7 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(issue.repo, str(clone_dir))
+    _write_runner_mcp_config(issue, root)
 
     parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
              "", f"## {issue.title}", "", issue.body or "(тело пустое)", ""]
@@ -1192,11 +1320,36 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
 
     rules = (clone_dir / ".openhands" / "task-rules.md")
     parts.append(rules.read_text(encoding="utf-8") if rules.exists() else _DEV_FALLBACK_RULES)
+    # Дописывается ПОСЛЕ правил репозитория, а не вместо: правила проекта
+    # главнее, а обращение к индексу — общий приём контура, который к ним
+    # добавляется в обеих ветках (свои правила есть и когда их нет).
+    if repowise.enabled():
+        parts.append(_DEV_REPOWISE_RULES)
 
     task = "\n".join(parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
     _handover_to_runner(clone_dir)
     return task
+
+
+_DEV_REPOWISE_RULES = """
+## Индекс кода (MCP-сервер `repowise`)
+
+Постоянный индекс репозиториев организации: граф символов, история git, blame,
+поиск, оценка риска правки, мёртвый код.
+
+1. **До начала работы** спроси про компоненты, которые собираешься менять, и
+   про их связи. Это дешевле, чем читать репозиторий целиком, и точнее, чем
+   догадываться по именам файлов.
+2. **При затруднении** спроси снова — вместо того чтобы продолжать вслепую.
+   Не понял, почему код устроен так — спроси про историю и решение, а не
+   переписывай.
+3. **Индекс недоступен** — работай без него. Это штатный режим, а не повод
+   останавливаться.
+
+Весь диалог сохраняется автоматически и публикуется артефактом: пересказывать
+его в отчёте не нужно.
+"""
 
 
 _DEV_FALLBACK_RULES = f"""## Как работать
@@ -1258,6 +1411,8 @@ def _dev_run_agent(issue: IssueInput) -> str:
         image=develop.runner_image(),
         volume=develop.workspace_volume(),
         mount=develop.workspace_mount(),
+        network=develop.proxy_network(),
+        home=_runner_home(slug),
     )
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""),
@@ -1277,6 +1432,61 @@ def _dev_run_agent(issue: IssueInput) -> str:
     logger.info("Develop %s#%s: вывод агента\n%s",
                 issue.repo, issue.issue_number, tail or "(пусто)")
     return tail
+
+
+DEV_DIALOG_PATH = "docs/research/issue-{n}-repowise-dialog.md"
+
+
+def _collect_dev_dialog(repo: str, issue_number: int, run_failed: bool) -> str:
+    """Транскрипт сессии разработки. Забирает ВОРКЕР, а не раннер.
+
+    Раннер к этому моменту уже мёртв — в этом и смысл: артефакт переживает
+    прогон, включая аварийный, а диалог полезен ровно тогда, когда разбирают
+    неудачу.
+
+    Пустая сессия даёт артефакт с отметкой, а не отсутствие артефакта:
+    «агент не обращался к индексу» — это факт, который надо видеть, а не
+    пробел, который надо угадывать.
+    """
+    session = repowise.session_id(repo, issue_number, repowise.DEVELOP)
+    text = repowise.transcript(session)
+    if text:
+        return text
+    failed = " (прогон завершился аварийно)" if run_failed else ""
+    return (
+        f"---\nissue: {repo}#{issue_number}\nsession: {session}\n"
+        f"agent: {repowise.DEVELOP}\noutcome: no-turns\nturns: 0\n---\n\n"
+        f"# Итог\n\nЗа время прогона обращений к индексу не было{failed}.\n\n"
+        f"Причины бывают три: индекс был недоступен, задача не потребовала "
+        f"дополнительного контекста, либо агент не воспользовался им, хотя "
+        f"стоило. Первую отличают по артефакту аналитики того же Issue.\n"
+    )
+
+
+def _publish_dev_dialog_sync(issue: IssueInput, branch: str) -> None:
+    """Опубликовать диалог разработки. Best-effort: исход прогона не подменяет.
+
+    Сбой публикации артефакта не должен выглядеть как сбой разработки — иначе
+    разбор начнут не с того места.
+    """
+    if not repowise.enabled():
+        return
+    text = _collect_dev_dialog(issue.repo, issue.issue_number, run_failed=False)
+    path = DEV_DIALOG_PATH.format(n=issue.issue_number)
+    try:
+        if branch:
+            github_client.push_artifacts_to_branch(
+                issue.repo, branch, {path: text},
+                f"docs(repowise): диалог разработки по issue #{issue.issue_number}")
+        github_client.post_comment(
+            issue.repo, issue.issue_number,
+            f"## 🧭 Контекст из Repowise (разработка)\n\n"
+            f"Диалог агента разработки с индексом кода — `{path}`"
+            f"{f' в ветке `{branch}`' if branch else ''}.\n\n"
+            f"<details><summary>Показать</summary>\n\n{text[:20000]}\n\n</details>")
+    except Exception as exc:
+        logger.warning("диалог разработки не опубликован (%s#%s): %s",
+                       issue.repo, issue.issue_number, exc)
 
 
 def _dev_tests(issue: IssueInput) -> str:
@@ -1357,7 +1567,12 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
                 issue.repo, issue.issue_number, len(task), task[:2000])
     await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
 
-    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    try:
+        await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    finally:
+        # В finally, а не после: диалог полезнее всего при разборе упавшего
+        # прогона, и терять его ровно в этом случае было бы худшим из исходов.
+        await asyncio.to_thread(_publish_dev_dialog_sync, issue, branch)
     # Находки собираются ДО тестов и публикации: файл находок обязан исчезнуть
     # из рабочего дерева раньше коммита, иначе он уедет в PR — в ревью как мусор,
     # а на следующем круге правок агент прочитает свои прошлые находки как новые.
@@ -1596,7 +1811,8 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     await asyncio.to_thread(_reap_runner, slug)
     command = develop.runner_command(
         slug, image=develop.runner_image(),
-        volume=develop.workspace_volume(), mount=develop.workspace_mount())
+        volume=develop.workspace_volume(), mount=develop.workspace_mount(),
+        network=develop.proxy_network(), home=_runner_home(slug))
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),
         os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6")}
@@ -2247,6 +2463,7 @@ MAX_ARTIFACTS_TOTAL_CHARS = 60_000
 # Пути артефактов из модели данных (docs/ARCHITECTURE.md). Отсутствующий
 # файл — штатная ситуация: research-пайплайн мог не дойти до этой стадии.
 ARTIFACT_PATHS = (
+    "docs/research/issue-{n}-repowise-dialog.md",
     "docs/bft/issue-{n}-blueprint.md",
     "docs/bft/issue-{n}-debate.md",
     "docs/bft/issue-{n}-recommendations.md",

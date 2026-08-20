@@ -201,6 +201,7 @@ def e2e(monkeypatch, tmp_path):
         out.write_text("<repo/>", encoding="utf-8")
 
     produced = {
+        "/repowise-context": "repowise-dialog.md",
         "/fnr-new-task": "task.md",
         "/fnr-concept": "concept.md",
         "/fnr-system-requirements": "system_requirements.md",
