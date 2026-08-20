@@ -1975,11 +1975,31 @@ class IssueBft:
             ok = False
             self._stage = "failed"
             reason = str(getattr(exc, "cause", None) or exc)
-            await workflow.execute_activity(
-                activities.publish_bft_error, args=[req, reason[:500]],
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+            published = False
+            if req.mode == bft.DEEP:
+                # Сначала спасаем сделанное, потом сообщаем о сбое. Порядок не
+                # косметический: `cleanup` в `finally` снимает каталог, и после
+                # него публиковать будет уже нечего. Прогон рвётся чаще от
+                # чужого — лимит провайдера, 524, выкладка посреди работы, — и
+                # терять из-за этого двадцать минут работы модели незачем.
+                try:
+                    done = await workflow.execute_activity(
+                        activities.publish_bft_partial, args=[req, reason[:300]],
+                        start_to_close_timeout=timedelta(seconds=300),
+                        retry_policy=RetryPolicy(maximum_attempts=2),
+                    )
+                    published = bool(done)
+                except Exception as partial_exc:
+                    workflow.logger.warning(
+                        "публикация частичного БФТ не удалась: %s", partial_exc)
+            if not published:
+                # Сказать нечего кроме самого сбоя: ни одна стадия не дала
+                # артефакта, продолжать в следующий раз будет не с чего.
+                await workflow.execute_activity(
+                    activities.publish_bft_error, args=[req, reason[:500]],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
         finally:
             if req.mode == bft.DEEP:
                 # Каталог живёт вне Temporal — снимаем на обоих путях. Провал

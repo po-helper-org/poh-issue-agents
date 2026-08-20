@@ -426,3 +426,72 @@ def cascade_gaps(cascade: dict, line_counts: dict[str, int]) -> list[str]:
             gaps.append(f"якорь R1 «{source}»: в файле {line_counts[path]} строк, "
                         f"строки {line} не существует")
     return gaps
+
+
+# --- Частичный прогон: что успели и что осталось ---
+#
+# Прогон срывается не только от ошибок в коде: провайдер отдаёт 524, кончается
+# лимит запросов, стенд передеплоивают посреди работы. Раньше это стоило всего
+# прогона целиком — артефакты жили в эфемерном каталоге, а `cleanup` в `finally`
+# стирал его на любом исходе. Двадцать минут работы модели уходили в никуда, и
+# повтор начинался с нуля.
+#
+# Теперь сделанное публикуется в ту же ветку `bft-research/issue-N`, из которой
+# следующий `/bft-deep` поднимает прошлый прогон: стадия с уже готовым
+# артефактом пропускается, работа продолжается с места обрыва.
+
+
+def stage_artifacts(issue_number: int) -> dict[str, str]:
+    """Стадия → путь её артефакта. Только стадии, у которых он есть.
+
+    `index` строит каталог `.bft/index/`, `debate` дописывает вердикт в конец
+    `concept.md` — по файлу их «сделанность» не определить, поэтому в карте их
+    нет и пропускать их нельзя.
+    """
+    return {name: expected
+            for name, _prompt, expected, _requires in deep_stages(issue_number)
+            if expected}
+
+
+def done_stages(issue_number: int, exists) -> list[str]:
+    """Стадии, чей артефакт уже лежит в рабочем каталоге.
+
+    `exists(path) -> bool` — проверка наличия, файловую систему трогает
+    вызывающий. Пустой файл за сделанную стадию не считаем: артефакт нулевого
+    размера означает оборванную запись, а не готовую работу.
+    """
+    return [name for name, path in stage_artifacts(issue_number).items() if exists(path)]
+
+
+def remaining_stages(issue_number: int, done: list[str]) -> list[str]:
+    """Стадии, которые осталось прогнать — в каноническом порядке."""
+    return [name for name in DEEP_STAGE_NAMES if name not in done]
+
+
+def render_partial_summary(repo: str, issue_number: int, files: list[str],
+                           done: list[str], reason: str) -> str:
+    """Комментарий о прогоне, оборванном на середине.
+
+    Человеку нужны три вещи: что сорвалось, что уцелело и что сделать дальше.
+    Без последнего пункта частичный результат выглядит как окончательный.
+    """
+    br = branch(issue_number)
+    base = f"https://github.com/{repo}/blob/{br}"
+    links = "\n".join(f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})"
+                      for path in sorted(files))
+    left = remaining_stages(issue_number, done)
+    head = (
+        "## ⏸ БФТ собран частично\n\n"
+        f"Прогон оборвался: {reason}\n\n"
+    )
+    if links:
+        head += (f"Что успели — в ветке `{br}`:\n\n{links}\n\n")
+    else:
+        head += "Ни одна стадия не успела дать артефакт.\n\n"
+    if left:
+        head += ("Осталось прогнать: "
+                 + ", ".join(f"`{name}`" for name in left) + ".\n\n")
+    return head + (
+        "Работа не потеряна: повторный `/bft-deep` поднимет эту ветку и "
+        "продолжит с места обрыва — готовые стадии заново не считаются."
+    )

@@ -2093,6 +2093,16 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
     """
     prompt, expected, requires = bft.deep_stage(stage_name, req.issue_number)
     clone_dir = _require_bft_workspace(req, requires)
+    if expected:
+        done = Path(clone_dir) / expected
+        if done.is_file() and done.stat().st_size > 0:
+            # Артефакт приехал с веткой прошлого прогона: стадия уже сделана, и
+            # повторять её — платить второй раз за тот же документ. Так `/bft-deep`
+            # после срыва продолжает с места обрыва, а не начинает заново.
+            logger.info("БФТ %s#%s: стадия %s уже сделана — пропускаю",
+                        req.repo, req.issue_number, stage_name)
+            return {"stage": stage_name, "artifact": expected,
+                    "bytes": done.stat().st_size, "skipped": True}
     if stage_name in bft.direct_stages() and expected:
         # Стадия без исследования репозитория: вход готов, выход — один файл.
         # Агент здесь стоит 356 МБ RSS и ничего не добавляет, кроме способности
@@ -2142,6 +2152,46 @@ async def cleanup_bft_workspace(req: BftRequest) -> None:
     """Best-effort снос рабочего каталога прогона."""
     await asyncio.to_thread(
         shutil.rmtree, str(_bft_workspace_dir(req)), ignore_errors=True)
+
+
+@activity.defn
+async def publish_bft_partial(req: BftRequest, reason: str) -> list[str]:
+    """Сорванный прогон отдаёт то, что успел собрать.
+
+    Прогон срывается не только от ошибок в коде: провайдер отвечает 524, кончается
+    лимит запросов, стенд передеплоивают посреди работы. Раньше это стоило всей
+    работы — артефакты жили в каталоге, который `cleanup` стирал на любом исходе,
+    и повтор начинался с нуля, заново оплачивая уже пройденные стадии.
+
+    Возвращает список стадий, чьи артефакты уже готовы: воркфлоу называет их
+    человеку, а следующий `/bft-deep` по ним же понимает, с чего продолжать.
+    Пустой результат — не ошибка: сорваться могло и на первой стадии.
+    """
+    clone_dir = _bft_clone_dir(req)
+    if not Path(clone_dir).is_dir():
+        logger.warning("БФТ %s#%s: каталог уже снят — публиковать нечего",
+                       req.repo, req.issue_number)
+        return []
+    files = await asyncio.to_thread(
+        _collect_bft_artifacts, clone_dir, req.issue_number)
+    done = bft.done_stages(
+        req.issue_number,
+        lambda rel: (Path(clone_dir) / rel).is_file()
+        and (Path(clone_dir) / rel).stat().st_size > 0)
+    if not files:
+        return done
+    branch = bft.branch(req.issue_number)
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        req.repo, branch, files,
+        f"docs(bft): частичный прогон по issue #{req.issue_number}",
+    )
+    await asyncio.to_thread(
+        github_client.post_comment, req.repo, req.issue_number,
+        bft.render_partial_summary(req.repo, req.issue_number,
+                                   list(files), done, reason),
+    )
+    return done
 
 
 @activity.defn

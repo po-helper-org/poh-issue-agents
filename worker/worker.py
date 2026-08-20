@@ -68,6 +68,7 @@ async def main() -> None:
             activities.run_bft_stage,
             activities.publish_bft_deep,
             activities.cleanup_bft_workspace,
+            activities.publish_bft_partial,
             activities.publish_bft_error,
             activities.duplicate_check,
             activities.score_priority,
