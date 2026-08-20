@@ -78,7 +78,7 @@ async def _client_disconnect(request: Request, exc: ClientDisconnect):
     return Response(status_code=204)
 
 
-HUMAN_DECISION_LABELS = {"research-me", "bug-me", "build-me"}
+HUMAN_DECISION_LABELS = {"research-me", "bug-me", "build-me", "not-duplicate", "confirm-duplicate"}
 
 
 def _log_effective_config() -> None:
