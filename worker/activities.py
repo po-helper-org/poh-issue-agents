@@ -52,6 +52,7 @@ from shared.workflow_types import (
     BftRequest,
     ClassificationResult,
     CommentAckInput,
+    CommentIntent,
     Deadlines,
     DuplicateResult,
     EstimateRequest,
@@ -108,6 +109,12 @@ class PriorityExtraction(BaseModel):
     who: str = ""
     risks: list[str] = []
     goal_impact: str = ""
+
+
+class CommentIntentExtraction(BaseModel):
+    intent: str = Field(description="proceed | rework | question | ack")
+    reason: str = Field(description="обоснование для комментария-ответа")
+    rework_note: str = Field(description="что именно переделывать (только для rework)", default="")
 
 
 # --- Zero-cost предфильтры ---
@@ -627,6 +634,51 @@ def answer_followup(issue: IssueInput, question: str) -> None:
         # выглядел бы как ответ и закрывал бы вопрос ничем.
         raise RuntimeError("модель вернула пустой ответ на реплику")
     github_client.post_comment(issue.repo, issue.issue_number, answer)
+
+
+@activity.defn
+def interpret_user_comment(issue: IssueInput, comment_text: str, current_phase: str,
+                          classification_label: str | None, awaiting_reason: str | None,
+                          recent_artifacts: dict[str, str] | None = None) -> CommentIntent:
+    """Разбор намерения из реплики человека.
+    
+    Анализирует комментарий и определяет, чего хочет человек: продолжить работу,
+    переделать этап, задать вопрос или просто подтвердить получение.
+    """
+    capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
+        if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
+    
+    thread = _followup_thread(issue.repo, issue.issue_number)
+    
+    parts = [
+        f"# Issue {issue.repo}#{issue.issue_number}: {issue.title}", "",
+        "## Описание", "", issue.body.strip() or "(тело пустое)", "",
+        "## Текущая фаза", "", current_phase, "",
+        "## Метка классификации", "", classification_label or "(нет)", "",
+        "## Чего ждёт Issue", "", awaiting_reason or "(ожидания нет)", "",
+        "## Известный функционал", "", capabilities
+    ]
+    
+    if thread:
+        parts += ["", "## Переписка Issue", "", thread]
+    
+    if recent_artifacts:
+        parts += ["", "## Последние артефакты этапа", ""]
+        for name, content in recent_artifacts.items():
+            parts += [f"### {name}", "", content[:1000]]  # Ограничиваем размер
+    
+    parts += ["", "## Реплика для разбора", "", comment_text.strip()]
+    
+    result = llm.extract(
+        _load_prompt("system_comment_intent.md"), "\n".join(parts), CommentIntentExtraction,
+        model=llm.MODEL_GATE,
+    )
+    
+    return CommentIntent(
+        intent=result.intent,
+        reason=result.reason,
+        rework_note=result.rework_note or ""
+    )
 
 
 # --- Duplicate Check ---

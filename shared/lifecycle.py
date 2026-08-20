@@ -89,6 +89,8 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
         # из них она и выведена. Своей аналитики ей не нужно, но фазу «требования
         # есть» она проходит честно: чеклист готовности ссылается на них.
         Transition(SYSTEM_REQUIREMENTS, AGENT, "требования готовы у родителя плана"),
+        # Человек вернул этап на пересборку (rework intent).
+        Transition(CREATED, HUMAN, "человек вернул этап на пересборку"),
         Transition(DUPLICATE, AGENT, "duplicate-check"),
         Transition(ANSWERED, AGENT, "advisor:consultation / existing-functionality"),
         Transition(ESCALATED, AGENT, "дедлайн парковки истёк"),
