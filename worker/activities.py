@@ -824,12 +824,41 @@ def _clone_dir(analyze: AnalyzeInput) -> str:
     return str(_workspace_dir(analyze) / "repo")
 
 
+def _existing_branch(repo: str, branch: str) -> str | None:
+    """Имя ветки, если она есть в origin, иначе None.
+
+    Проверка вспомогательная: её задача — подобрать артефакты прошлого прогона,
+    а не решить, состоится ли анализ. Недоступный GitHub (нет авторизации,
+    сеть, лимит) означает «продолжать не с чего», а не «прогон отменяется».
+    """
+    try:
+        return branch if github_client.branch_exists(repo, branch) else None
+    except Exception as exc:  # noqa: BLE001 — вспомогательная проверка
+        logger.warning("ветка %s не проверена (%s) — клон с дефолтной", branch, exc)
+        return None
+
+
 def _build_workspace(analyze: AnalyzeInput) -> str:
-    """Свежий каталог: снести остаток прежнего прогона, clone, repomix."""
+    """Свежий каталог: снести остаток прежнего прогона, clone, repomix.
+
+    Ветка артефактов забирается, если уже есть: повторный `/analyze` после
+    обрыва — это продолжение, а не второй анализ рядом. Стадия с готовым
+    артефактом тогда пропускается, и прогон не платит второй раз за уже
+    написанный документ. Без этого пропуск не сработал бы вовсе: в свежем
+    клоне дефолтной ветки прошлых артефактов нет.
+    """
     shutil.rmtree(_workspace_dir(analyze), ignore_errors=True)
     clone_dir = _clone_dir(analyze)
-    _clone_repo(analyze.repo, clone_dir)
+    previous = _existing_branch(analyze.repo, f"research/issue-{analyze.issue_number}")
+    # Аргумент передаём только когда ветка есть: вызов без него — прежний путь,
+    # и подменять его в тестах существующим способом по-прежнему можно.
+    if previous:
+        _clone_repo(analyze.repo, clone_dir, branch=previous)
+    else:
+        _clone_repo(analyze.repo, clone_dir)
     _run_repomix(clone_dir)
+    # Трекер диалога — до первой стадии: хуки живут в клоне, а он пересоздаётся.
+    _enable_entire(clone_dir)
     return clone_dir
 
 
@@ -1190,6 +1219,15 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     )
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
+    if expected:
+        ready = Path(clone_dir) / expected
+        if ready.is_file() and ready.stat().st_size > 0:
+            # Артефакт приехал с веткой прошлого прогона: стадия сделана, и
+            # повторять её — платить второй раз за тот же документ.
+            logger.info("FNR %s#%s: стадия %s уже сделана — пропускаю",
+                        analyze.repo, analyze.issue_number, stage_name)
+            return {"stage": stage_name, "artifact": expected,
+                    "bytes": ready.stat().st_size, "outcome": "skipped"}
     _write_repowise_config(analyze, clone_dir)
     if stage_name == REPOWISE_STAGE:
         degraded = await asyncio.to_thread(_degrade_repowise_stage, analyze, clone_dir, expected)
@@ -1226,6 +1264,50 @@ async def publish_analysis(analyze: AnalyzeInput) -> str:
         analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
     )
     return branch
+
+
+@activity.defn
+async def publish_analysis_partial(analyze: AnalyzeInput, reason: str) -> list[str]:
+    """Сорванный анализ отдаёт то, что успел собрать — как и БФТ.
+
+    Цепочка FNR стоит тех же денег и рвётся по тем же причинам: лимит
+    провайдера, 524, выкладка посреди прогона. Раньше это списывало всю работу:
+    артефакты жили в каталоге, который `cleanup_workspace` снимал на любом
+    исходе, а публикация случалась только после последней стадии.
+
+    Возвращает имена уцелевших артефактов: воркфлоу называет их человеку, а
+    следующий `/analyze` по ним понимает, какие стадии можно не повторять.
+    """
+    clone_dir = _workspace_dir(analyze) / "repo"
+    if not clone_dir.is_dir():
+        logger.warning("FNR %s#%s: каталог уже снят — публиковать нечего",
+                       analyze.repo, analyze.issue_number)
+        return []
+    files = await asyncio.to_thread(_collect_fnr_artifacts, str(clone_dir))
+    if not files:
+        return []
+    branch = f"research/issue-{analyze.issue_number}"
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        analyze.repo, branch, files,
+        f"docs(sa): частичный анализ issue #{analyze.issue_number}",
+    )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, str(clone_dir))
+    await asyncio.to_thread(_push_entire_branch, analyze.repo, str(clone_dir),
+                            session_branch)
+    links = "\n".join(
+        f"- [`{path.rsplit('/', 1)[-1]}`]"
+        f"(https://github.com/{analyze.repo}/blob/{branch}/{path})"
+        for path in sorted(files))
+    await asyncio.to_thread(
+        github_client.post_comment, analyze.repo, analyze.issue_number,
+        f"## ⏸ Анализ собран частично\n\nПрогон оборвался: {reason}\n\n"
+        f"Что успели — в ветке `{branch}`:\n\n{links}\n\n"
+        "Работа не потеряна: повторный `/analyze` поднимет эту ветку и продолжит "
+        "с места обрыва — готовые стадии заново не считаются."
+        + bft.render_session_hint(analyze.repo, session_id, session_branch),
+    )
+    return sorted(files)
 
 
 @activity.defn
@@ -2325,6 +2407,13 @@ def _enable_entire(clone_dir: str) -> None:
     контейнере нет, а без флага она ушла бы в диалоговый мастер и повисла до
     таймаута. Хуки ставятся в клон, поэтому включать надо на каждый прогон —
     каталог создаётся заново.
+
+    Флаг `--agent-help-skill` НЕ используем намеренно: он кладёт свой скилл по
+    тому же пути `.claude/skills/entire/SKILL.md` — но уже в КЛОН, а проектный
+    уровень перекрывает пользовательский. Наш скилл (`.claude/skills/entire/`
+    в образе) содержит то же указание читать `entire agent-help` плюс контекст
+    контура: когда трекер звать, что он не видит и чем чекпоинты отличаются от
+    артефактов. Их тринадцать строк это бы затёрли.
 
     Молча продолжаем при любом отказе: без трекера прогон соберёт БФТ ровно так
     же, просто без записи диалога. Менять исход из-за вспомогательного слоя
