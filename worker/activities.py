@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -2297,6 +2298,23 @@ def _bft_stage_inputs(clone_dir: str, issue_number: int,
     return "\n\n---\n\n".join(parts)
 
 
+def _append_dialog(clone_dir: str, issue_number: int, entry: str) -> None:
+    """Дописать строку в журнал прогона — best-effort.
+
+    Журнал вспомогательный: уронить из-за него стадию, которая отработала,
+    значит поменять настоящий результат на запись о нём.
+    """
+    try:
+        path = Path(clone_dir) / bft.dialog_log_path(issue_number)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(bft.DIALOG_LOG_HEADER, encoding="utf-8")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(entry + "\n")
+    except OSError as exc:
+        logger.warning("журнал прогона не дописан: %s", exc)
+
+
 def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
     """Стадия `draft` двумя вызовами модели вместо агента.
 
@@ -2328,12 +2346,21 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
         + f", якорей ≥ {bft.ANCHOR_FLOOR}.\n\n"
         f"Верни ТОЛЬКО JSON по схеме:\n{bft.CASCADE_SCHEMA}")
 
+    started = time.monotonic()
     cascade = bft.parse_cascade(llm.complete(system, cascade_task, model=model))
+    _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+        stage="draft", actor=f"прямой вызов ({model})", step="каскад требований",
+        outcome="готово", elapsed=time.monotonic() - started,
+        detail=f"требований {len(cascade.get('requirements') or [])}, "
+               f"якорей {len(cascade.get('anchors') or [])}"))
     for _ in range(BFT_TOP_UP_ATTEMPTS):
         gaps = bft.cascade_gaps(cascade, line_counts)
         if not gaps:
             break
         logger.info("БФТ %s#%s: добор каскада — %s", req.repo, issue, "; ".join(gaps))
+        _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+            stage="draft", actor=f"прямой вызов ({model})", step="добор каскада",
+            outcome="добор", detail="; ".join(gaps)))
         top_up = (f"{inputs}\n\n---\n\n# Уже собрано\n\n```json\n"
                   + json.dumps(cascade, ensure_ascii=False, indent=1) + "\n```\n\n"
                   "# Чего не хватает\n\n- " + "\n- ".join(gaps) + "\n\n"
@@ -2368,7 +2395,13 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
         "заканчивается последней строкой таблицы якорей, без обрамляющих "
         "```-блоков и без фраз до или после.")
 
-    return llm.complete(system2, render_task, model=model)
+    started = time.monotonic()
+    document = llm.complete(system2, render_task, model=model)
+    _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+        stage="draft", actor=f"прямой вызов ({model})", step="рендер документа",
+        outcome="готово", elapsed=time.monotonic() - started,
+        detail=f"{len(document)} символов"))
+    return document
 
 
 BFT_TOP_UP_ATTEMPTS = 2
@@ -2384,6 +2417,19 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
     """
     prompt, expected, requires = bft.deep_stage(stage_name, req.issue_number)
     clone_dir = _require_bft_workspace(req, requires)
+    if expected:
+        done = Path(clone_dir) / expected
+        if done.is_file() and done.stat().st_size > 0:
+            # Артефакт приехал с веткой прошлого прогона: стадия уже сделана, и
+            # повторять её — платить второй раз за тот же документ. Так `/bft-deep`
+            # после срыва продолжает с места обрыва, а не начинает заново.
+            logger.info("БФТ %s#%s: стадия %s уже сделана — пропускаю",
+                        req.repo, req.issue_number, stage_name)
+            _append_dialog(clone_dir, req.issue_number, bft.render_dialog_entry(
+                stage=stage_name, actor="—", step="артефакт прошлого прогона",
+                outcome="пропущено", detail=expected))
+            return {"stage": stage_name, "artifact": expected,
+                    "bytes": done.stat().st_size, "skipped": True}
     if stage_name in bft.direct_stages() and expected:
         # Стадия без исследования репозитория: вход готов, выход — один файл.
         # Агент здесь стоит 356 МБ RSS и ничего не добавляет, кроме способности
@@ -2394,8 +2440,12 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(document, encoding="utf-8")
     else:
+        started = time.monotonic()
         await _run_with_heartbeat(_run_claude, prompt, clone_dir,
                                   label=f"bft:{stage_name}")
+        _append_dialog(clone_dir, req.issue_number, bft.render_dialog_entry(
+            stage=stage_name, actor="claude -p", step=prompt, outcome="готово",
+            elapsed=time.monotonic() - started))
     artifact: str | None = None
     size = 0
     if expected:
@@ -2433,6 +2483,46 @@ async def cleanup_bft_workspace(req: BftRequest) -> None:
     """Best-effort снос рабочего каталога прогона."""
     await asyncio.to_thread(
         shutil.rmtree, str(_bft_workspace_dir(req)), ignore_errors=True)
+
+
+@activity.defn
+async def publish_bft_partial(req: BftRequest, reason: str) -> list[str]:
+    """Сорванный прогон отдаёт то, что успел собрать.
+
+    Прогон срывается не только от ошибок в коде: провайдер отвечает 524, кончается
+    лимит запросов, стенд передеплоивают посреди работы. Раньше это стоило всей
+    работы — артефакты жили в каталоге, который `cleanup` стирал на любом исходе,
+    и повтор начинался с нуля, заново оплачивая уже пройденные стадии.
+
+    Возвращает список стадий, чьи артефакты уже готовы: воркфлоу называет их
+    человеку, а следующий `/bft-deep` по ним же понимает, с чего продолжать.
+    Пустой результат — не ошибка: сорваться могло и на первой стадии.
+    """
+    clone_dir = _bft_clone_dir(req)
+    if not Path(clone_dir).is_dir():
+        logger.warning("БФТ %s#%s: каталог уже снят — публиковать нечего",
+                       req.repo, req.issue_number)
+        return []
+    files = await asyncio.to_thread(
+        _collect_bft_artifacts, clone_dir, req.issue_number)
+    done = bft.done_stages(
+        req.issue_number,
+        lambda rel: (Path(clone_dir) / rel).is_file()
+        and (Path(clone_dir) / rel).stat().st_size > 0)
+    if not files:
+        return done
+    branch = bft.branch(req.issue_number)
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        req.repo, branch, files,
+        f"docs(bft): частичный прогон по issue #{req.issue_number}",
+    )
+    await asyncio.to_thread(
+        github_client.post_comment, req.repo, req.issue_number,
+        bft.render_partial_summary(req.repo, req.issue_number,
+                                   list(files), done, reason),
+    )
+    return done
 
 
 @activity.defn
