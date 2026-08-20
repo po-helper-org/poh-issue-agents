@@ -1728,6 +1728,16 @@ class IssueLifecycle:
             # УЖЕ лежат в истории, и новый код запланировал бы на их месте
             # активность, которой там нет, — реплей упал бы недетерминизмом.
             return await self._answer_followup(issue, signal)
+        
+        # Обработка специфических сигналов для фазы DUPLICATE
+        if self._phase == lifecycle.DUPLICATE:
+            if signal == "not-duplicate":
+                # Вернуть в работу (переход в CLASSIFIED)
+                return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
+            if signal == "confirm-duplicate":
+                # Подтвердить дубликат (переход в CANCELLED)
+                return (lifecycle.CANCELLED, "cancelled", True)
+        
         if signal != "reopen":
             return (self._phase, self._stage, False)  # посторонний сигнал — ждём дальше
         back = next((t for t in lifecycle.allowed(self._phase)
