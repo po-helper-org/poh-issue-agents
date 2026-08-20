@@ -47,6 +47,15 @@ def test_bug_path_skips_analysis():
     assert lc.initiator(lc.CLASSIFIED, lc.READY_FOR_DEV) == lc.HUMAN
 
 
+def test_development_can_fail_in_one_step():
+    """Прогон агента разработки проходит путь целиком за один шаг — значит,
+    и сорваться может там же. Без этого перехода обработчик отказа падал сам:
+    `InvalidTransition` подменял настоящую причину, и цикл крутил её вместо
+    того, чтобы доложить человеку и остановиться."""
+    assert lc.can(lc.READY_FOR_DEV, lc.FAILED)
+    assert lc.initiator(lc.READY_FOR_DEV, lc.FAILED) == lc.AGENT
+
+
 # --- недопустимые переходы ---
 
 def test_invalid_transition_raises_instead_of_overwriting():
