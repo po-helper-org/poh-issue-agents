@@ -800,6 +800,31 @@ class IssueLifecycle:
         left = self._phase_since + timedelta(hours=hours) - workflow.now()
         return left if left > timedelta(0) else timedelta(0)
 
+    async def _phase_on_close(self) -> tuple[str, str]:
+        """Чем закончился путь Issue: слиянием или снятием с обработки.
+
+        Спрашиваем сам PR, а не того, кто закрыл Issue: закрыть его по `Closes`
+        может и бот, и человек, а `state_reason` у закрытия «как выполненное»
+        одинаков в обоих случаях. Номер PR у цикла уже есть — он запомнил его,
+        когда PR открылся.
+
+        Вопрос задаём, только если ответ может что-то изменить: PR нет либо из
+        текущей фазы в `merged` хода нет — значит, это отмена, и лишний вызов
+        GitHub на каждом закрытии не нужен.
+        """
+        if (self._issue is None or not self._pr_number
+                or not lifecycle.can(self._phase, lifecycle.MERGED)):
+            return (lifecycle.CANCELLED, "cancelled")
+        merged = await workflow.execute_activity(
+            activities.pr_is_merged,
+            args=[self._issue.repo, self._pr_number],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        if merged:
+            return (lifecycle.MERGED, "merged")
+        return (lifecycle.CANCELLED, "cancelled")
+
     async def _enter(self, phase: str, stage: str, *, write_label: bool = True) -> None:
         """Переход в фазу: проверка допустимости, стадия, метка.
 
@@ -966,6 +991,24 @@ class IssueLifecycle:
                 # надо, он лишь возвращает управление наверх на постороннем
                 # сигнале. `cancelled` в таблице переходов и означает «снято с
                 # обработки», и разрешён из любой нетерминальной фазы.
+                #
+                # Но «закрыт» и «снят с обработки» — не одно и то же. Issue,
+                # доведённый до `main`, GitHub закрывает сам по `Closes #N`, и
+                # прежнее правило метило его как отменённый: успех и отказ
+                # оказывались в одном состоянии, а фаза `merged` не
+                # использовалась вовсе. Маркер обязателен — у припаркованных
+                # прогонов на этом месте активности нет, и реплей без него
+                # упал бы недетерминизмом.
+                if workflow.patched("issue-lifecycle-merged-on-close"):
+                    phase, stage = await self._phase_on_close()
+                    await self._enter(phase, stage)
+                    # Выходим ЗДЕСЬ, не полагаясь на проверку терминальности
+                    # ниже: `merged` не терминальна намеренно — за ней в
+                    # таблице стоят `testing` и `released`. Вести их по
+                    # закрытому Issue некому, а парковка в нём — ровно тот
+                    # отказ, ради которого ветку закрытия и завели.
+                    await self._stop_awaiting()
+                    return
                 await self._enter(lifecycle.CANCELLED, "cancelled")
 
             if lifecycle.is_terminal(self._phase):

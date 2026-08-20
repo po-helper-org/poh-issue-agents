@@ -1945,6 +1945,25 @@ def _prfix_paths(repo: str, pr_number: int) -> tuple[Path, Path]:
     return root, root / "repo"
 
 
+@activity.defn
+async def pr_is_merged(repo: str, pr_number: int) -> bool:
+    """Влит ли PR. Спрашиваем сам PR, а не полезную нагрузку закрытия Issue.
+
+    У `issues.closed` признака слияния нет: `state_reason` одинаков и когда
+    Issue закрыл `Closes #N` во влитом PR, и когда человек закрыл его руками
+    «как выполненное». Доставки `issues.closed` и `pull_request.closed` идут
+    наперегонки, поэтому ждать второй, чтобы истолковать первую, — гонка.
+
+    PR своё состояние знает точно и в любой момент, а номер у цикла уже есть:
+    он запомнил его, когда PR открылся. Один вызов на закрытие — цена
+    честной фазы.
+    """
+    pr = await asyncio.to_thread(github_client.get_pull, repo, pr_number)
+    # `merged` булев и появляется только у влитого PR. `state == "closed"` для
+    # этого не годится: закрытый без слияния PR тоже `closed`.
+    return bool(pr.get("merged"))
+
+
 def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
     """Свежий клон ВЕТКИ PR + постановка круга файлом.
 

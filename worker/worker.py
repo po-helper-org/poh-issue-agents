@@ -61,6 +61,7 @@ async def main() -> None:
             activities.publish_decomposition,
             activities.run_pr_fix_round,
             activities.finish_pr_fixing,
+            activities.pr_is_merged,
             activities.classify_issue,
             activities.answer_followup,
             activities.ack_bft_command,
