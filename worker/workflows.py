@@ -6,7 +6,8 @@ IssueLifecycle — один Temporal-workflow на один issue (ID = issue-<r
 Signals заменяют то, что раньше делали отдельные GitHub Actions,
 триггерящиеся на лейблы:
 - human_decision("research-me" | "bug-me" | "build-me")
-- user_comment(текст) — ответ на уточняющий вопрос intake gate
+- user_comment(текст, id) — реплика человека: ответ на уточняющий вопрос
+  либо новый вопрос по припаркованной задаче
 
 Workflow буквально приостанавливается на await self._wait_for_signal() —
 это устраняет и гонку между duplicate-check/priority-scoring (теперь
@@ -24,10 +25,11 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared import lifecycle
-    from shared.commands import ANALYZE, ESTIMATE
+    from shared import bft, lifecycle
+    from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE
     from shared.workflow_ids import (
         analysis_workflow_id,
+        bft_workflow_id,
         development_workflow_id,
         estimate_workflow_id,
         pr_fix_workflow_id,
@@ -37,18 +39,26 @@ with workflow.unsafe.imports_passed_through():
     from shared.awaiting import Awaiting
     from shared.workflow_types import (
         AnalyzeInput,
+        BftRequest,
         ClassificationResult,
         CommentAckInput,
+        Deadlines,
         DevelopPlan,
         EstimateRequest,
         EstimateResult,
         IssueInput,
         LifecycleState,
         OrphanEventInput,
+        UserComment,
         WebhookAuditInput,
     )
 
     import activities
+
+# Прогон БФТ, запущенный самим триажем, а не человеком. Отличается тем, что не
+# трогает метки команды: помечать `run:bft` нечего — команды не было, а метка
+# вернулась бы вебхуком как новая.
+BFT_TRIAGE = "triage"
 
 MAX_CLARIFICATION_ROUNDS = 2
 
@@ -60,9 +70,9 @@ MAX_CLARIFICATION_ROUNDS = 2
 # возьмёт задачу.
 MAX_ANALYSIS_CLARIFY_ROUNDS = 2
 
-# Запрос на прогон аналитики, доставленный в общую очередь сигналов. Префикс —
-# та же схема, что у `__comment__:`: одна очередь, разные виды событий, и
-# обработчик фазы решает, что с ними делать.
+# Запрос на прогон аналитики, доставленный в общую очередь сигналов. Та же
+# схема, что у реплики человека (`UserComment`): одна очередь, разные виды
+# событий, и обработчик фазы решает, что с ними делать.
 AGENT_ANALYZE = "__agent__:analyze"
 
 # Issue закрыт на GitHub. Тот же приём: сигнал будит парковку, а решение
@@ -326,7 +336,7 @@ class IssueLifecycle:
         # Очередь несёт и решения человека (строки), и факты внешних агентов
         # (AgentEvent). Один поток вместо двух — иначе фаза, ждущая решения, не
         # проснулась бы на событии, и наоборот.
-        self._signal_queue: asyncio.Queue[str | AgentEvent] = asyncio.Queue()
+        self._signal_queue: asyncio.Queue[str | AgentEvent | UserComment] = asyncio.Queue()
         self._analyze_labeled = False
         self._issue: IssueInput | None = None
         self._stage = "intake"
@@ -347,6 +357,13 @@ class IssueLifecycle:
         # затем же, что и на входе: вопрос, на который не отвечают, не должен
         # держать задачу вечно.
         self._clarify_rounds = 0
+        # Сколько реплик человека уже отвечено содержательно и ключи последних
+        # из них. Ключ нужен из-за повторной доставки вебхука: одно событие
+        # приезжает сигналом дважды, и без него один вопрос получал бы два
+        # ответа. Потолок — из `Deadlines`, вместе с остальными тумблерами.
+        self._followup_rounds = 0
+        self._answered_comment_ids: list[int] = []
+        self._followup_max_rounds = Deadlines().followup_max_rounds
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -444,8 +461,14 @@ class IssueLifecycle:
         await self._signal_queue.put(label)
 
     @workflow.signal
-    async def user_comment(self, text: str) -> None:
-        await self._signal_queue.put(f"__comment__:{text}")
+    async def user_comment(self, text: str, comment_id: int | None = None) -> None:
+        """Реплика человека в Issue.
+
+        Второй аргумент со значением по умолчанию, а не новый сигнал: вебхук
+        прежнего поколения шлёт один аргумент, и прогоны, припаркованные до
+        этой правки, обязаны понимать обе формы.
+        """
+        await self._signal_queue.put(UserComment(text=text, comment_id=comment_id))
 
     @workflow.signal
     async def issue_closed(self, who: str | None = None) -> None:
@@ -548,6 +571,57 @@ class IssueLifecycle:
         await self._signal_queue.put(event)
 
     @workflow.signal
+    async def bft_requested(self, req: BftRequest) -> None:
+        """По Issue запрошен БФТ — командой `/bft`/`/bft-deep` или меткой `run:*`.
+
+        В очередь НЕ кладём, как и оценку: БФТ фазу не двигает. Быстрый проход —
+        это формулировка запроса, а не стадия пути; глубокий кладёт артефакты в
+        свою ветку и оставляет фазу честной. Двигать фазу в `business-analysis`
+        значило бы, что БФТ и цепочка FNR — одна и та же стадия, а это разные
+        документы с разной судьбой.
+
+        Прогон поднимаем прямо здесь и результата не ждём: цикл продолжает ждать
+        своё. Двойного прогона это не создаёт — id фиксирован в пределах режима.
+
+        Прогоны прежнего поколения сигнал получают, но обслужить не могут; им
+        лаунчер стартует root-прогон (см. query `handles_agents`), поэтому здесь
+        достаточно молча выйти — иначе на реплее их истории появилась бы команда,
+        которой там нет.
+        """
+        if not workflow.patched("issue-lifecycle-phase-loop"):
+            return
+        if isinstance(req, dict):
+            req = BftRequest(**req)
+        await workflow.wait_condition(lambda: self._issue is not None)
+        await self._start_bft(req)
+
+    async def _start_bft(self, req: BftRequest) -> bool:
+        """Прогон БФТ по команде — дочерним воркфлоу, без ожидания результата.
+
+        Результата не ждём: фазу БФТ не двигает, и циклу с его исходом делать
+        нечего. Прогон сам отвечает человеку — письмом, сводкой либо
+        комментарием о сбое.
+        """
+        try:
+            await workflow.start_child_workflow(
+                IssueBft.run, req,
+                id=bft_workflow_id(req.repo, req.issue_number, req.mode),
+                # Глубокий прогон идёт десятками минут. Ни continue-as-new
+                # родителя, ни его завершение не должны его обрывать.
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                # Прогон недетерминирован и стоит денег: повтор инициирует
+                # человек, а не политика ретраев.
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except WorkflowAlreadyStartedError:
+            # Прогон в этом режиме уже идёт: повторная команда, эхо собственной
+            # метки или дубль доставки вебхука — все три означают одно намерение.
+            workflow.logger.info("bft %s already running for %s#%s",
+                                 req.mode, req.repo, req.issue_number)
+            return False
+        return True
+
+    @workflow.signal
     async def estimate_requested(self, comment_id: int | None) -> None:
         """По Issue запрошена оценка трудоёмкости.
 
@@ -580,7 +654,8 @@ class IssueLifecycle:
             workflow.logger.info("estimate already running for %s#%s",
                                  req.repo, req.issue_number)
 
-    async def _wait_for_signal(self, timeout: timedelta | None = None) -> str | AgentEvent | None:
+    async def _wait_for_signal(
+            self, timeout: timedelta | None = None) -> str | AgentEvent | UserComment | None:
         # Нулевой остаток означает «срок уже вышел», а не «ждать без ограничения»:
         # `if timeout:` ниже принял бы timedelta(0) за отсутствие таймаута и
         # припарковал бы Issue навсегда — ровно то, от чего чинили #58.
@@ -635,6 +710,8 @@ class IssueLifecycle:
             self._root_issue = carried.root_issue
             self._pr_number = carried.pr_number
             self._clarify_rounds = carried.clarify_rounds
+            self._followup_rounds = carried.followup_rounds
+            self._answered_comment_ids = list(carried.answered_comment_ids)
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -664,6 +741,8 @@ class IssueLifecycle:
             root_issue=self._root_issue,
             pr_number=self._pr_number,
             clarify_rounds=self._clarify_rounds,
+            followup_rounds=self._followup_rounds,
+            answered_comment_ids=list(self._answered_comment_ids),
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -900,6 +979,7 @@ class IssueLifecycle:
         # Тумблеры едут вместе со сроками: значение обязано лежать в истории,
         # иначе переключённый посреди прогона уронил бы реплей недетерминизмом.
         self._decompose = deadlines.decompose_enabled
+        self._followup_max_rounds = deadlines.followup_max_rounds
         while True:
             if self._closed_by is not None and not lifecycle.is_terminal(self._phase):
                 # Issue закрыт на GitHub: любая парковка потеряла смысл. Одна
@@ -1061,8 +1141,8 @@ class IssueLifecycle:
                             retry_policy=default_retry,
                         )
                         return (lifecycle.ESCALATED, "escalated", True)
-                    if isinstance(raw, str) and raw.startswith("__comment__:"):
-                        comment_thread.append(raw[len("__comment__:"):])
+                    if isinstance(raw, UserComment):
+                        comment_thread.append(raw.text)
 
                     gate = await workflow.execute_activity(
                         activities.intake_gate,
@@ -1080,15 +1160,22 @@ class IssueLifecycle:
                     return (lifecycle.SPAM, "spam", True)
 
                 self._stage = "classify"
+                # БФТ вместо свободного advisor-ответа. Маркер патча обязателен:
+                # у припаркованных прогонов этих команд в истории нет, и реплей
+                # их истории новым кодом упал бы недетерминизмом.
+                bft_on_triage = (workflow.patched("issue-lifecycle-bft")
+                                 and deadlines.bft_on_triage)
                 classification = await workflow.execute_activity(
                     activities.classify_issue,
-                    issue,
+                    args=[issue, bft_on_triage],
                     start_to_close_timeout=timedelta(seconds=180),
                     retry_policy=default_retry,
                 )
                 if classification.label in ("advisor:existing-functionality",
                                             "advisor:consultation"):
                     return (lifecycle.ANSWERED, "answered", True)
+                if bft_on_triage and classification.label == "advisor:feature-request":
+                    await self._bft_on_triage(issue)
             self._classification_label = classification.label if classification else None
 
             self._stage = "duplicate-check"
@@ -1125,6 +1212,44 @@ class IssueLifecycle:
             )
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
+
+    async def _bft_on_triage(self, issue: IssueInput) -> None:
+        """БФТ как ответ триажа на запрос функционала.
+
+        Активностью, а не дочерним прогоном: это шаг триажа, такой же как
+        `intake_gate` и `classify_issue`, и в Event History ему место рядом с
+        ними. Отдельный прогон нужен командам — у них своя судьба, свои метки и
+        свой ack; у шага триажа ничего этого нет.
+
+        Сбой не роняет триаж: дедуп и приоритет всё равно нужны, а человек
+        получает комментарий о сбое. Оставить Issue без приоритета из-за того,
+        что не собралось письмо, — худший из двух исходов. Сам комментарий о
+        сбое тоже best-effort: если GitHub недоступен, сделать всё равно нечего,
+        а ронять из-за этого триаж — менять маленькую беду на большую.
+        """
+        req = BftRequest(repo=issue.repo, issue_number=issue.issue_number,
+                         title=issue.title, body=issue.body,
+                         mode=bft.FAST, trigger=BFT_TRIAGE)
+        try:
+            await workflow.execute_activity(
+                activities.run_bft_fast, req,
+                start_to_close_timeout=timedelta(seconds=300),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+            return
+        except Exception as exc:
+            workflow.logger.warning("БФТ на триаже не собрался: %s",
+                                    _failure_reason(exc))
+            reason = str(getattr(exc, "cause", None) or exc)[:500]
+        try:
+            await workflow.execute_activity(
+                activities.publish_bft_error, args=[req, reason],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as report_exc:
+            workflow.logger.warning("не удалось сообщить о сбое БФТ: %s",
+                                    _failure_reason(report_exc))
 
     async def _phase_await_decision(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `classified`: ждём решения человека о тяжёлой стадии.
@@ -1186,6 +1311,12 @@ class IssueLifecycle:
             # Явная команда человека сильнее гварда по типу Issue: он защищает
             # от неудачно поставленной метки, а не от прямого `/analyze`.
             return await self._analysis_requested(issue)
+        if isinstance(decision, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
+            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
+            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
+            # активность, которой там нет, — реплей упал бы недетерминизмом.
+            return await self._answer_followup(issue, decision)
 
         # `classification_label is None` — сокращённый триаж (Issue от агента):
         # он уже классифицирован на стороне создателя, гвард проверять не на чем.
@@ -1325,11 +1456,55 @@ class IssueLifecycle:
                 return await self._agent_event(signal)
             if signal == AGENT_ANALYZE:
                 return await self._analysis_requested(issue)
-            if isinstance(signal, str) and signal.startswith("__comment__:"):
+            if isinstance(signal, UserComment):
                 # Ответ получен. В анализ заново: он прочитает обсуждение и
                 # закроет вопрос — переписывать артефакты руками некому.
                 return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
             # Посторонний сигнал ответом не считается и круга не тратит.
+
+    async def _answer_followup(self, issue: IssueInput, comment: UserComment) -> tuple:
+        """Ответить на реплику человека, оставшись в той же фазе.
+
+        Отказ, ради которого это написано (`poh-demo-checkout#42`): триаж закрыл
+        консультацию содержательным ответом, человек спросил следующее — и цикл
+        отбросил его реплику как посторонний сигнал. Комментарий доехал, реакция
+        «глаза» встала, ответа не было. Со стороны человека это неотличимо от
+        сломанного контура, а с нашей — задача просто досиживала парковку.
+
+        Диалог идёт НА МЕСТЕ: фазу реплика не двигает. Вопрос по припаркованной
+        задаче — это вопрос, а не решение о ней; двигай он фазу, любая реплика
+        переписывала бы состояние Issue, и метка перестала бы означать
+        происходящее. Ходы между фазами остаются за метками и командами.
+
+        Ошибка модели гасится: реплика без ответа хуже, но упавшая по ней фаза
+        забирает с собой и парковку, и всё остальное состояние задачи.
+        """
+        # Повторная доставка вебхука (в истории #42 каждый сигнал ровно дважды)
+        # не должна давать второй ответ на тот же вопрос.
+        if comment.comment_id is not None and comment.comment_id in self._answered_comment_ids:
+            return (self._phase, self._stage, False)
+        # Потолок исчерпан — реплика по-прежнему будит парковку, но модель по ней
+        # не гоняем. Молчание здесь осознанное: круги кончились, разговор ведёт
+        # человек, которому задача поставлена в очередь.
+        if self._followup_rounds >= self._followup_max_rounds:
+            workflow.logger.info("потолок реплик исчерпан (%s) — отвечаю молчанием",
+                                 self._followup_max_rounds)
+            return (self._phase, self._stage, False)
+
+        self._followup_rounds += 1
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        try:
+            await workflow.execute_activity(
+                activities.answer_followup,
+                args=[issue, comment.text],
+                start_to_close_timeout=timedelta(seconds=180),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as exc:
+            workflow.logger.warning("не ответил на реплику: %s", _failure_reason(exc))
+        return (self._phase, self._stage, False)
 
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
@@ -1378,6 +1553,12 @@ class IssueLifecycle:
             return await self._agent_event(decision)
         if decision == AGENT_ANALYZE:
             return await self._analysis_requested(issue)
+        if isinstance(decision, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
+            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
+            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
+            # активность, которой там нет, — реплей упал бы недетерминизмом.
+            return await self._answer_followup(issue, decision)
         if decision != "build-me":
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
         return await self._start_development(issue)
@@ -1560,6 +1741,12 @@ class IssueLifecycle:
             # Команда работает и на припаркованном Issue: из бокового состояния
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
+        if isinstance(signal, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
+            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
+            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
+            # активность, которой там нет, — реплей упал бы недетерминизмом.
+            return await self._answer_followup(issue, signal)
         if signal != "reopen":
             return (self._phase, self._stage, False)  # посторонний сигнал — ждём дальше
         back = next((t for t in lifecycle.allowed(self._phase)
@@ -1689,8 +1876,8 @@ class IssueLifecycle:
                         )
                         self._stage = "escalated"
                         return
-                    if raw.startswith("__comment__:"):
-                        comment_thread.append(raw[len("__comment__:"):])
+                    if isinstance(raw, UserComment):
+                        comment_thread.append(raw.text)
 
                     gate = await workflow.execute_activity(
                         activities.intake_gate,
@@ -1994,6 +2181,137 @@ class IssueAnalysis:
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
         return await _run_staged_analysis(analyze)
+
+
+@workflow.defn(name="IssueBft")
+class IssueBft:
+    """БФТ по Issue: быстрый проход (`/bft`) и глубокая проработка (`/bft-deep`).
+
+    Один воркфлоу на оба режима — различает их поле `mode` входа. Разделение на
+    два воркфлоу дало бы две почти одинаковые обвязки (рубильник, ack, метки,
+    комментарий о сбое) и два места, где эту обвязку надо чинить.
+
+    Работает в двух режимах запуска, как и `IssueAnalysis` (#37): дочерним
+    прогоном цикла, когда цикл жив, и самостоятельным — иначе. Id фиксирован в
+    пределах режима, поэтому повторная команда при идущем прогоне упирается в
+    `WorkflowAlreadyStarted`, а не платит второй раз.
+    """
+
+    def __init__(self) -> None:
+        self._stage = "accepted"
+        self._mode = bft.FAST
+
+    @workflow.query
+    def stage(self) -> str:
+        """Стадия прогона — для Temporal UI (вкладка Queries).
+
+        У быстрого прохода стадий по сути нет, у глубокого их семь, и без этого
+        значения прогон, стоящий сорок минут на `concept`, выглядит в UI так же,
+        как зависший: просто `Running`.
+        """
+        return self._stage
+
+    @workflow.query
+    def mode(self) -> str:
+        return self._mode
+
+    @workflow.run
+    async def run(self, req: BftRequest) -> bool:
+        """Возвращает, опубликован ли БФТ.
+
+        Родителю ответ нужен затем же, зачем и от аналитики: триаж по нему решает,
+        оставлять ли Issue без содержательного ответа человеку. Автономный запуск
+        результат игнорирует.
+        """
+        # Вебхук и скрипты могут прислать сырой словарь — та же нормализация, что
+        # и в цикле: молча получить dict вместо dataclass хуже, чем упасть.
+        if isinstance(req, dict):
+            req = BftRequest(**req)
+        self._mode = req.mode
+        command = BFT_DEEP if req.mode == bft.DEEP else BFT
+        if await _agents_off(req.repo, req.issue_number, f"/{command}"):
+            return False
+
+        await workflow.execute_activity(
+            activities.ack_bft_command, req,
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+
+        ok = True
+        try:
+            if req.mode == bft.DEEP:
+                await self._run_deep(req)
+            else:
+                self._stage = "fast"
+                await workflow.execute_activity(
+                    activities.run_bft_fast, req,
+                    start_to_close_timeout=timedelta(seconds=300),
+                    # Один вызов модели: сетевой сбой лечится повтором, и
+                    # дублирующего комментария он не даёт — публикация идёт
+                    # последним шагом той же активности.
+                    retry_policy=RetryPolicy(maximum_attempts=2),
+                )
+            self._stage = "published"
+        except Exception as exc:
+            ok = False
+            self._stage = "failed"
+            reason = str(getattr(exc, "cause", None) or exc)
+            await workflow.execute_activity(
+                activities.publish_bft_error, args=[req, reason[:500]],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        finally:
+            if req.mode == bft.DEEP:
+                # Каталог живёт вне Temporal — снимаем на обоих путях. Провал
+                # самой уборки не должен затирать реальный исход прогона.
+                try:
+                    await workflow.execute_activity(
+                        activities.cleanup_bft_workspace, req,
+                        start_to_close_timeout=timedelta(seconds=60),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
+                except Exception as cleanup_exc:
+                    workflow.logger.warning(
+                        "cleanup_bft_workspace failed (best-effort, ignored): %s",
+                        cleanup_exc)
+        await _finish_labels(req.repo, req.issue_number, command, ok=ok)
+        return ok
+
+    async def _run_deep(self, req: BftRequest) -> None:
+        """Канонический пайплайн bft-writer — стадия за стадией.
+
+        Ретраев у стадии нет по той же причине, что и у стадий FNR: прогон
+        недетерминирован, мутирует файлы и стоит денег, поэтому повтор инициирует
+        человек. Исключение — потеря воркера: heartbeat-таймаут не сбой стадии, а
+        рестарт контейнера, и без второй попытки любая выкладка посреди прогона
+        убивала бы БФТ целиком.
+        """
+        self._stage = "prepare"
+        await workflow.execute_activity(
+            activities.prepare_bft_workspace, req,
+            start_to_close_timeout=timedelta(seconds=1000),  # clone 300 + repomix 600 + буфер
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        for stage_name in bft.DEEP_STAGE_NAMES:
+            self._stage = stage_name
+            await workflow.execute_activity(
+                activities.run_bft_stage, args=[req, stage_name],
+                start_to_close_timeout=timedelta(seconds=1200),  # claude до 900 + буфер
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2,
+                    non_retryable_error_types=["RuntimeError"],
+                ),
+            )
+        self._stage = "publish"
+        await workflow.execute_activity(
+            activities.publish_bft_deep, req,
+            start_to_close_timeout=timedelta(seconds=300),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
 
 
 @workflow.defn(name="IssueEstimation")

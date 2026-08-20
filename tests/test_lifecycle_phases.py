@@ -152,11 +152,19 @@ def test_every_current_stage_maps_to_a_phase():
 
 
 def test_bridge_covers_all_stage_values_used_by_the_workflow():
-    """Значения берутся из самого воркфлоу: разъехавшись, мост потеряет стадию."""
+    """Значения берутся из самого воркфлоу: разъехавшись, мост потеряет стадию.
+
+    Область — класс `IssueLifecycle` и только он. Мост переводит в фазы стадии
+    ЦИКЛА; у соседних воркфлоу (`IssueBft`) своя стадийность, к фазам Issue
+    отношения не имеющая, и требовать для неё записи в мосте значило бы
+    засорять словарь фаз чужими значениями.
+    """
     source = (__import__("pathlib").Path(__file__).resolve().parent.parent
               / "worker" / "workflows.py").read_text(encoding="utf-8")
+    body = source.split("class IssueLifecycle:", 1)[1].split("\n@workflow.defn", 1)[0]
     used = {line.split('self._stage = "')[1].split('"')[0]
-            for line in source.splitlines() if 'self._stage = "' in line}
+            for line in body.splitlines() if 'self._stage = "' in line}
+    assert used, "не нашёл ни одной стадии — разбор класса IssueLifecycle сломался"
     missing = used - set(lc.STAGE_TO_PHASE)
     assert not missing, f"стадии воркфлоу без фазы: {sorted(missing)}"
 
