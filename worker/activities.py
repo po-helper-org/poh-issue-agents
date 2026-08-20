@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -2006,6 +2007,23 @@ def _bft_stage_inputs(clone_dir: str, issue_number: int,
     return "\n\n---\n\n".join(parts)
 
 
+def _append_dialog(clone_dir: str, issue_number: int, entry: str) -> None:
+    """Дописать строку в журнал прогона — best-effort.
+
+    Журнал вспомогательный: уронить из-за него стадию, которая отработала,
+    значит поменять настоящий результат на запись о нём.
+    """
+    try:
+        path = Path(clone_dir) / bft.dialog_log_path(issue_number)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(bft.DIALOG_LOG_HEADER, encoding="utf-8")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(entry + "\n")
+    except OSError as exc:
+        logger.warning("журнал прогона не дописан: %s", exc)
+
+
 def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
     """Стадия `draft` двумя вызовами модели вместо агента.
 
@@ -2037,12 +2055,21 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
         + f", якорей ≥ {bft.ANCHOR_FLOOR}.\n\n"
         f"Верни ТОЛЬКО JSON по схеме:\n{bft.CASCADE_SCHEMA}")
 
+    started = time.monotonic()
     cascade = bft.parse_cascade(llm.complete(system, cascade_task, model=model))
+    _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+        stage="draft", actor=f"прямой вызов ({model})", step="каскад требований",
+        outcome="готово", elapsed=time.monotonic() - started,
+        detail=f"требований {len(cascade.get('requirements') or [])}, "
+               f"якорей {len(cascade.get('anchors') or [])}"))
     for _ in range(BFT_TOP_UP_ATTEMPTS):
         gaps = bft.cascade_gaps(cascade, line_counts)
         if not gaps:
             break
         logger.info("БФТ %s#%s: добор каскада — %s", req.repo, issue, "; ".join(gaps))
+        _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+            stage="draft", actor=f"прямой вызов ({model})", step="добор каскада",
+            outcome="добор", detail="; ".join(gaps)))
         top_up = (f"{inputs}\n\n---\n\n# Уже собрано\n\n```json\n"
                   + json.dumps(cascade, ensure_ascii=False, indent=1) + "\n```\n\n"
                   "# Чего не хватает\n\n- " + "\n- ".join(gaps) + "\n\n"
@@ -2077,7 +2104,13 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
         "заканчивается последней строкой таблицы якорей, без обрамляющих "
         "```-блоков и без фраз до или после.")
 
-    return llm.complete(system2, render_task, model=model)
+    started = time.monotonic()
+    document = llm.complete(system2, render_task, model=model)
+    _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+        stage="draft", actor=f"прямой вызов ({model})", step="рендер документа",
+        outcome="готово", elapsed=time.monotonic() - started,
+        detail=f"{len(document)} символов"))
+    return document
 
 
 BFT_TOP_UP_ATTEMPTS = 2
@@ -2101,6 +2134,9 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
             # после срыва продолжает с места обрыва, а не начинает заново.
             logger.info("БФТ %s#%s: стадия %s уже сделана — пропускаю",
                         req.repo, req.issue_number, stage_name)
+            _append_dialog(clone_dir, req.issue_number, bft.render_dialog_entry(
+                stage=stage_name, actor="—", step="артефакт прошлого прогона",
+                outcome="пропущено", detail=expected))
             return {"stage": stage_name, "artifact": expected,
                     "bytes": done.stat().st_size, "skipped": True}
     if stage_name in bft.direct_stages() and expected:
@@ -2113,8 +2149,12 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(document, encoding="utf-8")
     else:
+        started = time.monotonic()
         await _run_with_heartbeat(_run_claude, prompt, clone_dir,
                                   label=f"bft:{stage_name}")
+        _append_dialog(clone_dir, req.issue_number, bft.render_dialog_entry(
+            stage=stage_name, actor="claude -p", step=prompt, outcome="готово",
+            elapsed=time.monotonic() - started))
     artifact: str | None = None
     size = 0
     if expected:

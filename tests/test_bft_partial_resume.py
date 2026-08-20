@@ -152,3 +152,74 @@ async def test_empty_artifact_does_not_count_as_done(ready_workspace, monkeypatc
     await activities.run_bft_stage(_req(), "draft")
 
     assert ran, "пустой артефакт принят за готовую стадию"
+
+
+# --- Журнал прогона ---
+
+def test_dialog_log_lives_next_to_artifacts():
+    """Журнал уезжает в ту же ветку — отдельного хранилища не заводим."""
+    assert bft.dialog_log_path(41).startswith(bft.artefacts_dir(41))
+
+
+def test_dialog_entry_is_a_table_row_with_the_essentials():
+    row = bft.render_dialog_entry(
+        stage="draft", actor="прямой вызов (glm-4.6)", step="каскад требований",
+        outcome="добор", detail="якорей 20 из 24", elapsed=129.4, tokens="43k/8k")
+
+    assert row.startswith("|") and row.endswith("|")
+    for cell in ("draft", "прямой вызов (glm-4.6)", "добор", "129 с", "43k/8k",
+                 "якорей 20 из 24"):
+        assert cell in row
+
+
+def test_dialog_entry_does_not_break_the_table():
+    row = bft.render_dialog_entry(stage="draft", actor="claude -p", step="/bft-draft",
+                                  outcome="сбой",
+                                  detail="строка с | трубой\nи переводом строки")
+    assert row.count("\n") == 0, "перевод строки разорвал бы таблицу"
+    assert "\\|" in row, "труба в тексте не экранирована"
+
+
+def test_dialog_log_starts_with_a_header_then_appends(tmp_path):
+    clone = tmp_path / "repo"
+    activities._append_dialog(str(clone), 41, "| a | b | c | d | e | f | g |")
+    activities._append_dialog(str(clone), 41, "| h | i | j | k | l | m | n |")
+
+    text = (clone / bft.dialog_log_path(41)).read_text()
+    assert text.startswith("# Журнал прогона БФТ")
+    assert text.count("| a |") == 1 and text.count("| h |") == 1
+
+
+def test_dialog_log_failure_does_not_break_the_stage(monkeypatch, tmp_path):
+    """Журнал вспомогательный: из-за него не падает стадия, которая отработала."""
+    def boom(*a, **kw):
+        raise OSError("диск кончился")
+
+    monkeypatch.setattr(activities.Path, "mkdir", boom)
+    activities._append_dialog(str(tmp_path), 41, "| строка |")  # не бросает
+
+
+@pytest.mark.timeout(30)
+async def test_agent_stage_records_itself_in_the_log(ready_workspace, monkeypatch):
+    def fake_claude(prompt, cwd):
+        (ready_workspace / bft.document_path(41)).parent.mkdir(parents=True, exist_ok=True)
+        (ready_workspace / bft.document_path(41)).write_text("документ")
+
+    monkeypatch.setattr(activities, "_run_claude", fake_claude)
+
+    await activities.run_bft_stage(_req(), "draft")
+
+    log = (ready_workspace / bft.dialog_log_path(41)).read_text()
+    assert "claude -p" in log and "/bft-draft" in log
+
+
+@pytest.mark.timeout(30)
+async def test_skipped_stage_is_visible_in_the_log(ready_workspace, monkeypatch):
+    document = ready_workspace / bft.document_path(41)
+    document.parent.mkdir(parents=True, exist_ok=True)
+    document.write_text("документ прошлого прогона")
+    monkeypatch.setattr(activities, "_run_claude", lambda *a, **kw: None)
+
+    await activities.run_bft_stage(_req(), "draft")
+
+    assert "пропущено" in (ready_workspace / bft.dialog_log_path(41)).read_text()
