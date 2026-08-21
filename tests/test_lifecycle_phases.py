@@ -197,6 +197,17 @@ def test_set_phase_removes_the_previous_one():
         def add_label(repo, n, label):
             added.append(label)
 
+        @staticmethod
+        def set_labels(repo, n, *, add=(), remove=()):
+            """Тестовый двойник: складывает add/remove в те же списки, что и
+            add_label/remove_label выше, с тем же фильтром (remove минус
+            add), что и в реализации — иначе новую метку было бы видно
+            и в added, и в removed."""
+            add = list(add)
+            keep = set(add)
+            added.extend(add)
+            removed.extend(label for label in remove if label not in keep)
+
     original = activities.github_client
     activities.github_client = _GH
     try:

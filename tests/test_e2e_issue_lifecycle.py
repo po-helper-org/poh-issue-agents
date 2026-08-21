@@ -102,6 +102,18 @@ class FakeGitHub:
         if label in self.labels:
             self.labels.remove(label)
 
+    def set_labels(self, repo, issue_number, *, add=(), remove=()):
+        """Смена набора одной операцией: ставим через add_label, снимаем
+        через remove_label, так что self.labels/self.calls остаются той же
+        точкой правды, которую читают остальные тесты этого файла."""
+        add = [label for label in add if label]
+        keep = set(add)
+        remove = [label for label in remove if label and label not in keep]
+        for label in add:
+            self.add_label(repo, issue_number, label)
+        for label in remove:
+            self.remove_label(repo, issue_number, label)
+
     def close_issue(self, repo, issue_number):
         self.state = "closed"
 
