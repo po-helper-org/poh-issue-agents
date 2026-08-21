@@ -1609,11 +1609,17 @@ class IssueLifecycle:
         Одна точка на оба входа — решение человека `build-me` и автостарт. Две
         копии этого вызова разъехались бы на первой же правке ретраев, и один из
         входов молча остался бы со старым поведением.
+        
+        ISSUE-113: для подзадачи плана передаём root_issue и ветку родителя.
         """
+        # ISSUE-113 пункт 2: вычисляем ветку так же, как в _phase_handoff
+        source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
+        
         try:
             pr_number = await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
-                issue,
+                args=[issue, self._root_issue, branch],
                 # Прогон агента идёт десятками минут, поэтому потолок общий на
                 # весь шаг, а живость сообщается heartbeat'ом: без него сервер
                 # счёл бы активность мёртвой на первой же долгой стадии.

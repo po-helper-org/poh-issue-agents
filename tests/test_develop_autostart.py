@@ -137,7 +137,8 @@ async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None:
 
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop(issue: IssueInput) -> None:
+async def develop(issue: IssueInput, root_issue: int | None = None,
+                   branch: str | None = None) -> None:
     _calls.append("develop")
 
 
@@ -149,6 +150,11 @@ async def decompose(issue: IssueInput, branch: str) -> dict:
 
 @activity.defn(name="publish_decomposition")
 async def publish_plan(issue: IssueInput, plan: dict, branch: str) -> list[int]:
+    return []
+
+
+@activity.defn(name="read_open_questions")
+async def no_questions(repo: str, branch: str) -> list[str]:
     return []
 
 
@@ -175,7 +181,8 @@ async def _run_until_parked(autostart: bool) -> None:
                                       _deadlines(autostart), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
-                                      ready, develop, decompose, publish_plan, phase_stub]):
+                                      ready, develop, decompose, publish_plan, no_questions,
+                                      phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -212,7 +219,8 @@ async def test_without_autostart_the_task_waits_for_a_human():
 # --- Своя метка не заводит второй прогон ---
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop_noop(issue: IssueInput) -> None: ...
+async def develop_noop(issue: IssueInput, root_issue: int | None = None,
+                       branch: str | None = None) -> None: ...
 
 
 @pytest.mark.timeout(120)
@@ -238,7 +246,8 @@ async def test_own_run_label_does_not_start_a_second_analysis():
                                       _deadlines(False), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish,
                                       slow_ack, prepare, stage_ok, publish, cleanup,
-                                      publish_error, ready, develop_noop, phase_stub]):
+                                      publish_error, ready, develop_noop, no_questions,
+                                      phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -291,7 +300,7 @@ async def _run_closed_loop(classification: str) -> list[str]:
                                       _deadlines(True, research=True), gate, classify_as,
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_ok, publish, cleanup,
-                                      publish_error, ready, develop, phase_stub]):
+                                      publish_error, ready, develop, no_questions, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -352,7 +361,7 @@ async def test_subissue_of_a_plan_does_not_start_its_own_development():
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_ok, publish, cleanup,
                                       publish_error, ready, develop, decompose,
-                                      publish_plan, phase_stub]):
+                                      publish_plan, no_questions, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -404,7 +413,7 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_forbidden, publish,
                                       cleanup, publish_error, ready, develop, decompose,
-                                      publish_plan, phase_stub]):
+                                      publish_plan, no_questions, phase_stub]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -423,7 +432,8 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
 # --- Сорванная передача не повторяет прогон агента ---
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop_failing(issue: IssueInput) -> None:
+async def develop_failing(issue: IssueInput, root_issue: int | None = None,
+                          branch: str | None = None) -> None:
     """Падение на последнем шаге активности — как пуш на живом прогоне #39.
 
     Ретрай повторил бы её ЦЕЛИКОМ: объявление о передаче, прогон агента,
@@ -450,7 +460,7 @@ async def test_failed_handoff_runs_the_agent_once_and_reports():
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
                                       ready, develop_failing, decompose, publish_plan,
-                                      phase_stub, error_label]):
+                                      phase_stub, error_label, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")

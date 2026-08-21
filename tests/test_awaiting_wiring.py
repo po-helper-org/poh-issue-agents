@@ -95,7 +95,8 @@ async def escalate(issue: IssueInput, reason: str = "") -> None: ...
 
 
 @activity.defn(name="trigger_openhands_resolver")
-async def trigger_build(issue: IssueInput) -> None: ...
+async def trigger_build(issue: IssueInput, root_issue: int | None = None,
+                        branch: str | None = None) -> None: ...
 
 
 BASE = [mark_awaiting_spy, prefilter_ok, protocol_default, deadlines_stub,
