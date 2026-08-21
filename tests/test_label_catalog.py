@@ -2,7 +2,7 @@
 
 from shared import commands, develop, lifecycle, pr_closing
 from shared import labels as L
-from shared.label_catalog import catalog
+from shared.label_catalog import TRIGGERS, catalog
 
 
 def test_every_phase_is_present():
@@ -28,8 +28,13 @@ def test_control_labels_are_present():
 
 
 def test_trigger_labels_are_present():
+    """Каждая метка из HUMAN_DECISION_LABELS (единый список с вебхуком) обязана
+    попасть в каталог — сверка с константой целиком, а не с подмножеством: новая
+    точка решения человека, забытая здесь, должна ронять этот тест."""
     names = catalog()
-    assert {"research-me", "bug-me", "build-me"} <= set(names)
+    assert set(TRIGGERS) == set(L.HUMAN_DECISION_LABELS)
+    for label in L.HUMAN_DECISION_LABELS:
+        assert label in names
 
 
 def test_every_entry_has_colour_and_description():

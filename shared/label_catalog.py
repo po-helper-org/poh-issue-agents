@@ -26,8 +26,20 @@ NEUTRAL_COLOR = "#666666"
 ADVISOR_KINDS = ("answered", "bug", "consultation", "error",
                  "existing-functionality", "feature-request")
 PRIORITY_LEVELS = ("P0", "P1", "P2", "P3")
-TRIGGERS = {"research-me": "аналитика", "bug-me": "багфикс",
-            "build-me": "разработка"}
+
+# Источник имён — L.HUMAN_DECISION_LABELS (общий с вебхуком, shared/labels.py).
+# Здесь только текст: намеренно словарь, а не шаблон по имени метки — иначе
+# описание становится нечитаемым машинным слепком идентификатора.
+_HUMAN_DECISION_DESCRIPTIONS = {
+    "research-me": "Триггер человека: запустить аналитику",
+    "bug-me": "Триггер человека: запустить багфикс",
+    "build-me": "Триггер человека: запустить разработку",
+    "not-duplicate": "Человек считает Issue не дубликатом — контур возвращает его в работу",
+    "confirm-duplicate": "Человек подтверждает дубликат — контур закрывает Issue",
+}
+# KeyError здесь — сигнал, что в HUMAN_DECISION_LABELS завели метку без
+# описания: пусть модуль не импортируется, чем каталог тихо потеряет метку.
+TRIGGERS = {name: _HUMAN_DECISION_DESCRIPTIONS[name] for name in L.HUMAN_DECISION_LABELS}
 FLAT = {
     "bot-authored": "Issue заведён ботом",
     "security-sensitive": "Затрагивает безопасность",
@@ -66,7 +78,7 @@ def catalog() -> dict[str, LabelSpec]:
             f"Команда /{command} завершена")
         add(f"{commands.FAILED_PREFIX}{command}", FAILED_COLOR,
             f"Команда /{command} сорвалась")
-    for legacy in commands._LEGACY_RUNNING_LABELS.get("analyze", ()):
+    for legacy in commands._LEGACY_RUNNING_LABELS.get(commands.ANALYZE, ()):
         add(legacy, RUNNING_COLOR, "Legacy-метка выполнения /analyze")
 
     add(L.NEEDS_HUMAN_TRIAGE, HUMAN_COLOR, "Ход за человеком")
@@ -76,8 +88,8 @@ def catalog() -> dict[str, LabelSpec]:
     add(L.READY_FOR_DEV, DONE_COLOR, "Готово к разработке")
     add(develop.IN_DEVELOPMENT_LABEL, RUNNING_COLOR, "У агента разработки")
 
-    for trigger, what in TRIGGERS.items():
-        add(trigger, TRIGGER_COLOR, f"Триггер человека: запустить {what}")
+    for trigger, description in TRIGGERS.items():
+        add(trigger, TRIGGER_COLOR, description)
     for flat, description in FLAT.items():
         add(flat, NEUTRAL_COLOR, description)
     return out

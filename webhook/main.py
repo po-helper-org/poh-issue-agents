@@ -46,7 +46,7 @@ from shared.commands import (
 from shared.agent_comment import is_agent_comment
 from shared.agent_launcher import request_analysis, request_bft, request_estimate
 from shared.authz import may_trigger, trigger_allowlist
-from shared.labels import parse_root_issue
+from shared.labels import HUMAN_DECISION_LABELS, parse_root_issue
 from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import (
@@ -76,9 +76,6 @@ async def _client_disconnect(request: Request, exc: ClientDisconnect):
     _log.info("отправитель разорвал соединение до конца тела (%s) — доставка будет повторена",
               request.headers.get("x-github-delivery", "без id"))
     return Response(status_code=204)
-
-
-HUMAN_DECISION_LABELS = {"research-me", "bug-me", "build-me", "not-duplicate", "confirm-duplicate"}
 
 
 def _log_effective_config() -> None:
