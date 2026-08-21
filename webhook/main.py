@@ -70,8 +70,10 @@ async def _client_disconnect(request: Request, exc: ClientDisconnect):
 
     Отвечать 500 некому: соединения уже нет, а событие уезжает в Sentry как
     сбой вебхука (ISSUE-AGENT-8, пять штук за один разрыв связи с прокси).
-    Доставка не потеряна — GitHub ретраит её сам, так что здесь нечего чинить
-    и не о чем будить. 204 закрывает запрос тихо и оставляет след в логе.
+    Доставка не потеряна: GitHub повторит её сам. У GitLab ретраев нет — там
+    оборванная доставка теряется, поэтому обработчик ниже принимает всё, что
+    прошло подпись, и разбирается внутри. 204 закрывает запрос тихо и
+    оставляет след в логе.
     """
     _log.info("отправитель разорвал соединение до конца тела (%s) — доставка будет повторена",
               request.headers.get("x-github-delivery", "без id"))
@@ -166,7 +168,7 @@ def _issue_input(payload: dict, *, interactive: bool):
         title=issue["title"],
         body=issue.get("body") or "",
         author_login=issue["user"]["login"],
-        author_type=issue["user"]["type"],
+        author_type=(issue.get("user") or {}).get("type") or "User",
         interactive=interactive,
     )
 
@@ -384,10 +386,33 @@ async def github_webhook(
     x_hub_signature_256: str | None = Header(None),
     x_github_delivery: str | None = Header(None),
 ):
+    """Приём доставки. Отказать может только подпись.
+
+    Всё остальное — включая payload, который мы не сумели разобрать, — уезжает
+    в аудит и подтверждается 200. Причина: у GitLab автоматических ретраев нет,
+    доставка теряется навсегда, а четыре подряд провала отключают вебхук на
+    срок до суток. 500 отсюда стоит дороже, чем необработанное событие.
+    """
     body = await request.body()
     verify_signature(body, x_hub_signature_256)
     payload = await request.json()
+    try:
+        return await _handle_delivery(payload, x_github_event, x_github_delivery)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception(
+            "не разобрал доставку %s (%s) — принимаю и ухожу в аудит",
+            x_github_delivery or "без id", x_github_event)
+        await _audit_dropped_delivery(
+            payload, x_github_event, x_github_delivery,
+            (payload.get("repository") or {}).get("full_name"),
+            ["(ошибка разбора)"])
+        return {"ok": True}
 
+
+async def _handle_delivery(payload: dict, x_github_event: str,
+                           x_github_delivery: str | None):
     # Allowlist: действуем только на репозитории из ISSUE_AGENT_REPOS (пусто/* —
     # любой установленный). Чужой репозиторий игнорируем до старта workflow.
     repo_full = (payload.get("repository") or {}).get("full_name")
@@ -524,7 +549,10 @@ async def github_webhook(
         # Комментарии от самого сервиса не должны сигналить сами себя —
         # тот же принцип, что и guard `comment.user.type != 'Bot'` в старой
         # версии на Actions.
-        if payload["comment"]["user"]["type"] == "Bot":
+        # `.get`, а не индексация: поле есть только у GitHub. Основную работу
+        # всё равно делает подпись ниже — она различает происхождение, а не
+        # автора, и работает у любого провайдера.
+        if (payload["comment"].get("user") or {}).get("type") == "Bot":
             return {"ok": True}
         # Гейта по типу автора мало: под PAT сервис пишет от имени человека, и
         # его комментарии возвращаются с `type == "User"`. На живом прогоне
