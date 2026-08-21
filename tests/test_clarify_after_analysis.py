@@ -134,7 +134,8 @@ async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None:
 
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop(issue: IssueInput) -> int | None:
+async def develop(issue: IssueInput, root_issue: int | None = None,
+                  branch: str | None = None) -> int | None:
     _calls.append("develop")
     return 42
 

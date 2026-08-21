@@ -1619,9 +1619,7 @@ class IssueLifecycle:
         try:
             pr_number = await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
-                issue,
-                self._root_issue,  # ISSUE-113: передаём root_issue для подзадач
-                branch,           # ISSUE-113: передаём вычисленную ветку
+                args=[issue, self._root_issue, branch],
                 # Прогон агента идёт десятками минут, поэтому потолок общий на
                 # весь шаг, а живость сообщается heartbeat'ом: без него сервер
                 # счёл бы активность мёртвой на первой же долгой стадии.
