@@ -29,10 +29,14 @@ def test_control_labels_are_present():
 
 def test_trigger_labels_are_present():
     """Каждая метка из HUMAN_DECISION_LABELS (единый список с вебхуком) обязана
-    попасть в каталог — сверка с константой целиком, а не с подмножеством: новая
-    точка решения человека, забытая здесь, должна ронять этот тест."""
+    попасть в каталог: новая точка решения человека, забытая здесь, должна
+    ронять этот тест.
+
+    Забытое описание ловит не этот тест, а сам импорт модуля: TRIGGERS строится
+    как {name: _HUMAN_DECISION_DESCRIPTIONS[name] for name in
+    L.HUMAN_DECISION_LABELS} (shared/label_catalog.py), так что метка без
+    описания роняет KeyError раньше, чем мы сюда доберёмся."""
     names = catalog()
-    assert set(TRIGGERS) == set(L.HUMAN_DECISION_LABELS)
     for label in L.HUMAN_DECISION_LABELS:
         assert label in names
 
