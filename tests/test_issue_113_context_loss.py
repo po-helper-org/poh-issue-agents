@@ -1,6 +1,6 @@
 """Тесты для ISSUE-113 — проверка сохранения контекста в разработке."""
 import pytest
-from worker.activities import (
+from activities import (
     _truncate,
     _apply_size_limit,
     _fetch_decomposition_plan,
@@ -58,7 +58,7 @@ def test_apply_size_limit_empty_list():
 def test_fetch_decomposition_plan_no_marker(monkeypatch):
     """Нет маркера декомпозиции — пустая строка."""
     monkeypatch.setattr(
-        "worker.activities.github_client.list_comments",
+        "activities.github_client.list_comments",
         lambda repo, number, limit: [{"body": "Some comment"}]
     )
     result = _fetch_decomposition_plan(
@@ -71,7 +71,7 @@ def test_fetch_decomposition_plan_with_marker(monkeypatch):
     """Есть маркер декомпозиции — возвращается текст."""
     plan_text = "🧩 Декомпозиция\n1. Task A\n2. Task B"
     monkeypatch.setattr(
-        "worker.activities.github_client.list_comments",
+        "activities.github_client.list_comments",
         lambda repo, number, limit: [{"body": "Other comment"}, {"body": plan_text}]
     )
     result = _fetch_decomposition_plan(
@@ -85,7 +85,7 @@ def test_fetch_decomposition_plan_with_marker(monkeypatch):
 def test_fetch_subtasks_empty(monkeypatch):
     """Нет подзадач — пустой список."""
     monkeypatch.setattr(
-        "worker.activities.github_client.list_open_issues",
+        "activities.github_client.list_open_issues",
         lambda repo, limit: []
     )
     result = _fetch_subtasks(
@@ -113,7 +113,7 @@ def test_fetch_subtasks_with_children(monkeypatch):
         }
     ]
     monkeypatch.setattr(
-        "worker.activities.github_client.list_open_issues",
+        "activities.github_client.list_open_issues",
         lambda repo, limit: issues
     )
     result = _fetch_subtasks(
@@ -127,7 +127,7 @@ def test_fetch_subtasks_with_children(monkeypatch):
 def test_fetch_dev_comments_no_comments(monkeypatch):
     """Нет комментариев — пустой список."""
     monkeypatch.setattr(
-        "worker.activities.github_client.list_comments",
+        "activities.github_client.list_comments",
         lambda repo, number, limit: []
     )
     result = _fetch_dev_comments(
@@ -144,11 +144,14 @@ def test_fetch_dev_comments_filters_commands(monkeypatch):
         {"body": "/estimate", "user": {"login": "bot"}, "created_at": "2025-01-03"}
     ]
     monkeypatch.setattr(
-        "worker.activities.github_client.list_comments",
+        "activities.github_client.list_comments",
         lambda repo, number, limit: comments
     )
-    monkeypatch.setattr("worker.activities.parse_command", lambda body: 
-                        "/analyze" in body or "/estimate" in body)
+    monkeypatch.setattr(
+        "activities.parse_command",
+        lambda body: "/analyze" if "/analyze" in body
+        else "/estimate" if "/estimate" in body else None,
+    )
     
     result = _fetch_dev_comments(
         type("Issue", (), {"repo": "o/r", "issue_number": 42})()
@@ -162,7 +165,7 @@ def test_refresh_issue_body_success(monkeypatch):
     """Успешное обновление тела Issue."""
     fresh_body = "Updated body text"
     monkeypatch.setattr(
-        "worker.activities.github_client.get_issue",
+        "activities.github_client.get_issue",
         lambda repo, number: {"body": fresh_body}
     )
     
@@ -181,7 +184,7 @@ def test_refresh_issue_body_failure_fallback(monkeypatch):
     def boom(repo, number):
         raise RuntimeError("GitHub API error")
     
-    monkeypatch.setattr("worker.activities.github_client.get_issue", boom)
+    monkeypatch.setattr("activities.github_client.get_issue", boom)
     
     issue = type("Issue", (), {
         "repo": "o/r", 

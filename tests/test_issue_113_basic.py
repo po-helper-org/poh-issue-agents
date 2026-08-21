@@ -5,7 +5,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from worker.activities import _truncate, _apply_size_limit
+from activities import _truncate, _apply_size_limit
 
 
 def test_truncate_short_text():
