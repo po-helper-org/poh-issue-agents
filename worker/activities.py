@@ -772,6 +772,11 @@ CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментар
 CONTEXT_PR_LIMIT = 20           # связанных PR
 CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
 
+# Потолок размера постановки для агента разработки (ISSUE-113)
+DEV_TASK_MAX_CHARS = 50000      # общий размер .task.md
+DEV_ARTIFACT_MAX_CHARS = 10000  # отдельный артефакт FNR
+DEV_COMMENT_CHARS = 1000        # обрезка одного комментария для разработки
+
 
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     """Стадии цепочки FNR: (имя, промпт, ожидаемый артефакт).
@@ -1082,6 +1087,115 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + " …[обрезано]"
+
+
+def _fetch_decomposition_plan(issue: IssueInput) -> str:
+    """Получает план декомпозиции из комментария родителя.
+    
+    Если родитель содержит комментарий с декомпозицией (есть маркер "🧩 Декомпозиция"),
+    возвращает этот текст. Иначе — пустую строку.
+    """
+    try:
+        comments = github_client.list_comments(issue.repo, issue.issue_number, limit=50)
+        for comment in reversed(comments):  # Сначала свежие
+            body = comment.get("body") or ""
+            if "🧩 Декомпозиция" in body:
+                return body
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать декомпозицию #%s: %s", issue.issue_number, exc)
+    return ""
+
+
+def _fetch_subtasks(issue: IssueInput) -> list[dict]:
+    """Получает подзадачи плана: номера, заголовки, тела и релизы.
+    
+    Читает все открытые Issue и фильтрует те, что содержат ссылку на родителя.
+    Это медленно, но работает без search API. Для оптимизации нужно индексирование.
+    """
+    try:
+        all_issues = github_client.list_open_issues(issue.repo, limit=500)
+        subtasks = []
+        for item in all_issues:
+            body = item.get("body") or ""
+            # Проверяем, что это подзадача этого родителя
+            if f"root-issue: #{issue.issue_number}" in body:
+                # Дополнительно проверяем наличие метки релиза (release:*)
+                labels = item.get("labels", [])
+                if any(str(l).startswith("release:") for l in labels):
+                    subtasks.append({
+                        "number": item.get("number"),
+                        "title": item.get("title"),
+                        "body": body,
+                        "state": item.get("state"),
+                    })
+        return subtasks
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать подзадачи #%s: %s", issue.issue_number, exc)
+        return []
+
+
+def _fetch_dev_comments(issue: IssueInput) -> list[str]:
+    """Свежие комментарии для постановки разработки (аналогично _fetch_comment_blocks).
+    
+    Отфильтровывает командный шум, обрезает по DEV_COMMENT_CHARS, возвращает от
+    старых к свежим.
+    """
+    try:
+        comments = github_client.list_comments(
+            issue.repo, issue.issue_number, limit=50
+        )
+        kept = [c for c in comments if parse_command(c.get("body") or "") is None]
+        blocks: list[str] = []
+        for c in kept[-10:]:  # До 10 свежих комментариев для разработки
+            user = (c.get("user") or {}).get("login", "?")
+            date = (c.get("created_at") or "")[:10]
+            body = _truncate(c.get("body") or "", DEV_COMMENT_CHARS)
+            blocks.append(f"**@{user} ({date}):**\n{body}")
+        return blocks
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for #%s: %s", issue.issue_number, exc)
+        return []
+
+
+def _refresh_issue_body(issue: IssueInput) -> str:
+    """Перечитывает тело Issue из GitHub вместо устаревшего снимка.
+    
+    Снимок в `IssueInput` создается вебхуком один раз и устаревает для
+    долгоживущих задач в `ready-for-dev`.
+    """
+    try:
+        fresh = github_client.get_issue(issue.repo, issue.issue_number)
+        return fresh.get("body") or ""
+    except Exception as exc:  # noqa: BLE001 — деградация к старому снимку
+        logger.warning("не удалось обновить тело #%s, используется снимок: %s",
+                       issue.issue_number, exc)
+        return issue.body
+
+
+def _apply_size_limit(parts: list[str], limit: int, priority_order: list[int] | None = None) -> list[str]:
+    """Обрезает части постановки по лимиту, удаляя от старого к свежему.
+    
+    `priority_order` — индексы частей, которые обрезаются в последнюю очередь.
+    Если не задан, все части равноправны.
+    """
+    if priority_order is None:
+        priority_order = []
+    
+    # Сортируем индексы по приоритету (сначала низкий приоритет)
+    indices = list(range(len(parts)))
+    indices.sort(key=lambda i: priority_order.index(i) if i in priority_order else -1)
+    
+    total = "\n\n".join(parts)
+    while len(total) > limit and len(parts) > 1:
+        # Удаляем часть с самым низким приоритетом
+        for idx in indices:
+            if idx < len(parts):
+                removed = parts.pop(idx)
+                total = "\n\n".join(parts)
+                logger.debug("обрезка постановки: удалена часть %d (%d симв.), осталось %d",
+                           idx, len(removed), len(total))
+                break
+    return parts
 
 
 def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
@@ -1467,6 +1581,13 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     Постановка собирается ЗДЕСЬ, а не в промпте агента: то, что уехало в
     работу, должно быть видно дословно. Иначе на разборе «почему агент сделал
     не то» предъявить нечего.
+    
+    ISSUE-113: в постановку включается:
+    - свежее тело Issue (вместо устаревшего снимка);
+    - план декомпозиции и подзадачи (если есть);
+    - обсуждение Issue (комментарии);
+    - все артефакты FNR, включая repowise-dialog.md и validation.md;
+    - применён общий потолок размера с усечением по приоритету.
     """
     root, clone_dir = _dev_paths(issue)
     shutil.rmtree(root, ignore_errors=True)
@@ -1474,21 +1595,64 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     _clone_repo(issue.repo, str(clone_dir))
     _write_runner_mcp_config(issue, root)
 
+    # 1. Свежее тело Issue вместо устаревшего снимка (ISSUE-113 пункт 5)
+    fresh_body = _refresh_issue_body(issue)
+    
     parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
-             "", f"## {issue.title}", "", issue.body or "(тело пустое)", ""]
+             "", f"## {issue.title}", "", fresh_body or "(тело пустое)", ""]
 
+    # 2. План декомпозиции и подзадачи (ISSUE-113 пункт 1)
+    plan = _fetch_decomposition_plan(issue)
+    if plan:
+        parts.append("## План декомпозиции")
+        parts.append("")
+        parts.append(plan)
+        parts.append("")
+        
+        # Подзадачи плана с телами
+        subtasks = _fetch_subtasks(issue)
+        if subtasks:
+            parts.append("### Подзадачи плана")
+            parts.append("")
+            for sub in subtasks:
+                parts.append(f"#### #{sub['number']} — {sub['title']}")
+                parts.append("")
+                parts.append(sub['body'])
+                parts.append("")
+
+    # 3. Артефакты FNR — все пять, включая отброшенные (ISSUE-113 пункт 4)
     if branch:
-        # Требования идут ПЕРВЫМИ: то, что агент прочитает раньше, весит
-        # больше, а task/concept — путь к требованиям, а не сами требования.
         parts.append("## Системные требования (аналитика Issue-Agent)")
         parts.append("")
+        
+        # Три основных артефакта (как было)
         for name in ("system_requirements.md", "task.md", "concept.md"):
             text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
             if text:
+                # Обрезаем каждый артефакт отдельно, если слишком большой
+                if len(text) > DEV_ARTIFACT_MAX_CHARS:
+                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
+                parts += [f"### {name}", "", text, ""]
+        
+        # Два дополнительных артефакта (ISSUE-113 пункт 3)
+        for name in ("repowise-dialog.md", "validation.md"):
+            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
+            if text:
+                if len(text) > DEV_ARTIFACT_MAX_CHARS:
+                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
                 parts += [f"### {name}", "", text, ""]
     else:
         parts += ["## Аналитики по задаче нет — работай от тела Issue.", ""]
 
+    # 4. Обсуждение Issue (ISSUE-113 пункт 2)
+    comments = _fetch_dev_comments(issue)
+    if comments:
+        parts.append("## Обсуждение Issue")
+        parts.append("")
+        parts.extend(comments)
+        parts.append("")
+
+    # 5. Правила репозитория и Repowise (как было)
     rules = (clone_dir / ".openhands" / "task-rules.md")
     parts.append(rules.read_text(encoding="utf-8") if rules.exists() else _DEV_FALLBACK_RULES)
     # Дописывается ПОСЛЕ правил репозитория, а не вместо: правила проекта
@@ -1497,7 +1661,47 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     if repowise.enabled():
         parts.append(_DEV_REPOWISE_RULES)
 
-    task = "\n".join(parts)
+    # 6. Применение потолка размера с усечением по приоритету (ISSUE-113 пункт 6)
+    # Приоритет: заголовок/тело > план > артефакты > обсуждение > правила
+    task_parts = []
+    current_section = []
+    section_name = ""
+    
+    for part in parts:
+        # Определяем заголовок секции (начинается с #)
+        if part.startswith("#") and not part.startswith("##"):  # Главный заголовок
+            if current_section:
+                task_parts.append((section_name, "\n".join(current_section)))
+            section_name = part
+            current_section = []
+        elif part.startswith("##"):  # Заголовок уровня 2
+            if current_section:
+                task_parts.append((section_name, "\n".join(current_section)))
+            section_name = part
+            current_section = []
+        else:
+            current_section.append(part)
+    
+    if current_section:
+        task_parts.append((section_name, "\n".join(current_section)))
+    
+    # Применяем лимит с приоритетом
+    priority_order = []
+    for i, (name, _) in enumerate(task_parts):
+        if name == f"# Задача: реализовать Issue #{issue.issue_number}" or name == f"## {issue.title}":
+            priority_order.append(i)
+        elif name.startswith("## План декомпозиции"):
+            priority_order.append(i)
+        elif name.startswith("## Системные требования"):
+            priority_order.append(i)
+    
+    final_parts = []
+    for name, content in task_parts:
+        final_parts.append(content)
+    
+    final_parts = _apply_size_limit(final_parts, DEV_TASK_MAX_CHARS, priority_order)
+    
+    task = "\n\n".join(final_parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
     _handover_to_runner(root)
     return task
@@ -1717,7 +1921,8 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
 
 
 @activity.defn
-async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
+async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None = None, 
+                                     branch: str | None = None) -> int | None:
     """Активность Develop: разработка по подготовленному Issue.
 
     Два режима (`shared/develop.py`). `local` — прогон одноразовым контейнером
@@ -1726,12 +1931,22 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
 
     Возвращает номер PR (режим `local`) либо None (`dispatch`: результат
     придёт событием `pr-open`, прогон идёт на чужой стороне).
+    
+    ISSUE-113: для подзадачи плана использует ветку родителя, а не свою.
+    `root_issue` — номер родительской задачи (если это подзадача плана),
+    `branch` — готовая ветка (если вычислена в workflow).
     """
     if not develop.enabled():
         raise RuntimeError(
             "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
 
-    branch = f"research/issue-{issue.issue_number}"
+    # ISSUE-113 пункт 2: если передана готовая ветка, используем её; иначе
+    # вычисляем как раньше. Для подзадачи плана workflow уже посчитал ветку
+    # родителя, поэтому передаём её явно.
+    if branch is None:
+        source = root_issue if root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
+    
     if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
         # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
         # агент работает от тела Issue, но знать об этом должен явно.
