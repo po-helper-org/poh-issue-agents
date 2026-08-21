@@ -129,12 +129,12 @@ def prefilter_bot_and_security(issue: IssueInput, origin_agent: bool = False) ->
     """
     if not origin_agent:
         if issue.author_type == "Bot":
-            github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
+            github_client.add_label(issue.repo, issue.issue_number, labels.BOT_AUTHORED)
             return "bot"
 
         KNOWN_BOT_LOGINS = {"dependabot", "renovate", "snyk-bot", "github-actions"}
         if issue.author_login.lower().removesuffix("[bot]") in KNOWN_BOT_LOGINS:
-            github_client.add_label(issue.repo, issue.issue_number, "bot-authored")
+            github_client.add_label(issue.repo, issue.issue_number, labels.BOT_AUTHORED)
             return "bot"
 
     # Latin terms must match whole words: the substring "rce" otherwise fires on
@@ -152,7 +152,7 @@ def prefilter_bot_and_security(issue: IssueInput, origin_agent: bool = False) ->
             "Автоматическая обработка приостановлена. Если включён Private "
             "Vulnerability Reporting — перенеси репорт туда.",
         )
-        github_client.add_label(issue.repo, issue.issue_number, "security-sensitive")
+        github_client.add_label(issue.repo, issue.issue_number, labels.SECURITY_SENSITIVE)
         return "security"
 
     return None
@@ -173,13 +173,13 @@ def intake_gate(issue: IssueInput, comment_thread: list[str]) -> GateResult:
 @activity.defn
 def post_clarifying_question(issue: IssueInput, questions: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, questions)
-    github_client.add_label(issue.repo, issue.issue_number, "needs-clarification")
+    github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_CLARIFICATION)
 
 
 @activity.defn
 def close_as_spam(issue: IssueInput, reason: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, f"🚫 Похоже на спам: {reason}")
-    github_client.add_label(issue.repo, issue.issue_number, "spam")
+    github_client.add_label(issue.repo, issue.issue_number, labels.SPAM)
     github_client.close_issue(issue.repo, issue.issue_number)
 
 
@@ -550,18 +550,18 @@ def classify_issue(issue: IssueInput, bft_on_triage: bool = False) -> Classifica
         _load_prompt("system_advisor.md"), user_message, ClassificationExtraction, model=llm.MODEL_CLASSIFY,
     )
     label_map = {
-        "EXISTING": "advisor:existing-functionality",
-        "CONSULTATION": "advisor:consultation",
-        "BUG": "advisor:bug",
-        "FEATURE": "advisor:feature-request",
+        "EXISTING": labels.ADVISOR_EXISTING,
+        "CONSULTATION": labels.ADVISOR_CONSULTATION,
+        "BUG": labels.ADVISOR_BUG,
+        "FEATURE": labels.ADVISOR_FEATURE,
     }
-    label = label_map.get(result.category, "advisor:answered")
+    label = label_map.get(result.category, labels.ADVISOR_ANSWERED)
     # The advisor prompt still asks the model to prefix its answer with a
     # legacy [[MARKER]] (from the pre-Instructor text-parsing era). The
     # category is now carried structurally, so strip that marker line before
     # posting — it must not appear in the user-facing comment.
     answer = re.sub(r"^\s*\[\[[^\]]+\]\]\s*", "", result.answer)
-    if not (bft_on_triage and label == "advisor:feature-request"):
+    if not (bft_on_triage and label == labels.ADVISOR_FEATURE):
         github_client.post_comment(issue.repo, issue.issue_number, answer)
     github_client.add_label(issue.repo, issue.issue_number, label)
     return ClassificationResult(label=label, answer=answer)
@@ -680,12 +680,12 @@ def duplicate_check(issue: IssueInput) -> DuplicateResult:
             f"\n\n⚠️ Не закрыт автоматически — нужно решение человека "
             f"(функциональный дубль ≠ целевой, см. #111).",
         )
-        github_client.add_label(issue.repo, issue.issue_number, "duplicate")
+        github_client.add_label(issue.repo, issue.issue_number, labels.DUPLICATE)
         return DuplicateResult(decision="duplicate", best_match_number=best.number,
                                 probability=best.probability, reason=best.reason, context_branch=branch)
 
     if best.probability >= 0.5:
-        github_client.add_label(issue.repo, issue.issue_number, "possible-duplicate")
+        github_client.add_label(issue.repo, issue.issue_number, labels.POSSIBLE_DUPLICATE)
         return DuplicateResult(decision="possible", best_match_number=best.number,
                                 probability=best.probability, reason=best.reason, context_branch=None)
 
@@ -730,6 +730,7 @@ def score_priority(issue: IssueInput, classification: ClassificationResult | Non
     if extracted.bug_severity == "critical":
         tier = config["bug_severity_override"]["critical_forces_priority"]
 
+    priority_label = f"{labels.PRIORITY_PREFIX}{priority.tier}"
     breakdown = (
         f"## Приоритет: {tier}\n\n"
         f"- Impact: {extracted.impact}/5, Time criticality: {extracted.time_criticality}/5, "
@@ -741,7 +742,7 @@ def score_priority(issue: IssueInput, classification: ClassificationResult | Non
         f"**Риски:** {', '.join(extracted.risks) or '—'}\n"
         f"**Влияние на цели:** {extracted.goal_impact}"
     )
-    return PriorityResult(tier=tier, breakdown_markdown=breakdown)
+    return PriorityResult(tier=tier, breakdown_markdown=breakdown, priority_label=priority_label)
 
 
 @activity.defn
@@ -753,7 +754,7 @@ def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: Dupl
             f"({dup.probability:.0%}) — стоит проверить перед запуском тяжёлой стадии."
         )
     github_client.post_comment(issue.repo, issue.issue_number, body)
-    github_client.add_label(issue.repo, issue.issue_number, f"priority:{priority.tier}")
+    github_client.add_label(issue.repo, issue.issue_number, priority.priority_label)
 
 
 # --- Пайплайн SA-helper (FNR) ---
@@ -3107,7 +3108,7 @@ def compute_estimate(facts_payload: dict, context: EstimationContext) -> Estimat
 def post_estimate_comment(req: EstimateRequest, result: EstimateResult) -> None:
     github_client.post_comment(req.repo, req.issue_number, result.markdown)
     if not result.stopped:
-        github_client.add_label(req.repo, req.issue_number, "estimated")
+        github_client.add_label(req.repo, req.issue_number, labels.ESTIMATED)
 
 
 @activity.defn
