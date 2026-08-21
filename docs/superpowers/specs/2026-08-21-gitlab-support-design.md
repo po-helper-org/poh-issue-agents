@@ -130,7 +130,9 @@ class Forge(Protocol):
 
 Это чинит существующий недостаток: `activities.py:199` `set_phase` делает **до 20 DELETE + 1 POST** на каждую смену фазы, и в окне между ними меток `phase:*` нет вовсе — `phase_from_labels` вернёт `None`. Через `set_labels` на GitLab это один вызов, на GitHub — прежняя последовательность, но описанная в одном месте.
 
-**`ensure_labels_exist` как явная операция.** Сегодня bootstrap меток отсутствует: grep по `label create` / `POST .../labels` даёт ноль. Система полагается на то, что GitHub заводит отсутствующую метку сам при добавлении на Issue — в коде это нигде не записано и не проверяется. Поведение GitLab в документации не описано; кроме того, `GET /projects/:id/labels` отдаёт **401 даже на публичном проекте** (проверено на цели демо). Значит метки надо заводить явно и заранее.
+**`ensure_labels_exist` как явная операция.** Сегодня bootstrap меток отсутствует: grep по `label create` / `POST .../labels` даёт ноль. Система полагается на то, что GitHub заводит отсутствующую метку сам при добавлении на Issue — в коде это нигде не записано и не проверяется. **Проверено на цели демо 2026-08-21:** GitLab заводит метку автоматически — `PUT` с `add_labels=<несуществующее имя>` отдаёт 200, метка появляется и на Issue, и в списке проекта. Поведение то же, что у GitHub.
+
+Значит `ensure_labels_exist` — не блокер корректности, а защита от другого: опечатка в имени метки молча создаёт мусорную метку вместо ошибки. Плюс явное заведение даёт цвета и описания, по которым выборку видно глазами. Отдельно: `GET /projects/:id/labels` отдаёт **401 даже на публичном проекте** — читать состояние меток без токена нельзя вовсе.
 
 **`linked_change_requests` возвращает список, а не сырой ответ.** У GitHub это Timeline API с `Accept: application/vnd.github.mockingbird-preview+json` и событием `cross-referenced`. Аналога в GitLab нет — граф пересобирается из `related_merge_requests`, `closed_by` и системных нот (`system: true`). Наружу разница не течёт.
 
@@ -427,9 +429,13 @@ GitLab → Preferences → Access tokens → новый токен:
 
 ### Шаг 2. Метки
 
-Контур хранит состояние Issue в метках и **сам их не создаёт**. Завести заранее (или дождаться `ensure_labels_exist` из шага 1 этапов):
+Контур хранит состояние Issue в метках и **сам их не создаёт**. GitLab заведёт недостающую сам при первом применении, но тогда она приедет без цвета и описания, а опечатка осядет мусорной меткой. Завести заранее:
 
-`phase:*` (19 значений), `advisor:*`, `priority:*`, `run:*` / `done:*` / `failed:*`, `needs-human:triage`, `needs-human:pr`, `origin:agent`, `agents:off`, `ready-for-dev`, `in-development`, `research-me`, `bug-me`, `build-me`, `duplicate`, `possible-duplicate`, `spam`, `bot-authored`, `security-sensitive`, `needs-clarification`, `estimated`.
+Полный набор — **59 меток**: `phase:*` (19), `advisor:*` (6), `priority:P0..P3` (4), `run:*` / `done:*` / `failed:*` по четырём командам (12), `needs-human:triage`, `needs-human:pr`, legacy `needs-human-triage` и `analyzing`, `origin:agent`, `agents:off`, `ready-for-dev`, `in-development`, триггерные `research-me` / `bug-me` / `build-me` и семь плоских (`duplicate`, `possible-duplicate`, `spam`, `bot-authored`, `security-sensitive`, `needs-clarification`, `estimated`).
+
+Список собирается из кода, а не переписывается руками: `lifecycle.PHASES`, `shared/labels.py`, `shared/commands.py:_COMMANDS`, `shared/pr_closing.py`, `shared/develop.py`. Иначе он разъедется с контуром на первой же новой фазе.
+
+**На цели демо метки заведены 2026-08-21** — 59 штук, ошибок ноль.
 
 ### Шаг 3. Вебхук
 
@@ -488,7 +494,7 @@ Project → Settings → Webhooks → Test → Issues events. Ожидается
 
 Ответы снимаются на стенде, не из документации.
 
-- **Заводит ли GitLab метку автоматически** при применении к Issue — в документации не описано. От этого зависит, обязателен ли `ensure_labels_exist` или он только страховка.
+- ~~Заводит ли GitLab метку автоматически~~ — **снято 2026-08-21**: заводит, `PUT` с `add_labels` на несуществующее имя даёт 200. `ensure_labels_exist` остаётся как защита от опечаток и ради цветов, а не как условие работоспособности.
 - **Код и текст ошибки при создании MR, который уже существует** — не задокументированы ни в API MR, ни в траблшутинге. Полагаться на «создай и поймай 409» как на контракт нельзя: закладывается pre-check по `?source_branch=&state=opened`.
 - **Поведение при рассинхроне `last_commit_id`** в Repository Files API — 400 или 409, не задокументировано.
 - **Дефолт `gitlab_rails['webhook_timeout']`** для self-managed: на `gitlab.com` 10 с, в примере кода документации фигурирует 60.
