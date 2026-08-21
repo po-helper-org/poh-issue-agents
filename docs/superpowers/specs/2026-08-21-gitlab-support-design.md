@@ -2,7 +2,7 @@
 
 **Дата:** 2026-08-21
 **Issue:** [#109](https://github.com/po-helper-org/poh-issue-agents/issues/109)
-**Статус:** дизайн согласован, реализация не начата
+**Статус:** этап 1 (закалка) выполнен, этап 2 (извлечение `poh-forge`) не начат
 
 ---
 
@@ -156,7 +156,7 @@ class RepoRef:
 
 **26 URL в `github_client.py` подставляют `{repo}` в путь без URL-кодирования.** Для GitHub `owner/repo` — корректный сегмент. GitLab требует `group%2Fsub%2Fproj`. Показательно, что в том же файле метка кодируется (`:166`), `workflow_file` кодируется (`:450`) — а repo нигде. Кодирование уезжает в `api_segment` и перестаёт быть заботой вызывающего.
 
-**`shared/repos.py:47` `is_allowed` на многосегментных путях.** Проверено прогоном: `group/subgroup/*` даёт `False`, точное совпадение `group/subgroup` даёт `False` — событие молча отбрасывается до Temporal. При этом `group/*` даёт `True`, но матчит рекурсивно все подгруппы: тише и шире, чем задумано.
+**`shared/repos.py:47` `is_allowed` на многосегментных путях.** Проверено прогоном: `group/sub/*` даёт `False` — единственный реальный дефект. Точное совпадение `group/sub/project` работает корректно (`True`), а при `group/*` даёт `True`, но матчит рекурсивно все подгруппы: тише и шире, чем задумано.
 
 Для цели демо это **не блокер**: `poh-harness/harness-demo-service` — ровно два сегмента, та же форма, что `owner/repo`. Проблема касается только корпоративного `group/subgroup/project`. Подгруппы GitLab вкладываются до 20 уровней.
 
@@ -431,7 +431,7 @@ GitLab → Preferences → Access tokens → новый токен:
 
 Контур хранит состояние Issue в метках и **сам их не создаёт**. GitLab заведёт недостающую сам при первом применении, но тогда она приедет без цвета и описания, а опечатка осядет мусорной меткой. Завести заранее:
 
-Полный набор — **59 меток**: `phase:*` (19), `advisor:*` (6), `priority:P0..P3` (4), `run:*` / `done:*` / `failed:*` по четырём командам (12), `needs-human:triage`, `needs-human:pr`, legacy `needs-human-triage` и `analyzing`, `origin:agent`, `agents:off`, `ready-for-dev`, `in-development`, триггерные `research-me` / `bug-me` / `build-me` и семь плоских (`duplicate`, `possible-duplicate`, `spam`, `bot-authored`, `security-sensitive`, `needs-clarification`, `estimated`).
+Полный набор — **60 меток**: `phase:*` (19), `advisor:*` (6), `priority:P0..P3` (4), `run:*` / `done:*` / `failed:*` по четырём командам (12), `needs-human:triage`, `needs-human:pr`, `not-duplicate`, `confirm-duplicate`, legacy `needs-human-triage` и `analyzing`, `origin:agent`, `agents:off`, `ready-for-dev`, `in-development`, триггерные `research-me` / `bug-me` / `build-me` и семь плоских (`duplicate`, `possible-duplicate`, `spam`, `bot-authored`, `security-sensitive`, `needs-clarification`, `estimated`). Каталог намеренно исключает `needs-human-triage` (система её не ставит), но включает `not-duplicate` и `confirm-duplicate`, которых в первоначальном списке не было.
 
 Список собирается из кода, а не переписывается руками: `lifecycle.PHASES`, `shared/labels.py`, `shared/commands.py:_COMMANDS`, `shared/pr_closing.py`, `shared/develop.py`. Иначе он разъедется с контуром на первой же новой фазе.
 
@@ -480,7 +480,7 @@ Project → Settings → Webhooks → Test → Issues events. Ожидается
 
 | # | Этап | Содержание |
 |---|---|---|
-| 1 | **Закалка** | `RepoRef` и URL-кодирование; allowlist на многосегментных путях; вебхук перестаёт отдавать 5xx; `set_labels(add, remove)`; `ensure_labels_exist`; опознание своих комментариев без `user.type`; характеризующие тесты на транспорт |
+| 1 | **Закалка** | `RepoRef` и URL-кодирование; allowlist на многосегментных путях; вебхук перестаёт отдавать 5xx; `set_labels(add, remove)`; `ensure_labels_exist`; опознание своих комментариев без `user.type`; характеризующие тесты на транспорт — **сделано** |
 | 2 | **Извлечение `poh-forge`** | Единственный драйвер GitHub. Поведение не меняется — но уже под страховкой тестов шага 1 |
 | 3 | **Драйвер GitLab** | Notes API, `PUT` для меток, MR, дельта меток из `changes`, граф Issue↔MR из трёх источников, award emoji с `issue_iid` |
 | 4 | **Демо** | `gitlab.com/poh-harness/harness-demo-service`: Issue про сервис планирования спринтов → MR с кодом |
