@@ -35,6 +35,8 @@ from workflows import (  # noqa: E402
     WebhookAudit,
 )
 
+from tests.conftest import make_fake_set_labels  # noqa: E402
+
 SECRET = "e2e-secret"
 REPO = "acme/widgets"
 
@@ -103,16 +105,12 @@ class FakeGitHub:
             self.labels.remove(label)
 
     def set_labels(self, repo, issue_number, *, add=(), remove=()):
-        """Смена набора одной операцией: ставим через add_label, снимаем
-        через remove_label, так что self.labels/self.calls остаются той же
-        точкой правды, которую читают остальные тесты этого файла."""
-        add = [label for label in add if label]
-        keep = set(add)
-        remove = [label for label in remove if label and label not in keep]
-        for label in add:
-            self.add_label(repo, issue_number, label)
-        for label in remove:
-            self.remove_label(repo, issue_number, label)
+        """Смена набора одной операцией: делегирует общему двойнику
+        (tests/conftest.py), который ставит через add_label и снимает через
+        remove_label, так что self.labels/self.calls остаются той же точкой
+        правды, которую читают остальные тесты этого файла."""
+        make_fake_set_labels(self.add_label, self.remove_label)(
+            repo, issue_number, add=add, remove=remove)
 
     def close_issue(self, repo, issue_number):
         self.state = "closed"

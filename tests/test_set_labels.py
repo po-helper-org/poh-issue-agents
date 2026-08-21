@@ -60,16 +60,47 @@ def test_failed_removal_is_logged_not_raised(monkeypatch):
 
 
 def test_failed_add_still_raises(monkeypatch):
-    """Непоставленная метка — потерянное состояние, это ошибка."""
+    """Непоставленная метка — потерянное состояние, это ошибка.
+
+    Но снятие всё равно должно было отработать: иначе 5xx на постановке
+    итоговой метки оставляет `run:*` на Issue навсегда, а прогон при этом уже
+    состоялся (успешно или нет) — выборка «прогон идёт» лжёт бессрочно.
+    """
     gc = _fresh(monkeypatch)
+    removed = []
     monkeypatch.setattr(gc.requests, "post", lambda url, **kw: _Resp(500))
-    monkeypatch.setattr(gc.requests, "delete", lambda url, **kw: _Resp())
+    monkeypatch.setattr(gc.requests, "delete",
+                        lambda url, **kw: removed.append(url) or _Resp())
 
     try:
-        gc.set_labels("o/r", 7, add=["phase:groomed"])
+        gc.set_labels("o/r", 7, add=["phase:groomed"], remove=["phase:classified"])
     except RuntimeError:
-        return
-    raise AssertionError("ошибка постановки метки должна подниматься")
+        pass
+    else:
+        raise AssertionError("ошибка постановки метки должна подниматься")
+
+    assert len(removed) == 1 and removed[0].endswith("/labels/phase%3Aclassified"), (
+        "снятие должно было выполниться, несмотря на сбой постановки")
+
+
+def test_removal_order_survives_a_failed_add(monkeypatch):
+    """Порядок «постановка → снятие» не нарушается сбоем: снятие не
+    пропускается, просто ошибка постановки поднимается уже после него."""
+    gc = _fresh(monkeypatch)
+    order = []
+    monkeypatch.setattr(gc.requests, "post",
+                        lambda url, **kw: order.append("add") or _Resp(500))
+    monkeypatch.setattr(gc.requests, "delete",
+                        lambda url, **kw: order.append("remove") or _Resp())
+
+    try:
+        gc.set_labels("o/r", 7, add=["phase:groomed"], remove=["phase:classified"])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("ошибка постановки метки должна подниматься")
+
+    assert order == ["add", "remove"]
 
 
 def test_label_being_added_is_never_removed(monkeypatch):

@@ -5,25 +5,7 @@ import asyncio
 import activities
 from shared.commands import ANALYZE, ESTIMATE
 from shared.workflow_types import AnalyzeInput, EstimateRequest
-
-
-def _fake_set_labels(repo, n, *, add=(), remove=()):
-    """Тестовый двойник `set_labels`: сохраняет её порядок (add раньше remove)
-    и фильтр (remove минус add), но проводит каждую метку через уже
-    подставленные `add_label`/`remove_label` — так шпион ниже (`_spy` и её
-    ad-hoc варианты) продолжает видеть вызовы на прежнем уровне, а не подмену
-    целого модуля. Отказ снятия — best-effort здесь же, как в реализации;
-    отказ постановки не ловится и уходит выше, как в реализации."""
-    add = [label for label in add if label]
-    keep = set(add)
-    remove = [label for label in remove if label and label not in keep]
-    for label in add:
-        activities.github_client.add_label(repo, n, label)
-    for label in remove:
-        try:
-            activities.github_client.remove_label(repo, n, label)
-        except Exception:
-            pass
+from tests.conftest import make_fake_set_labels
 
 
 def _spy(monkeypatch):
@@ -32,7 +14,9 @@ def _spy(monkeypatch):
                         lambda repo, n, label: calls.append(("+", repo, n, label)))
     monkeypatch.setattr(activities.github_client, "remove_label",
                         lambda repo, n, label: calls.append(("-", repo, n, label)))
-    monkeypatch.setattr(activities.github_client, "set_labels", _fake_set_labels)
+    monkeypatch.setattr(activities.github_client, "set_labels",
+                        make_fake_set_labels(activities.github_client.add_label,
+                                             activities.github_client.remove_label))
     return calls
 
 
@@ -75,7 +59,9 @@ def test_outcome_label_survives_a_failed_removal(monkeypatch):
     monkeypatch.setattr(activities.github_client, "remove_label", boom_remove)
     monkeypatch.setattr(activities.github_client, "add_label",
                         lambda repo, n, label: calls.append(label))
-    monkeypatch.setattr(activities.github_client, "set_labels", _fake_set_labels)
+    monkeypatch.setattr(activities.github_client, "set_labels",
+                        make_fake_set_labels(activities.github_client.add_label,
+                                             activities.github_client.remove_label))
 
     asyncio.run(activities.finish_command_labels("o/r", 7, ANALYZE, True))
 
@@ -89,7 +75,9 @@ def test_failed_outcome_label_does_not_break_the_workflow(monkeypatch):
         raise RuntimeError("GitHub 503")
 
     monkeypatch.setattr(activities.github_client, "add_label", boom_add)
-    monkeypatch.setattr(activities.github_client, "set_labels", _fake_set_labels)
+    monkeypatch.setattr(activities.github_client, "set_labels",
+                        make_fake_set_labels(activities.github_client.add_label,
+                                             activities.github_client.remove_label))
 
     asyncio.run(activities.finish_command_labels("o/r", 7, ANALYZE, True))  # не бросает
 

@@ -144,13 +144,17 @@ def post_comment(repo: str, issue_number: int, body: str) -> None:
     resp.raise_for_status()
 
 
+def _post_labels(repo: str, issue_number: int, labels: list[str]) -> None:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
+    resp = requests.post(url, headers=_auth_headers(repo), json={"labels": labels}, timeout=30)
+    resp.raise_for_status()
+
+
 def add_label(repo: str, issue_number: int, label: str) -> None:
     if _dry_run():
         _log.info("[DRY_RUN] label %s#%s += %s", repo, issue_number, label)
         return
-    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
-    resp = requests.post(url, headers=_auth_headers(repo), json={"labels": [label]}, timeout=30)
-    resp.raise_for_status()
+    _post_labels(repo, issue_number, [label])
 
 
 def remove_label(repo: str, issue_number: int, label: str) -> None:
@@ -173,7 +177,7 @@ def remove_label(repo: str, issue_number: int, label: str) -> None:
 
 
 def set_labels(repo: str, issue_number: int, *,
-               add: "Sequence[str]" = (), remove: "Sequence[str]" = ()) -> None:
+               add: Sequence[str] = (), remove: Sequence[str] = ()) -> None:
     """Приводит набор меток к нужному виду одной операцией.
 
     Порядок намеренный: сначала ставим целевые, потом снимаем лишние. При
@@ -182,10 +186,15 @@ def set_labels(repo: str, issue_number: int, *,
     выглядеть как не входивший в жизненный цикл. Две метки в том же окне
     противоречивы, но видны и восстановимы.
 
-    Постановка и снятие различаются по строгости, и это не случайность.
-    Непоставленная метка — потерянное состояние, поэтому ошибка поднимается.
-    Неснятая — мусор в выборке, из-за которого не стоит ронять прогон; она
-    уходит в лог, как это делал `set_phase`.
+    Снятие выполняется В ЛЮБОМ СЛУЧАЕ — даже если постановка упала. Раньше
+    сбой POST обрывал функцию до снятия, и 5xx на постановке итоговой метки
+    оставлял `run:analyze` на Issue навсегда: выборка «прогон идёт» показывала
+    завершённый прогон, а activity тем временем рапортовала успех. Постановка
+    и снятие всё равно различаются по строгости, и это не случайность.
+    Непоставленная метка — потерянное состояние, поэтому её ошибка
+    поднимается — но только ПОСЛЕ того, как снятие отработало. Неснятая —
+    мусор в выборке, из-за которого не стоит ронять прогон; она уходит в лог,
+    как это делал `set_phase`.
 
     У второго провайдера операция схлопывается в один запрос: GitLab
     обновляет метки одним `PUT` с `add_labels` / `remove_labels`. Здесь она
@@ -199,16 +208,19 @@ def set_labels(repo: str, issue_number: int, *,
     if _dry_run():
         _log.info("[DRY_RUN] labels %s#%s += %s -= %s", repo, issue_number, add, remove)
         return
+    add_error: Exception | None = None
     if add:
-        url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
-        resp = requests.post(url, headers=_auth_headers(repo),
-                             json={"labels": add}, timeout=30)
-        resp.raise_for_status()
+        try:
+            _post_labels(repo, issue_number, add)
+        except Exception as exc:
+            add_error = exc
     for label in remove:
         try:
             remove_label(repo, issue_number, label)
         except Exception as exc:
             _log.warning("не снял метку %s с %s#%s: %s", label, repo, issue_number, exc)
+    if add_error is not None:
+        raise add_error
 
 
 def create_issue(repo: str, title: str, body: str, labels: list[str] | None = None) -> int:

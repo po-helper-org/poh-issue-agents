@@ -16,25 +16,12 @@ import pytest
 import activities as activities_module
 from shared import develop
 from shared.workflow_types import IssueInput
+from tests.conftest import make_fake_set_labels
 
 
 def _issue(number: int = 7) -> IssueInput:
     return IssueInput(repo="o/r", issue_number=number, title="t", body="b",
                       author_login="u", author_type="User", interactive=True)
-
-
-def _fake_set_labels(repo, n, *, add=(), remove=()):
-    """Тестовый двойник set_labels для тестов, что мокают add_label/remove_label
-    по отдельности, а не github_client целиком: сохраняет порядок и фильтр
-    (remove минус add) реализации, но зовёт уже подставленные функции, чтобы
-    существующие списки-шпионы (`removed`) продолжали видеть вызовы."""
-    add = [label for label in add if label]
-    keep = set(add)
-    remove = [label for label in remove if label and label not in keep]
-    for label in add:
-        activities_module.github_client.add_label(repo, n, label)
-    for label in remove:
-        activities_module.github_client.remove_label(repo, n, label)
 
 
 @pytest.fixture
@@ -227,7 +214,9 @@ def test_in_development_label_is_dropped_when_the_phase_moves_on(monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "remove_label",
                         lambda repo, n, label: removed.append(label))
     monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
-    monkeypatch.setattr(activities_module.github_client, "set_labels", _fake_set_labels)
+    monkeypatch.setattr(activities_module.github_client, "set_labels",
+                        make_fake_set_labels(activities_module.github_client.add_label,
+                                             activities_module.github_client.remove_label))
 
     activities_module.set_phase("o/r", 7, "pr-open")
 
@@ -239,7 +228,9 @@ def test_in_development_label_survives_its_own_phase(monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "remove_label",
                         lambda repo, n, label: removed.append(label))
     monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
-    monkeypatch.setattr(activities_module.github_client, "set_labels", _fake_set_labels)
+    monkeypatch.setattr(activities_module.github_client, "set_labels",
+                        make_fake_set_labels(activities_module.github_client.add_label,
+                                             activities_module.github_client.remove_label))
 
     activities_module.set_phase("o/r", 7, "in-development")
 

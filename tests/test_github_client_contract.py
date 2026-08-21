@@ -76,6 +76,14 @@ def test_add_label_contract(capture):
     assert calls[0][2]["json"] == {"labels": ["phase:classified"]}
 
 
+def test_set_labels_contract(capture):
+    gc, calls = capture
+    gc.set_labels("o/r", 7, add=["phase:groomed"], remove=["phase:classified"])
+    assert calls[0][:2] == ("POST", f"{B}/repos/o/r/issues/7/labels")
+    assert calls[0][2]["json"] == {"labels": ["phase:groomed"]}
+    assert calls[1][:2] == ("DELETE", f"{B}/repos/o/r/issues/7/labels/phase%3Aclassified")
+
+
 def test_remove_label_contract(capture):
     gc, calls = capture
     gc.remove_label("o/r", 7, "run:analyze")
