@@ -445,6 +445,18 @@ def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
 
 
 @activity.defn
+def read_issue_labels(repo: str, issue_number: int) -> list[str]:
+    """Читает текущие метки Issue для проверки уже стоящих решений.
+    
+    Используется в сценариях, когда Issue приходит в фазу с уже проставленными
+    метками (например, `research-me` на Issue, который вернулся из DUPLICATE),
+    чтобы не ждать нового сигнала человека, а сразу продолжить обработку.
+    """
+    issue = github_client.get_issue(repo, issue_number)
+    return [label["name"] for label in issue.get("labels", [])]
+
+
+@activity.defn
 def post_error_label(issue: IssueInput, reason: str = "") -> None:
     # Sentry ПЕРЕД комментарием, а не после: id события уезжает в тот же
     # комментарий ссылкой, иначе человек видит «не удалось» и не знает, где
