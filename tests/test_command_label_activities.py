@@ -5,6 +5,7 @@ import asyncio
 import activities
 from shared.commands import ANALYZE, ESTIMATE
 from shared.workflow_types import AnalyzeInput, EstimateRequest
+from tests.conftest import make_fake_set_labels
 
 
 def _spy(monkeypatch):
@@ -13,6 +14,9 @@ def _spy(monkeypatch):
                         lambda repo, n, label: calls.append(("+", repo, n, label)))
     monkeypatch.setattr(activities.github_client, "remove_label",
                         lambda repo, n, label: calls.append(("-", repo, n, label)))
+    monkeypatch.setattr(activities.github_client, "set_labels",
+                        make_fake_set_labels(activities.github_client.add_label,
+                                             activities.github_client.remove_label))
     return calls
 
 
@@ -55,6 +59,9 @@ def test_outcome_label_survives_a_failed_removal(monkeypatch):
     monkeypatch.setattr(activities.github_client, "remove_label", boom_remove)
     monkeypatch.setattr(activities.github_client, "add_label",
                         lambda repo, n, label: calls.append(label))
+    monkeypatch.setattr(activities.github_client, "set_labels",
+                        make_fake_set_labels(activities.github_client.add_label,
+                                             activities.github_client.remove_label))
 
     asyncio.run(activities.finish_command_labels("o/r", 7, ANALYZE, True))
 
@@ -68,6 +75,9 @@ def test_failed_outcome_label_does_not_break_the_workflow(monkeypatch):
         raise RuntimeError("GitHub 503")
 
     monkeypatch.setattr(activities.github_client, "add_label", boom_add)
+    monkeypatch.setattr(activities.github_client, "set_labels",
+                        make_fake_set_labels(activities.github_client.add_label,
+                                             activities.github_client.remove_label))
 
     asyncio.run(activities.finish_command_labels("o/r", 7, ANALYZE, True))  # не бросает
 

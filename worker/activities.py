@@ -204,6 +204,10 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
 
     Допустимость самого перехода проверяет воркфлоу (у него есть предыдущая
     фаза); здесь — только запись, идемпотентная по построению.
+
+    Целевая метка ставится раньше снятия прежних: окно, в котором меток
+    `phase:*` нет вовсе, хуже окна, в котором их две. Атомарно это делается
+    только на провайдере, умеющем менять набор одним запросом.
     """
     target = lifecycle.phase_label(phase)
     stale_labels = [lifecycle.phase_label(other) for other in lifecycle.PHASES]
@@ -213,14 +217,7 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
     # завершилась; единственная точка, которая знает о смене состояния, — здесь.
     if phase != lifecycle.IN_DEVELOPMENT:
         stale_labels.append(develop.IN_DEVELOPMENT_LABEL)
-    for stale in stale_labels:
-        if stale != target:
-            try:
-                github_client.remove_label(repo, issue_number, stale)
-            except Exception as exc:
-                logger.warning("не снял метку фазы %s с %s#%s: %s",
-                               stale, repo, issue_number, exc)
-    github_client.add_label(repo, issue_number, target)
+    github_client.set_labels(repo, issue_number, add=[target], remove=stale_labels)
 
 
 @activity.defn
@@ -238,12 +235,9 @@ def mark_awaiting(repo: str, issue_number: int, waiting=None) -> None:
     if waiting is not None and isinstance(waiting, dict):
         waiting = Awaiting(**waiting)
     if waiting is not None and waiting.blocks_on_human:
-        github_client.add_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
+        github_client.set_labels(repo, issue_number, add=[labels.NEEDS_HUMAN_TRIAGE])
         return
-    try:
-        github_client.remove_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
-    except Exception as exc:
-        logger.warning("не снял метку ожидания с %s#%s: %s", repo, issue_number, exc)
+    github_client.set_labels(repo, issue_number, remove=[labels.NEEDS_HUMAN_TRIAGE])
 
 
 @activity.defn
@@ -502,9 +496,13 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     Неуспех получает СВОЮ метку, а не просто снятый `run:*`: молча снятая метка
     неотличима от «никто не запускал», а именно это и нужно увидеть в ленте.
 
-    Best-effort по каждой метке: прогон уже состоялся, и провал косметики не
-    должен превращать успешный анализ в проваленный. Ошибка уходит в лог, но
-    наружу не пробрасывается — activity зовётся из терминальных веток воркфлоу.
+    Best-effort по операции целиком, а не по каждой метке отдельно:
+    `set_labels` снимает `run:*` и предыдущий исход даже если постановка новой
+    метки исхода упала — иначе 5xx на POST оставлял бы `run:analyze` на Issue
+    навсегда. Ошибка от `set_labels` (если постановка всё же не удалась)
+    гасится здесь же: прогон уже состоялся, и провал косметики не должен
+    превращать успешный анализ в проваленный. Наружу не пробрасывается —
+    activity зовётся из терминальных веток воркфлоу.
     """
     outcome = done_label(command) if ok else failed_label(command)
     # Исход ПРЕДЫДУЩЕГО прогона снимается вместе с «идёт»: `done:analyze` рядом
@@ -512,15 +510,13 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     # сказать, чем кончился последний прогон, и выборка `label:failed:*`
     # показывает задачи, которые давно починены повторным запуском.
     previous = failed_label(command) if ok else done_label(command)
-    for stale in (*running_labels(command), previous):
-        try:
-            await asyncio.to_thread(github_client.remove_label, repo, issue_number, stale)
-        except Exception as exc:
-            logger.warning("не снял метку %s с %s#%s: %s", stale, repo, issue_number, exc)
     try:
-        await asyncio.to_thread(github_client.add_label, repo, issue_number, outcome)
+        await asyncio.to_thread(
+            github_client.set_labels, repo, issue_number,
+            add=[outcome], remove=[*running_labels(command), previous])
     except Exception as exc:
-        logger.warning("не поставил метку %s на %s#%s: %s", outcome, repo, issue_number, exc)
+        logger.warning("не привёл метки команды на %s#%s к виду %s: %s",
+                       repo, issue_number, outcome, exc)
 
 
 # --- Классификация ---

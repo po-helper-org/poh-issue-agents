@@ -16,6 +16,7 @@ import pytest
 import activities as activities_module
 from shared import develop
 from shared.workflow_types import IssueInput
+from tests.conftest import make_fake_set_labels
 
 
 def _issue(number: int = 7) -> IssueInput:
@@ -213,6 +214,9 @@ def test_in_development_label_is_dropped_when_the_phase_moves_on(monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "remove_label",
                         lambda repo, n, label: removed.append(label))
     monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+    monkeypatch.setattr(activities_module.github_client, "set_labels",
+                        make_fake_set_labels(activities_module.github_client.add_label,
+                                             activities_module.github_client.remove_label))
 
     activities_module.set_phase("o/r", 7, "pr-open")
 
@@ -224,6 +228,9 @@ def test_in_development_label_survives_its_own_phase(monkeypatch):
     monkeypatch.setattr(activities_module.github_client, "remove_label",
                         lambda repo, n, label: removed.append(label))
     monkeypatch.setattr(activities_module.github_client, "add_label", lambda *a: None)
+    monkeypatch.setattr(activities_module.github_client, "set_labels",
+                        make_fake_set_labels(activities_module.github_client.add_label,
+                                             activities_module.github_client.remove_label))
 
     activities_module.set_phase("o/r", 7, "in-development")
 
