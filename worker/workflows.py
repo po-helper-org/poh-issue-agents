@@ -25,7 +25,7 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared import bft, lifecycle
+    from shared import bft, labels, lifecycle
     from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE
     from shared.workflow_ids import (
         analysis_workflow_id,
@@ -1438,6 +1438,24 @@ class IssueLifecycle:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+        
+        # При RESEARCH_AUTOSTART ожидания нет: триаж сам довёл задачу до
+        # system-requirements, и решение «декомпозиция или сразу разработка»
+        # уже принято в коде (флаг self._decompose). Нет смысла парковаться и
+        # ждать того же решения от человека.
+        #
+        # Если включён и DEVELOP_AUTOSTART — идём сразу в разработку, минуя
+        # парковку в ready-for-dev. Если только RESEARCH_AUTOSTART — всё равно
+        # не парковаться: задача дошла до конца исследовательского пути, и
+        # следующее решение (запуск разработки) принимается отдельно, в своей
+        # фазе (_phase_await_build).
+        if deadlines.research_autostart:
+            if deadlines.develop_autostart and not self._plan_member:
+                # Полный автостарт: Research + Develop → замкнутый контур
+                return await self._start_development(issue)
+            # Только Research автостарт: дошли до ready-for-dev без парковки
+            return (lifecycle.READY_FOR_DEV, None, False)
+        
         return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
 
     async def _clarify_open_questions(self, issue: IssueInput, deadlines,
@@ -1851,6 +1869,30 @@ class IssueLifecycle:
         if self._phase == lifecycle.DUPLICATE:
             if signal == "not-duplicate":
                 # Вернуть в работу (переход в CLASSIFIED)
+                # Если на Issue уже стоят метки решения (research-me/bug-me), 
+                # проверить их сразу, чтобы не парковать на полный срок
+                if workflow.patched("issue-lifecycle-duplicate-exit-checks-existing-labels"):
+                    current_labels = await workflow.execute_activity(
+                        activities.read_issue_labels,
+                        args=[issue.repo, issue.issue_number],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    # Проверяем метки решения человека
+                    if labels.has(current_labels, "research-me"):
+                        # Проверяем классификацию для совместимости с гардами
+                        label = self._classification_label
+                        feature = label is None or label == "advisor:feature-request"
+                        if feature:
+                            # Подзадача плана аналитику не заказывает (см. _phase_await_decision)
+                            if self._plan_member and workflow.patched(
+                                    "issue-lifecycle-plan-member-skips-analysis"):
+                                return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
+                            return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+                    elif labels.has(current_labels, "bug-me"):
+                        label = self._classification_label
+                        bug = label is None or label == "advisor:bug"
+                        if bug:
+                            return (lifecycle.READY_FOR_DEV, "bug", True)
                 return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
             if signal == "confirm-duplicate":
                 # Подтвердить дубликат (переход в CANCELLED)
