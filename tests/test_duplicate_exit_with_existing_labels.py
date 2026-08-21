@@ -182,6 +182,7 @@ async def test_duplicate_exit_with_research_me_label_skips_park():
     _calls.clear()
     
     # Заглушка, которая возвращает метку research-me
+    @activity.defn(name="read_issue_labels")
     async def read_labels_with_research_me(repo: str, issue_number: int) -> list[str]:
         return ["research-me", "phase:duplicate"]
     
@@ -201,19 +202,24 @@ async def test_duplicate_exit_with_research_me_label_skips_park():
                           activities=activities):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            
-            # Ждём, пока Issue перейдёт в DUPLICATE
-            current = await _await_phase(env, handle, lifecycle.DUPLICATE)
-            assert current == lifecycle.DUPLICATE, f"Expected DUPLICATE, got {current}"
-            assert "duplicate_check" in _calls
-            
-            # Отправляем сигнал "not-duplicate" при уже стоящей метке research-me
-            await handle.signal(IssueLifecycle.human_decision, "not-duplicate")
-            
-            # Ждём перехода в BUSINESS_ANALYSIS (не в CLASSIFIED!)
-            current = await _await_phase(env, handle, lifecycle.BUSINESS_ANALYSIS)
-            assert current == lifecycle.BUSINESS_ANALYSIS, \
-                f"Expected BUSINESS_ANALYSIS, got {current}"
+
+            # Таймскип отключаем на время наблюдения: без этого авто-продвижение
+            # времени на каждом query гонится с параллельными парковками
+            # (см. тот же приём в test_research_autostart.py) и валит запрос
+            # RPCError'ом "query deadline exceeded".
+            with env.auto_time_skipping_disabled():
+                # Ждём, пока Issue перейдёт в DUPLICATE
+                current = await _await_phase(env, handle, lifecycle.DUPLICATE)
+                assert current == lifecycle.DUPLICATE, f"Expected DUPLICATE, got {current}"
+                assert "duplicate_check" in _calls
+
+                # Отправляем сигнал "not-duplicate" при уже стоящей метке research-me
+                await handle.signal(IssueLifecycle.human_decision, "not-duplicate")
+
+                # Ждём перехода в BUSINESS_ANALYSIS (не в CLASSIFIED!)
+                current = await _await_phase(env, handle, lifecycle.BUSINESS_ANALYSIS)
+                assert current == lifecycle.BUSINESS_ANALYSIS, \
+                    f"Expected BUSINESS_ANALYSIS, got {current}"
 
 
 @pytest.mark.timeout(90)
@@ -222,10 +228,12 @@ async def test_duplicate_exit_with_bug_me_label_skips_park():
     _calls.clear()
     
     # Заглушка, которая возвращает метку bug-me
+    @activity.defn(name="read_issue_labels")
     async def read_labels_with_bug_me(repo: str, issue_number: int) -> list[str]:
         return ["bug-me", "phase:duplicate"]
     
     # Заглушка классификации для бага
+    @activity.defn(name="classify_issue")
     async def classify_bug(issue: IssueInput, bft_on_triage: bool = False):
         return ClassificationResult(label="advisor:bug", answer="ok")
     
@@ -245,18 +253,19 @@ async def test_duplicate_exit_with_bug_me_label_skips_park():
                           activities=activities):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            
-            # Ждём, пока Issue перейдёт в DUPLICATE
-            current = await _await_phase(env, handle, lifecycle.DUPLICATE)
-            assert current == lifecycle.DUPLICATE, f"Expected DUPLICATE, got {current}"
-            
-            # Отправляем сигнал "not-duplicate" при уже стоящей метке bug-me
-            await handle.signal(IssueLifecycle.human_decision, "not-duplicate")
-            
-            # Ждём перехода в READY_FOR_DEV (не в CLASSIFIED!)
-            current = await _await_phase(env, handle, lifecycle.READY_FOR_DEV)
-            assert current == lifecycle.READY_FOR_DEV, \
-                f"Expected READY_FOR_DEV, got {current}"
+
+            with env.auto_time_skipping_disabled():
+                # Ждём, пока Issue перейдёт в DUPLICATE
+                current = await _await_phase(env, handle, lifecycle.DUPLICATE)
+                assert current == lifecycle.DUPLICATE, f"Expected DUPLICATE, got {current}"
+
+                # Отправляем сигнал "not-duplicate" при уже стоящей метке bug-me
+                await handle.signal(IssueLifecycle.human_decision, "not-duplicate")
+
+                # Ждём перехода в READY_FOR_DEV (не в CLASSIFIED!)
+                current = await _await_phase(env, handle, lifecycle.READY_FOR_DEV)
+                assert current == lifecycle.READY_FOR_DEV, \
+                    f"Expected READY_FOR_DEV, got {current}"
 
 
 @pytest.mark.timeout(90)
@@ -265,6 +274,7 @@ async def test_duplicate_exit_without_decision_labels_parks_normally():
     _calls.clear()
     
     # Заглушка, которая возвращает метки без решения
+    @activity.defn(name="read_issue_labels")
     async def read_labels_no_decision(repo: str, issue_number: int) -> list[str]:
         return ["phase:duplicate"]
     
