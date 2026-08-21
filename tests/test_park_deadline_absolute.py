@@ -20,6 +20,7 @@ from temporalio.worker import Worker
 
 from shared.workflow_types import (
     ClassificationResult,
+    CommentIntent,
     Deadlines,
     DuplicateResult,
     GateResult,
@@ -80,6 +81,13 @@ async def escalate(issue: IssueInput, reason: str = "") -> None:
     _calls.append("escalated")
 
 
+@activity.defn(name="interpret_user_comment")
+async def interpret_user_comment_stub(issue: IssueInput, comment_text: str,
+                                      current_phase: str, classification_label,
+                                      awaiting_reason: str, recent_artifacts=None) -> CommentIntent:
+    return CommentIntent(intent="question", reason="посторонняя реплика")
+
+
 def _deadlines(hours: int):
     @activity.defn(name="read_deadlines")
     async def read() -> Deadlines:
@@ -88,7 +96,8 @@ def _deadlines(hours: int):
 
 
 ACTIVITIES = [prefilter_ok, protocol_default, set_phase_stub, gate_ok,
-              classify_feature, duplicate_none, score_p1, post_priority, escalate]
+              classify_feature, duplicate_none, score_p1, post_priority, escalate,
+              interpret_user_comment_stub]
 
 
 def _issue() -> IssueInput:

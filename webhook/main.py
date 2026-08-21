@@ -633,5 +633,20 @@ async def _handle_delivery(payload: dict, x_github_event: str,
             # нет; поэтому комментарий по-прежнему best-effort.
             _log.info("no live lifecycle for %s#%s — комментарий не доставлен",
                       repo, issue_number)
+            
+            # Минимальная реакция на комментарий в мёртвый прогон:
+            # ставим реакцию 👀, чтобы человек увидел, что его комментарий принят,
+            # но цикл по этому Issue завершён.
+            try:
+                from worker import github_client
+                await asyncio.to_thread(
+                    github_client.add_reaction,
+                    repo,
+                    payload["comment"]["id"],
+                    "eyes"
+                )
+            except Exception as reaction_exc:
+                # Реакция — только удобство, её неудача не должна ломать вебхук
+                _log.warning("не смог поставить реакцию на комментарий: %s", reaction_exc)
 
     return {"ok": True}

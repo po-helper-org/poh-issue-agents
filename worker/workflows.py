@@ -40,6 +40,7 @@ with workflow.unsafe.imports_passed_through():
         BftRequest,
         ClassificationResult,
         CommentAckInput,
+        CommentIntent,
         Deadlines,
         EstimateRequest,
         EstimateResult,
@@ -66,6 +67,10 @@ MAX_CLARIFICATION_ROUNDS = 2
 # кончаются, вопросы уезжают в чеклист готовности, и решение принимает тот, кто
 # возьмёт задачу.
 MAX_ANALYSIS_CLARIFY_ROUNDS = 2
+
+# Потолок возвратов этапа на пересборку. Человек может вернуть этап много раз,
+# но каждый круг — это полный прогон триажа/аналитики, который стоит денег.
+MAX_REWORK_ROUNDS = 2
 
 # Запрос на прогон аналитики, доставленный в общую очередь сигналов. Та же
 # схема, что у реплики человека (`UserComment`): одна очередь, разные виды
@@ -343,6 +348,11 @@ class IssueLifecycle:
         self._followup_rounds = 0
         self._answered_comment_ids: list[int] = []
         self._followup_max_rounds = Deadlines().followup_max_rounds
+        # Сколько раз человек вернул этап на пересборку (rework intent).
+        # Потолок нужен, чтобы пара «переделай» ↔ «переделал» не стояла по
+        # LLM-прогону за круг без конца.
+        self._rework_rounds = 0
+        self._rework_max_rounds = MAX_REWORK_ROUNDS
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -691,6 +701,7 @@ class IssueLifecycle:
             self._clarify_rounds = carried.clarify_rounds
             self._followup_rounds = carried.followup_rounds
             self._answered_comment_ids = list(carried.answered_comment_ids)
+            self._rework_rounds = carried.rework_rounds
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -722,6 +733,7 @@ class IssueLifecycle:
             clarify_rounds=self._clarify_rounds,
             followup_rounds=self._followup_rounds,
             answered_comment_ids=list(self._answered_comment_ids),
+            rework_rounds=self._rework_rounds,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -1333,12 +1345,17 @@ class IssueLifecycle:
             # Явная команда человека сильнее гварда по типу Issue: он защищает
             # от неудачно поставленной метки, а не от прямого `/analyze`.
             return await self._analysis_requested(issue)
-        if isinstance(decision, UserComment) and workflow.patched(
-                "issue-lifecycle-followup-answer"):
-            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
-            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
-            # активность, которой там нет, — реплей упал бы недетерминизмом.
-            return await self._answer_followup(issue, decision)
+        if isinstance(decision, UserComment):
+            # Разбор намерения из реплики человека
+            intent = await workflow.execute_activity(
+                activities.interpret_user_comment,
+                args=[issue, decision.text, self._phase, self._classification_label,
+                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            
+            return await self._handle_comment_intent(issue, decision, intent, deadlines)
 
         # `classification_label is None` — сокращённый триаж (Issue от агента):
         # он уже классифицирован на стороне создателя, гвард проверять не на чем.
@@ -1546,6 +1563,107 @@ class IssueLifecycle:
             workflow.logger.warning("не ответил на реплику: %s", _failure_reason(exc))
         return (self._phase, self._stage, False)
 
+    async def _handle_comment_intent(self, issue: IssueInput, comment: UserComment,
+                                   intent: CommentIntent, deadlines) -> tuple:
+        """Обработка намерения, извлечённого из реплики человека.
+        
+        Реагирует на comment intent в зависимости от текущей фазы и типа намерения.
+        """
+        # Защита от повторной доставки: уже отвеченные комментарии игнорируем
+        if comment.comment_id is not None and comment.comment_id in self._answered_comment_ids:
+            workflow.logger.info("комментарий #%s уже обработан — пропускаю", comment.comment_id)
+            return (self._phase, self._stage, False)
+        
+        # Отмечаем комментарий как обработанный
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        
+        # Обработка по типу намерения
+        if intent.intent == "proceed":
+            # Человек подтвердил продолжение — двигаем фазу по основному пути
+            if self._phase == lifecycle.CLASSIFIED:
+                label = self._classification_label
+                feature = label is None or label == "advisor:feature-request"
+                bug = label is None or label == "advisor:bug"
+                
+                if feature:
+                    return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+                if bug:
+                    return (lifecycle.READY_FOR_DEV, "bug", True)
+            
+            # В других фазах proceed — просто ответ, что продолжаем
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, intent.reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "rework":
+            # Проверяем потолок возвратов этапа
+            if self._rework_rounds >= self._rework_max_rounds:
+                # Потолок исчерпан — отвечаем, что больше не переделываем
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                 "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                return (self._phase, self._stage, False)
+            
+            self._rework_rounds += 1
+            
+            # Возврат в created с репликой в контексте
+            if self._phase == lifecycle.CLASSIFIED:
+                # Возвращаемся в created, триаж перезапустится
+                return (lifecycle.CREATED, "rework", True)
+            
+            # В других фазах rework не поддерживаем — отвечаем, что не можем
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                             "Продолжай работу или поставь метку для перехода."],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "question":
+            # Вопрос — отвечаем, парковку держим
+            if self._followup_rounds >= self._followup_max_rounds:
+                workflow.logger.info("потолок реплик исчерпан (%s) — отвечаю молчанием",
+                                     self._followup_max_rounds)
+                return (self._phase, self._stage, False)
+            self._followup_rounds += 1
+            try:
+                await workflow.execute_activity(
+                    activities.answer_followup,
+                    args=[issue, comment.text],
+                    start_to_close_timeout=timedelta(seconds=180),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as exc:
+                workflow.logger.warning("не ответил на вопрос: %s", _failure_reason(exc))
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "ack":
+            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные ходы
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, intent.reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        else:
+            # Неизвестный intent — логируем и игнорируем
+            workflow.logger.warning("неизвестный intent: %s", intent.intent)
+            return (self._phase, self._stage, False)
+
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
 
@@ -1746,12 +1864,17 @@ class IssueLifecycle:
             # Команда работает и на припаркованном Issue: из бокового состояния
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
-        if isinstance(signal, UserComment) and workflow.patched(
-                "issue-lifecycle-followup-answer"):
-            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
-            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
-            # активность, которой там нет, — реплей упал бы недетерминизмом.
-            return await self._answer_followup(issue, signal)
+        if isinstance(signal, UserComment):
+            # Разбор намерения из реплики человека
+            intent = await workflow.execute_activity(
+                activities.interpret_user_comment,
+                args=[issue, signal.text, self._phase, self._classification_label,
+                      awaiting_mod.reason_for_phase(self._phase)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            
+            return await self._handle_comment_intent(issue, signal, intent, deadlines)
         
         # Обработка специфических сигналов для фазы DUPLICATE
         if self._phase == lifecycle.DUPLICATE:

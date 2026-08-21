@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -145,6 +146,11 @@ class LifecycleState:
     # доставки вебхука — иначе первый же continue-as-new отвечает дважды.
     followup_rounds: int = 0
     answered_comment_ids: list[int] = field(default_factory=list)
+    # Сколько раз человек вернул этап на пересборку (rework intent).
+    # Переносится по той же причине, что и `clarify_rounds`: перезапуск
+    # не должен обнулять потолок, иначе «переделай» ↔ «переделал» будет
+    # повторяться бесконечно.
+    rework_rounds: int = 0
 
 
 @dataclass
@@ -358,3 +364,15 @@ class Increment:
     name: str
     rationale: str
     issue_numbers: list[int]
+
+
+@dataclass
+class CommentIntent:
+    """Намерение, извлечённое из реплики человека.
+    
+    Активность `interpret_user_comment` возвращает этот тип — по нему цикл
+    принимает решение о том, что делать с комментарием.
+    """
+    intent: str  # "proceed" | "rework" | "question" | "ack"
+    reason: str  # обоснование для комментария-ответа
+    rework_note: str = ""  # что именно переделывать (только для intent="rework")
