@@ -223,6 +223,49 @@ def set_labels(repo: str, issue_number: int, *,
         raise add_error
 
 
+def ensure_labels_exist(repo: str, specs) -> int:
+    """Заводит недостающие метки. Возвращает число созданных.
+
+    Трекеры создают метку сами при первом применении — и GitHub, и GitLab
+    (проверено 2026-08-21). Проблема не в отказе, а в тишине: опечатка в имени
+    оседает новой меткой вместо ошибки, и выборка тихо перестаёт находить то,
+    что искала. Явное заведение делает набор конечным и заодно даёт цвета.
+
+    Идемпотентна: существующая метка не трогается, цвет ей не переписывается —
+    человек мог поправить его руками, и спорить с ним незачем.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] ensure labels %s: %s", repo, [s.name for s in specs])
+        return 0
+    url = f"https://api.github.com/repos/{repo}/labels"
+    existing: set[str] = set()
+    page = 1
+    while True:
+        resp = requests.get(url, headers=_auth_headers(repo),
+                            params={"per_page": 100, "page": page}, timeout=30)
+        resp.raise_for_status()
+        chunk = resp.json()
+        existing.update(item["name"] for item in chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+
+    created = 0
+    for spec in specs:
+        if spec.name in existing:
+            continue
+        resp = requests.post(url, headers=_auth_headers(repo), timeout=30, json={
+            "name": spec.name,
+            "color": spec.color.lstrip("#"),
+            "description": spec.description,
+        })
+        if resp.status_code == 422:
+            continue  # завелась параллельно — не наша забота
+        resp.raise_for_status()
+        created += 1
+    return created
+
+
 def create_issue(repo: str, title: str, body: str, labels: list[str] | None = None) -> int:
     """Создаёт Issue и возвращает его номер.
 

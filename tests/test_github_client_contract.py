@@ -13,6 +13,8 @@ import importlib
 
 import pytest
 
+from shared.label_catalog import LabelSpec
+
 
 def _fresh(monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "tok")
@@ -146,3 +148,50 @@ def test_pat_beats_app_in_auth_header(capture):
     headers = gc._auth_headers("o/r")
     assert headers["Authorization"] == "Bearer tok"
     assert headers["Accept"] == "application/vnd.github+json"
+
+
+def test_ensure_labels_exist_contract(monkeypatch):
+    """`ensure_labels_exist` бьёт в /labels проекта — другой ресурс, чем
+    `_post_labels` (метки НА Issue). Опечатка в этом URL проходила бы весь
+    набор зелёным без этого теста: остальные тесты клиента мокают
+    `ensure_labels_exist` целиком, а не транспорт.
+
+    Закрепляем: постраничный GET списка меток проекта, и POST с телом
+    `name`/`color` (без решётки)/`description`; существующая метка не
+    перепосится — идемпотентность видна уже на форме запросов."""
+    gc = _fresh(monkeypatch)
+
+    get_calls = []
+    page1 = [{"name": f"l{i}"} for i in range(100)]  # полная страница → ждём вторую
+    page2 = [{"name": "existing"}]                    # неполная → это последняя
+
+    def fake_get(url, **kwargs):
+        get_calls.append((url, kwargs))
+        page = kwargs["params"]["page"]
+        return _Resp(page1 if page == 1 else page2)
+
+    post_calls = []
+
+    def fake_post(url, **kwargs):
+        post_calls.append((url, kwargs))
+        return _Resp({})
+
+    monkeypatch.setattr(gc.requests, "get", fake_get)
+    monkeypatch.setattr(gc.requests, "post", fake_post)
+
+    specs = [
+        LabelSpec(name="existing", color="#ABCDEF", description="уже есть"),
+        LabelSpec(name="new-one", color="#123456", description="новая"),
+    ]
+    created = gc.ensure_labels_exist("o/r", specs)
+
+    assert [c[0] for c in get_calls] == [f"{B}/repos/o/r/labels"] * 2
+    assert get_calls[0][1]["params"] == {"per_page": 100, "page": 1}
+    assert get_calls[1][1]["params"] == {"per_page": 100, "page": 2}
+
+    assert len(post_calls) == 1  # существующая метка не перепосилась
+    assert post_calls[0][0] == f"{B}/repos/o/r/labels"
+    assert post_calls[0][1]["json"] == {
+        "name": "new-one", "color": "123456", "description": "новая",
+    }
+    assert created == 1
