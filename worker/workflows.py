@@ -1421,6 +1421,24 @@ class IssueLifecycle:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+        
+        # При RESEARCH_AUTOSTART ожидания нет: триаж сам довёл задачу до
+        # system-requirements, и решение «декомпозиция или сразу разработка»
+        # уже принято в коде (флаг self._decompose). Нет смысла парковаться и
+        # ждать того же решения от человека.
+        #
+        # Если включён и DEVELOP_AUTOSTART — идём сразу в разработку, минуя
+        # парковку в ready-for-dev. Если только RESEARCH_AUTOSTART — всё равно
+        # не парковаться: задача дошла до конца исследовательского пути, и
+        # следующее решение (запуск разработки) принимается отдельно, в своей
+        # фазе (_phase_await_build).
+        if deadlines.research_autostart:
+            if deadlines.develop_autostart and not self._plan_member:
+                # Полный автостарт: Research + Develop → замкнутый контур
+                return await self._start_development(issue)
+            # Только Research автостарт: дошли до ready-for-dev без парковки
+            return (lifecycle.READY_FOR_DEV, None, False)
+        
         return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
 
     async def _clarify_open_questions(self, issue: IssueInput, deadlines,
