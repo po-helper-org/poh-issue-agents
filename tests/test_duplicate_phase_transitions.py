@@ -111,6 +111,12 @@ async def post_error_stub(repo: str, issue_number: int, error: str):
     _calls.append(f"error-label:{error[:30]}")
 
 
+@activity.defn(name="read_issue_labels")
+async def read_labels_stub(repo: str, issue_number: int) -> list[str]:
+    """Заглушка без меток решения — обычная парковка после not-duplicate."""
+    return []
+
+
 def _issue(interactive: bool = True) -> IssueInput:
     return IssueInput(
         repo="test/repo",
@@ -143,22 +149,22 @@ async def test_duplicate_phase_has_not_duplicate_transition():
                       deadlines_stub, set_phase_stub, gate_sufficient,
                       duplicate_detected, post_comment_stub, add_label_stub,
                       classify_stub, score_priority_stub, post_priority_stub,
-                      escalate_stub, post_error_stub]
-        
-        async with Worker(env.client, task_queue=tq, 
+                      escalate_stub, post_error_stub, read_labels_stub]
+
+        async with Worker(env.client, task_queue=tq,
                           workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
                           activities=activities):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            
+
             # Ждём, пока Issue перейдёт в DUPLICATE
             current = await _await_phase(env, handle, lifecycle.DUPLICATE)
             assert current == lifecycle.DUPLICATE, f"Expected DUPLICATE, got {current}"
             assert "duplicate_check" in _calls
-            
+
             # Отправляем сигнал "not-duplicate"
             await handle.signal(IssueLifecycle.human_decision, "not-duplicate")
-            
+
             # Ждём перехода в CLASSIFIED
             current = await _await_phase(env, handle, lifecycle.CLASSIFIED)
             assert current == lifecycle.CLASSIFIED, f"Expected CLASSIFIED, got {current}"

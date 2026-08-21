@@ -117,6 +117,10 @@ def ready_workspace(tmp_path, monkeypatch):
     (clone / "sa_documentation" / "repomix-output.xml").write_text("<x/>")
     (clone / bft.artefacts_dir(41)).mkdir(parents=True)
     (clone / bft.artefacts_dir(41) / "concept.md").write_text("концепт")
+    (clone / bft.artefacts_dir(41) / "problem.md").write_text("проблема")
+    (clone / bft.artefacts_dir(41) / "bft-context-pack.md").write_text("пак")
+    (clone / bft.artefacts_dir(41) / "po-statement.md").write_text("постановка")
+    (clone / "src").mkdir()
     monkeypatch.setattr(activities, "_bft_clone_dir", lambda req: str(clone))
     return clone
 
@@ -148,6 +152,8 @@ async def test_empty_artifact_does_not_count_as_done(ready_workspace, monkeypatc
         document.write_text("свежий документ")
 
     monkeypatch.setattr(activities, "_run_claude", fake_claude)
+    monkeypatch.setattr(activities, "_validate_stage_anchors",
+                        lambda *a, **kw: asyncio.sleep(0, result=[]))
 
     await activities.run_bft_stage(_req(), "draft")
 
@@ -207,6 +213,8 @@ async def test_agent_stage_leaves_the_log_to_entire(ready_workspace, monkeypatch
         (ready_workspace / bft.document_path(41)).write_text("документ")
 
     monkeypatch.setattr(activities, "_run_claude", fake_claude)
+    monkeypatch.setattr(activities, "_validate_stage_anchors",
+                        lambda *a, **kw: asyncio.sleep(0, result=[]))
 
     await activities.run_bft_stage(_req(), "draft")
 
