@@ -63,6 +63,7 @@ async def main() -> None:
             activities.finish_pr_fixing,
             activities.pr_is_merged,
             activities.classify_issue,
+            activities.interpret_user_comment,
             activities.answer_followup,
             activities.ack_bft_command,
             activities.run_bft_fast,

@@ -1633,6 +1633,11 @@ class IssueLifecycle:
         
         elif intent.intent == "question":
             # Вопрос — отвечаем, парковку держим
+            if self._followup_rounds >= self._followup_max_rounds:
+                workflow.logger.info("потолок реплик исчерпан (%s) — отвечаю молчанием",
+                                     self._followup_max_rounds)
+                return (self._phase, self._stage, False)
+            self._followup_rounds += 1
             try:
                 await workflow.execute_activity(
                     activities.answer_followup,
