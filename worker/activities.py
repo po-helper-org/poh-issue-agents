@@ -445,6 +445,18 @@ def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
 
 
 @activity.defn
+def read_issue_labels(repo: str, issue_number: int) -> list[str]:
+    """Читает текущие метки Issue для проверки уже стоящих решений.
+    
+    Используется в сценариях, когда Issue приходит в фазу с уже проставленными
+    метками (например, `research-me` на Issue, который вернулся из DUPLICATE),
+    чтобы не ждать нового сигнала человека, а сразу продолжить обработку.
+    """
+    issue = github_client.get_issue(repo, issue_number)
+    return [label["name"] for label in issue.get("labels", [])]
+
+
+@activity.defn
 def post_error_label(issue: IssueInput, reason: str = "") -> None:
     # Sentry ПЕРЕД комментарием, а не после: id события уезжает в тот же
     # комментарий ссылкой, иначе человек видит «не удалось» и не знает, где
@@ -2374,10 +2386,16 @@ def _require_bft_workspace(req: BftRequest, requires: str | None) -> str:
     clone_dir = _bft_clone_dir(req)
     if not (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists():
         raise RuntimeError("рабочий каталог потерян (рестарт воркера?) — повтори /bft-deep")
-    if requires and not (Path(clone_dir) / requires).exists():
-        raise RuntimeError(
-            f"нет входа {requires} (стадия-предшественник не отработала?) — повтори /bft-deep"
-        )
+    if requires:
+        # `requires` — список путей через запятую (см. `deep_stages`): каждый
+        # проверяется отдельно, иначе весь список читался бы как один
+        # несуществующий путь и стадия падала бы даже при готовых артефактах.
+        missing = [item for item in requires.split(",")
+                  if not (Path(clone_dir) / item).exists()]
+        if missing:
+            raise RuntimeError(
+                f"нет входа {','.join(missing)} (стадия-предшественник не отработала?) — повтори /bft-deep"
+            )
     return clone_dir
 
 
@@ -2728,6 +2746,61 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
 BFT_TOP_UP_ATTEMPTS = 2
 
 
+async def _validate_stage_anchors(clone_dir: str, issue_number: int, 
+                                  stage_name: str) -> list[str]:
+    """Проверка якорей R1 в документе после draft/validate (Issue #78, находка B).
+    
+    Извлекает каскад из документа и проверяет, что все якоря R1 указывают на
+    существующие строки существующих файлов.
+    """
+    # Для draft проверяем документ, для validate - validation.md
+    if stage_name == "draft":
+        doc_path = Path(clone_dir) / bft.document_path(issue_number)
+    else:  # validate
+        doc_path = Path(clone_dir) / bft.artefacts_dir(issue_number) / "validation.md"
+    
+    if not doc_path.exists():
+        return [f"документ {doc_path.name} не найден"]
+    
+    # Пытаемся извлечь каскад из документа
+    content = doc_path.read_text(encoding="utf-8")
+    cascade = bft.extract_cascade_from_document(str(doc_path))
+    
+    if not cascade:
+        # Если каскад не найден в документе, это не ошибка для validate
+        # (там может быть только текст вердикта), но для draft это проблема
+        if stage_name == "draft":
+            return ["каскад требований не найден в документе"]
+        return []
+    
+    # Получаем исходники для проверки строк
+    sources = _bft_sources(clone_dir)
+    line_counts = {rel: len(body.splitlines()) for rel, body in sources.items()}
+    
+    # Проверяем якори
+    return bft.cascade_gaps(cascade, line_counts)
+
+
+async def _validate_formal_gates(clone_dir: str, issue_number: int) -> list[str]:
+    """Проверка формальных гейтов валидации (Issue #78, находка E).
+    
+    Проверяет документ БФТ на соответствие формальным требованиям:
+    - отсутствие запрещённых разделов
+    - правильность идентификаторов
+    - непустые связи
+    - НФТ с числовыми значениями
+    - отсутствие битых ссылок
+    """
+    doc_path = Path(clone_dir) / bft.document_path(issue_number)
+    if not doc_path.exists():
+        return [f"документ БФТ не найден: {doc_path}"]
+    
+    content = doc_path.read_text(encoding="utf-8")
+    epic_slug = bft.epic_slug(issue_number)
+    
+    return bft.validate_formal_gates(content, epic_slug)
+
+
 @activity.defn
 async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
     """Одна стадия канонического пайплайна БФТ — отдельный `claude -p`.
@@ -2771,6 +2844,37 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
             raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
         artifact = expected
         size = path.stat().st_size
+        
+        # Issue #78, находка A: проверка минимального размера артефакта
+        size_issues = bft.check_artifact_size(expected, size)
+        if size_issues:
+            raise RuntimeError(
+                f"стадия {stage_name}: артефакт не прошёл проверку размера — "
+                + "; ".join(size_issues)
+            )
+        
+        # Issue #78, находка B: проверка якорей после draft и validate
+        if stage_name in ("draft", "validate"):
+            anchor_issues = await _validate_stage_anchors(
+                clone_dir, req.issue_number, stage_name
+            )
+            if anchor_issues:
+                raise RuntimeError(
+                    f"стадия {stage_name}: якоря не прошли проверку — "
+                    + "; ".join(anchor_issues)
+                )
+        
+        # Issue #78, находка E: проверка формальных гейтов после validate
+        if stage_name == "validate":
+            formal_issues = await _validate_formal_gates(
+                clone_dir, req.issue_number
+            )
+            if formal_issues:
+                raise RuntimeError(
+                    f"стадия {stage_name}: формальные гейты не пройдены — "
+                    + "; ".join(formal_issues)
+                )
+    
     return {"stage": stage_name, "artifact": artifact, "bytes": size}
 
 
