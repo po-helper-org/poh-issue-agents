@@ -2386,10 +2386,16 @@ def _require_bft_workspace(req: BftRequest, requires: str | None) -> str:
     clone_dir = _bft_clone_dir(req)
     if not (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists():
         raise RuntimeError("рабочий каталог потерян (рестарт воркера?) — повтори /bft-deep")
-    if requires and not (Path(clone_dir) / requires).exists():
-        raise RuntimeError(
-            f"нет входа {requires} (стадия-предшественник не отработала?) — повтори /bft-deep"
-        )
+    if requires:
+        # `requires` — список путей через запятую (см. `deep_stages`): каждый
+        # проверяется отдельно, иначе весь список читался бы как один
+        # несуществующий путь и стадия падала бы даже при готовых артефактах.
+        missing = [item for item in requires.split(",")
+                  if not (Path(clone_dir) / item).exists()]
+        if missing:
+            raise RuntimeError(
+                f"нет входа {','.join(missing)} (стадия-предшественник не отработала?) — повтори /bft-deep"
+            )
     return clone_dir
 
 

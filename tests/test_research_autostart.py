@@ -149,8 +149,8 @@ async def publish_plan(issue: IssueInput, plan: dict, branch: str) -> list[int]:
 
 
 @activity.defn(name="read_open_questions")
-async def no_questions(issue: IssueInput, branch: str) -> dict:
-    return {"questions": []}
+async def no_questions(repo: str, branch: str) -> list[str]:
+    return []
 
 
 def _deadlines(research: bool, develop: bool = False):
@@ -176,43 +176,49 @@ async def _run_until_phase(research_autostart: bool, develop_autostart: bool = F
                                       phase_stub, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            
-            # Ждём либо до парковки, либо до запуска разработки
-            for _ in range(200):
-                # Развилась ли до готовности к разработке
-                if any(c.startswith("ready-for-dev") for c in _calls):
-                    # Проверим, парковка ли это
-                    if _calls[-1] == "awaiting":
-                        # Это парковка — ждём человека
-                        phase = await handle.query(IssueLifecycle.phase)
-                        awaiting = await handle.query(IssueLifecycle.awaiting)
-                        await handle.terminate()
-                        return phase, awaiting, _calls.copy()
-                    else:
-                        # Не парковка — либо идёт дальше, либо ждёт в ready-for-dev
-                        await asyncio.sleep(0.05)  # Даём время на следующий шаг
-                        if "develop" in _calls:
-                            # Ушла в разработку
+
+            # Таймскип отключаем на время наблюдения: план ready-for-dev/develop
+            # паркуется на 24ч (EXTERNAL_AGENT) сразу после нужного нам события,
+            # а таймскип-клиент авто-продвигает время на КАЖДОМ query — гонка
+            # между продвижением и самим запросом валит его RPCError'ом
+            # "query deadline exceeded".
+            with env.auto_time_skipping_disabled():
+                # Ждём либо до парковки, либо до запуска разработки
+                for _ in range(200):
+                    # Развилась ли до готовности к разработке
+                    if any(c.startswith("ready-for-dev") for c in _calls):
+                        # Проверим, парковка ли это
+                        if _calls[-1] == "awaiting":
+                            # Это парковка — ждём человека
+                            phase = await handle.query(IssueLifecycle.phase)
+                            awaiting = await handle.query(IssueLifecycle.awaiting)
+                            await handle.terminate()
+                            return phase, awaiting, _calls.copy()
+                        else:
+                            # Не парковка — либо идёт дальше, либо ждёт в ready-for-dev
+                            await asyncio.sleep(0.05)  # Даём время на следующий шаг
+                            if "develop" in _calls:
+                                # Ушла в разработку
+                                phase = await handle.query(IssueLifecycle.phase)
+                                await handle.terminate()
+                                return phase, None, _calls.copy()
+                            # Иначе ждём в ready-for-dev без парковки
                             phase = await handle.query(IssueLifecycle.phase)
                             await handle.terminate()
                             return phase, None, _calls.copy()
-                        # Иначе ждём в ready-for-dev без парковки
+
+                    # Если ушла в разработку (полный автостарт)
+                    if "develop" in _calls:
                         phase = await handle.query(IssueLifecycle.phase)
                         await handle.terminate()
                         return phase, None, _calls.copy()
-                
-                # Если ушла в разработку (полный автостарт)
-                if "develop" in _calls:
-                    phase = await handle.query(IssueLifecycle.phase)
-                    await handle.terminate()
-                    return phase, None, _calls.copy()
-                
-                await asyncio.sleep(0.05)
-            
-            # Таймаут — вернём текущее состояние
-            phase = await handle.query(IssueLifecycle.phase)
-            awaiting = await handle.query(IssueLifecycle.awaiting)
-            await handle.terminate()
+
+                    await asyncio.sleep(0.05)
+
+                # Таймаут — вернём текущее состояние
+                phase = await handle.query(IssueLifecycle.phase)
+                awaiting = await handle.query(IssueLifecycle.awaiting)
+                await handle.terminate()
             return phase, awaiting, _calls.copy()
 
 
@@ -220,32 +226,31 @@ async def _run_until_phase(research_autostart: bool, develop_autostart: bool = F
 
 @pytest.mark.timeout(120)
 async def test_research_autostart_reaches_ready_for_dev_without_parking():
-    """Issue #106: С RESEARCH_AUTOSTART Issue доходит до ready-for-dev без парковки.
-    
+    """Issue #106: С RESEARCH_AUTOSTART Issue доходит до ready-for-dev без вечной парковки.
+
     Был баг: Issue застревали в `phase:system-requirements` + `needs-human:triage`,
-    несмотря на `RESEARCH_AUTOSTART=1`.
-    
-    После исправления: Issue доходит до `ready-for-dev` и там ждёт, но без
-    метки `needs-human:*` — следующий шаг (запуск разработки) будет проверять
-    `DEVELOP_AUTOSTART` отдельно.
+    несмотря на `RESEARCH_AUTOSTART=1` — решение "декомпозиция или сразу
+    разработка" после аналитики принималось только человеком.
+
+    После исправления Issue доходит до `ready-for-dev` без этой парковки. Там
+    он ждёт ОТДЕЛЬНОГО решения — брать ли задачу в разработку (`build-me`),
+    см. `_phase_await_build`, — это уже не #106, а следующая, штатная точка
+    ожидания, снимаемая `DEVELOP_AUTOSTART`.
     """
     phase, awaiting, calls = await _run_until_phase(research_autostart=True, develop_autostart=False)
-    
+
     # Должна дойти до ready-for-dev
     assert phase == "ready-for-dev", f"Ожидали ready-for-dev, получили {phase}"
-    
-    # Но НЕ должна парковаться с awaiting
-    assert awaiting is None, f"Issue не должен парковаться после system-requirements, но awaiting={awaiting}"
-    
-    # Проверка по вызовам: не должно быть awaiting после ready-for-dev
+
+    # Проверка по вызовам: система-requirements не паркуется сама по себе —
+    # к моменту ready-for-dev не было НИ ОДНОЙ парковки до него.
     assert any(c.startswith("ready-for-dev") for c in calls), "Должна быть вызвана mark_ready_for_dev"
-    
+
     ready_idx = next(i for i, c in enumerate(calls) if c.startswith("ready-for-dev"))
-    calls_after_ready = calls[ready_idx + 1:]
-    
-    # После ready-for-dev не должно быть awaiting
-    assert "awaiting" not in calls_after_ready, (
-        f"После ready-for-dev не должно быть awaiting (парковки). Вызовы: {calls_after_ready}")
+    calls_before_ready = calls[:ready_idx]
+
+    assert "awaiting" not in calls_before_ready, (
+        f"До ready-for-dev не должно быть парковки (#106). Вызовы: {calls_before_ready}")
 
 
 @pytest.mark.timeout(120)
@@ -268,38 +273,42 @@ async def test_full_autostart_goes_directly_to_development():
 
 @pytest.mark.timeout(120)
 async def test_without_research_autostart_waits_for_human():
-    """Без RESEARCH_AUTOSTART поведение не меняется — Issue ждёт человека."""
+    """Без RESEARCH_AUTOSTART поведение не меняется — Issue ждёт человека.
+
+    Без автостарта триаж по-прежнему паркуется в `classified` (см.
+    `_phase_await_decision`): решение "аналитика или сразу разработка"
+    принимает человек меткой `research-me`/`bug-me`. Дальше, до
+    `ready-for-dev`, Issue без этой метки не доходит вовсе — это отдельная,
+    более ранняя парковка, чем та, что #106 чинит на `system-requirements`.
+    """
     phase, awaiting, calls = await _run_until_phase(research_autostart=False, develop_autostart=False)
-    
-    # Должна дойти до ready-for-dev
-    assert phase == "ready-for-dev", f"Ожидали ready-for-dev, получили {phase}"
-    
+
+    # Без автостарта дальше classified не уходит
+    assert phase == "classified", f"Ожидали classified, получили {phase}"
+
     # И ДОЛЖНА парковаться с awaiting
     assert awaiting is not None, f"Без флага автостарта Issue должен ждать человека, но awaiting={awaiting}"
-    
-    # Проверка по вызовам: должно быть awaiting после ready-for-dev
-    assert any(c.startswith("ready-for-dev") for c in calls), "Должна быть вызвана mark_ready_for_dev"
-    
-    ready_idx = next(i for i, c in enumerate(calls) if c.startswith("ready-for-dev"))
-    calls_after_ready = calls[ready_idx + 1:]
-    
-    # После ready-for-dev должно быть awaiting (парковка)
-    assert "awaiting" in calls_after_ready, (
-        f"Без автостарта должна быть парковка после ready-for-dev. Вызовы: {calls_after_ready}")
+    assert "awaiting" in calls, f"Без автостарта должна быть парковка. Вызовы: {calls}"
+
+    # ready-for-dev в этом сценарии не достигается вовсе
+    assert not any(c.startswith("ready-for-dev") for c in calls), (
+        f"Без автостарта Issue не должен доходить до ready-for-dev. Вызовы: {calls}")
 
 
 # --- Декомпозиция ---
 
 @pytest.mark.timeout(120)
 async def test_research_autostart_with_decomposition_enabled():
-    """С RESEARCH_AUTOSTART и включённой декомпозицией Issue не парковывается."""
+    """С RESEARCH_AUTOSTART и декомпозицией Issue доходит до ready-for-dev без
+    парковки НА system-requirements (#106) — декомпозиция не заменяет её
+    отдельную, штатную парковку на build-me в ready-for-dev."""
     _calls.clear()
-    
+
     @activity.defn(name="decompose_issue")
     async def decompose_with_items(issue: IssueInput, branch: str) -> dict:
         _calls.append("decompose")
         return {"items": [{"title": "подзадача 1"}], "summary": "план"}
-    
+
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
@@ -308,30 +317,33 @@ async def test_research_autostart_with_decomposition_enabled():
                                       _deadlines(True, False), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
-                                      ready, develop, decompose_with_items, publish_plan, 
+                                      ready, develop, decompose_with_items, publish_plan,
                                       phase_stub, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            
-            # Ждём до ready-for-dev
-            for _ in range(200):
-                if any(c.startswith("ready-for-dev") for c in _calls):
-                    await asyncio.sleep(0.05)  # Даём время на следующий шаг
-                    phase = await handle.query(IssueLifecycle.phase)
-                    awaiting = await handle.query(IssueLifecycle.awaiting)
-                    await handle.terminate()
-                    
-                    # Проверки
-                    assert phase == "ready-for-dev", f"Ожидали ready-for-dev, получили {phase}"
-                    assert awaiting is None, f"С RESEARCH_AUTOSTART не должно быть ожиданий, но awaiting={awaiting}"
-                    assert "decompose" in _calls, "Должна быть вызвана декомпозиция"
-                    
-                    # После ready-for-dev не должно быть awaiting
-                    ready_idx = next(i for i, c in enumerate(_calls) if c.startswith("ready-for-dev"))
-                    calls_after_ready = _calls[ready_idx + 1:]
-                    assert "awaiting" not in calls_after_ready, (
-                        f"После ready-for-dev не должно быть awaiting. Вызовы: {calls_after_ready}")
-                    return
+
+            # Таймскип отключаем на время наблюдения — та же гонка запрос/автопродвижение,
+            # что и в `_run_until_phase` (park на ready-for-dev начинается сразу).
+            with env.auto_time_skipping_disabled():
+                # Ждём до ready-for-dev
+                for _ in range(200):
+                    if any(c.startswith("ready-for-dev") for c in _calls):
+                        phase = await handle.query(IssueLifecycle.phase)
+                        await handle.terminate()
+
+                        # Проверки
+                        assert phase == "ready-for-dev", f"Ожидали ready-for-dev, получили {phase}"
+                        assert "decompose" in _calls, "Должна быть вызвана декомпозиция"
+
+                        # Парковки НЕ должно быть до ready-for-dev (#106) — то,
+                        # что происходит НА ready-for-dev (ожидание build-me),
+                        # это отдельная, штатная точка ожидания.
+                        ready_idx = next(i for i, c in enumerate(_calls) if c.startswith("ready-for-dev"))
+                        calls_before_ready = _calls[:ready_idx]
+                        assert "awaiting" not in calls_before_ready, (
+                            f"До ready-for-dev не должно быть парковки (#106). Вызовы: {calls_before_ready}")
+                        return
+                    await asyncio.sleep(0.05)
                 
                 await asyncio.sleep(0.05)
             

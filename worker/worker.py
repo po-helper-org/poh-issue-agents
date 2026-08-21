@@ -73,6 +73,7 @@ async def main() -> None:
             activities.publish_bft_partial,
             activities.publish_bft_error,
             activities.duplicate_check,
+            activities.read_issue_labels,
             activities.score_priority,
             activities.post_priority_comment,
             activities.prepare_workspace,
