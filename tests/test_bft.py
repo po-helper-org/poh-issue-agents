@@ -43,10 +43,19 @@ def test_deep_stages_are_chained_by_their_artifacts():
     stages = bft.deep_stages(7)
     assert [name for name, *_ in stages] == list(bft.DEEP_STAGE_NAMES)
 
-    produced: set[str] = set()
+    # Файлы, которые существуют снаружи (не создаются стадиями БФТ)
+    external_files = {
+        ".bft/documentation/issue-7/artefacts/po-statement.md",
+        "src"  # каталог исходников
+    }
+    
+    produced: set[str] = external_files.copy()
     for name, _prompt, expected, requires in stages:
         if requires is not None:
-            assert requires in produced, f"стадия {name} требует того, чего никто не создал"
+            # Supports multiple required files (comma-separated)
+            required_files = [f.strip() for f in requires.split(",")]
+            for req_file in required_files:
+                assert req_file in produced, f"стадия {name} требует {req_file}, которого никто не создал"
         if expected:
             produced.add(expected)
 
@@ -62,7 +71,9 @@ def test_deep_stage_lookup_matches_the_table():
     prompt, expected, requires = bft.deep_stage("problem", 7)
     assert prompt == "/bft-problem issue-7"
     assert expected.endswith("problem.md")
-    assert requires.endswith("bft-context-pack.md")
+    # The problem stage now requires multiple files including external ones
+    assert "bft-context-pack.md" in requires
+    assert "po-statement.md" in requires
 
 
 def test_unknown_deep_stage_is_an_error():

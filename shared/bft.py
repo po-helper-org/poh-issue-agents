@@ -98,13 +98,19 @@ def deep_stages(issue_number: int) -> list[tuple[str, str, str | None, str | Non
 
     `index` и `debate` ожидаемого файла не имеют: первый строит каталог
     `.bft/index/`, второй дописывает вердикт в конец `concept.md`.
+
+    Issue #78, находка D: требуемый вход объявлен полностью, чтобы не терять
+    зависимости при смене исполнителя.
     """
     slug = epic_slug(issue_number)
-    pack = f"{artefacts_dir(issue_number)}/bft-context-pack.md"
-    problem = f"{artefacts_dir(issue_number)}/problem.md"
-    concept = f"{artefacts_dir(issue_number)}/concept.md"
+    artefacts = artefacts_dir(issue_number)
+    pack = f"{artefacts}/bft-context-pack.md"
+    problem = f"{artefacts}/problem.md"
+    concept = f"{artefacts}/concept.md"
+    statement = f"{artefacts}/po-statement.md"
     document = document_path(issue_number)
-    validation = f"{artefacts_dir(issue_number)}/validation.md"
+    validation = f"{artefacts}/validation.md"
+    
     return [
         ("index", "/bft-index", None, None),
         # Второй аргумент `/bft-context-gen` — ключ эпика в трекере. Трекера нет,
@@ -112,10 +118,12 @@ def deep_stages(issue_number: int) -> list[tuple[str, str, str | None, str | Non
         # именами: команда увидит тот же slug и не станет искать несуществующий
         # проект.
         ("context", f"/bft-context-gen {slug} {slug}", pack, None),
-        ("problem", f"/bft-problem {slug}", problem, pack),
-        ("concept", f"/bft-concept {slug}", concept, problem),
+        ("problem", f"/bft-problem {slug}", problem, f"{pack},{statement}"),
+        ("concept", f"/bft-concept {slug}", concept, f"{problem},{pack},{statement}"),
         ("debate", f"/bft-debate {slug}", None, concept),
-        ("draft", f"/bft-draft {slug}", document, concept),
+        # Для draft нужны все предыдущие артефакты плюс исходники репозитория
+        ("draft", f"/bft-draft {slug}", document, 
+         f"{concept},{problem},{pack},{statement},src"),
         ("validate", f"/bft-validate {slug}", validation, document),
     ]
 
@@ -350,6 +358,17 @@ def render_deep_summary(repo: str, issue_number: int, files: list[str]) -> str:
 CASCADE_FLOOR: dict[str, int] = {"БТ": 4, "ПТ": 5, "ИТ": 6, "ФТ": 10, "НФТ": 4}
 ANCHOR_FLOOR = 24
 
+# --- Минимальные размеры артефактов (Issue #78, находка A) ---
+# Артефакт нулевого или близкого к нулю размера означает оборванную запись,
+# а не готовую работу. Пороги выбраны эвристически: документ меньше 100 байт
+# — это явно обрезанный на середине текст, problem.md меньше 500 байт — не
+# содержит содержательного разбора.
+ARTIFACT_MIN_SIZE: dict[str, int] = {
+    "problem.md": 500,
+    "concept.md": 300,
+    "validation.md": 200,
+}
+
 CASCADE_SCHEMA = """{
   "requirements": [
     {"id": "БТ-1", "type": "БТ", "title": "…", "body": "…",
@@ -426,6 +445,148 @@ def cascade_gaps(cascade: dict, line_counts: dict[str, int]) -> list[str]:
             gaps.append(f"якорь R1 «{source}»: в файле {line_counts[path]} строк, "
                         f"строки {line} не существует")
     return gaps
+
+
+def check_artifact_size(artifact_name: str, size: int) -> list[str]:
+    """Проверка минимального размера артефакта (Issue #78, находка A).
+
+    Артефакт нулевого или слишком маленького размера означает оборванную
+    запись или пустой документ — ни то, ни другое не считается успешной
+    стадией.
+
+    Возвращает список претензий (пустой = размер нормальный).
+    """
+    issues: list[str] = []
+    min_size = ARTIFACT_MIN_SIZE.get(artifact_name, 0)
+    if min_size > 0 and size < min_size:
+        issues.append(
+            f"артефакт {artifact_name} слишком мал ({size} байт, минимум {min_size}) — "
+            f"документ обрезан или пуст"
+        )
+    return issues
+
+
+def extract_cascade_from_document(document_path: str) -> dict | None:
+    """Извлечь каскад требований из документа БФТ (Issue #78, находка B).
+
+    Ищет JSON-блок с каскадом в документе и возвращает его, если найден.
+    Возвращает None, если каскад не найден или документ не существует.
+
+    Функция чистая: чтение файла делает вызывающий.
+    """
+    try:
+        with open(document_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+    except (FileNotFoundError, IOError):
+        return None
+    
+    # Ищем JSON-блок в документе. Обычно он оформлен как ```json ... ```
+    json_pattern = r'```(?:json)?\s*\n(\{.*?\})\s*```'
+    matches = re.findall(json_pattern, content, re.DOTALL)
+    
+    for match in matches:
+        try:
+            cascade = json.loads(match)
+            # Проверяем, что это действительно каскад (есть requirements или anchors)
+            if "requirements" in cascade or "anchors" in cascade:
+                return cascade
+        except json.JSONDecodeError:
+            continue
+    
+    # Если не нашли в кодовых блоках, ищем просто JSON в тексте
+    try:
+        start = content.find('{')
+        if start >= 0:
+            # Ищем закрывающую скобку на том же уровне вложенности
+            brace_count = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(content)):
+                char = content[i]
+                if escape:
+                    escape = False
+                    continue
+                if char == '\\':
+                    escape = True
+                    continue
+                if char == '"' and not escape:
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            json_str = content[start:i+1]
+                            cascade = json.loads(json_str)
+                            if "requirements" in cascade or "anchors" in cascade:
+                                return cascade
+                            break
+    except json.JSONDecodeError:
+        pass
+    
+    return None
+
+
+def validate_formal_gates(document_content: str, epic_slug: str) -> list[str]:
+    """Проверка формальных гейтов валидации (Issue #78, находка E).
+
+    Проверяет то, что можно проверить кодом без понимания смысла:
+    - Порядок разделов
+    - Отсутствие запрещённых разделов
+    - Локальные идентификаторы без префикса эпика
+    - Непустые «Связанные требования»
+    - НФТ с числовым значением
+    - Отсутствие битых ссылок между требованиями
+
+    Возвращает список претензий (пустой = все формальные гейты пройдены).
+    """
+    issues: list[str] = []
+
+    # Запрещённые разделы (не должны присутствовать в БФТ)
+    forbidden_sections = ["Ключевые решения", "Границы", "Критерии успеха"]
+    for section in forbidden_sections:
+        if f"## {section}" in document_content:
+            issues.append(f"запрещённый раздел «{section}» — убери, это не формат БФТ")
+
+    # Проверка идентификаторов требований
+    # Находим все идентификаторы в документе (работает с латиницей и кириллицей)
+    req_pattern = r'([A-ZА-Я]{2,3})-(\d+)'
+    found_ids = re.findall(req_pattern, document_content)
+    
+    # Проверяем каждый найденный тип
+    for kind, _ in found_ids:
+        if kind not in CASCADE_FLOOR:
+            issues.append(f"неизвестный тип требования «{kind}» — используй "
+                         f"один из: {', '.join(CASCADE_FLOOR.keys())}")
+            break  # Сообщаем только один раз о неизвестном типе
+
+    # Проверка НФТ на числовое значение
+    nft_pattern = r'НФТ-(\d+).*?[:\s]+([^\n]+)'
+    nft_matches = re.findall(nft_pattern, document_content, re.DOTALL)
+    for num, value in nft_matches:
+        # Проверяем, что значение содержит число
+        if not re.search(r'\d+', value):
+            issues.append(f"НФТ-{num} без числового значения — добавь измеримую характеристику")
+
+    # Проверка связей между требованиями
+    # Ищем упоминания требований в поле "related" или похожих контекстах
+    linked_reqs = set()
+    req_refs = re.findall(r'[A-ZА-Я]{2,3}-\d+', document_content)
+    linked_reqs.update(req_refs)
+
+    # Проверяем, что все упомянутые требования объявлены
+    declared_reqs = set()
+    for kind, num in re.findall(req_pattern, document_content):
+        declared_reqs.add(f"{kind}-{num}")
+
+    broken_links = linked_reqs - declared_reqs
+    if broken_links:
+        issues.append(f"битые ссылки на требования: {', '.join(sorted(broken_links))} — "
+                     f"объяви или удали ссылки")
+
+    return issues
 
 
 # --- Частичный прогон: что успели и что осталось ---
