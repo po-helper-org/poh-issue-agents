@@ -88,6 +88,9 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+      args:
+        - SYSREQ_AGENT_VERSION=${SYSREQ_AGENT_VERSION:-main}
+        - SYSREQ_AGENT_REPO=${SYSREQ_AGENT_REPO:-https://github.com/po-helper-org/poh-sysreq-agent.git}
     restart: unless-stopped
     env_file: .env
     environment:

@@ -54,6 +54,21 @@ ENV PATH="/root/.local/bin:${PATH}"
 COPY .claude/skills /root/.claude/skills
 COPY .claude/commands /root/.claude/commands
 
+# Затем подключаем внешний модуль poh-sysreq-agent для стадии sysreq.
+# Версия пинится для детерминизма durable-прогонов Temporal.
+ARG SYSREQ_AGENT_VERSION=main
+ARG SYSREQ_AGENT_REPO=https://github.com/po-helper-org/poh-sysreq-agent.git
+
+# Клонируем нужную версию и копируем только sysreq-артефакты.
+# Это заменяет локальную копию .claude/skills/system-analyst-sysreq и
+# .claude/commands/fnr-system-requirements.md при сборке образа.
+RUN git clone --depth 1 --branch ${SYSREQ_AGENT_VERSION} ${SYSREQ_AGENT_REPO} /tmp/poh-sysreq-agent \
+    && rm -rf /root/.claude/skills/system-analyst-sysreq \
+    && cp -r /tmp/poh-sysreq-agent/.claude/skills/system-analyst-sysreq /root/.claude/skills/ \
+    && rm -f /root/.claude/commands/fnr-system-requirements.md \
+    && cp /tmp/poh-sysreq-agent/.claude/commands/fnr-system-requirements.md /root/.claude/commands/ \
+    && rm -rf /tmp/poh-sysreq-agent
+
 WORKDIR /app
 COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

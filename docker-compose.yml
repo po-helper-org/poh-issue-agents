@@ -26,6 +26,9 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
+      args:
+        - SYSREQ_AGENT_VERSION=${SYSREQ_AGENT_VERSION:-main}
+        - SYSREQ_AGENT_REPO=${SYSREQ_AGENT_REPO:-https://github.com/po-helper-org/poh-sysreq-agent.git}
     restart: unless-stopped
     # TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE берутся из .env (внешний Temporal).
     env_file: .env
