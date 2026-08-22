@@ -998,15 +998,12 @@ def _run_repomix(clone_dir: str) -> None:
     )
 
 
-def _claude_anthropic_creds(model: str | None = None) -> tuple[str, str, str | None]:
+def _claude_anthropic_creds() -> tuple[str, str]:
     """Креды для `claude -p` из тех же ZAI_*, что и Python-стадии (единый ключ
     z.ai). claude-code говорит по протоколу Anthropic, поэтому нужен другой ПУТЬ
     эндпоинта того же хоста: ZAI_BASE_URL = .../coding/paas/v4 (OpenAI-формат),
     Anthropic-формат живёт на .../api/anthropic. Отдельные ANTHROPIC_* задавать
-    не нужно, но если заданы — приоритетнее (явный override).
-    
-    Возвращает кортеж (token, base_url, model) — модель передаётся в claude -p
-    через переменную окружения ANTHROPIC_MODEL или берётся из дефолта."""
+    не нужно, но если заданы — приоритетнее (явный override)."""
     token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ZAI_API_KEY", "")
     base = os.environ.get("ANTHROPIC_BASE_URL", "")
     if not base:
@@ -1015,14 +1012,10 @@ def _claude_anthropic_creds(model: str | None = None) -> tuple[str, str, str | N
             from urllib.parse import urlsplit
             p = urlsplit(zai)
             base = f"{p.scheme}://{p.netloc}/api/anthropic"
-    
-    # Если модель не передана явно, пробуем взять из ANTHROPIC_MODEL
-    if model is None:
-        model = os.environ.get("ANTHROPIC_MODEL")
-    
-    return token, base, model
+    return token, base
 
-def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None, model: str | None = None) -> None:
+
+def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None) -> None:
     """Одна стадия FNR — отдельный процесс `claude -p` с чистым контекстом.
 
     Креды берутся из ZAI_* (как в main) и прокидываются в claude-code через его
@@ -1032,12 +1025,9 @@ def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None, model: str
     не перестраховка: `claude -p` НЕ подхватывает проектный `.mcp.json` сам.
     Положить файл в каталог прогона и надеяться — ровно то, что провалилось на
     первом живом Issue: стадия отработала за минуту, вышла с нулём, инструментов
-    не увидела и артефакта не создана.
-    
-    `model` — опциональная модель для стадии. Если не передана, используется
-    дефолтная модель из ANTHROPIC_MODEL или та, что задана в кредах.
+    не увидела и артефакта не создала.
     """
-    token, base, resolved_model = _claude_anthropic_creds(model)
+    token, base = _claude_anthropic_creds()
     # Понятная ошибка вместо голого "exit 1", если z.ai не сконфигурирован:
     # без креды claude-code уходит на дефолтный Anthropic API и падает.
     if not token or not base:
@@ -1059,18 +1049,12 @@ def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None, model: str
         # молча не состоится.
         command += ["--mcp-config", mcp_config, "--strict-mcp-config",
                     "--allowedTools", f"mcp__{repowise.SERVER_NAME}"]
-    # Подготавливаем окружение для claude -p
-    env = {**os.environ, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_BASE_URL": base}
-    
-    # Если модель задана, передаём её через переменную окружения
-    if resolved_model:
-        env["ANTHROPIC_MODEL"] = resolved_model
-    
     result = subprocess.run(
         command,
         cwd=cwd, capture_output=True, text=True,
         timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
-        env=env,
+        # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
+        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_BASE_URL": base},
     )
     if result.returncode != 0:
         # claude-code часто пишет диагностику в stdout, а не stderr — берём оба
@@ -1497,12 +1481,9 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     # Конфигурация MCP передаётся ТОЛЬКО стадии сбора контекста: остальным
     # стадиям индекс не нужен, а лишние инструменты в сессии — лишние соблазны
     # и лишние деньги.
-    # Выбираем модель для данной стадии из конфигурации в llm.py
-    stage_model = llm.FNR_STAGE_MODELS.get(stage_name)
     await _run_with_heartbeat(
         _run_claude, prompt, clone_dir,
         mcp_config if stage_name == REPOWISE_STAGE else None,
-        stage_model,
         label=stage_name)
 
     outcome = "ok"
@@ -3248,10 +3229,7 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
         # Диалог этой стадии пишет entire: у `claude -p` есть сессия, за которую
         # он цепляется хуками. Дублировать её журналом значит вести две записи
         # одного и того же и обе поддерживать.
-        # Выбираем модель для данной стадии из конфигурации в llm.py
-        stage_model = llm.FNR_STAGE_MODELS.get(stage_name)
         await _run_with_heartbeat(_run_claude, prompt, clone_dir,
-                                  stage_model,
                                   label=f"bft:{stage_name}")
     artifact: str | None = None
     size = 0
