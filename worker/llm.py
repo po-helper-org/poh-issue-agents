@@ -19,6 +19,32 @@ from openai import OpenAI
 MODEL_GATE = os.environ.get("MODEL_GATE", "glm-4.5-air")
 MODEL_CLASSIFY = os.environ.get("MODEL_CLASSIFY", "glm-5.2")
 
+# Per-stage модели для FNR (Layer C - глубокий анализ).
+# Каждая стадия может использовать свою модель для оптимизации затрат/скорости.
+# Дефолты основаны на сложности стадии:
+# - repowise: сбор контекста, относительно простая задача
+# - task: структурирование постановки, средняя сложность
+# - concept: архитектурные концепты, нужна хорошая модель
+# - debate: архитектурные дебаты, нужна сильная модель
+# - sysreq: генерация системных требований, нужна сильная модель
+# - validate: валидация, можно использовать модель средней силы
+MODEL_FNR_REPOWISE = os.environ.get("MODEL_FNR_REPOWISE", "glm-4.6")
+MODEL_FNR_TASK = os.environ.get("MODEL_FNR_TASK", "glm-4.6")
+MODEL_FNR_CONCEPT = os.environ.get("MODEL_FNR_CONCEPT", "glm-4.6")
+MODEL_FNR_DEBATE = os.environ.get("MODEL_FNR_DEBATE", "glm-5.2")
+MODEL_FNR_SYSREQ = os.environ.get("MODEL_FNR_SYSREQ", "glm-4.6")
+MODEL_FNR_VALIDATE = os.environ.get("MODEL_FNR_VALIDATE", "glm-4.6")
+
+# Маппинг имён стадий к переменным модели
+FNR_STAGE_MODELS = {
+    "repowise": MODEL_FNR_REPOWISE,
+    "task": MODEL_FNR_TASK,
+    "concept": MODEL_FNR_CONCEPT,
+    "debate": MODEL_FNR_DEBATE,
+    "sysreq": MODEL_FNR_SYSREQ,
+    "validate": MODEL_FNR_VALIDATE,
+}
+
 _client: instructor.Instructor | None = None
 
 
