@@ -96,7 +96,8 @@ async def escalate(issue: IssueInput, reason: str = "") -> None: ...
 
 
 @activity.defn(name="trigger_openhands_resolver")
-async def trigger_build(issue: IssueInput) -> None: ...
+async def trigger_build(issue: IssueInput, root_issue: int | None = None,
+                        branch: str | None = None) -> None: ...
 
 
 # Разработка ушла в дочерний воркфлоу `IssueDevelopment` (#FNR-6):

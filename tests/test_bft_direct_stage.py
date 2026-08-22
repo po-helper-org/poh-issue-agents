@@ -139,6 +139,9 @@ def workspace(tmp_path, monkeypatch):
     artefacts = clone / bft.artefacts_dir(41)
     artefacts.mkdir(parents=True)
     (artefacts / "concept.md").write_text("концепт")
+    (artefacts / "problem.md").write_text("проблема")
+    (artefacts / "bft-context-pack.md").write_text("пак")
+    (artefacts / "po-statement.md").write_text("постановка")
     (clone / "src").mkdir()
     (clone / "src" / "pricing.mjs").write_text("строка\n" * 20)
     monkeypatch.setattr(activities, "_bft_clone_dir", lambda req: str(clone))
@@ -153,6 +156,10 @@ async def test_flagged_stage_skips_the_agent_and_writes_the_artifact(
         "при включённом флаге стадия не должна запускать claude -p"))
     monkeypatch.setattr(activities, "_bft_direct_draft",
                         lambda req, clone_dir: "---\nEpic: issue-41\n---\n# БФТ")
+    # Якоря (Issue #78, находка B) — отдельная, уже покрытая проверка выше по
+    # файлу; этот тест — про маршрутизацию агент/прямой вызов, не про неё.
+    monkeypatch.setattr(activities, "_validate_stage_anchors",
+                        lambda *a, **kw: asyncio.sleep(0, result=[]))
 
     result = await activities.run_bft_stage(_req(), "draft")
 
@@ -168,7 +175,7 @@ async def test_stage_without_the_flag_still_goes_through_the_agent(
     monkeypatch.setenv("BFT_DIRECT_STAGES", "validate")  # draft НЕ включён
     called = []
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         called.append(prompt)
         (workspace / bft.document_path(41)).parent.mkdir(parents=True, exist_ok=True)
         (workspace / bft.document_path(41)).write_text("документ агента")
@@ -176,6 +183,8 @@ async def test_stage_without_the_flag_still_goes_through_the_agent(
     monkeypatch.setattr(activities, "_run_claude", fake_claude)
     monkeypatch.setattr(activities, "_bft_direct_draft", lambda *a: pytest.fail(
         "стадия без флага ушла в прямой вызов"))
+    monkeypatch.setattr(activities, "_validate_stage_anchors",
+                        lambda *a, **kw: asyncio.sleep(0, result=[]))
 
     await activities.run_bft_stage(_req(), "draft")
 

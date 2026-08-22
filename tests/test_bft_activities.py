@@ -3,6 +3,7 @@
 GitHub и модель подменены — проверяется решение активности, а не чужой HTTP.
 """
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -275,13 +276,17 @@ def deep_env(monkeypatch, tmp_path, gh):
 
     def fake_clone(repo, dest, branch=None):
         Path(dest).mkdir(parents=True, exist_ok=True)
+        # "draft" требует `src` во входе (Issue #78, находка D) — имитируем
+        # исходники клона, как их видел бы `_bft_sources`.
+        (Path(dest) / "src").mkdir(parents=True, exist_ok=True)
+        (Path(dest) / "src" / "pricing.mjs").write_text("строка\n", encoding="utf-8")
 
     def fake_repomix(clone_dir):
         out = Path(clone_dir) / "sa_documentation" / "repomix-output.xml"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text("<repo/>", encoding="utf-8")
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         state["prompts"].append(prompt)
         produced = {
             "/bft-context-gen": f"{bft.artefacts_dir(42)}/bft-context-pack.md",
@@ -301,9 +306,14 @@ def deep_env(monkeypatch, tmp_path, gh):
     return state
 
 
-async def test_the_whole_deep_pipeline_runs_end_to_end(deep_env):
+async def test_the_whole_deep_pipeline_runs_end_to_end(deep_env, monkeypatch):
     """Каждая стадия видит вход предыдущей: цепочка проверяется на настоящих
     файлах, а не на согласованности таблицы с самой собой."""
+    # Якоря (Issue #78, находка B) требуют настоящий каскад в документе —
+    # здесь фокус на порядке стадий, а не на содержимом, которое `fake_claude`
+    # заведомо не производит.
+    monkeypatch.setattr(acts, "_validate_stage_anchors",
+                        lambda *a, **kw: asyncio.sleep(0, result=[]))
     req = _req(mode=bft.DEEP)
     await acts.prepare_bft_workspace(req)
     for stage in bft.DEEP_STAGE_NAMES:
@@ -321,7 +331,7 @@ async def test_a_stage_that_produced_nothing_is_a_failure(deep_env, monkeypatch)
     req = _req(mode=bft.DEEP)
     await acts.prepare_bft_workspace(req)
     await acts.run_bft_stage(req, "index")
-    monkeypatch.setattr(acts, "_run_claude", lambda prompt, cwd: None)
+    monkeypatch.setattr(acts, "_run_claude", lambda prompt, cwd, mcp=None: None)
 
     with pytest.raises(RuntimeError, match="не создан"):
         await acts.run_bft_stage(req, "context")

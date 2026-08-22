@@ -202,6 +202,11 @@ DEV_STEPS = [dev_begin_local, dev_dispatch_stub, dev_prepare_ok, dev_announce_ok
              dev_agent_ok, dev_followups_ok, dev_checks_ok, dev_publish_ok]
 
 
+@activity.defn(name="read_open_questions")
+async def no_questions(repo: str, branch: str) -> list[str]:
+    return []
+
+
 @activity.defn(name="decompose_issue")
 async def decompose(issue: IssueInput, branch: str) -> dict:
     _calls.append("decompose")
@@ -238,7 +243,7 @@ async def _run_until_parked(autostart: bool) -> None:
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
                                       ready, develop, decompose, publish_plan, phase_stub,
-                                      *DEV_STEPS]):
+                                      *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -303,7 +308,7 @@ async def test_own_run_label_does_not_start_a_second_analysis():
                                       score, post_priority, mark_running, finish,
                                       slow_ack, prepare, stage_ok, publish, cleanup,
                                       publish_error, ready, develop_noop, phase_stub,
-                                      *DEV_STEPS]):
+                                      *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -358,7 +363,7 @@ async def _run_closed_loop(classification: str) -> list[str]:
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_ok, publish, cleanup,
                                       publish_error, ready, develop, phase_stub,
-                                      *DEV_STEPS]):
+                                      *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -420,7 +425,7 @@ async def test_subissue_of_a_plan_does_not_start_its_own_development():
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_ok, publish, cleanup,
                                       publish_error, ready, develop, decompose,
-                                      publish_plan, phase_stub, *DEV_STEPS]):
+                                      publish_plan, phase_stub, *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -473,7 +478,7 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_forbidden, publish,
                                       cleanup, publish_error, ready, develop, decompose,
-                                      publish_plan, phase_stub, *DEV_STEPS]):
+                                      publish_plan, phase_stub, *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -492,7 +497,8 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
 # --- Сорванная передача не повторяет прогон агента ---
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop_failing(issue: IssueInput) -> None:
+async def develop_failing(issue: IssueInput, root_issue: int | None = None,
+                          branch: str | None = None) -> None:
     """Прежний путь одной активностью — оставлен для ветки без маркера патча."""
     _calls.append("develop")
     raise RuntimeError("git push → код 1: remote: Permission denied")
@@ -533,7 +539,7 @@ async def test_failed_handoff_runs_the_agent_once_and_reports():
                                       prepare, stage_ok, publish, cleanup, publish_error,
                                       ready, develop_failing, decompose, publish_plan,
                                       phase_stub, error_label,
-                                      *DEV_STEPS_FAILING_PUBLISH]):
+                                      *DEV_STEPS_FAILING_PUBLISH, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")

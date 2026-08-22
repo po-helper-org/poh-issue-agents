@@ -25,7 +25,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared import bft, lifecycle
+    from shared import bft, labels, lifecycle
     from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE
     from shared.workflow_ids import (
         analysis_workflow_id,
@@ -42,6 +42,7 @@ with workflow.unsafe.imports_passed_through():
         BftRequest,
         ClassificationResult,
         CommentAckInput,
+        CommentIntent,
         Deadlines,
         DevelopPlan,
         EstimateRequest,
@@ -69,6 +70,10 @@ MAX_CLARIFICATION_ROUNDS = 2
 # кончаются, вопросы уезжают в чеклист готовности, и решение принимает тот, кто
 # возьмёт задачу.
 MAX_ANALYSIS_CLARIFY_ROUNDS = 2
+
+# Потолок возвратов этапа на пересборку. Человек может вернуть этап много раз,
+# но каждый круг — это полный прогон триажа/аналитики, который стоит денег.
+MAX_REWORK_ROUNDS = 2
 
 # Запрос на прогон аналитики, доставленный в общую очередь сигналов. Та же
 # схема, что у реплики человека (`UserComment`): одна очередь, разные виды
@@ -199,12 +204,26 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
         # exc — ActivityError с общим текстом; настоящая причина в exc.cause
         # (например, «стадия concept: артефакт ... не создан»). Разворачиваем.
         reason = str(getattr(exc, "cause", None) or exc)
-        await workflow.execute_activity(
-            activities.publish_analysis_error,
-            args=[analyze, reason[:500]],
-            start_to_close_timeout=timedelta(seconds=60),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
+        # Сначала спасаем сделанное, потом сообщаем о сбое: `cleanup` в
+        # `finally` снимет каталог, и после него публиковать будет нечего.
+        saved = []
+        try:
+            saved = await workflow.execute_activity(
+                activities.publish_analysis_partial,
+                args=[analyze, reason[:300]],
+                start_to_close_timeout=timedelta(seconds=300),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            )
+        except Exception as partial_exc:
+            workflow.logger.warning(
+                "публикация частичного анализа не удалась: %s", partial_exc)
+        if not saved:
+            await workflow.execute_activity(
+                activities.publish_analysis_error,
+                args=[analyze, reason[:500]],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
         await _finish_labels(analyze.repo, analyze.issue_number, ANALYZE, ok=False)
     finally:
         # Каталог живёт вне Temporal — снимаем его на обоих путях. Best-effort:
@@ -364,6 +383,11 @@ class IssueLifecycle:
         self._followup_rounds = 0
         self._answered_comment_ids: list[int] = []
         self._followup_max_rounds = Deadlines().followup_max_rounds
+        # Сколько раз человек вернул этап на пересборку (rework intent).
+        # Потолок нужен, чтобы пара «переделай» ↔ «переделал» не стояла по
+        # LLM-прогону за круг без конца.
+        self._rework_rounds = 0
+        self._rework_max_rounds = MAX_REWORK_ROUNDS
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -712,6 +736,7 @@ class IssueLifecycle:
             self._clarify_rounds = carried.clarify_rounds
             self._followup_rounds = carried.followup_rounds
             self._answered_comment_ids = list(carried.answered_comment_ids)
+            self._rework_rounds = carried.rework_rounds
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -743,6 +768,7 @@ class IssueLifecycle:
             clarify_rounds=self._clarify_rounds,
             followup_rounds=self._followup_rounds,
             answered_comment_ids=list(self._answered_comment_ids),
+            rework_rounds=self._rework_rounds,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -820,6 +846,31 @@ class IssueLifecycle:
             return timedelta(hours=hours)
         left = self._phase_since + timedelta(hours=hours) - workflow.now()
         return left if left > timedelta(0) else timedelta(0)
+
+    async def _phase_on_close(self) -> tuple[str, str]:
+        """Чем закончился путь Issue: слиянием или снятием с обработки.
+
+        Спрашиваем сам PR, а не того, кто закрыл Issue: закрыть его по `Closes`
+        может и бот, и человек, а `state_reason` у закрытия «как выполненное»
+        одинаков в обоих случаях. Номер PR у цикла уже есть — он запомнил его,
+        когда PR открылся.
+
+        Вопрос задаём, только если ответ может что-то изменить: PR нет либо из
+        текущей фазы в `merged` хода нет — значит, это отмена, и лишний вызов
+        GitHub на каждом закрытии не нужен.
+        """
+        if (self._issue is None or not self._pr_number
+                or not lifecycle.can(self._phase, lifecycle.MERGED)):
+            return (lifecycle.CANCELLED, "cancelled")
+        merged = await workflow.execute_activity(
+            activities.pr_is_merged,
+            args=[self._issue.repo, self._pr_number],
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        if merged:
+            return (lifecycle.MERGED, "merged")
+        return (lifecycle.CANCELLED, "cancelled")
 
     async def _enter(self, phase: str, stage: str, *, write_label: bool = True) -> None:
         """Переход в фазу: проверка допустимости, стадия, метка.
@@ -987,6 +1038,24 @@ class IssueLifecycle:
                 # надо, он лишь возвращает управление наверх на постороннем
                 # сигнале. `cancelled` в таблице переходов и означает «снято с
                 # обработки», и разрешён из любой нетерминальной фазы.
+                #
+                # Но «закрыт» и «снят с обработки» — не одно и то же. Issue,
+                # доведённый до `main`, GitHub закрывает сам по `Closes #N`, и
+                # прежнее правило метило его как отменённый: успех и отказ
+                # оказывались в одном состоянии, а фаза `merged` не
+                # использовалась вовсе. Маркер обязателен — у припаркованных
+                # прогонов на этом месте активности нет, и реплей без него
+                # упал бы недетерминизмом.
+                if workflow.patched("issue-lifecycle-merged-on-close"):
+                    phase, stage = await self._phase_on_close()
+                    await self._enter(phase, stage)
+                    # Выходим ЗДЕСЬ, не полагаясь на проверку терминальности
+                    # ниже: `merged` не терминальна намеренно — за ней в
+                    # таблице стоят `testing` и `released`. Вести их по
+                    # закрытому Issue некому, а парковка в нём — ровно тот
+                    # отказ, ради которого ветку закрытия и завели.
+                    await self._stop_awaiting()
+                    return
                 await self._enter(lifecycle.CANCELLED, "cancelled")
 
             if lifecycle.is_terminal(self._phase):
@@ -1311,12 +1380,17 @@ class IssueLifecycle:
             # Явная команда человека сильнее гварда по типу Issue: он защищает
             # от неудачно поставленной метки, а не от прямого `/analyze`.
             return await self._analysis_requested(issue)
-        if isinstance(decision, UserComment) and workflow.patched(
-                "issue-lifecycle-followup-answer"):
-            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
-            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
-            # активность, которой там нет, — реплей упал бы недетерминизмом.
-            return await self._answer_followup(issue, decision)
+        if isinstance(decision, UserComment):
+            # Разбор намерения из реплики человека
+            intent = await workflow.execute_activity(
+                activities.interpret_user_comment,
+                args=[issue, decision.text, self._phase, self._classification_label,
+                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            
+            return await self._handle_comment_intent(issue, decision, intent, deadlines)
 
         # `classification_label is None` — сокращённый триаж (Issue от агента):
         # он уже классифицирован на стороне создателя, гвард проверять не на чем.
@@ -1399,6 +1473,24 @@ class IssueLifecycle:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+        
+        # При RESEARCH_AUTOSTART ожидания нет: триаж сам довёл задачу до
+        # system-requirements, и решение «декомпозиция или сразу разработка»
+        # уже принято в коде (флаг self._decompose). Нет смысла парковаться и
+        # ждать того же решения от человека.
+        #
+        # Если включён и DEVELOP_AUTOSTART — идём сразу в разработку, минуя
+        # парковку в ready-for-dev. Если только RESEARCH_AUTOSTART — всё равно
+        # не парковаться: задача дошла до конца исследовательского пути, и
+        # следующее решение (запуск разработки) принимается отдельно, в своей
+        # фазе (_phase_await_build).
+        if deadlines.research_autostart:
+            if deadlines.develop_autostart and not self._plan_member:
+                # Полный автостарт: Research + Develop → замкнутый контур
+                return await self._start_development(issue)
+            # Только Research автостарт: дошли до ready-for-dev без парковки
+            return (lifecycle.READY_FOR_DEV, None, False)
+        
         return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", True)
 
     async def _clarify_open_questions(self, issue: IssueInput, deadlines,
@@ -1506,6 +1598,107 @@ class IssueLifecycle:
             workflow.logger.warning("не ответил на реплику: %s", _failure_reason(exc))
         return (self._phase, self._stage, False)
 
+    async def _handle_comment_intent(self, issue: IssueInput, comment: UserComment,
+                                   intent: CommentIntent, deadlines) -> tuple:
+        """Обработка намерения, извлечённого из реплики человека.
+        
+        Реагирует на comment intent в зависимости от текущей фазы и типа намерения.
+        """
+        # Защита от повторной доставки: уже отвеченные комментарии игнорируем
+        if comment.comment_id is not None and comment.comment_id in self._answered_comment_ids:
+            workflow.logger.info("комментарий #%s уже обработан — пропускаю", comment.comment_id)
+            return (self._phase, self._stage, False)
+        
+        # Отмечаем комментарий как обработанный
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        
+        # Обработка по типу намерения
+        if intent.intent == "proceed":
+            # Человек подтвердил продолжение — двигаем фазу по основному пути
+            if self._phase == lifecycle.CLASSIFIED:
+                label = self._classification_label
+                feature = label is None or label == "advisor:feature-request"
+                bug = label is None or label == "advisor:bug"
+                
+                if feature:
+                    return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+                if bug:
+                    return (lifecycle.READY_FOR_DEV, "bug", True)
+            
+            # В других фазах proceed — просто ответ, что продолжаем
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, intent.reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "rework":
+            # Проверяем потолок возвратов этапа
+            if self._rework_rounds >= self._rework_max_rounds:
+                # Потолок исчерпан — отвечаем, что больше не переделываем
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                 "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                return (self._phase, self._stage, False)
+            
+            self._rework_rounds += 1
+            
+            # Возврат в created с репликой в контексте
+            if self._phase == lifecycle.CLASSIFIED:
+                # Возвращаемся в created, триаж перезапустится
+                return (lifecycle.CREATED, "rework", True)
+            
+            # В других фазах rework не поддерживаем — отвечаем, что не можем
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                             "Продолжай работу или поставь метку для перехода."],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "question":
+            # Вопрос — отвечаем, парковку держим
+            if self._followup_rounds >= self._followup_max_rounds:
+                workflow.logger.info("потолок реплик исчерпан (%s) — отвечаю молчанием",
+                                     self._followup_max_rounds)
+                return (self._phase, self._stage, False)
+            self._followup_rounds += 1
+            try:
+                await workflow.execute_activity(
+                    activities.answer_followup,
+                    args=[issue, comment.text],
+                    start_to_close_timeout=timedelta(seconds=180),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as exc:
+                workflow.logger.warning("не ответил на вопрос: %s", _failure_reason(exc))
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "ack":
+            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные ходы
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, intent.reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        else:
+            # Неизвестный intent — логируем и игнорируем
+            workflow.logger.warning("неизвестный intent: %s", intent.intent)
+            return (self._phase, self._stage, False)
+
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
 
@@ -1569,7 +1762,13 @@ class IssueLifecycle:
         Одна точка на оба входа — решение человека `build-me` и автостарт. Две
         копии этого вызова разъехались бы на первой же правке ретраев, и один из
         входов молча остался бы со старым поведением.
+        
+        ISSUE-113: для подзадачи плана передаём root_issue и ветку родителя.
         """
+        # ISSUE-113 пункт 2: вычисляем ветку так же, как в _phase_handoff
+        source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
+        
         try:
             if workflow.patched("issue-lifecycle-develop-child"):
                 # Дочерний прогон: у стадии появляется свой WorkflowId, а
@@ -1587,7 +1786,7 @@ class IssueLifecycle:
             else:
                 pr_number = await workflow.execute_activity(
                     activities.trigger_openhands_resolver,
-                    issue,
+                    args=[issue, self._root_issue, branch],
                     # Прогон агента идёт десятками минут, поэтому потолок общий
                     # на весь шаг, а живость сообщается heartbeat'ом.
                     start_to_close_timeout=timedelta(seconds=3600),
@@ -1741,12 +1940,51 @@ class IssueLifecycle:
             # Команда работает и на припаркованном Issue: из бокового состояния
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
-        if isinstance(signal, UserComment) and workflow.patched(
-                "issue-lifecycle-followup-answer"):
-            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
-            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
-            # активность, которой там нет, — реплей упал бы недетерминизмом.
-            return await self._answer_followup(issue, signal)
+        if isinstance(signal, UserComment):
+            # Разбор намерения из реплики человека
+            intent = await workflow.execute_activity(
+                activities.interpret_user_comment,
+                args=[issue, signal.text, self._phase, self._classification_label,
+                      awaiting_mod.reason_for_phase(self._phase)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            
+            return await self._handle_comment_intent(issue, signal, intent, deadlines)
+        
+        # Обработка специфических сигналов для фазы DUPLICATE
+        if self._phase == lifecycle.DUPLICATE:
+            if signal == "not-duplicate":
+                # Вернуть в работу (переход в CLASSIFIED)
+                # Если на Issue уже стоят метки решения (research-me/bug-me), 
+                # проверить их сразу, чтобы не парковать на полный срок
+                if workflow.patched("issue-lifecycle-duplicate-exit-checks-existing-labels"):
+                    current_labels = await workflow.execute_activity(
+                        activities.read_issue_labels,
+                        args=[issue.repo, issue.issue_number],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    # Проверяем метки решения человека
+                    if labels.has(current_labels, "research-me"):
+                        # Проверяем классификацию для совместимости с гардами
+                        label = self._classification_label
+                        feature = label is None or label == "advisor:feature-request"
+                        if feature:
+                            # Подзадача плана аналитику не заказывает (см. _phase_await_decision)
+                            if self._plan_member and workflow.patched(
+                                    "issue-lifecycle-plan-member-skips-analysis"):
+                                return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
+                            return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+                    elif labels.has(current_labels, "bug-me"):
+                        label = self._classification_label
+                        bug = label is None or label == "advisor:bug"
+                        if bug:
+                            return (lifecycle.READY_FOR_DEV, "bug", True)
+                return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
+            if signal == "confirm-duplicate":
+                # Подтвердить дубликат (переход в CANCELLED)
+                return (lifecycle.CANCELLED, "cancelled", True)
+        
         if signal != "reopen":
             return (self._phase, self._stage, False)  # посторонний сигнал — ждём дальше
         back = next((t for t in lifecycle.allowed(self._phase)
@@ -2257,11 +2495,31 @@ class IssueBft:
             ok = False
             self._stage = "failed"
             reason = str(getattr(exc, "cause", None) or exc)
-            await workflow.execute_activity(
-                activities.publish_bft_error, args=[req, reason[:500]],
-                start_to_close_timeout=timedelta(seconds=60),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+            published = False
+            if req.mode == bft.DEEP:
+                # Сначала спасаем сделанное, потом сообщаем о сбое. Порядок не
+                # косметический: `cleanup` в `finally` снимает каталог, и после
+                # него публиковать будет уже нечего. Прогон рвётся чаще от
+                # чужого — лимит провайдера, 524, выкладка посреди работы, — и
+                # терять из-за этого двадцать минут работы модели незачем.
+                try:
+                    done = await workflow.execute_activity(
+                        activities.publish_bft_partial, args=[req, reason[:300]],
+                        start_to_close_timeout=timedelta(seconds=300),
+                        retry_policy=RetryPolicy(maximum_attempts=2),
+                    )
+                    published = bool(done)
+                except Exception as partial_exc:
+                    workflow.logger.warning(
+                        "публикация частичного БФТ не удалась: %s", partial_exc)
+            if not published:
+                # Сказать нечего кроме самого сбоя: ни одна стадия не дала
+                # артефакта, продолжать в следующий раз будет не с чего.
+                await workflow.execute_activity(
+                    activities.publish_bft_error, args=[req, reason[:500]],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
         finally:
             if req.mode == bft.DEEP:
                 # Каталог живёт вне Temporal — снимаем на обоих путях. Провал

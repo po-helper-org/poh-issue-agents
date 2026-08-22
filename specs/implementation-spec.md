@@ -181,11 +181,19 @@ research/issue-<n>.
 
 **TASKS:**
 - [ ] T5.1. Установить deb8flow в worker/Dockerfile (способ + флаги CLI).
-- [ ] T5.2. Решить MCP Confluence/Jira для Repowise в headless-среде.
+- [x] T5.2. ~~Решить MCP Confluence/Jira для Repowise в headless-среде.~~
+      Переформулирована и закрыта (FNR-5): блокирующее условие было
+      поставлено к системе управления знаниями, тогда как Repowise в
+      организации индексирует **кодовую базу**. Работоспособность без
+      облачной учётной записи проверена —
+      `docs/spikes/2026-08-19-repowise-headless.md`.
 - [ ] T5.3. Подтвердить/задать плейсхолдеры в шаблоне po-helper.
 - [ ] T5.4. Реализовать шаг po-helper (проверить запись .docx через claude -p).
 - [ ] T5.5. Реализовать шаг gh-поиска связанных Issue.
-- [ ] T5.6. Реализовать шаг Repowise (контекст-дозаполнение).
+- [x] T5.6. ~~Реализовать шаг Repowise (контекст-дозаполнение).~~
+      Стадия `repowise` идёт первой в цепочке FNR, её артефакт
+      `repowise-dialog.md` — вход стадии `task`
+      (`sa_documentation/FNR/FNR_5/system_requirements.md`).
 - [ ] T5.7. Реализовать шаг Blueprint.
 - [ ] T5.8. Реализовать шаг deb8flow.
 - [ ] T5.9. Реализовать шаг SA-helper.

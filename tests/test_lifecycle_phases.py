@@ -8,6 +8,7 @@
 import pytest
 
 from shared import lifecycle as lc
+from tests.conftest import make_fake_set_labels
 
 
 # --- полнота и связность ---
@@ -45,6 +46,15 @@ def test_bug_path_skips_analysis():
     подмножества. Путь бага короче — из классификации сразу к разработке."""
     assert lc.can(lc.CLASSIFIED, lc.READY_FOR_DEV)
     assert lc.initiator(lc.CLASSIFIED, lc.READY_FOR_DEV) == lc.HUMAN
+
+
+def test_development_can_fail_in_one_step():
+    """Прогон агента разработки проходит путь целиком за один шаг — значит,
+    и сорваться может там же. Без этого перехода обработчик отказа падал сам:
+    `InvalidTransition` подменял настоящую причину, и цикл крутил её вместо
+    того, чтобы доложить человеку и остановиться."""
+    assert lc.can(lc.READY_FOR_DEV, lc.FAILED)
+    assert lc.initiator(lc.READY_FOR_DEV, lc.FAILED) == lc.AGENT
 
 
 # --- недопустимые переходы ---
@@ -179,14 +189,16 @@ def test_set_phase_removes_the_previous_one():
     removed: list[str] = []
     added: list[str] = []
 
-    class _GH:
-        @staticmethod
-        def remove_label(repo, n, label):
-            removed.append(label)
+    def _add_label(repo, n, label):
+        added.append(label)
 
-        @staticmethod
-        def add_label(repo, n, label):
-            added.append(label)
+    def _remove_label(repo, n, label):
+        removed.append(label)
+
+    class _GH:
+        add_label = staticmethod(_add_label)
+        remove_label = staticmethod(_remove_label)
+        set_labels = staticmethod(make_fake_set_labels(_add_label, _remove_label))
 
     original = activities.github_client
     activities.github_client = _GH
@@ -197,7 +209,14 @@ def test_set_phase_removes_the_previous_one():
 
     assert added == [lc.phase_label(lc.GROOMED)]
     assert lc.phase_label(lc.CLASSIFIED) in removed
-    assert lc.phase_label(lc.GROOMED) not in removed, "новая метка не должна сниматься"
+    # Не проверяем `lc.phase_label(lc.GROOMED) not in removed` здесь: `set_phase`
+    # намеренно передаёт целевую фазу внутри `remove` (см. её докстринг и
+    # `stale_labels` в реализации) — отбрасывает её оттуда фильтр самого
+    # `set_labels` (remove минус add), а не эта функция. Утверждать это через
+    # тестовый двойник было бы тавтологией: он реализует тот же фильтр, что и
+    # продукт, и вернёт «верно» независимо от того, работает ли фильтр в
+    # настоящем `github_client.set_labels`. Это свойство реального транспорта
+    # проверяет tests/test_set_labels.py::test_label_being_added_is_never_removed.
 
 
 def test_phase_query_follows_the_loop_when_it_drives():

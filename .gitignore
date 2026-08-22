@@ -5,6 +5,9 @@ secrets/
 
 # Python
 .venv/
+# и симлинк на общий venv из worktree: правило с завершающим слэшем
+# каталог ловит, а ссылку — нет
+.venv
 __pycache__/
 *.pyc
 .pytest_cache/

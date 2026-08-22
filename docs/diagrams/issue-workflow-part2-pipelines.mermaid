@@ -16,7 +16,7 @@ flowchart TD
     subgraph RESEARCHPIPE["research-pipeline.yml"]
         FGuard["Guard: advisor:feature-request?"] --> PO["po-helper: критерии приёмки<br/>(UJM/интерфейсы/НФТ) → БФТ.docx"]
         PO --> RelIssues["Поиск связанных issue"]
-        RelIssues --> RepowiseCtx["Repowise: стратегия / история / рынок"]
+        RelIssues --> RepowiseCtx["Стадия repowise: автономный диалог<br/>с индексом кода → repowise-dialog.md<br/>(недоступен → деградация, конвейер идёт)"]
         RepowiseCtx --> Blueprint["Repowise — Blueprint:<br/>Service Blueprint + IDEF0<br/>+ Несогласованности"]
         Blueprint --> Debate["deb8flow: дебаты по обогащённому БФТ"]
         Debate --> SAHelper["SA-helper: техспека"]

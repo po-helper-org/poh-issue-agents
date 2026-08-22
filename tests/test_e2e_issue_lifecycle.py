@@ -35,6 +35,8 @@ from workflows import (  # noqa: E402
     WebhookAudit,
 )
 
+from tests.conftest import make_fake_set_labels  # noqa: E402
+
 SECRET = "e2e-secret"
 REPO = "acme/widgets"
 
@@ -101,6 +103,14 @@ class FakeGitHub:
         self.calls.append(f"remove_label:{label}")
         if label in self.labels:
             self.labels.remove(label)
+
+    def set_labels(self, repo, issue_number, *, add=(), remove=()):
+        """Смена набора одной операцией: делегирует общему двойнику
+        (tests/conftest.py), который ставит через add_label и снимает через
+        remove_label, так что self.labels/self.calls остаются той же точкой
+        правды, которую читают остальные тесты этого файла."""
+        make_fake_set_labels(self.add_label, self.remove_label)(
+            repo, issue_number, add=add, remove=remove)
 
     def close_issue(self, repo, issue_number):
         self.state = "closed"
@@ -201,13 +211,14 @@ def e2e(monkeypatch, tmp_path):
         out.write_text("<repo/>", encoding="utf-8")
 
     produced = {
+        "/repowise-context": "repowise-dialog.md",
         "/fnr-new-task": "task.md",
         "/fnr-concept": "concept.md",
         "/fnr-system-requirements": "system_requirements.md",
         "/validate-doc": "validation.md",
     }
 
-    def fake_claude(prompt, cwd):
+    def fake_claude(prompt, cwd, mcp=None):
         fnr = Path(cwd) / activities_module.FNR_DIR
         fnr.mkdir(parents=True, exist_ok=True)
         name = produced.get(prompt.split()[0])

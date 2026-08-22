@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
@@ -24,7 +25,16 @@ import estimate_report
 import estimation
 import github_client
 import llm
-from shared import bft, decomposition, develop, labels, lifecycle, pr_closing, sentry_setup
+from shared import (
+    bft,
+    decomposition,
+    develop,
+    labels,
+    lifecycle,
+    pr_closing,
+    repowise,
+    sentry_setup,
+)
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,
@@ -42,6 +52,7 @@ from shared.workflow_types import (
     BftRequest,
     ClassificationResult,
     CommentAckInput,
+    CommentIntent,
     Deadlines,
     DevelopPlan,
     DuplicateResult,
@@ -99,6 +110,12 @@ class PriorityExtraction(BaseModel):
     who: str = ""
     risks: list[str] = []
     goal_impact: str = ""
+
+
+class CommentIntentExtraction(BaseModel):
+    intent: str = Field(description="proceed | rework | question | ack")
+    reason: str = Field(description="обоснование для комментария-ответа")
+    rework_note: str = Field(description="что именно переделывать (только для rework)", default="")
 
 
 # --- Zero-cost предфильтры ---
@@ -195,6 +212,10 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
 
     Допустимость самого перехода проверяет воркфлоу (у него есть предыдущая
     фаза); здесь — только запись, идемпотентная по построению.
+
+    Целевая метка ставится раньше снятия прежних: окно, в котором меток
+    `phase:*` нет вовсе, хуже окна, в котором их две. Атомарно это делается
+    только на провайдере, умеющем менять набор одним запросом.
     """
     target = lifecycle.phase_label(phase)
     stale_labels = [lifecycle.phase_label(other) for other in lifecycle.PHASES]
@@ -204,14 +225,7 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
     # завершилась; единственная точка, которая знает о смене состояния, — здесь.
     if phase != lifecycle.IN_DEVELOPMENT:
         stale_labels.append(develop.IN_DEVELOPMENT_LABEL)
-    for stale in stale_labels:
-        if stale != target:
-            try:
-                github_client.remove_label(repo, issue_number, stale)
-            except Exception as exc:
-                logger.warning("не снял метку фазы %s с %s#%s: %s",
-                               stale, repo, issue_number, exc)
-    github_client.add_label(repo, issue_number, target)
+    github_client.set_labels(repo, issue_number, add=[target], remove=stale_labels)
 
 
 @activity.defn
@@ -225,16 +239,18 @@ def mark_awaiting(repo: str, issue_number: int, waiting=None) -> None:
     Ожидание машины (стенд, соседний сервис) метку НЕ ставит: задача, по которой
     человеку делать нечего, в его очереди — шум, из-за которого перестают
     смотреть на саму выборку.
+
+    Асимметрия обработки ошибок: постановка метки падает при сбое, снятие
+    проглатывается (ошибка уходит в лог, но наружу не пробрасывается). Это
+    поведение гарантирует, что неудачное снятие не заблокирует продолжение
+    потока, который уже ушёл дальше.
     """
     if waiting is not None and isinstance(waiting, dict):
         waiting = Awaiting(**waiting)
     if waiting is not None and waiting.blocks_on_human:
-        github_client.add_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
+        github_client.set_labels(repo, issue_number, add=[labels.NEEDS_HUMAN_TRIAGE])
         return
-    try:
-        github_client.remove_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
-    except Exception as exc:
-        logger.warning("не снял метку ожидания с %s#%s: %s", repo, issue_number, exc)
+    github_client.set_labels(repo, issue_number, remove=[labels.NEEDS_HUMAN_TRIAGE])
 
 
 @activity.defn
@@ -436,6 +452,18 @@ def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
 
 
 @activity.defn
+def read_issue_labels(repo: str, issue_number: int) -> list[str]:
+    """Читает текущие метки Issue для проверки уже стоящих решений.
+    
+    Используется в сценариях, когда Issue приходит в фазу с уже проставленными
+    метками (например, `research-me` на Issue, который вернулся из DUPLICATE),
+    чтобы не ждать нового сигнала человека, а сразу продолжить обработку.
+    """
+    issue = github_client.get_issue(repo, issue_number)
+    return [label["name"] for label in issue.get("labels", [])]
+
+
+@activity.defn
 def post_error_label(issue: IssueInput, reason: str = "") -> None:
     # Sentry ПЕРЕД комментарием, а не после: id события уезжает в тот же
     # комментарий ссылкой, иначе человек видит «не удалось» и не знает, где
@@ -481,9 +509,13 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     Неуспех получает СВОЮ метку, а не просто снятый `run:*`: молча снятая метка
     неотличима от «никто не запускал», а именно это и нужно увидеть в ленте.
 
-    Best-effort по каждой метке: прогон уже состоялся, и провал косметики не
-    должен превращать успешный анализ в проваленный. Ошибка уходит в лог, но
-    наружу не пробрасывается — activity зовётся из терминальных веток воркфлоу.
+    Best-effort по операции целиком, а не по каждой метке отдельно:
+    `set_labels` снимает `run:*` и предыдущий исход даже если постановка новой
+    метки исхода упала — иначе 5xx на POST оставлял бы `run:analyze` на Issue
+    навсегда. Ошибка от `set_labels` (если постановка всё же не удалась)
+    гасится здесь же: прогон уже состоялся, и провал косметики не должен
+    превращать успешный анализ в проваленный. Наружу не пробрасывается —
+    activity зовётся из терминальных веток воркфлоу.
     """
     outcome = done_label(command) if ok else failed_label(command)
     # Исход ПРЕДЫДУЩЕГО прогона снимается вместе с «идёт»: `done:analyze` рядом
@@ -491,15 +523,13 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     # сказать, чем кончился последний прогон, и выборка `label:failed:*`
     # показывает задачи, которые давно починены повторным запуском.
     previous = failed_label(command) if ok else done_label(command)
-    for stale in (*running_labels(command), previous):
-        try:
-            await asyncio.to_thread(github_client.remove_label, repo, issue_number, stale)
-        except Exception as exc:
-            logger.warning("не снял метку %s с %s#%s: %s", stale, repo, issue_number, exc)
     try:
-        await asyncio.to_thread(github_client.add_label, repo, issue_number, outcome)
+        await asyncio.to_thread(
+            github_client.set_labels, repo, issue_number,
+            add=[outcome], remove=[*running_labels(command), previous])
     except Exception as exc:
-        logger.warning("не поставил метку %s на %s#%s: %s", outcome, repo, issue_number, exc)
+        logger.warning("не привёл метки команды на %s#%s к виду %s: %s",
+                       repo, issue_number, outcome, exc)
 
 
 # --- Классификация ---
@@ -620,6 +650,51 @@ def answer_followup(issue: IssueInput, question: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, answer)
 
 
+@activity.defn
+def interpret_user_comment(issue: IssueInput, comment_text: str, current_phase: str,
+                          classification_label: str | None, awaiting_reason: str | None,
+                          recent_artifacts: dict[str, str] | None = None) -> CommentIntent:
+    """Разбор намерения из реплики человека.
+    
+    Анализирует комментарий и определяет, чего хочет человек: продолжить работу,
+    переделать этап, задать вопрос или просто подтвердить получение.
+    """
+    capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
+        if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
+    
+    thread = _followup_thread(issue.repo, issue.issue_number)
+    
+    parts = [
+        f"# Issue {issue.repo}#{issue.issue_number}: {issue.title}", "",
+        "## Описание", "", issue.body.strip() or "(тело пустое)", "",
+        "## Текущая фаза", "", current_phase, "",
+        "## Метка классификации", "", classification_label or "(нет)", "",
+        "## Чего ждёт Issue", "", awaiting_reason or "(ожидания нет)", "",
+        "## Известный функционал", "", capabilities
+    ]
+    
+    if thread:
+        parts += ["", "## Переписка Issue", "", thread]
+    
+    if recent_artifacts:
+        parts += ["", "## Последние артефакты этапа", ""]
+        for name, content in recent_artifacts.items():
+            parts += [f"### {name}", "", content[:1000]]  # Ограничиваем размер
+    
+    parts += ["", "## Реплика для разбора", "", comment_text.strip()]
+    
+    result = llm.extract(
+        _load_prompt("system_comment_intent.md"), "\n".join(parts), CommentIntentExtraction,
+        model=llm.MODEL_GATE,
+    )
+    
+    return CommentIntent(
+        intent=result.intent,
+        reason=result.reason,
+        rework_note=result.rework_note or ""
+    )
+
+
 # --- Duplicate Check ---
 
 @activity.defn
@@ -738,7 +813,8 @@ def post_priority_comment(issue: IssueInput, priority: PriorityResult, dup: Dupl
 # --- Пайплайн SA-helper (FNR) ---
 
 FNR_DIR = "sa_documentation/FNR/FNR_1"
-ARTIFACT_FILES = ("task.md", "concept.md", "system_requirements.md", "validation.md")
+ARTIFACT_FILES = ("repowise-dialog.md", "task.md", "concept.md",
+                  "system_requirements.md", "validation.md")
 CLAUDE_STAGE_TIMEOUT_SEC = 900
 REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
@@ -750,14 +826,24 @@ CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментар
 CONTEXT_PR_LIMIT = 20           # связанных PR
 CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
 
+# Потолок размера постановки для агента разработки (ISSUE-113)
+DEV_TASK_MAX_CHARS = 50000      # общий размер .task.md
+DEV_ARTIFACT_MAX_CHARS = 10000  # отдельный артефакт FNR
+DEV_COMMENT_CHARS = 1000        # обрезка одного комментария для разработки
+
 
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     """Стадии цепочки FNR: (имя, промпт, ожидаемый артефакт).
 
     У `debate` и `validate` ожидаемого файла нет: дебаты дописываются в
     concept.md, а валидация может остаться отчётом в выводе.
+
+    `repowise` идёт ПЕРВОЙ: её результат — вход для постановки задачи, и
+    обращаться к индексу после написания task.md уже поздно.
     """
     return [
+        ("repowise", f"/repowise-context {description}",
+         f"{FNR_DIR}/repowise-dialog.md"),
         ("task", f"/fnr-new-task {description}", f"{FNR_DIR}/task.md"),
         ("concept", f"/fnr-concept {FNR_DIR}/task.md", f"{FNR_DIR}/concept.md"),
         ("debate", f"/fnr-debate {FNR_DIR}/concept.md", None),
@@ -767,12 +853,21 @@ def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     ]
 
 
-FNR_STAGE_NAMES = ("task", "concept", "debate", "sysreq", "validate")
+# Имя стадии сбора контекста — константой: на него ссылается ветвь деградации,
+# и разъехавшийся литерал означал бы стадию, которая деградировать не умеет.
+REPOWISE_STAGE = "repowise"
+
+FNR_STAGE_NAMES = (REPOWISE_STAGE, "task", "concept", "debate", "sysreq", "validate")
 
 # Входной артефакт каждой стадии — что уже должно лежать в рабочем каталоге,
 # чтобы стадия имела смысл (используется guard'ом _require_workspace).
+#
+# У `task` вход — артефакт диалога: пропустить сбор контекста незаметно нельзя.
+# Артефакт создаётся и при недоступном Repowise (деградация, см. run_fnr_stage),
+# поэтому guard не превращает сервис в обязательную зависимость конвейера.
 _FNR_STAGE_REQUIRES = {
-    "task": None,
+    "repowise": None,
+    "task": f"{FNR_DIR}/repowise-dialog.md",
     "concept": f"{FNR_DIR}/task.md",
     "debate": f"{FNR_DIR}/concept.md",
     "sysreq": f"{FNR_DIR}/concept.md",
@@ -800,12 +895,41 @@ def _clone_dir(analyze: AnalyzeInput) -> str:
     return str(_workspace_dir(analyze) / "repo")
 
 
+def _existing_branch(repo: str, branch: str) -> str | None:
+    """Имя ветки, если она есть в origin, иначе None.
+
+    Проверка вспомогательная: её задача — подобрать артефакты прошлого прогона,
+    а не решить, состоится ли анализ. Недоступный GitHub (нет авторизации,
+    сеть, лимит) означает «продолжать не с чего», а не «прогон отменяется».
+    """
+    try:
+        return branch if github_client.branch_exists(repo, branch) else None
+    except Exception as exc:  # noqa: BLE001 — вспомогательная проверка
+        logger.warning("ветка %s не проверена (%s) — клон с дефолтной", branch, exc)
+        return None
+
+
 def _build_workspace(analyze: AnalyzeInput) -> str:
-    """Свежий каталог: снести остаток прежнего прогона, clone, repomix."""
+    """Свежий каталог: снести остаток прежнего прогона, clone, repomix.
+
+    Ветка артефактов забирается, если уже есть: повторный `/analyze` после
+    обрыва — это продолжение, а не второй анализ рядом. Стадия с готовым
+    артефактом тогда пропускается, и прогон не платит второй раз за уже
+    написанный документ. Без этого пропуск не сработал бы вовсе: в свежем
+    клоне дефолтной ветки прошлых артефактов нет.
+    """
     shutil.rmtree(_workspace_dir(analyze), ignore_errors=True)
     clone_dir = _clone_dir(analyze)
-    _clone_repo(analyze.repo, clone_dir)
+    previous = _existing_branch(analyze.repo, f"research/issue-{analyze.issue_number}")
+    # Аргумент передаём только когда ветка есть: вызов без него — прежний путь,
+    # и подменять его в тестах существующим способом по-прежнему можно.
+    if previous:
+        _clone_repo(analyze.repo, clone_dir, branch=previous)
+    else:
+        _clone_repo(analyze.repo, clone_dir)
     _run_repomix(clone_dir)
+    # Трекер диалога — до первой стадии: хуки живут в клоне, а он пересоздаётся.
+    _enable_entire(clone_dir)
     return clone_dir
 
 
@@ -887,11 +1011,17 @@ def _claude_anthropic_creds() -> tuple[str, str]:
     return token, base
 
 
-def _run_claude(prompt: str, cwd: str) -> None:
+def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None) -> None:
     """Одна стадия FNR — отдельный процесс `claude -p` с чистым контекстом.
 
     Креды берутся из ZAI_* (как в main) и прокидываются в claude-code через его
     ANTHROPIC_* — единый ключ z.ai, отдельную пару переменных заводить не нужно.
+
+    `mcp_config` — путь к файлу с описанием MCP-серверов. Передаётся ЯВНО, и это
+    не перестраховка: `claude -p` НЕ подхватывает проектный `.mcp.json` сам.
+    Положить файл в каталог прогона и надеяться — ровно то, что провалилось на
+    первом живом Issue: стадия отработала за минуту, вышла с нулём, инструментов
+    не увидела и артефакта не создала.
     """
     token, base = _claude_anthropic_creds()
     # Понятная ошибка вместо голого "exit 1", если z.ai не сконфигурирован:
@@ -901,11 +1031,22 @@ def _run_claude(prompt: str, cwd: str) -> None:
             "claude -p не сконфигурирован: задай ZAI_API_KEY и ZAI_BASE_URL "
             "(или явные ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN) в окружении воркера."
         )
+    # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
+    # работает от root, а тот флаг под root запрещён самим claude-code
+    # (проверено спайком, docs/spikes/2026-07-22-claude-p-zai-tool-calling.md).
+    command = ["claude", "-p", prompt, "--permission-mode", "acceptEdits"]
+    if mcp_config:
+        # --strict-mcp-config: брать ТОЛЬКО этот файл. Иначе в сессию могли бы
+        # затесаться серверы из окружения образа, и стадия ходила бы не туда,
+        # куда её послали.
+        #
+        # --allowedTools по имени сервера: без него вызов инструмента ждёт
+        # подтверждения, которого в неинтерактивном режиме не будет, и диалог
+        # молча не состоится.
+        command += ["--mcp-config", mcp_config, "--strict-mcp-config",
+                    "--allowedTools", f"mcp__{repowise.SERVER_NAME}"]
     result = subprocess.run(
-        # acceptEdits, а НЕ --dangerously-skip-permissions: контейнер воркера
-        # работает от root, а тот флаг под root запрещён самим claude-code
-        # (проверено спайком, docs/spikes/2026-07-22-claude-p-zai-tool-calling.md).
-        ["claude", "-p", prompt, "--permission-mode", "acceptEdits"],
+        command,
         cwd=cwd, capture_output=True, text=True,
         timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
         # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
@@ -930,10 +1071,22 @@ def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
 def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) -> str:
     base = f"https://github.com/{analyze.repo}/blob/{branch}"
     links = "\n".join(f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})" for path in sorted(files))
+    # Артефакт диалога называется отдельно: без пояснения он выглядит служебным
+    # мусором рядом с документами FNR, а это источник, из которого выведена
+    # часть постановки, — и повод перечитать её критически, если диалог пуст.
+    dialog = ""
+    if any(p.endswith("repowise-dialog.md") for p in files):
+        dialog = (
+            "\n`repowise-dialog.md` — диалог с **Repowise**, постоянным индексом кода: "
+            "что уже было известно о затронутых компонентах до постановки задачи. "
+            "Пустой диалог означает, что индекс был недоступен, и остальные документы "
+            "написаны без него.\n"
+        )
     return (
         "## 🤖 Автономный анализ (SA-helper)\n\n"
         f"Прогнал полную цепочку FNR по этой задаче. Артефакты — в ветке `{branch}`:\n\n"
-        f"{links}\n\n"
+        f"{links}\n"
+        f"{dialog}\n"
         "Начни с `system_requirements.md` — это ответ на вопрос «как реализовать эту "
         "задачу»: разбор текущего поведения на код-доказательствах, план миграции с "
         "откатами, задачи с критериями приёмки и риски с митигацией.\n\n"
@@ -988,6 +1141,115 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + " …[обрезано]"
+
+
+def _fetch_decomposition_plan(issue: IssueInput) -> str:
+    """Получает план декомпозиции из комментария родителя.
+    
+    Если родитель содержит комментарий с декомпозицией (есть маркер "🧩 Декомпозиция"),
+    возвращает этот текст. Иначе — пустую строку.
+    """
+    try:
+        comments = github_client.list_comments(issue.repo, issue.issue_number, limit=50)
+        for comment in reversed(comments):  # Сначала свежие
+            body = comment.get("body") or ""
+            if "🧩 Декомпозиция" in body:
+                return body
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать декомпозицию #%s: %s", issue.issue_number, exc)
+    return ""
+
+
+def _fetch_subtasks(issue: IssueInput) -> list[dict]:
+    """Получает подзадачи плана: номера, заголовки, тела и релизы.
+    
+    Читает все открытые Issue и фильтрует те, что содержат ссылку на родителя.
+    Это медленно, но работает без search API. Для оптимизации нужно индексирование.
+    """
+    try:
+        all_issues = github_client.list_open_issues(issue.repo, limit=500)
+        subtasks = []
+        for item in all_issues:
+            body = item.get("body") or ""
+            # Проверяем, что это подзадача этого родителя
+            if f"root-issue: #{issue.issue_number}" in body:
+                # Дополнительно проверяем наличие метки релиза (release:*)
+                labels = item.get("labels", [])
+                if any(str(l).startswith("release:") for l in labels):
+                    subtasks.append({
+                        "number": item.get("number"),
+                        "title": item.get("title"),
+                        "body": body,
+                        "state": item.get("state"),
+                    })
+        return subtasks
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать подзадачи #%s: %s", issue.issue_number, exc)
+        return []
+
+
+def _fetch_dev_comments(issue: IssueInput) -> list[str]:
+    """Свежие комментарии для постановки разработки (аналогично _fetch_comment_blocks).
+    
+    Отфильтровывает командный шум, обрезает по DEV_COMMENT_CHARS, возвращает от
+    старых к свежим.
+    """
+    try:
+        comments = github_client.list_comments(
+            issue.repo, issue.issue_number, limit=50
+        )
+        kept = [c for c in comments if parse_command(c.get("body") or "") is None]
+        blocks: list[str] = []
+        for c in kept[-10:]:  # До 10 свежих комментариев для разработки
+            user = (c.get("user") or {}).get("login", "?")
+            date = (c.get("created_at") or "")[:10]
+            body = _truncate(c.get("body") or "", DEV_COMMENT_CHARS)
+            blocks.append(f"**@{user} ({date}):**\n{body}")
+        return blocks
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for #%s: %s", issue.issue_number, exc)
+        return []
+
+
+def _refresh_issue_body(issue: IssueInput) -> str:
+    """Перечитывает тело Issue из GitHub вместо устаревшего снимка.
+    
+    Снимок в `IssueInput` создается вебхуком один раз и устаревает для
+    долгоживущих задач в `ready-for-dev`.
+    """
+    try:
+        fresh = github_client.get_issue(issue.repo, issue.issue_number)
+        return fresh.get("body") or ""
+    except Exception as exc:  # noqa: BLE001 — деградация к старому снимку
+        logger.warning("не удалось обновить тело #%s, используется снимок: %s",
+                       issue.issue_number, exc)
+        return issue.body
+
+
+def _apply_size_limit(parts: list[str], limit: int, priority_order: list[int] | None = None) -> list[str]:
+    """Обрезает части постановки по лимиту, удаляя от старого к свежему.
+    
+    `priority_order` — индексы частей, которые обрезаются в последнюю очередь.
+    Если не задан, все части равноправны.
+    """
+    if priority_order is None:
+        priority_order = []
+    
+    # Сортируем индексы по приоритету (сначала низкий приоритет)
+    indices = list(range(len(parts)))
+    indices.sort(key=lambda i: priority_order.index(i) if i in priority_order else -1)
+    
+    total = "\n\n".join(parts)
+    while len(total) > limit and len(parts) > 1:
+        # Удаляем часть с самым низким приоритетом
+        for idx in indices:
+            if idx < len(parts):
+                removed = parts.pop(idx)
+                total = "\n\n".join(parts)
+                logger.debug("обрезка постановки: удалена часть %d (%d симв.), осталось %d",
+                           idx, len(removed), len(total))
+                break
+    return parts
 
 
 def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
@@ -1084,6 +1346,102 @@ async def prepare_workspace(analyze: AnalyzeInput) -> None:
     await _run_with_heartbeat(_build_workspace, analyze, label="preparing")
 
 
+def _write_repowise_config(analyze: AnalyzeInput, clone_dir: str) -> str | None:
+    """Конфигурация MCP в рабочий каталог прогона. Возвращает путь к файлу.
+
+    Не в образ: адрес прокси и идентификатор сессии зависят от Issue, и вшить
+    их в образ нельзя. Пишется на КАЖДОЙ стадии, а не однажды: каталог прогона
+    пересоздаётся стадией 0 (`_build_workspace`), и файл, положенный до неё,
+    молча исчезнет — а выглядело бы это как агент, забывший про индекс.
+
+    Путь возвращается, потому что файл надо ПЕРЕДАТЬ явно: `claude -p`
+    проектный `.mcp.json` сам не читает (см. `_run_claude`).
+    """
+    if not repowise.enabled():
+        return None
+    config = repowise.claude_mcp_config(
+        analyze.repo, analyze.issue_number, repowise.ANALYSIS)
+    path = Path(clone_dir) / ".mcp.json"
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+    return str(path)
+
+
+def _ensure_dialog_artifact(analyze: AnalyzeInput, clone_dir: str,
+                            expected: str) -> str:
+    """Дописать артефакт диалога транскриптом из журнала прокси.
+
+    Артефакт НЕ должен зависеть от того, вспомнила ли модель его записать. На
+    первом живом прогоне она не вспомнила, стадия упала на guard'е, и весь
+    конвейер встал — при исправном сервисе и состоявшемся, возможно, диалоге.
+
+    Транскрипт берётся у прокси, как и для агента разработки: там журнал, и он
+    полон по построению. Модель отвечает только за «Итог» — если она его
+    написала, он сохраняется выше транскрипта.
+
+    Возвращает исход: `ok` — ходы были, `no-turns` — сервис отвечал, но агент
+    к нему не обратился.
+    """
+    session = repowise.session_id(analyze.repo, analyze.issue_number,
+                                 repowise.ANALYSIS)
+    transcript = repowise.transcript(session)
+    path = Path(clone_dir) / expected
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    written = path.read_text(encoding="utf-8") if path.exists() else ""
+    if transcript:
+        path.write_text(f"{written}\n\n{transcript}" if written else transcript,
+                        encoding="utf-8")
+        return "ok"
+
+    if not written:
+        path.write_text(
+            f"---\nissue: {analyze.repo}#{analyze.issue_number}\n"
+            f"session: {session}\nagent: {repowise.ANALYSIS}\n"
+            f"outcome: no-turns\nturns: 0\n---\n\n"
+            f"# Итог\n\nАгент не обратился к индексу ни разу, хотя сервис был "
+            f"доступен.\n\nЭто не отказ сервиса: постановка ниже написана без "
+            f"дополнительного контекста, и перечитать её стоит критически.\n",
+            encoding="utf-8")
+    return "no-turns"
+
+
+def _degrade_repowise_stage(analyze: AnalyzeInput, clone_dir: str,
+                            expected: str | None) -> dict | None:
+    """Артефакт-заглушка, если источник недоступен. None — источник на месте.
+
+    Модификация M1 вердикта дебатов (`sa_documentation/FNR/FNR_5/concept.md`).
+    Без неё прокси становится обязательной зависимостью на пути, который
+    сегодня остановить нечему: `_build_workspace` зависит только от `git` и
+    `repomix` внутри того же контейнера.
+
+    Артефакт создаётся ВСЕГДА, поэтому guard стадии `task` остаётся без
+    изменений и по-прежнему ловит молчаливый пропуск. Дорогой процесс диалога
+    при этом не запускается — платить за заведомо недоступный источник незачем.
+    """
+    if not repowise.enabled():
+        reason = "REPOWISE_PROXY_URL не задан — интеграция выключена"
+    elif not repowise.available(timeout=repowise.PROBE_TIMEOUT_SEC):
+        reason = "прокси не отвечает на проверку живости"
+    else:
+        return None
+
+    path = Path(clone_dir) / expected
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        repowise.unavailable_artifact(
+            analyze.repo, analyze.issue_number, repowise.ANALYSIS, reason),
+        encoding="utf-8",
+    )
+    # WARNING, а не ERROR: это штатная деградация, а не отказ. Считать её долю
+    # положено снаружи (FR-9), и ошибкой в Sentry она быть не должна — иначе
+    # выключенная интеграция превратится в поток ложных сбоев.
+    logger.warning("стадия %s деградировала (%s#%s): %s", REPOWISE_STAGE,
+                analyze.repo, analyze.issue_number, reason)
+    return {"stage": REPOWISE_STAGE, "artifact": expected,
+            "bytes": path.stat().st_size, "outcome": "degraded"}
+
+
 @activity.defn
 async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     """Одна стадия FNR — отдельный `claude -p`. Guard рабочего каталога,
@@ -1102,7 +1460,35 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
     )
     prompt, expected, requires = _fnr_stage(stage_name, description)
     clone_dir = _require_workspace(analyze, requires)
-    await _run_with_heartbeat(_run_claude, prompt, clone_dir, label=stage_name)
+    if expected:
+        ready = Path(clone_dir) / expected
+        if ready.is_file() and ready.stat().st_size > 0:
+            # Артефакт приехал с веткой прошлого прогона: стадия сделана, и
+            # повторять её — платить второй раз за тот же документ.
+            logger.info("FNR %s#%s: стадия %s уже сделана — пропускаю",
+                        analyze.repo, analyze.issue_number, stage_name)
+            return {"stage": stage_name, "artifact": expected,
+                    "bytes": ready.stat().st_size, "outcome": "skipped"}
+    mcp_config = _write_repowise_config(analyze, clone_dir)
+    if stage_name == REPOWISE_STAGE:
+        degraded = await asyncio.to_thread(_degrade_repowise_stage, analyze, clone_dir, expected)
+        if degraded is not None:
+            return degraded
+    # Конфигурация MCP передаётся ТОЛЬКО стадии сбора контекста: остальным
+    # стадиям индекс не нужен, а лишние инструменты в сессии — лишние соблазны
+    # и лишние деньги.
+    await _run_with_heartbeat(
+        _run_claude, prompt, clone_dir,
+        mcp_config if stage_name == REPOWISE_STAGE else None,
+        label=stage_name)
+
+    outcome = "ok"
+    if stage_name == REPOWISE_STAGE and expected:
+        # Артефакт дописывается транскриптом из журнала прокси и потому не
+        # зависит от того, вспомнила ли модель его записать.
+        outcome = await asyncio.to_thread(
+            _ensure_dialog_artifact, analyze, clone_dir, expected)
+
     artifact: str | None = None
     size = 0
     if expected:
@@ -1111,7 +1497,8 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
             raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
         artifact = expected
         size = path.stat().st_size
-    return {"stage": stage_name, "artifact": artifact, "bytes": size}
+    return {"stage": stage_name, "artifact": artifact, "bytes": size,
+            "outcome": outcome}
 
 
 @activity.defn
@@ -1136,6 +1523,50 @@ async def publish_analysis(analyze: AnalyzeInput) -> str:
 
 
 @activity.defn
+async def publish_analysis_partial(analyze: AnalyzeInput, reason: str) -> list[str]:
+    """Сорванный анализ отдаёт то, что успел собрать — как и БФТ.
+
+    Цепочка FNR стоит тех же денег и рвётся по тем же причинам: лимит
+    провайдера, 524, выкладка посреди прогона. Раньше это списывало всю работу:
+    артефакты жили в каталоге, который `cleanup_workspace` снимал на любом
+    исходе, а публикация случалась только после последней стадии.
+
+    Возвращает имена уцелевших артефактов: воркфлоу называет их человеку, а
+    следующий `/analyze` по ним понимает, какие стадии можно не повторять.
+    """
+    clone_dir = _workspace_dir(analyze) / "repo"
+    if not clone_dir.is_dir():
+        logger.warning("FNR %s#%s: каталог уже снят — публиковать нечего",
+                       analyze.repo, analyze.issue_number)
+        return []
+    files = await asyncio.to_thread(_collect_fnr_artifacts, str(clone_dir))
+    if not files:
+        return []
+    branch = f"research/issue-{analyze.issue_number}"
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        analyze.repo, branch, files,
+        f"docs(sa): частичный анализ issue #{analyze.issue_number}",
+    )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, str(clone_dir))
+    await asyncio.to_thread(_push_entire_branch, analyze.repo, str(clone_dir),
+                            session_branch)
+    links = "\n".join(
+        f"- [`{path.rsplit('/', 1)[-1]}`]"
+        f"(https://github.com/{analyze.repo}/blob/{branch}/{path})"
+        for path in sorted(files))
+    await asyncio.to_thread(
+        github_client.post_comment, analyze.repo, analyze.issue_number,
+        f"## ⏸ Анализ собран частично\n\nПрогон оборвался: {reason}\n\n"
+        f"Что успели — в ветке `{branch}`:\n\n{links}\n\n"
+        "Работа не потеряна: повторный `/analyze` поднимет эту ветку и продолжит "
+        "с места обрыва — готовые стадии заново не считаются."
+        + bft.render_session_hint(analyze.repo, session_id, session_branch),
+    )
+    return sorted(files)
+
+
+@activity.defn
 async def cleanup_workspace(analyze: AnalyzeInput) -> None:
     """Best-effort снос рабочего каталога прогона."""
     await asyncio.to_thread(shutil.rmtree, str(_workspace_dir(analyze)), ignore_errors=True)
@@ -1151,6 +1582,40 @@ def run_bug_pipeline(issue: IssueInput) -> None:
 
 DEV_CLONE_TIMEOUT_SEC = 300
 DEV_TESTS_TIMEOUT_SEC = 900
+
+
+def _runner_home(slug: str) -> str:
+    """Домашний каталог раннера — каталог задачи, но только при живой интеграции.
+
+    Агент ищет конфигурацию MCP в `$HOME/.openhands/mcp.json` (спайк FR-16), а
+    общий том смонтирован в другом месте. Переставить HOME дешевле, чем
+    оборачивать ENTRYPOINT образа.
+
+    Интеграция выключена — возвращаем пусто, и HOME остаётся тем, что задан
+    образом: поведение прогонов без Repowise не меняется вовсе.
+    """
+    if not repowise.enabled():
+        return ""
+    return f"{develop.workspace_mount()}/{slug}"
+
+
+def _write_runner_mcp_config(issue: IssueInput, root: Path) -> None:
+    """Конфигурация MCP в каталог задачи, откуда её прочитает раннер.
+
+    Каталог лежит на общем томе и виден обоим контейнерам; права выставляются
+    вместе с остальным содержимым каталога задачи — раннер работает от
+    непривилегированного пользователя и в чужой каталог писать не сможет.
+    """
+    if not repowise.enabled():
+        return
+    config_dir = root / develop.MCP_CONFIG_DIR
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / develop.MCP_CONFIG_NAME).write_text(
+        json.dumps(repowise.openhands_mcp_config(
+            issue.repo, issue.issue_number, repowise.DEVELOP),
+            ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
@@ -1170,34 +1635,159 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     Постановка собирается ЗДЕСЬ, а не в промпте агента: то, что уехало в
     работу, должно быть видно дословно. Иначе на разборе «почему агент сделал
     не то» предъявить нечего.
+    
+    ISSUE-113: в постановку включается:
+    - свежее тело Issue (вместо устаревшего снимка);
+    - план декомпозиции и подзадачи (если есть);
+    - обсуждение Issue (комментарии);
+    - все артефакты FNR, включая repowise-dialog.md и validation.md;
+    - применён общий потолок размера с усечением по приоритету.
     """
     root, clone_dir = _dev_paths(issue)
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(issue.repo, str(clone_dir))
+    _write_runner_mcp_config(issue, root)
 
+    # 1. Свежее тело Issue вместо устаревшего снимка (ISSUE-113 пункт 5)
+    fresh_body = _refresh_issue_body(issue)
+    
     parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
-             "", f"## {issue.title}", "", issue.body or "(тело пустое)", ""]
+             "", f"## {issue.title}", "", fresh_body or "(тело пустое)", ""]
 
+    # 2. План декомпозиции и подзадачи (ISSUE-113 пункт 1)
+    plan = _fetch_decomposition_plan(issue)
+    if plan:
+        parts.append("## План декомпозиции")
+        parts.append("")
+        parts.append(plan)
+        parts.append("")
+        
+        # Подзадачи плана с телами
+        subtasks = _fetch_subtasks(issue)
+        if subtasks:
+            parts.append("### Подзадачи плана")
+            parts.append("")
+            for sub in subtasks:
+                parts.append(f"#### #{sub['number']} — {sub['title']}")
+                parts.append("")
+                parts.append(sub['body'])
+                parts.append("")
+
+    # 3. Артефакты FNR — все пять, включая отброшенные (ISSUE-113 пункт 4)
     if branch:
-        # Требования идут ПЕРВЫМИ: то, что агент прочитает раньше, весит
-        # больше, а task/concept — путь к требованиям, а не сами требования.
         parts.append("## Системные требования (аналитика Issue-Agent)")
         parts.append("")
+        
+        # Три основных артефакта (как было)
         for name in ("system_requirements.md", "task.md", "concept.md"):
             text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
             if text:
+                # Обрезаем каждый артефакт отдельно, если слишком большой
+                if len(text) > DEV_ARTIFACT_MAX_CHARS:
+                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
+                parts += [f"### {name}", "", text, ""]
+        
+        # Два дополнительных артефакта (ISSUE-113 пункт 3)
+        for name in ("repowise-dialog.md", "validation.md"):
+            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
+            if text:
+                if len(text) > DEV_ARTIFACT_MAX_CHARS:
+                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
                 parts += [f"### {name}", "", text, ""]
     else:
         parts += ["## Аналитики по задаче нет — работай от тела Issue.", ""]
 
+    # 4. Обсуждение Issue (ISSUE-113 пункт 2)
+    comments = _fetch_dev_comments(issue)
+    if comments:
+        parts.append("## Обсуждение Issue")
+        parts.append("")
+        parts.extend(comments)
+        parts.append("")
+
+    # 5. Правила репозитория и Repowise (как было)
     rules = (clone_dir / ".openhands" / "task-rules.md")
     parts.append(rules.read_text(encoding="utf-8") if rules.exists() else _DEV_FALLBACK_RULES)
+    # Дописывается ПОСЛЕ правил репозитория, а не вместо: правила проекта
+    # главнее, а обращение к индексу — общий приём контура, который к ним
+    # добавляется в обеих ветках (свои правила есть и когда их нет).
+    if repowise.enabled():
+        parts.append(_DEV_REPOWISE_RULES)
 
-    task = "\n".join(parts)
+    # 6. Применение потолка размера с усечением по приоритету (ISSUE-113 пункт 6)
+    # Приоритет: заголовок/тело > план > артефакты > обсуждение > правила
+    task_parts = []
+    current_section = []
+    section_name = ""
+    
+    for part in parts:
+        # Определяем заголовок секции (начинается с #)
+        if part.startswith("#") and not part.startswith("##"):  # Главный заголовок
+            if current_section:
+                task_parts.append((section_name, "\n".join(current_section)))
+            section_name = part
+            current_section = []
+        elif part.startswith("##"):  # Заголовок уровня 2
+            if current_section:
+                task_parts.append((section_name, "\n".join(current_section)))
+            section_name = part
+            current_section = []
+        else:
+            current_section.append(part)
+    
+    if current_section:
+        task_parts.append((section_name, "\n".join(current_section)))
+    
+    # Применяем лимит с приоритетом
+    priority_order = []
+    for i, (name, _) in enumerate(task_parts):
+        if name == f"# Задача: реализовать Issue #{issue.issue_number}" or name == f"## {issue.title}":
+            priority_order.append(i)
+        elif name.startswith("## План декомпозиции"):
+            priority_order.append(i)
+        elif name.startswith("## Системные требования"):
+            priority_order.append(i)
+    
+    final_parts = []
+    for name, content in task_parts:
+        final_parts.append(content)
+    
+    final_parts = _apply_size_limit(final_parts, DEV_TASK_MAX_CHARS, priority_order)
+    
+    task = "\n\n".join(final_parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
-    _handover_to_runner(clone_dir)
+    _handover_to_runner(root)
     return task
+
+
+_DEV_REPOWISE_RULES = """
+## Индекс кода (MCP-сервер `repowise`) — обращение обязательно
+
+Постоянный индекс репозиториев организации: граф символов, история git, blame,
+поиск, оценка риска правки, мёртвый код.
+
+1. **До начала работы** — ПЕРВЫМ ДЕЙСТВИЕМ, до чтения файлов и до первой
+   правки — задай индексу не меньше одного вопроса о компонентах, которые
+   собираешься менять, и об их связях: `search_codebase`, `get_context`,
+   `get_symbol`, `get_answer`. Это дешевле, чем читать репозиторий целиком, и
+   точнее, чем догадываться по именам файлов.
+
+   «Задача выглядит простой», «требования и так подробные», «репозиторий
+   маленький» — НЕ основания пропустить шаг. Индекс знает то, чего нет ни в
+   требованиях, ни в файлах: кто ещё вызывает этот код, чем он был раньше и
+   почему устроен так. Пропуск шага — ошибка прогона, даже если правка вышла
+   верной.
+2. **При затруднении** спроси снова — вместо того чтобы продолжать вслепую.
+   Не понял, почему код устроен так — спроси про историю и решение
+   (`get_why`, `get_risk`), а не переписывай.
+3. **Индекс недоступен** — работай без него. Это штатный режим, а не повод
+   останавливаться. Недоступен — значит вызов вернул ошибку; отсутствие
+   желания спрашивать недоступностью не считается.
+
+Весь диалог сохраняется автоматически и публикуется артефактом: пересказывать
+его в отчёте не нужно.
+"""
 
 
 _DEV_FALLBACK_RULES = f"""## Как работать
@@ -1217,7 +1807,13 @@ _DEV_FALLBACK_RULES = f"""## Как работать
 
 
 def _handover_to_runner(path: Path) -> None:
-    """Передать каталог задачи раннеру: он работает не от root.
+    """Передать каталог задачи раннеру целиком: он работает не от root.
+
+    Передаётся ВЕСЬ каталог задачи, а не только клон. Каталог задачи — это
+    ещё и `$HOME` раннера (см. `_runner_home`), а OpenHands держит там своё
+    состояние: `$HOME/.openhands/conversations`. Оставленный за root'ом, он
+    даёт `PermissionError` на первом же шаге, но код возврата остаётся нулевым
+    — снаружи прогон выглядит как отработавший, а правок нет ни одной.
 
     Падаем громко. Молча оставленный каталог root'а — рабочее место, в которое
     агент не может писать: он не сообщает об отказе, а уходит писать в /tmp и
@@ -1259,6 +1855,8 @@ def _dev_run_agent(issue: IssueInput) -> str:
         image=develop.runner_image(),
         volume=develop.workspace_volume(),
         mount=develop.workspace_mount(),
+        network=develop.proxy_network(),
+        home=_runner_home(slug),
     )
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""),
@@ -1278,6 +1876,61 @@ def _dev_run_agent(issue: IssueInput) -> str:
     logger.info("Develop %s#%s: вывод агента\n%s",
                 issue.repo, issue.issue_number, tail or "(пусто)")
     return tail
+
+
+DEV_DIALOG_PATH = "docs/research/issue-{n}-repowise-dialog.md"
+
+
+def _collect_dev_dialog(repo: str, issue_number: int, run_failed: bool) -> str:
+    """Транскрипт сессии разработки. Забирает ВОРКЕР, а не раннер.
+
+    Раннер к этому моменту уже мёртв — в этом и смысл: артефакт переживает
+    прогон, включая аварийный, а диалог полезен ровно тогда, когда разбирают
+    неудачу.
+
+    Пустая сессия даёт артефакт с отметкой, а не отсутствие артефакта:
+    «агент не обращался к индексу» — это факт, который надо видеть, а не
+    пробел, который надо угадывать.
+    """
+    session = repowise.session_id(repo, issue_number, repowise.DEVELOP)
+    text = repowise.transcript(session)
+    if text:
+        return text
+    failed = " (прогон завершился аварийно)" if run_failed else ""
+    return (
+        f"---\nissue: {repo}#{issue_number}\nsession: {session}\n"
+        f"agent: {repowise.DEVELOP}\noutcome: no-turns\nturns: 0\n---\n\n"
+        f"# Итог\n\nЗа время прогона обращений к индексу не было{failed}.\n\n"
+        f"Причины бывают три: индекс был недоступен, задача не потребовала "
+        f"дополнительного контекста, либо агент не воспользовался им, хотя "
+        f"стоило. Первую отличают по артефакту аналитики того же Issue.\n"
+    )
+
+
+def _publish_dev_dialog_sync(issue: IssueInput, branch: str) -> None:
+    """Опубликовать диалог разработки. Best-effort: исход прогона не подменяет.
+
+    Сбой публикации артефакта не должен выглядеть как сбой разработки — иначе
+    разбор начнут не с того места.
+    """
+    if not repowise.enabled():
+        return
+    text = _collect_dev_dialog(issue.repo, issue.issue_number, run_failed=False)
+    path = DEV_DIALOG_PATH.format(n=issue.issue_number)
+    try:
+        if branch:
+            github_client.push_artifacts_to_branch(
+                issue.repo, branch, {path: text},
+                f"docs(repowise): диалог разработки по issue #{issue.issue_number}")
+        github_client.post_comment(
+            issue.repo, issue.issue_number,
+            f"## 🧭 Контекст из Repowise (разработка)\n\n"
+            f"Диалог агента разработки с индексом кода — `{path}`"
+            f"{f' в ветке `{branch}`' if branch else ''}.\n\n"
+            f"<details><summary>Показать</summary>\n\n{text[:20000]}\n\n</details>")
+    except Exception as exc:
+        logger.warning("диалог разработки не опубликован (%s#%s): %s",
+                       issue.repo, issue.issue_number, exc)
 
 
 def _dev_tests(issue: IssueInput) -> str:
@@ -1321,7 +1974,8 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     )
 
 
-async def _dev_resolve_branch(issue: IssueInput) -> str:
+async def _dev_resolve_branch(issue: IssueInput, root_issue: int | None = None,
+                              branch: str | None = None) -> str:
     """Выключатель разработки + ветка аналитики — общий вход в стадию.
 
     Раньше — две дословные копии, в `trigger_openhands_resolver` и в
@@ -1333,7 +1987,9 @@ async def _dev_resolve_branch(issue: IssueInput) -> str:
         raise RuntimeError(
             "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
 
-    branch = f"research/issue-{issue.issue_number}"
+    if branch is None:
+        source = root_issue if root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
     if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
         # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
         # агент работает от тела Issue, но знать об этом должен явно.
@@ -1358,7 +2014,8 @@ async def _dev_dispatch_and_announce(issue: IssueInput, branch: str) -> None:
 
 
 @activity.defn
-async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
+async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None = None, 
+                                     branch: str | None = None) -> int | None:
     """Активность Develop: разработка по подготовленному Issue.
 
     Два режима (`shared/develop.py`). `local` — прогон одноразовым контейнером
@@ -1367,8 +2024,12 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
 
     Возвращает номер PR (режим `local`) либо None (`dispatch`: результат
     придёт событием `pr-open`, прогон идёт на чужой стороне).
+    
+    ISSUE-113: для подзадачи плана использует ветку родителя, а не свою.
+    `root_issue` — номер родительской задачи (если это подзадача плана),
+    `branch` — готовая ветка (если вычислена в workflow).
     """
-    branch = await _dev_resolve_branch(issue)
+    branch = await _dev_resolve_branch(issue, root_issue=root_issue, branch=branch)
 
     if develop.mode() == develop.DISPATCH:
         await _dev_dispatch_and_announce(issue, branch)
@@ -1381,7 +2042,12 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
                 issue.repo, issue.issue_number, len(task), task[:2000])
     await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
 
-    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    try:
+        await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+    finally:
+        # В finally, а не после: диалог полезнее всего при разборе упавшего
+        # прогона, и терять его ровно в этом случае было бы худшим из исходов.
+        await asyncio.to_thread(_publish_dev_dialog_sync, issue, branch)
     # Находки собираются ДО тестов и публикации: файл находок обязан исчезнуть
     # из рабочего дерева раньше коммита, иначе он уедет в PR — в ревью как мусор,
     # а на следующем круге правок агент прочитает свои прошлые находки как новые.
@@ -1682,6 +2348,25 @@ def _prfix_paths(repo: str, pr_number: int) -> tuple[Path, Path]:
     return root, root / "repo"
 
 
+@activity.defn
+async def pr_is_merged(repo: str, pr_number: int) -> bool:
+    """Влит ли PR. Спрашиваем сам PR, а не полезную нагрузку закрытия Issue.
+
+    У `issues.closed` признака слияния нет: `state_reason` одинаков и когда
+    Issue закрыл `Closes #N` во влитом PR, и когда человек закрыл его руками
+    «как выполненное». Доставки `issues.closed` и `pull_request.closed` идут
+    наперегонки, поэтому ждать второй, чтобы истолковать первую, — гонка.
+
+    PR своё состояние знает точно и в любой момент, а номер у цикла уже есть:
+    он запомнил его, когда PR открылся. Один вызов на закрытие — цена
+    честной фазы.
+    """
+    pr = await asyncio.to_thread(github_client.get_pull, repo, pr_number)
+    # `merged` булев и появляется только у влитого PR. `state == "closed"` для
+    # этого не годится: закрытый без слияния PR тоже `closed`.
+    return bool(pr.get("merged"))
+
+
 def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
     """Свежий клон ВЕТКИ PR + постановка круга файлом.
 
@@ -1693,7 +2378,7 @@ def _prfix_prepare(repo: str, pr_number: int, branch: str, task: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(repo, str(clone_dir), branch=branch)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
-    _handover_to_runner(clone_dir)
+    _handover_to_runner(root)
 
 
 @activity.defn
@@ -1722,7 +2407,8 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     await asyncio.to_thread(_reap_runner, slug)
     command = develop.runner_command(
         slug, image=develop.runner_image(),
-        volume=develop.workspace_volume(), mount=develop.workspace_mount())
+        volume=develop.workspace_volume(), mount=develop.workspace_mount(),
+        network=develop.proxy_network(), home=_runner_home(slug))
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),
         os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6")}
@@ -2066,6 +2752,12 @@ def _build_bft_workspace(req: BftRequest) -> str:
     (Path(clone_dir) / "bft-config.md").write_text(bft.render_config(),
                                                    encoding="utf-8")
 
+    # Трекер диалога — до первой стадии: хуки ставятся в клон, а он создаётся
+    # заново на каждый прогон.
+    _enable_entire(clone_dir)
+    if req.session_id:
+        _resume_entire_session(req.repo, clone_dir, req.session_id)
+
     thread, _ = _bft_thread(req)
     statement = Path(clone_dir) / bft.statement_path(req.issue_number)
     statement.parent.mkdir(parents=True, exist_ok=True)
@@ -2085,10 +2777,16 @@ def _require_bft_workspace(req: BftRequest, requires: str | None) -> str:
     clone_dir = _bft_clone_dir(req)
     if not (Path(clone_dir) / "sa_documentation" / "repomix-output.xml").exists():
         raise RuntimeError("рабочий каталог потерян (рестарт воркера?) — повтори /bft-deep")
-    if requires and not (Path(clone_dir) / requires).exists():
-        raise RuntimeError(
-            f"нет входа {requires} (стадия-предшественник не отработала?) — повтори /bft-deep"
-        )
+    if requires:
+        # `requires` — список путей через запятую (см. `deep_stages`): каждый
+        # проверяется отдельно, иначе весь список читался бы как один
+        # несуществующий путь и стадия падала бы даже при готовых артефактах.
+        missing = [item for item in requires.split(",")
+                  if not (Path(clone_dir) / item).exists()]
+        if missing:
+            raise RuntimeError(
+                f"нет входа {','.join(missing)} (стадия-предшественник не отработала?) — повтори /bft-deep"
+            )
     return clone_dir
 
 
@@ -2207,6 +2905,146 @@ def _bft_stage_inputs(clone_dir: str, issue_number: int,
     return "\n\n---\n\n".join(parts)
 
 
+ENTIRE_TIMEOUT_SEC = 120
+
+
+def _entire(clone_dir: str, *args: str, check: bool = False):
+    """Вызов `entire` в каталоге задачи.
+
+    Трекер вспомогательный: его отказ не должен ронять прогон, который в
+    остальном идёт нормально. Поэтому по умолчанию `check=False`, а вызывающий
+    смотрит на `returncode`, если исход ему важен.
+    """
+    return subprocess.run(["entire", *args], cwd=clone_dir, capture_output=True,
+                          text=True, timeout=ENTIRE_TIMEOUT_SEC, check=check)
+
+
+def _enable_entire(clone_dir: str) -> None:
+    """Включить запись диалога стадий в клоне задачи.
+
+    `--agent claude-code` переводит команду в неинтерактивный режим: TTY в
+    контейнере нет, а без флага она ушла бы в диалоговый мастер и повисла до
+    таймаута. Хуки ставятся в клон, поэтому включать надо на каждый прогон —
+    каталог создаётся заново.
+
+    Флаг `--agent-help-skill` НЕ используем намеренно: он кладёт свой скилл по
+    тому же пути `.claude/skills/entire/SKILL.md` — но уже в КЛОН, а проектный
+    уровень перекрывает пользовательский. Наш скилл (`.claude/skills/entire/`
+    в образе) содержит то же указание читать `entire agent-help` плюс контекст
+    контура: когда трекер звать, что он не видит и чем чекпоинты отличаются от
+    артефактов. Их тринадцать строк это бы затёрли.
+
+    Молча продолжаем при любом отказе: без трекера прогон соберёт БФТ ровно так
+    же, просто без записи диалога. Менять исход из-за вспомогательного слоя
+    нельзя.
+    """
+    try:
+        result = _entire(clone_dir, "enable", "--agent", "claude-code")
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("entire не включён (%s) — прогон без записи диалога", exc)
+        return
+    if result.returncode != 0:
+        logger.warning("entire не включён (код %s): %s", result.returncode,
+                       (result.stderr or result.stdout or "").strip()[:300])
+
+
+def _entire_session(clone_dir: str) -> tuple[str, str]:
+    """(id сессии, ветка чекпоинтов) — то, чем человек продолжит прогон.
+
+    Пустые строки, если трекера нет или сессия не завелась: комментарий тогда
+    просто не обещает продолжения по id.
+    """
+    try:
+        listing = _entire(clone_dir, "session", "list")
+        refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)"],
+                              cwd=clone_dir, capture_output=True, text=True,
+                              timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("сессия entire не прочитана: %s", exc)
+        return "", ""
+    return (bft.parse_session_id(listing.stdout or ""),
+            bft.parse_session_branch(refs.stdout or ""))
+
+
+def _push_entire_branch(repo: str, clone_dir: str, session_branch: str) -> None:
+    """Ветка чекпоинтов уезжает в origin рядом с артефактами.
+
+    Иначе запись диалога живёт только в каталоге, который снимут вместе с
+    прогоном, — то есть ровно там, где её и теряли.
+    """
+    if not session_branch:
+        return
+    try:
+        token = github_client.auth_token(repo)
+        env = {
+            **os.environ,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0":
+                "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
+            "GIT_CONFIG_KEY_1": "safe.directory",
+            "GIT_CONFIG_VALUE_1": clone_dir,
+            "GH_PUSH_TOKEN": token,
+        }
+        result = subprocess.run(
+            ["git", "-C", clone_dir, "push", "-f", "origin",
+             f"{session_branch}:{session_branch}"],
+            env=env, capture_output=True, text=True, timeout=120, check=False)
+        if result.returncode != 0:
+            logger.warning("ветка сессии не отправлена: %s",
+                           (result.stderr or "").strip()[:300])
+    except Exception as exc:  # noqa: BLE001 — вспомогательный слой
+        logger.warning("ветка сессии не отправлена: %s", exc)
+
+
+def _resume_entire_session(repo: str, clone_dir: str, session_id: str) -> None:
+    """Поднять диалог прошлого прогона по id из `/bft-deep <id>`.
+
+    Ветку чекпоинтов забираем из origin, потому что писал её ДРУГОЙ прогон и в
+    свежем клоне её нет. Дальше `entire session resume` возвращает контекст той
+    сессии — стадии видят, о чём уже говорили, а не начинают знакомство заново.
+
+    Отказ не останавливает прогон: артефакты лежат в ветке БФТ, и без диалога
+    он соберётся — просто без памяти о прошлых рассуждениях. Сказать об этом в
+    лог обязательно, иначе «продолжение» тихо превратится в новый прогон.
+    """
+    try:
+        fetched = subprocess.run(
+            ["git", "-C", clone_dir, "fetch", "-q", "origin",
+             "+refs/heads/entire/*:refs/heads/entire/*"],
+            capture_output=True, text=True, timeout=120, check=False)
+        if fetched.returncode != 0:
+            logger.warning("ветки сессий не забраны: %s",
+                           (fetched.stderr or "").strip()[:200])
+        result = _entire(clone_dir, "session", "resume", session_id)
+        if result.returncode != 0:
+            logger.warning(
+                "сессия %s не поднята (код %s): %s — прогон пойдёт без её контекста",
+                session_id, result.returncode,
+                (result.stderr or result.stdout or "").strip()[:300])
+        else:
+            logger.info("БФТ %s: продолжаю сессию %s", repo, session_id)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("сессия %s не поднята: %s", session_id, exc)
+
+
+def _append_dialog(clone_dir: str, issue_number: int, entry: str) -> None:
+    """Дописать строку в журнал прогона — best-effort.
+
+    Журнал вспомогательный: уронить из-за него стадию, которая отработала,
+    значит поменять настоящий результат на запись о нём.
+    """
+    try:
+        path = Path(clone_dir) / bft.dialog_log_path(issue_number)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(bft.DIALOG_LOG_HEADER, encoding="utf-8")
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(entry + "\n")
+    except OSError as exc:
+        logger.warning("журнал прогона не дописан: %s", exc)
+
+
 def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
     """Стадия `draft` двумя вызовами модели вместо агента.
 
@@ -2238,12 +3076,21 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
         + f", якорей ≥ {bft.ANCHOR_FLOOR}.\n\n"
         f"Верни ТОЛЬКО JSON по схеме:\n{bft.CASCADE_SCHEMA}")
 
+    started = time.monotonic()
     cascade = bft.parse_cascade(llm.complete(system, cascade_task, model=model))
+    _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+        stage="draft", actor=f"прямой вызов ({model})", step="каскад требований",
+        outcome="готово", elapsed=time.monotonic() - started,
+        detail=f"требований {len(cascade.get('requirements') or [])}, "
+               f"якорей {len(cascade.get('anchors') or [])}"))
     for _ in range(BFT_TOP_UP_ATTEMPTS):
         gaps = bft.cascade_gaps(cascade, line_counts)
         if not gaps:
             break
         logger.info("БФТ %s#%s: добор каскада — %s", req.repo, issue, "; ".join(gaps))
+        _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+            stage="draft", actor=f"прямой вызов ({model})", step="добор каскада",
+            outcome="добор", detail="; ".join(gaps)))
         top_up = (f"{inputs}\n\n---\n\n# Уже собрано\n\n```json\n"
                   + json.dumps(cascade, ensure_ascii=False, indent=1) + "\n```\n\n"
                   "# Чего не хватает\n\n- " + "\n- ".join(gaps) + "\n\n"
@@ -2278,10 +3125,71 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
         "заканчивается последней строкой таблицы якорей, без обрамляющих "
         "```-блоков и без фраз до или после.")
 
-    return llm.complete(system2, render_task, model=model)
+    started = time.monotonic()
+    document = llm.complete(system2, render_task, model=model)
+    _append_dialog(clone_dir, issue, bft.render_dialog_entry(
+        stage="draft", actor=f"прямой вызов ({model})", step="рендер документа",
+        outcome="готово", elapsed=time.monotonic() - started,
+        detail=f"{len(document)} символов"))
+    return document
 
 
 BFT_TOP_UP_ATTEMPTS = 2
+
+
+async def _validate_stage_anchors(clone_dir: str, issue_number: int, 
+                                  stage_name: str) -> list[str]:
+    """Проверка якорей R1 в документе после draft/validate (Issue #78, находка B).
+    
+    Извлекает каскад из документа и проверяет, что все якоря R1 указывают на
+    существующие строки существующих файлов.
+    """
+    # Для draft проверяем документ, для validate - validation.md
+    if stage_name == "draft":
+        doc_path = Path(clone_dir) / bft.document_path(issue_number)
+    else:  # validate
+        doc_path = Path(clone_dir) / bft.artefacts_dir(issue_number) / "validation.md"
+    
+    if not doc_path.exists():
+        return [f"документ {doc_path.name} не найден"]
+    
+    # Пытаемся извлечь каскад из документа
+    content = doc_path.read_text(encoding="utf-8")
+    cascade = bft.extract_cascade_from_document(str(doc_path))
+    
+    if not cascade:
+        # Если каскад не найден в документе, это не ошибка для validate
+        # (там может быть только текст вердикта), но для draft это проблема
+        if stage_name == "draft":
+            return ["каскад требований не найден в документе"]
+        return []
+    
+    # Получаем исходники для проверки строк
+    sources = _bft_sources(clone_dir)
+    line_counts = {rel: len(body.splitlines()) for rel, body in sources.items()}
+    
+    # Проверяем якори
+    return bft.cascade_gaps(cascade, line_counts)
+
+
+async def _validate_formal_gates(clone_dir: str, issue_number: int) -> list[str]:
+    """Проверка формальных гейтов валидации (Issue #78, находка E).
+    
+    Проверяет документ БФТ на соответствие формальным требованиям:
+    - отсутствие запрещённых разделов
+    - правильность идентификаторов
+    - непустые связи
+    - НФТ с числовыми значениями
+    - отсутствие битых ссылок
+    """
+    doc_path = Path(clone_dir) / bft.document_path(issue_number)
+    if not doc_path.exists():
+        return [f"документ БФТ не найден: {doc_path}"]
+    
+    content = doc_path.read_text(encoding="utf-8")
+    epic_slug = bft.epic_slug(issue_number)
+    
+    return bft.validate_formal_gates(content, epic_slug)
 
 
 @activity.defn
@@ -2294,6 +3202,16 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
     """
     prompt, expected, requires = bft.deep_stage(stage_name, req.issue_number)
     clone_dir = _require_bft_workspace(req, requires)
+    if expected:
+        done = Path(clone_dir) / expected
+        if done.is_file() and done.stat().st_size > 0:
+            # Артефакт приехал с веткой прошлого прогона: стадия уже сделана, и
+            # повторять её — платить второй раз за тот же документ. Так `/bft-deep`
+            # после срыва продолжает с места обрыва, а не начинает заново.
+            logger.info("БФТ %s#%s: стадия %s уже сделана — пропускаю",
+                        req.repo, req.issue_number, stage_name)
+            return {"stage": stage_name, "artifact": expected,
+                    "bytes": done.stat().st_size, "skipped": True}
     if stage_name in bft.direct_stages() and expected:
         # Стадия без исследования репозитория: вход готов, выход — один файл.
         # Агент здесь стоит 356 МБ RSS и ничего не добавляет, кроме способности
@@ -2304,6 +3222,9 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(document, encoding="utf-8")
     else:
+        # Диалог этой стадии пишет entire: у `claude -p` есть сессия, за которую
+        # он цепляется хуками. Дублировать её журналом значит вести две записи
+        # одного и того же и обе поддерживать.
         await _run_with_heartbeat(_run_claude, prompt, clone_dir,
                                   label=f"bft:{stage_name}")
     artifact: str | None = None
@@ -2314,6 +3235,37 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
             raise RuntimeError(f"стадия {stage_name}: артефакт {expected} не создан")
         artifact = expected
         size = path.stat().st_size
+        
+        # Issue #78, находка A: проверка минимального размера артефакта
+        size_issues = bft.check_artifact_size(expected, size)
+        if size_issues:
+            raise RuntimeError(
+                f"стадия {stage_name}: артефакт не прошёл проверку размера — "
+                + "; ".join(size_issues)
+            )
+        
+        # Issue #78, находка B: проверка якорей после draft и validate
+        if stage_name in ("draft", "validate"):
+            anchor_issues = await _validate_stage_anchors(
+                clone_dir, req.issue_number, stage_name
+            )
+            if anchor_issues:
+                raise RuntimeError(
+                    f"стадия {stage_name}: якоря не прошли проверку — "
+                    + "; ".join(anchor_issues)
+                )
+        
+        # Issue #78, находка E: проверка формальных гейтов после validate
+        if stage_name == "validate":
+            formal_issues = await _validate_formal_gates(
+                clone_dir, req.issue_number
+            )
+            if formal_issues:
+                raise RuntimeError(
+                    f"стадия {stage_name}: формальные гейты не пройдены — "
+                    + "; ".join(formal_issues)
+                )
+    
     return {"stage": stage_name, "artifact": artifact, "bytes": size}
 
 
@@ -2331,9 +3283,12 @@ async def publish_bft_deep(req: BftRequest) -> str:
         req.repo, branch, files,
         f"docs(bft): БФТ по issue #{req.issue_number}",
     )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, clone_dir)
+    await asyncio.to_thread(_push_entire_branch, req.repo, clone_dir, session_branch)
     await asyncio.to_thread(
         github_client.post_comment, req.repo, req.issue_number,
-        bft.render_deep_summary(req.repo, req.issue_number, list(files)),
+        bft.render_deep_summary(req.repo, req.issue_number, list(files))
+        + bft.render_session_hint(req.repo, session_id, session_branch),
     )
     return branch
 
@@ -2343,6 +3298,49 @@ async def cleanup_bft_workspace(req: BftRequest) -> None:
     """Best-effort снос рабочего каталога прогона."""
     await asyncio.to_thread(
         shutil.rmtree, str(_bft_workspace_dir(req)), ignore_errors=True)
+
+
+@activity.defn
+async def publish_bft_partial(req: BftRequest, reason: str) -> list[str]:
+    """Сорванный прогон отдаёт то, что успел собрать.
+
+    Прогон срывается не только от ошибок в коде: провайдер отвечает 524, кончается
+    лимит запросов, стенд передеплоивают посреди работы. Раньше это стоило всей
+    работы — артефакты жили в каталоге, который `cleanup` стирал на любом исходе,
+    и повтор начинался с нуля, заново оплачивая уже пройденные стадии.
+
+    Возвращает список стадий, чьи артефакты уже готовы: воркфлоу называет их
+    человеку, а следующий `/bft-deep` по ним же понимает, с чего продолжать.
+    Пустой результат — не ошибка: сорваться могло и на первой стадии.
+    """
+    clone_dir = _bft_clone_dir(req)
+    if not Path(clone_dir).is_dir():
+        logger.warning("БФТ %s#%s: каталог уже снят — публиковать нечего",
+                       req.repo, req.issue_number)
+        return []
+    files = await asyncio.to_thread(
+        _collect_bft_artifacts, clone_dir, req.issue_number)
+    done = bft.done_stages(
+        req.issue_number,
+        lambda rel: (Path(clone_dir) / rel).is_file()
+        and (Path(clone_dir) / rel).stat().st_size > 0)
+    if not files:
+        return done
+    branch = bft.branch(req.issue_number)
+    await asyncio.to_thread(
+        github_client.push_artifacts_to_branch,
+        req.repo, branch, files,
+        f"docs(bft): частичный прогон по issue #{req.issue_number}",
+    )
+    session_id, session_branch = await asyncio.to_thread(_entire_session, clone_dir)
+    await asyncio.to_thread(_push_entire_branch, req.repo, clone_dir, session_branch)
+    await asyncio.to_thread(
+        github_client.post_comment, req.repo, req.issue_number,
+        bft.render_partial_summary(req.repo, req.issue_number,
+                                   list(files), done, reason)
+        + bft.render_session_hint(req.repo, session_id, session_branch),
+    )
+    return done
 
 
 @activity.defn
@@ -2373,6 +3371,7 @@ MAX_ARTIFACTS_TOTAL_CHARS = 60_000
 # Пути артефактов из модели данных (docs/ARCHITECTURE.md). Отсутствующий
 # файл — штатная ситуация: research-пайплайн мог не дойти до этой стадии.
 ARTIFACT_PATHS = (
+    "docs/research/issue-{n}-repowise-dialog.md",
     "docs/bft/issue-{n}-blueprint.md",
     "docs/bft/issue-{n}-debate.md",
     "docs/bft/issue-{n}-recommendations.md",

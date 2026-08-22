@@ -89,6 +89,8 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
         # из них она и выведена. Своей аналитики ей не нужно, но фазу «требования
         # есть» она проходит честно: чеклист готовности ссылается на них.
         Transition(SYSTEM_REQUIREMENTS, AGENT, "требования готовы у родителя плана"),
+        # Человек вернул этап на пересборку (rework intent).
+        Transition(CREATED, HUMAN, "человек вернул этап на пересборку"),
         Transition(DUPLICATE, AGENT, "duplicate-check"),
         Transition(ANSWERED, AGENT, "advisor:consultation / existing-functionality"),
         Transition(ESCALATED, AGENT, "дедлайн парковки истёк"),
@@ -107,6 +109,12 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
         # готовности сразу после аналитики и передаёт задачу разработчику.
         # Явная приёмка требований остаётся возможностью, а не условием.
         Transition(READY_FOR_DEV, AGENT, "чеклист готовности опубликован"),
+        # DEVELOP_AUTOSTART пропускает парковку в ready-for-dev целиком (см.
+        # `_phase_handoff`): решение "брать в разработку" уже принято флагом,
+        # и ждать в фазе, где ждать нечего, незачем — тот же приём, что и у
+        # перехода READY_FOR_DEV → PR_OPEN за один шаг.
+        Transition(IN_DEVELOPMENT, AGENT, "полный автостарт: передача разработчику"),
+        Transition(PR_OPEN, AGENT, "полный автостарт: агент открыл PR за один шаг"),
         Transition(BUSINESS_ANALYSIS, HUMAN, "актуализация: вернуть в анализ"),
         Transition(FAILED, AGENT, "сбой стадии"),
         Transition(CANCELLED, HUMAN, "agents:off"),
@@ -124,6 +132,10 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
         # потому, что ждать в ней нечего: результат уже здесь. Прогон в чужих
         # Actions — наоборот, уходит в `in-development` и ждёт события.
         Transition(PR_OPEN, AGENT, "агент разработки открыл PR за один шаг"),
+        # Тот же прогон за один шаг может и сорваться. Без этого перехода
+        # обработчик отказа падал сам — `InvalidTransition` подменял настоящую
+        # причину, и цикл крутил её вместо того, чтобы доложить и остановиться.
+        Transition(FAILED, AGENT, "прогон разработки сорвался"),
         Transition(GROOMED, HUMAN, "актуализация постановки"),
         Transition(CANCELLED, HUMAN, "снято с обработки"),
     ),
@@ -171,6 +183,12 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     ),
     DUPLICATE: (
         Transition(CLASSIFIED, HUMAN, "не дубликат, вернуть в работу"),
+        # Метка решения (research-me/bug-me) уже стоит на Issue до выхода из
+        # DUPLICATE — ждать её повторно (в CLASSIFIED) незачем, тот же приём,
+        # что и у READY_FOR_DEV → PR_OPEN за один шаг.
+        Transition(BUSINESS_ANALYSIS, HUMAN, "не дубликат, метка research-me уже стоит"),
+        Transition(SYSTEM_REQUIREMENTS, HUMAN, "не дубликат, подзадача плана с меткой research-me"),
+        Transition(READY_FOR_DEV, HUMAN, "не дубликат, метка bug-me уже стоит"),
         Transition(CANCELLED, HUMAN, "подтвердить дубликат"),
     ),
     ANSWERED: (
