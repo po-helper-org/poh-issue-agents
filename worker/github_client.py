@@ -127,20 +127,54 @@ def _auth_headers(repo: str) -> dict:
     return _installation_token_headers(repo)
 
 
-def post_comment(repo: str, issue_number: int, body: str) -> None:
+def post_comment(repo: str, issue_number: int, body: str) -> int:
     """Комментарий сервиса — всегда подписанный.
 
     Подпись ставится здесь, в единственной точке отправки, а не в каждом месте,
     где текст собирается: пропущенная подпись означала бы, что вебхук примет наш
     комментарий за ответ человека и накормит им цикл уточнений (см.
     shared/agent_comment.py).
+    
+    Возвращает ID созданного комментария для последующего обновления/удаления.
     """
     body = sign(body)
     if _dry_run():
         _log.info("[DRY_RUN] comment %s#%s: %s", repo, issue_number, body[:200])
-        return
+        return 0
     url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
     resp = requests.post(url, headers=_auth_headers(repo), json={"body": body}, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def update_comment(repo: str, comment_id: int, body: str) -> None:
+    """Правит существующий комментарий сервиса.
+    
+    Комментарий остаётся подписанным — sign() идемпотентен и не дублирует
+    подпись при повторном вызове.
+    """
+    body = sign(body)
+    if _dry_run():
+        _log.info("[DRY_RUN] update comment %s#%d: %s", repo, comment_id, body[:200])
+        return
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+    resp = requests.patch(url, headers=_auth_headers(repo), json={"body": body}, timeout=30)
+    resp.raise_for_status()
+
+
+def delete_comment(repo: str, comment_id: int) -> None:
+    """Удаляет комментарий сервиса.
+    
+    Отсутствующий комментарий (404) не считается ошибкой — он мог быть
+    удалён ранее, и повторная попытка удаления — штатная ситуация.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] delete comment %s#%d", repo, comment_id)
+        return
+    url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+    resp = requests.delete(url, headers=_auth_headers(repo), timeout=30)
+    if resp.status_code == 404:
+        return  # Уже удалён — нормально
     resp.raise_for_status()
 
 

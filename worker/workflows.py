@@ -147,7 +147,7 @@ def _failure_reason(e: BaseException) -> str:
     return f"{type(cause).__name__}: {cause}"
 
 
-async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
+async def _run_staged_analysis(analyze: AnalyzeInput, comment_id: int | None = None) -> bool:
     """Пер-стадийный прогон FNR — общий для обоих входов в аналитику.
 
     Один код на команду `/analyze` (IssueAnalysis) и на лейбл research-me внутри
@@ -162,6 +162,8 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
 
     Возвращает True, если артефакты опубликованы: от этого зависит, можно ли
     передавать задачу разработчику — без аналитики передавать нечего.
+    
+    comment_id: ID плейсхолдер-комментария для реализации «одно сообщение на задачу»
     """
     ok = True
     try:
@@ -194,7 +196,7 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
             )
         await workflow.execute_activity(
             activities.publish_analysis,
-            analyze,
+            args=[analyze, comment_id],
             start_to_close_timeout=timedelta(seconds=120),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
@@ -417,6 +419,10 @@ class IssueLifecycle:
         # Кто закрыл Issue на GitHub. None — открыт. Закрытие обрывает любую
         # парковку: досиживать срок в закрытом Issue незачем.
         self._closed_by: str | None = None
+        # ID плейсхолдер-комментария прогона для реализации «одно сообщение на задачу».
+        # Сохраняется в состоянии workflow, а не в переменной activity, чтобы пережить
+        # ретрай и continue-as-new. Используется shared/run_comment.py.
+        self._run_comment_id: int | None = None
 
     @workflow.query
     def stage(self) -> str:
@@ -737,6 +743,7 @@ class IssueLifecycle:
             self._followup_rounds = carried.followup_rounds
             self._answered_comment_ids = list(carried.answered_comment_ids)
             self._rework_rounds = carried.rework_rounds
+            self._run_comment_id = carried.run_comment_id
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -769,6 +776,7 @@ class IssueLifecycle:
             followup_rounds=self._followup_rounds,
             answered_comment_ids=list(self._answered_comment_ids),
             rework_rounds=self._rework_rounds,
+            run_comment_id=self._run_comment_id,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -2401,6 +2409,10 @@ class IssueAnalysis:
     режимах: повторный `/analyze` упрётся в WorkflowAlreadyStarted, а не
     запустит второй дорогой прогон.
     """
+    
+    def __init__(self):
+        # ID плейсхолдер-комментария прогона для реализации «одно сообщение на задачу»
+        self._run_comment_id: int | None = None
 
     @workflow.run
     async def run(self, analyze: AnalyzeInput) -> bool:
@@ -2412,13 +2424,16 @@ class IssueAnalysis:
         """
         if await _agents_off(analyze.repo, analyze.issue_number, "/analyze"):
             return False
-        await workflow.execute_activity(
+        comment_id = await workflow.execute_activity(
             activities.ack_command,
             analyze,
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-        return await _run_staged_analysis(analyze)
+        # Сохраняем ID плейсхолдера для последующего управления
+        # (в IssueAnalysis это состояние не persists, но сохраняется для согласованности)
+        self._run_comment_id = comment_id
+        return await _run_staged_analysis(analyze, comment_id)
 
 
 @workflow.defn(name="IssueBft")
