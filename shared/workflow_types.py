@@ -151,6 +151,10 @@ class LifecycleState:
     # не должен обнулять потолок, иначе «переделай» ↔ «переделал» будет
     # повторяться бесконечно.
     rework_rounds: int = 0
+    # ID плейсхолдер-комментария прогона для реализации «одно сообщение на задачу».
+    # Сохраняется в состоянии workflow, а не в переменной activity, чтобы пережить
+    # ретрай и continue-as-new. Используется shared/run_comment.py.
+    run_comment_id: int | None = None
 
 
 @dataclass

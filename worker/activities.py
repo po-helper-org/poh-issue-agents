@@ -1506,9 +1506,13 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
 
 
 @activity.defn
-async def publish_analysis(analyze: AnalyzeInput) -> str:
+async def publish_analysis(analyze: AnalyzeInput, comment_id: int | None = None) -> str:
     """Финал пайплайна: собрать артефакты, push ветки research/issue-N,
-    итоговый коммент. Мутации GitHub гейтятся DRY_RUN внутри github_client."""
+    итоговый коммент. Мутации GitHub гейтятся DRY_RUN внутри github_client.
+    
+    Теперь использует shared/run_comment.py для реализации «одно сообщение на задачу»:
+    публикует результат и удаляет плейсхолдер (если есть).
+    """
     clone_dir = _require_workspace(analyze, None)
     files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
     if not files:
@@ -1519,10 +1523,20 @@ async def publish_analysis(analyze: AnalyzeInput) -> str:
         analyze.repo, branch, files,
         f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
     )
-    await asyncio.to_thread(
-        github_client.post_comment,
-        analyze.repo, analyze.issue_number, _build_summary(analyze, branch, files),
+    
+    # Получаем RunID для включения в финальное сообщение
+    from temporalio import workflow
+    run_id = workflow.info().run_id
+    
+    # Строим финальное сообщение
+    summary = _build_summary(analyze, branch, files)
+    
+    # Используем новый unified layer: публикуем результат и удаляем плейсхолдер
+    from shared import run_comment
+    await run_comment.finish_run_comment(
+        analyze.repo, analyze.issue_number, comment_id, run_id, summary
     )
+    
     return branch
 
 
@@ -2492,7 +2506,7 @@ async def ack_comment_seen(ack: CommentAckInput) -> None:
 # --- Слой C: аналитика по запросу (команда /analyze) ---
 
 @activity.defn
-async def ack_command(analyze: AnalyzeInput) -> None:
+async def ack_command(analyze: AnalyzeInput) -> int:
     """Видимое подтверждение приёма команды ДО тяжёлой работы.
 
     Комментарий — это и есть подтверждение, поэтому он идёт первым и ничем не
@@ -2505,18 +2519,28 @@ async def ack_command(analyze: AnalyzeInput) -> None:
     метку, а не команду. Явно переданный `trigger` перекрывает эту догадку:
     аналитику запускает и цикл по метке `research-me`, и назвать её
     `run:analyze` значило бы указать человеку на метку, которой он не ставил.
+    
+    Теперь использует shared/run_comment.py для реализации «одно сообщение на задачу».
+    Возвращает ID созданного комментария для сохранения в состоянии workflow.
     """
     trigger = (f"`{analyze.trigger}`" if analyze.trigger
                else f"`{run_label(ANALYZE)}`" if analyze.comment_id is None
                else "`/analyze`")
-    await asyncio.to_thread(
-        github_client.post_comment,
-        analyze.repo,
-        analyze.issue_number,
-        f"🔍 Взял {trigger} в работу — запускаю автономный анализ через SA-helper.\n\n"
-        "Прогон занимает несколько минут: артефакты появятся в ветке "
-        f"`research/issue-{analyze.issue_number}`, а сводка — следующим комментарием.",
+    
+    # Получаем RunID для отслеживания
+    from temporalio import workflow
+    run_id = workflow.info().run_id
+    
+    message = (f"🔍 Взял {trigger} в работу — запускаю автономный анализ через SA-helper.\n\n"
+               "Прогон занимает несколько минут: артефакты появятся в ветке "
+               f"`research/issue-{analyze.issue_number}`, а сводка — следующим комментарием.")
+    
+    # Используем новый unified layer для управления комментариями
+    from shared import run_comment
+    comment_id = await run_comment.open_run_comment(
+        analyze.repo, analyze.issue_number, run_id, message, skip_placeholder=False
     )
+    
     await asyncio.to_thread(
         github_client.add_label, analyze.repo, analyze.issue_number, run_label(ANALYZE)
     )
@@ -2525,6 +2549,8 @@ async def ack_command(analyze: AnalyzeInput) -> None:
             await asyncio.to_thread(github_client.add_reaction, analyze.repo, analyze.comment_id, "eyes")
         except Exception:
             pass  # best-effort: декорация не должна ронять ack или весь прогон
+    
+    return comment_id
 
 
 @activity.defn
