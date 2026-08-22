@@ -1,10 +1,8 @@
-"""Каталог меток контура: имя, цвет, описание.
+"""Единый каталог меток Issue-Agent: имена, цвета и описания.
 
-Собирается из тех же констант, что и рабочий код. Переписанный руками список
-разъезжается с контуром на первой же новой фазе — и разъезд этот тихий: метка
-всё равно заведётся при первом применении, просто серой и без описания.
-
-Чистый модуль: ни сети, ни Temporal, ни обращений к трекеру.
+Имена собираются из тех же констант, что и рабочий код. Это не даёт каталогу
+тихо разъехаться с вебхуком или воркером при добавлении новой фазы, команды или
+решения человека.
 """
 from __future__ import annotations
 
@@ -27,9 +25,6 @@ ADVISOR_KINDS = ("answered", "bug", "consultation", "error",
                  "existing-functionality", "feature-request")
 PRIORITY_LEVELS = ("P0", "P1", "P2", "P3")
 
-# Источник имён — L.HUMAN_DECISION_LABELS (общий с вебхуком, shared/labels.py).
-# Здесь только текст: намеренно словарь, а не шаблон по имени метки — иначе
-# описание становится нечитаемым машинным слепком идентификатора.
 _HUMAN_DECISION_DESCRIPTIONS = {
     "research-me": "Триггер человека: запустить аналитику",
     "bug-me": "Триггер человека: запустить багфикс",
@@ -37,9 +32,8 @@ _HUMAN_DECISION_DESCRIPTIONS = {
     "not-duplicate": "Человек считает Issue не дубликатом — контур возвращает его в работу",
     "confirm-duplicate": "Человек подтверждает дубликат — контур снимает Issue с обработки, но на GitHub его не закрывает",
 }
-# KeyError здесь — сигнал, что в HUMAN_DECISION_LABELS завели метку без
-# описания: пусть модуль не импортируется, чем каталог тихо потеряет метку.
-TRIGGERS = {name: _HUMAN_DECISION_DESCRIPTIONS[name] for name in L.HUMAN_DECISION_LABELS}
+TRIGGERS = {name: _HUMAN_DECISION_DESCRIPTIONS[name]
+            for name in L.HUMAN_DECISION_LABELS}
 FLAT = {
     "bot-authored": "Issue заведён ботом",
     "security-sensitive": "Затрагивает безопасность",
@@ -58,8 +52,63 @@ class LabelSpec:
     description: str
 
 
+def _all_phase_labels() -> frozenset[str]:
+    return frozenset(lifecycle.phase_label(phase) for phase in lifecycle.PHASES)
+
+
+def _all_command_labels() -> frozenset[str]:
+    result: set[str] = set()
+    # _COMMANDS maps slash-command names to the canonical label suffix.
+    for command in commands._COMMANDS.values():
+        result.add(commands.run_label(command))
+        result.add(commands.done_label(command))
+        result.add(commands.failed_label(command))
+    result.update(commands._LEGACY_RUNNING_LABELS.get(commands.ANALYZE, ()))
+    return frozenset(result)
+
+
+def _protocol_labels() -> frozenset[str]:
+    return frozenset({
+        L.NEEDS_HUMAN_TRIAGE,
+        L.LEGACY_NEEDS_HUMAN_TRIAGE,
+        L.READY_FOR_DEV,
+        L.AGENTS_OFF,
+        L.ORIGIN_AGENT,
+    })
+
+
+def _control_labels() -> frozenset[str]:
+    return frozenset({pr_closing.NEEDS_HUMAN_PR, develop.IN_DEVELOPMENT_LABEL})
+
+
+def _all_internal_labels() -> frozenset[str]:
+    return L.ADVISOR_LABELS | L.PRIORITY_LABELS | L.FLAT_LABELS
+
+
+def label_families() -> dict[str, frozenset[str]]:
+    """Метки по семействам; каждое семейство неизменяемо."""
+    return {
+        "phases": _all_phase_labels(),
+        "commands": _all_command_labels(),
+        "advisors": L.ADVISOR_LABELS,
+        "priorities": L.PRIORITY_LABELS,
+        "flat": L.FLAT_LABELS,
+        "protocol": _protocol_labels(),
+        "control": _control_labels(),
+        "triggers": frozenset(TRIGGERS),
+    }
+
+
+def all_labels() -> frozenset[str]:
+    """Все метки, которыми оперирует контур Issue-Agent."""
+    result: set[str] = set()
+    for family in label_families().values():
+        result.update(family)
+    return frozenset(result)
+
+
 def catalog() -> dict[str, LabelSpec]:
-    """Все метки, которыми оперирует контур."""
+    """Все метки, которыми оперирует контур, с цветом и описанием."""
     out: dict[str, LabelSpec] = {}
 
     def add(name: str, color: str, description: str) -> None:
@@ -72,16 +121,17 @@ def catalog() -> dict[str, LabelSpec]:
     for level in PRIORITY_LEVELS:
         add(f"priority:{level}", PRIORITY_COLOR, "Расчётный приоритет")
     for command in commands._COMMANDS.values():
-        add(f"{commands.RUN_PREFIX}{command}", RUNNING_COLOR,
+        add(commands.run_label(command), RUNNING_COLOR,
             f"Команда /{command} выполняется")
-        add(f"{commands.DONE_PREFIX}{command}", DONE_COLOR,
+        add(commands.done_label(command), DONE_COLOR,
             f"Команда /{command} завершена")
-        add(f"{commands.FAILED_PREFIX}{command}", FAILED_COLOR,
+        add(commands.failed_label(command), FAILED_COLOR,
             f"Команда /{command} сорвалась")
     for legacy in commands._LEGACY_RUNNING_LABELS.get(commands.ANALYZE, ()):
         add(legacy, RUNNING_COLOR, "Legacy-метка выполнения /analyze")
 
     add(L.NEEDS_HUMAN_TRIAGE, HUMAN_COLOR, "Ход за человеком")
+    add(L.LEGACY_NEEDS_HUMAN_TRIAGE, HUMAN_COLOR, "Историческая очередь к человеку")
     add(pr_closing.NEEDS_HUMAN_PR, HUMAN_COLOR, "Круг правок PR требует человека")
     add(L.ORIGIN_AGENT, NEUTRAL_COLOR, "Issue или PR заведён агентом")
     add(L.AGENTS_OFF, "#333333", "Контур не трогает этот Issue")

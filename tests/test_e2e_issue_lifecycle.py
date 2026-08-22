@@ -60,6 +60,8 @@ E2E_ACTIVITIES = [
     activities_module.finish_command_labels,
     activities_module.classify_issue,
     activities_module.duplicate_check,
+    activities_module.run_bft_fast,
+    activities_module.publish_bft_error,
     activities_module.score_priority,
     activities_module.post_priority_comment,
     activities_module.prepare_workspace,

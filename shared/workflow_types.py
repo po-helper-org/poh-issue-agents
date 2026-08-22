@@ -224,6 +224,7 @@ class DuplicateResult:
 class PriorityResult:
     tier: str  # "P0" | "P1" | "P2" | "P3"
     breakdown_markdown: str
+    priority_label: str = ""  # Full label name, e.g. "priority:P0"
 
 
 @dataclass

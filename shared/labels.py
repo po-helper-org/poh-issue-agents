@@ -4,10 +4,13 @@
 **одна метка, один писатель**: метку из чужой зоны агент только читает, иначе два
 агента затирают друг друга.
 
-Здесь живут только метки контура (общие для Issue-Agent, PR-Agent, PR-Closer).
-Внутренние метки этого сервиса (`advisor:*`, `priority:*`, `duplicate`,
-`run:*`/`done:*`/`failed:*`) остаются там, где применяются: их пишет только этот
-сервис, и общего словаря им не нужно.
+Здесь живут:
+- Метки контура (общие для Issue-Agent, PR-Agent, PR-Closer)
+- Внутренние метки Issue-Agent (`advisor:*`, `priority:*`, плоские метки)
+
+Константы живут здесь, чтобы и вебхук, и воркер, и каталог меток читали из
+одного источника — иначе новый добавленный в коде label не попадёт в каталог и
+разъедется.
 
 Модуль намеренно без зависимостей: его читают и вебхук, и воркер.
 """
@@ -40,6 +43,52 @@ AGENTS_OFF = "agents:off"
 # выхода, и контур начинает кормить сам себя.
 ORIGIN_AGENT = "origin:agent"
 
+# --- Внутренние метки Issue-Agent ---
+# Эти метки пишет только Issue-Agent; словарь нужен для каталога и проверки
+# согласованности. Константы живут здесь, чтобы и вебхук, и воркер, и каталог
+# читали из одного источника — иначе новый добавленный в коде label не попадёт
+# в каталог и разъедется.
+
+# Advisor: классификация на триаже
+ADVISOR_PREFIX = "advisor:"
+ADVISOR_EXISTING = f"{ADVISOR_PREFIX}existing-functionality"
+ADVISOR_CONSULTATION = f"{ADVISOR_PREFIX}consultation"
+ADVISOR_BUG = f"{ADVISOR_PREFIX}bug"
+ADVISOR_FEATURE = f"{ADVISOR_PREFIX}feature-request"
+ADVISOR_ANSWERED = f"{ADVISOR_PREFIX}answered"
+ADVISOR_LABELS = frozenset({
+    ADVISOR_EXISTING,
+    ADVISOR_CONSULTATION,
+    ADVISOR_BUG,
+    ADVISOR_FEATURE,
+    ADVISOR_ANSWERED,
+})
+
+# Приоритеты: рассчитываются по формуле Cost of Delay / Effort
+PRIORITY_PREFIX = "priority:"
+PRIORITY_P0 = f"{PRIORITY_PREFIX}P0"
+PRIORITY_P1 = f"{PRIORITY_PREFIX}P1"
+PRIORITY_P2 = f"{PRIORITY_PREFIX}P2"
+PRIORITY_P3 = f"{PRIORITY_PREFIX}P3"
+PRIORITY_LABELS = frozenset({PRIORITY_P0, PRIORITY_P1, PRIORITY_P2, PRIORITY_P3})
+
+# Плоские метки: используются в разных точках контура
+BOT_AUTHORED = "bot-authored"
+SECURITY_SENSITIVE = "security-sensitive"
+NEEDS_CLARIFICATION = "needs-clarification"
+SPAM = "spam"
+DUPLICATE = "duplicate"
+POSSIBLE_DUPLICATE = "possible-duplicate"
+ESTIMATED = "estimated"
+FLAT_LABELS = frozenset({
+    BOT_AUTHORED,
+    SECURITY_SENSITIVE,
+    NEEDS_CLARIFICATION,
+    SPAM,
+    DUPLICATE,
+    POSSIBLE_DUPLICATE,
+    ESTIMATED,
+})
 # --- Точки решения человека ---
 # Метки, которыми человек отвечает контуру на прямой вопрос: `research-me` /
 # `bug-me` — куда вести Issue после триажа, `build-me` — запускать ли
