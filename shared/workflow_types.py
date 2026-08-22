@@ -207,7 +207,7 @@ class GateResult:
 
 @dataclass
 class ClassificationResult:
-    label: str  # "advisor:existing-functionality" | "advisor:consultation" | "advisor:bug" | "advisor:feature-request"
+    label: str  # "advisor:existing-functionality" | "advisor:consultation" | "advisor:bug" | "advisor:feature-request" | "advisor:product-research"
     answer: str
 
 

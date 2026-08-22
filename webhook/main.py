@@ -37,6 +37,7 @@ from shared.commands import (
     BFT,
     BFT_DEEP,
     ESTIMATE,
+    RESEARCH,
     bft_mode,
     build_analyze_input,
     build_bft_request,
@@ -44,7 +45,7 @@ from shared.commands import (
     parse_label_command,
 )
 from shared.agent_comment import is_agent_comment
-from shared.agent_launcher import request_analysis, request_bft, request_estimate
+from shared.agent_launcher import request_analysis, request_bft, request_estimate, request_research
 from shared.authz import may_trigger, trigger_allowlist
 from shared.labels import HUMAN_DECISION_LABELS, parse_root_issue
 from shared.repos import allowed_specs, is_allowed
@@ -507,6 +508,21 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                 )
                 return {"ok": True}
 
+            if command == RESEARCH:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                from shared.workflow_types import AnalyzeInput
+
+                await request_research(
+                    client,
+                    _issue_input(payload, interactive=False),
+                    AnalyzeInput(repo=repo, issue_number=issue_number,
+                               title=payload["issue"]["title"], body=payload["issue"]["body"],
+                               comment_id=None, trigger="label"),
+                    search_attributes=_search_attributes(repo, payload, issue_number),
+                )
+                return {"ok": True}
+
             if command in (BFT, BFT_DEEP):
                 if not _may_start_expensive(payload, label, repo, issue_number):
                     return {"ok": True}
@@ -592,6 +608,22 @@ async def _handle_delivery(payload: dict, x_github_event: str,
             )
             return {"ok": True}
 
+        if command == RESEARCH:
+            if not _may_start_expensive(payload, "/research", repo, issue_number):
+                return {"ok": True}
+            from shared.workflow_types import AnalyzeInput
+
+            comment_id = payload["comment"]["id"]
+            await request_research(
+                client,
+                _issue_input(payload, interactive=True),
+                AnalyzeInput(repo=repo, issue_number=issue_number,
+                           title=payload["issue"]["title"], body=payload["issue"]["body"],
+                           comment_id=comment_id, trigger="comment"),
+                search_attributes=_search_attributes(repo, payload, issue_number),
+            )
+            return {"ok": True}
+
         if command in (BFT, BFT_DEEP):
             if not _may_start_expensive(payload, f"/{command}", repo, issue_number):
                 return {"ok": True}
@@ -614,6 +646,18 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                 client,
                 _issue_input(payload, interactive=True),
                 build_analyze_input(payload),
+                search_attributes=_search_attributes(repo, payload, issue_number),
+            )
+            return {"ok": True}
+
+        if command == RESEARCH:
+            if not _may_start_expensive(payload, "/research", repo, issue_number):
+                return {"ok": True}
+            # Продуктовое исследование — отдельный workflow, аналогично анализу
+            await request_research(
+                client,
+                _issue_input(payload, interactive=True),
+                build_analyze_input(payload),  # Reuse same input structure for now
                 search_attributes=_search_attributes(repo, payload, issue_number),
             )
             return {"ok": True}
