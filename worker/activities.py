@@ -3138,6 +3138,254 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
     return document
 
 
+def _bft_direct_problem(req: BftRequest, clone_dir: str) -> str:
+    """Стадия `problem` прямым вызовом модели вместо агента.
+    
+    Генерирует диагноз проблемы: rich picture + As-Is/Gap без решений.
+    """
+    model = os.environ.get("BFT_DIRECT_MODEL", "glm-4.6")
+    sources = _bft_sources(clone_dir)
+    line_counts = {rel: len(body.splitlines()) for rel, body in sources.items()}
+    inputs = _bft_stage_inputs(clone_dir, req.issue_number, sources)
+    issue_number = req.issue_number
+
+    system = _bft_stage_system(
+        "problem", "СЕЙЧАС ты ставишь диагноз проблемы БЕЗ предложений решений. "
+                 "Твоя роль: Problem Analyst. Реконструируй проблемную ситуацию, "
+                 "As-Is, Gap, затронутые компоненты, конфликты.")
+    
+    task = (
+        f"{inputs}\\n\\n---\\n\\n# Задание\\n\\n"
+        f"Собери диагноз проблемы для эпика issue-{issue_number}.\\n\\n"
+        "## Требования к содержанию\\n\\n"
+        "### Rich Picture (богатая картина)\\n"
+        "- Акторы — кто вовлечён (пользователи, команды, внешние системы)\\n"
+        "- Потоки — что/как движется (данные, события, деньги)\\n"
+        "- Конкурирующие worldviews — разные взгляды на проблему\\n"
+        "- Конфликты — где worldviews противоречат\\n\\n"
+        "### As-Is (текущее поведение)\\n"
+        "- Как система работает СЕЙЧАС, только подтверждённое якорями\\n"
+        "- Ключевые компоненты: `Компонент | Роль | Якорь (R1 код:line / R2 задача/wiki)`\\n"
+        "- Используй `.bft/index/architecture.md` для цитат кода\\n"
+        "- Не додумывай реализацию → `[УТОЧНИТЬ]`\\n\\n"
+        "### Gap (разрыв)\\n"
+        "- Что не так в As-Is относительно желаемого\\n"
+        "- Конкретные проблемы (не «плохо»), каждая с ≥1 доказательством\\n\\n"
+        "### Затронутые компоненты\\n"
+        "- Прямое (что менять), косвенное (что зависит), защищённые (backward compat)\\n\\n"
+        "### Открытые вопросы\\n"
+        "- Вопросы к владельцам, безsilent skip\\n\\n"
+        "## Требования к якорям\\n\\n"
+        "Каждый факт As-Is должен иметь якорь ранга R1 (код:строки) или R2 (задача/wiki). "
+        "Минимум якорей: ≥" + str(bft.ANCHOR_FLOOR) + ".\\n\\n"
+        "Верни документ в формате markdown. Начни с YAML-шапки:\\n```\\n---\\n"
+        "Epic: issue-" + str(issue_number) + "\\nНазвание: <название>\\n"
+        "Стадия: problem\\nДата: <сегодня>\\n---\\n```"
+    )
+
+    started = time.monotonic()
+    document = llm.complete(system, task, model=model)
+    elapsed = time.monotonic() - started
+    
+    # Логируем результат
+    _append_dialog(clone_dir, issue_number, bft.render_dialog_entry(
+        stage="problem", actor=f"прямой вызов ({model})", step="генерация диагноза",
+        outcome="готово", elapsed=elapsed,
+        detail=f"{len(document)} символов"))
+    
+    return document
+
+
+def _bft_direct_concept(req: BftRequest, clone_dir: str) -> str:
+    """Стадия `concept` прямым вызовом модели вместо агента.
+    
+    Генерирует 2-3 концепта решения через CATWOE.
+    """
+    model = os.environ.get("BFT_DIRECT_MODEL", "glm-4.6")
+    sources = _bft_sources(clone_dir)
+    inputs = _bft_stage_inputs(clone_dir, req.issue_number, sources)
+    issue_number = req.issue_number
+
+    system = _bft_stage_system(
+        "concept", "СЕЙЧАС ты генерируешь спектр решений проблемы. "
+                 "Твоя роль: Solution Designer. Дай 2-3 варианта с плюсами/минусами, "
+                 "не выбирай за PO.")
+    
+    task = (
+        f"{inputs}\\n\\n---\\n\\n# Задание\\n\\n"
+        f"Сгенерируй концепты решения для эпика issue-{issue_number}.\\n\\n"
+        "## Требования к концептам\\n\\n"
+        "### Спектр решений\\n"
+        "- **Концепт 1 — «чистый»** (правильная долгосрочная модель)\\n"
+        "- **Концепт 2 — «компромисс»** (баланс усилий/качества)\\n"
+        "- **Концепт 3 (опц.) — «быстрый/костыль»** (минимум усилий, техдолг)\\n\\n"
+        "### CATWOE для каждого концепта\\n"
+        "Для каждого концепта примени метод CATWOE:\\n"
+        "- **C** Customer — кто выигрывает/теряет\\n"
+        "- **A** Actor — кто выполняет трансформацию\\n"
+        "- **T** Transformation — что меняется (суть)\\n"
+        "- **W** Weltanschauung — мировоззрение/ценность\\n"
+        "- **O** Owner — кто владеет/контролирует\\n"
+        "- **E** Environment — ограничения среды\\n\\n"
+        "### Плюсы и минусы\\n"
+        "- Конкретные (не «лучше/хуже»)\\n"
+        "- Опираются на As-Is/Gap из problem.md\\n\\n"
+        "Верни документ в формате markdown. Начни с YAML-шапки:\\n```\\n---\\n"
+        "Epic: issue-" + str(issue_number) + "\\nНазвание: <название>\\n"
+        "Стадия: concept\\nДата: <сегодня>\\n---\\n```"
+    )
+
+    started = time.monotonic()
+    document = llm.complete(system, task, model=model)
+    elapsed = time.monotonic() - started
+    
+    # Логируем результат
+    _append_dialog(clone_dir, issue_number, bft.render_dialog_entry(
+        stage="concept", actor=f"прямой вызов ({model})", step="генерация концептов",
+        outcome="готово", elapsed=elapsed,
+        detail=f"{len(document)} символов"))
+    
+    return document
+
+
+def _bft_direct_debate(req: BftRequest, clone_dir: str) -> str:
+    """Стадия `debate` прямым вызовом модели вместо агента.
+    
+    Проводит дебаты между концептами и выбирает лучший.
+    """
+    model = os.environ.get("BFT_DIRECT_MODEL", "glm-4.6")
+    sources = _bft_sources(clone_dir)
+    inputs = _bft_stage_inputs(clone_dir, req.issue_number, sources)
+    issue_number = req.issue_number
+
+    system = _bft_stage_system(
+        "debate", "СЕЙЧАС ты проводишь дебаты между концептами. "
+                 "Твоя роль: Devil's Advocate + Arbitrator. "
+                 "Выяви слабости каждого концепта и выбери лучший.")
+    
+    task = (
+        f"{inputs}\\n\\n---\\n\\n# Задание\\n\\n"
+        f"Проведи дебаты концептов для эпика issue-{issue_number} и выбери лучший.\\n\\n"
+        "## Процесс дебатов\\n\\n"
+        "### Раунд 1: Архитектор против Адвоката Дьявола\\n"
+        "- Архитектор защищает каждый концепт от критики\\n"
+        "- Адвокат Дьявола находит слабости, риски, скрытые assumptions\\n\\n"
+        "### Раунд 2: Пересмотр\\n"
+        "- Архитектор отвечает на критику\\n"
+        "- Укрепляет слабые места или признаёт их\\n\\n"
+        "### Финальный вердикт\\n"
+        "- Выбери один концепт (или гибрид)\\n"
+        "- Обоснуй выбор: почему он лучше других\\n"
+        "- Назови оставшиеся риски и mitigations\\n\\n"
+        "Верни ТОЛЬКО вердикт (без markdown formatting)."
+    )
+
+    started = time.monotonic()
+    verdict = llm.complete(system, task, model=model)
+    elapsed = time.monotonic() - started
+    
+    # Добавляем вердикт в конец concept.md
+    concept_path = Path(clone_dir) / bft.artefacts_dir(issue_number) / "concept.md"
+    if concept_path.exists():
+        with concept_path.open("a", encoding="utf-8") as f:
+            f.write("\\n\\n---\\n\\n## Вердикт дебатов\\n\\n")
+            f.write(verdict)
+    else:
+        raise RuntimeError(f"concept.md не найден для добавления вердикта: {concept_path}")
+    
+    # Логируем результат
+    _append_dialog(clone_dir, issue_number, bft.render_dialog_entry(
+        stage="debate", actor=f"прямой вызов ({model})", step="дебаты и выбор",
+        outcome="готово", elapsed=elapsed,
+        detail=f"{len(verdict)} символов добавлено в concept.md"))
+    
+    return verdict
+
+
+def _bft_direct_validate(req: BftRequest, clone_dir: str) -> str:
+    """Стадия `validate` прямым вызовом модели вместо агента.
+    
+    Валидирует финальный документ БФТ на соответствие стандартам.
+    """
+    model = os.environ.get("BFT_DIRECT_MODEL", "glm-4.6")
+    sources = _bft_sources(clone_dir)
+    inputs = _bft_stage_inputs(clone_dir, req.issue_number, sources)
+    issue_number = req.issue_number
+    
+    # Читаем документ для валидации
+    doc_path = Path(clone_dir) / bft.document_path(req.issue_number)
+    if not doc_path.exists():
+        raise RuntimeError(f"документ БФТ не найден: {doc_path}")
+    
+    document_content = doc_path.read_text(encoding="utf-8")
+
+    system = _bft_stage_system(
+        "validate", "СЕЙЧАС ты валидируешь документ БФТ на соответствие стандартам. "
+                 "Твоя роль: Quality Assurance. Проверь формальные требования, "
+                 "якоря, полноту и качество.")
+    
+    task = (
+        f"{inputs}\\n\\n---\\n\\n# Документ для валидации\\n\\n"
+        f"```\\n{document_content}\\n```\\n\\n"
+        f"# Задание\\n\\n"
+        f"Проверь документ БФТ для эпика issue-{issue_number} на соответствие стандартам.\\n\\n"
+        "## Чек-лист проверки\\n\\n"
+        "### Формальные требования\\n"
+        "- YAML-шапка присутствует и корректна\\n"
+        "- Отсутствуют запрещённые разделы (см. bft_standards.md)\\n"
+        "- Идентификаторы требований соответствуют формату\\n"
+        "- Связи между требованиями не пустые\\n"
+        "- НФТ имеют числовые значения\\n"
+        "- Нет битых ссылок на требования\\n\\n"
+        "### Якоря\\n"
+        "- Все As-Is-факты имеют якоря R1 (код:строки) или R2 (задача/wiki)\\n"
+        "- Якоря указывают на существующие строки/файлы\\n"
+        "- Таблица якорей полная и корректная\\n\\n"
+        "### Полнота\\n"
+        "- Число требований по каждому типу не ниже нижней границы: "
+        + ", ".join(f"{k} ≥ {v}" for k, v in bft.CASCADE_FLOOR.items()) + "\\n"
+        f"- Общее число якорей ≥ {bft.ANCHOR_FLOOR}\\n\\n"
+        "### Качество\\n"
+        "- Требования измеримы и проверяемы\\n"
+        "- Нет противоречий между требованиями\\n"
+        "- Язык чёткий, однозначный\\n\\n"
+        "## Формат вердикта\\n\\n"
+        "Верни вердикт в формате markdown (без yaml-шапки):\\n\\n"
+        "# Вердикт валидации\\n\\n"
+        "## Статус: ПРОВЕРЕН / НЕ ПРОШЁЛ\\n\\n"
+        "## Найденные проблемы\\n"
+        "- проблема 1\\n"
+        "- проблема 2\\n\\n"
+        "## Рекомендации\\n"
+        "- рекомендация 1\\n"
+        "- рекомендация 2"
+    )
+
+    started = time.monotonic()
+    verdict = llm.complete(system, task, model=model)
+    elapsed = time.monotonic() - started
+    
+    # Логируем результат
+    _append_dialog(clone_dir, issue_number, bft.render_dialog_entry(
+        stage="validate", actor=f"прямой вызов ({model})", step="валидация документа",
+        outcome="готово", elapsed=elapsed,
+        detail=f"{len(verdict)} символов"))
+    
+    return verdict
+
+
+def _append_dialog(clone_dir: str, issue_number: int, entry: str) -> None:
+    """Добавляет запись в журнал прямых вызовов."""
+    log_path = Path(clone_dir) / bft.dialog_log_path(issue_number)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    if not log_path.exists():
+        log_path.write_text(bft.DIALOG_LOG_HEADER, encoding="utf-8")
+    
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(entry + "\\n")
+
+
 BFT_TOP_UP_ATTEMPTS = 2
 
 
@@ -3216,15 +3464,46 @@ async def run_bft_stage(req: BftRequest, stage_name: str) -> dict:
                         req.repo, req.issue_number, stage_name)
             return {"stage": stage_name, "artifact": expected,
                     "bytes": done.stat().st_size, "skipped": True}
-    if stage_name in bft.direct_stages() and expected:
-        # Стадия без исследования репозитория: вход готов, выход — один файл.
+    # Маршрутизация прямых стадий
+    if stage_name in bft.direct_stages():
+        # Стадия без исследования репозитория: вход готов, выход — один файл (или ни одного).
         # Агент здесь стоит 356 МБ RSS и ничего не добавляет, кроме способности
         # дочитать файл, который мы и так подаём (#77).
-        document = await _run_with_heartbeat(
-            _bft_direct_draft, req, clone_dir, label=f"bft:{stage_name}")
-        path = Path(clone_dir) / expected
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(document, encoding="utf-8")
+        
+        # Маршрутизация к конкретной функции прямой стадии
+        direct_functions = {
+            "index": None,  # index всегда требует агента (исследует репозиторий)
+            "context": None,  # context всегда требует агента (исследует репозиторий)
+            "problem": _bft_direct_problem,
+            "concept": _bft_direct_concept,
+            "debate": _bft_direct_debate,
+            "draft": _bft_direct_draft,
+            "validate": _bft_direct_validate,
+        }
+        
+        if stage_name not in direct_functions:
+            raise RuntimeError(f"прямая стадия {stage_name} не реализована")
+        
+        direct_func = direct_functions[stage_name]
+        if direct_func is None:
+            # Эта стадия всегда требует агента, игнорируем флаг
+            logger.warning("БФТ %s#%s: стадия %s помечена как прямая, но требует агента — "
+                          "используем claude -p", req.repo, req.issue_number, stage_name)
+            await _run_with_heartbeat(_run_claude, prompt, clone_dir,
+                                      label=f"bft:{stage_name}")
+        else:
+            # Прямая реализация доступна
+            if expected:
+                # Стадия с ожидаемым артефактом
+                document = await _run_with_heartbeat(
+                    direct_func, req, clone_dir, label=f"bft:{stage_name}")
+                path = Path(clone_dir) / expected
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(document, encoding="utf-8")
+            else:
+                # Стадия без артефакта (например, debate пишет в concept.md)
+                await _run_with_heartbeat(
+                    direct_func, req, clone_dir, label=f"bft:{stage_name}")
     else:
         # Диалог этой стадии пишет entire: у `claude -p` есть сессия, за которую
         # он цепляется хуками. Дублировать её журналом значит вести две записи
