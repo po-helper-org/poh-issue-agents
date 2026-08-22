@@ -54,6 +54,7 @@ from shared.workflow_types import (
     CommentAckInput,
     CommentIntent,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     EstimateRequest,
     EstimateResult,
@@ -1973,6 +1974,45 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     )
 
 
+async def _dev_resolve_branch(issue: IssueInput, root_issue: int | None = None,
+                              branch: str | None = None) -> str:
+    """Выключатель разработки + ветка аналитики — общий вход в стадию.
+
+    Раньше — две дословные копии, в `trigger_openhands_resolver` и в
+    `dev_begin`: правка формата ветки или условия выключателя попала бы в
+    одну и была бы забыта в другой, и линейный путь молча разошёлся бы с
+    путём через дочерний воркфлоу.
+    """
+    if not develop.enabled():
+        raise RuntimeError(
+            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
+
+    if branch is None:
+        source = root_issue if root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
+    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
+        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
+        # агент работает от тела Issue, но знать об этом должен явно.
+        branch = ""
+    return branch
+
+
+async def _dev_dispatch_and_announce(issue: IssueInput, branch: str) -> None:
+    """Режим `dispatch`: запуск в GitHub Actions + объявление человеку.
+
+    Раньше — две дословные копии, в `trigger_openhands_resolver` и в
+    `dev_dispatch`: правка аргументов `dispatch_inputs` или текста объявления
+    попала бы в одну и была бы забыта в другой.
+    """
+    await asyncio.to_thread(
+        github_client.dispatch_workflow,
+        issue.repo, develop.workflow_file(), develop.workflow_ref(),
+        develop.dispatch_inputs(issue.issue_number, branch=branch),
+    )
+    await _dev_announce(issue, branch,
+                        where="запустил OpenHands Resolver в GitHub Actions")
+
+
 @activity.defn
 async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None = None, 
                                      branch: str | None = None) -> int | None:
@@ -1989,29 +2029,10 @@ async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None =
     `root_issue` — номер родительской задачи (если это подзадача плана),
     `branch` — готовая ветка (если вычислена в workflow).
     """
-    if not develop.enabled():
-        raise RuntimeError(
-            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
-
-    # ISSUE-113 пункт 2: если передана готовая ветка, используем её; иначе
-    # вычисляем как раньше. Для подзадачи плана workflow уже посчитал ветку
-    # родителя, поэтому передаём её явно.
-    if branch is None:
-        source = root_issue if root_issue else issue.issue_number
-        branch = f"research/issue-{source}"
-    
-    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
-        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
-        # агент работает от тела Issue, но знать об этом должен явно.
-        branch = ""
+    branch = await _dev_resolve_branch(issue, root_issue=root_issue, branch=branch)
 
     if develop.mode() == develop.DISPATCH:
-        await asyncio.to_thread(
-            github_client.dispatch_workflow,
-            issue.repo, develop.workflow_file(), develop.workflow_ref(),
-            develop.dispatch_inputs(issue.issue_number, branch=branch),
-        )
-        await _dev_announce(issue, branch, where="запустил OpenHands Resolver в GitHub Actions")
+        await _dev_dispatch_and_announce(issue, branch)
         return None
 
     # Порядок не косметический: сначала клон и постановка — они единственные
@@ -2037,6 +2058,108 @@ async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None =
     if number is None:
         raise RuntimeError("агент не изменил ни одного файла — открывать нечего")
     return number
+
+
+# --- Разработка дочерним воркфлоу: шаги как отдельные активности ---
+#
+# Прежде вся разработка была ОДНОЙ активностью, и её ретрай повторял четыре
+# внутренних шага целиком. На прогоне #39 падал только `git push` — уже после
+# работы агента, — а заново шёл весь прогон, и контур трижды объявил о передаче
+# задачи. Лечение снижением до одной попытки отменяло ретраи и там, где они
+# уместны. Разрезав стадию на активности, ретраи возвращаются туда, где дёшевы.
+#
+# Приватные `_dev_*` НЕ трогаем: по ним идёт `trigger_openhands_resolver`, а по
+# нему — реплей прогонов, начатых до выкладки, и прежний линейный сценарий.
+
+
+@activity.defn
+async def dev_begin(issue: IssueInput) -> DevelopPlan:
+    """Решения входа в стадию: работаем ли вообще, в каком режиме и от чего.
+
+    Собрано в один шаг намеренно. Выключатель и наличие ветки читаются из
+    окружения и из GitHub — в воркфлоу так нельзя, там решение обязано быть
+    детерминированным при реплее. Один вызов вместо трёх ещё и делает вход в
+    стадию одной строкой в истории.
+    """
+    branch = await _dev_resolve_branch(issue)
+    return DevelopPlan(mode=develop.mode(), branch=branch)
+
+
+@activity.defn
+async def dev_dispatch(issue: IssueInput, branch: str) -> None:
+    """Режим `dispatch`: прогон уезжает в GitHub Actions.
+
+    Своих шагов на этой стороне нет — отсюда и один вызов вместо цепочки.
+    Результат придёт событием `pr-open` от внешнего агента.
+    """
+    await _dev_dispatch_and_announce(issue, branch)
+
+
+@activity.defn
+async def dev_prepare(issue: IssueInput, branch: str) -> int:
+    """Шаг 1: свежий клон и постановка файлом. Возвращает длину постановки.
+
+    Длину, а не текст: постановка уже лежит в `.task.md` в общем томе, и
+    дублировать её в payload Temporal незачем. В лог она уходит целиком — там
+    её и смотрят, когда разбираются «почему агент сделал не то».
+    """
+    task = await _run_with_heartbeat(_dev_prepare, issue, branch, label="dev:prepare")
+    logger.info("Develop %s#%s: постановка (%d симв.)\n%s",
+                issue.repo, issue.issue_number, len(task), task[:2000])
+    return len(task)
+
+
+@activity.defn
+async def dev_announce(issue: IssueInput, branch: str) -> None:
+    """Шаг 2: метка и комментарий о начале работы — best-effort.
+
+    Отдельным шагом, а не частью прогона: объявление обязано случиться ПОСЛЕ
+    успешного клона (иначе контур скажет о работе, которая не началась) и ДО
+    прогона агента (иначе человек двадцать минут не знает, что задача в работе).
+    """
+    await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
+
+
+@activity.defn
+async def dev_run_agent(issue: IssueInput) -> None:
+    """Шаг 3: прогон одноразового контейнера агента.
+
+    Возврата нет: хвост вывода уходит в лог воркера на любом исходе
+    (`_dev_run_agent`), а в историю воркфлоу ему не место — это килобайты
+    текста на прогон.
+    """
+    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+
+
+@activity.defn
+async def dev_followups(issue: IssueInput) -> list[int]:
+    """Шаг 4: находки агента — отдельными SubIssue.
+
+    Идёт ДО тестов и публикации: файл находок обязан исчезнуть из рабочего
+    дерева раньше коммита, иначе он уедет в PR — в ревью как мусор, а на
+    следующем круге правок агент прочитает свои прошлые находки как новые.
+    """
+    return await collect_dev_followups(issue)
+
+
+@activity.defn
+async def dev_tests(issue: IssueInput) -> None:
+    """Шаг 5: проверки проекта — до пуша.
+
+    Красный код не должен доезжать до PR, а на PR от агента CI может и не
+    запуститься: события от токена Actions не порождают прогонов.
+    """
+    await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
+
+
+@activity.defn
+async def dev_publish(issue: IssueInput, branch: str) -> int | None:
+    """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
+
+    `None` — агент не изменил ни одного файла. Это не сбой шага, а его
+    результат; решение, что делать с пустым прогоном, принимает воркфлоу.
+    """
+    return await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
 
 
 async def collect_dev_followups(issue: IssueInput) -> list[int]:

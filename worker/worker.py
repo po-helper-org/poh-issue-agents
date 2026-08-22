@@ -22,13 +22,32 @@ from workflows import (
     CommentAck,
     IssueAnalysis,
     IssueBft,
+    IssueDevelopment,
     IssueEstimation,
     IssueLifecycle,
+    IssuePrFix,
     OrphanAgentEvent,
     WebhookAudit,
 )
 
 sentry_setup.configure("worker")  # no-op без SENTRY_DSN
+
+# Список-манифест шести-восьми шагов разработки: test_develop_child.py сверяет
+# его целиком с активностями worker'а, и незарегистрированный шаг обнаружится
+# здесь, а не на живом прогоне. В конструктор Worker ниже эти же активности
+# идут явными именами (`activities.dev_*`), а не звёздочкой от этого списка —
+# test_worker_wiring.py находит использованные воркфлоу активности разбором
+# AST и умеет узнавать только `activities.<имя>` прямо в списке elts.
+DEVELOP_ACTIVITIES = [
+    activities.dev_begin,
+    activities.dev_dispatch,
+    activities.dev_prepare,
+    activities.dev_announce,
+    activities.dev_run_agent,
+    activities.dev_followups,
+    activities.dev_tests,
+    activities.dev_publish,
+]
 
 
 async def main() -> None:
@@ -36,8 +55,9 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue="issue-lifecycle",
-        workflows=[IssueLifecycle, IssueAnalysis, IssueBft, IssueEstimation,
-                   ConsolidationWorkflow, WebhookAudit, OrphanAgentEvent, CommentAck],
+        workflows=[IssueLifecycle, IssueAnalysis, IssueBft, IssueDevelopment,
+                   IssueEstimation, IssuePrFix, ConsolidationWorkflow, WebhookAudit,
+                   OrphanAgentEvent, CommentAck],
         activities=[
             activities.prefilter_bot_and_security,
             activities.read_protocol_state,
@@ -86,6 +106,18 @@ async def main() -> None:
             activities.publish_analysis_error,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,
+            # DEVELOP_ACTIVITIES не разворачиваем звёздочкой: test_worker_wiring.py
+            # ищет использованные воркфлоу активности разбором AST и видит только
+            # `activities.<имя>` прямо в списке — `*DEVELOP_ACTIVITIES` для него
+            # непрозрачен, и шаги IssueDevelopment ушли бы из-под проверки.
+            activities.dev_begin,
+            activities.dev_dispatch,
+            activities.dev_prepare,
+            activities.dev_announce,
+            activities.dev_run_agent,
+            activities.dev_followups,
+            activities.dev_tests,
+            activities.dev_publish,
             activities.ack_estimate_command,
             activities.collect_estimation_context,
             activities.extract_estimation_facts,
