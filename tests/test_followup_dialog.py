@@ -23,6 +23,7 @@ from temporalio.worker import Worker
 from shared import lifecycle
 from shared.workflow_types import (
     ClassificationResult,
+    CommentIntent,
     Deadlines,
     DuplicateResult,
     GateResult,
@@ -103,9 +104,17 @@ async def answer_followup_stub(issue: IssueInput, question: str) -> None:
     _answers.append(question)
 
 
+@activity.defn(name="interpret_user_comment")
+async def interpret_user_comment_stub(issue: IssueInput, comment_text: str,
+                                      current_phase: str, classification_label,
+                                      awaiting_reason: str, recent_artifacts=None) -> CommentIntent:
+    return CommentIntent(intent="question", reason="вопрос человека")
+
+
 ACTIVITIES = [awaiting_stub, prefilter_ok, protocol_default, set_phase_stub,
               gate_sufficient, classify_consultation, duplicate_none, score_p1,
-              post_priority, post_error, escalate, answer_followup_stub]
+              post_priority, post_error, escalate, answer_followup_stub,
+              interpret_user_comment_stub]
 
 
 def _issue() -> IssueInput:

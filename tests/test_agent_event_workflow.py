@@ -17,6 +17,7 @@ from shared.agent_events import BLOCKED, FAILED, STARTED, SUCCEEDED, AgentEvent
 from shared.workflow_types import (
     ClassificationResult,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     GateResult,
     IssueInput,
@@ -24,7 +25,7 @@ from shared.workflow_types import (
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
+from workflows import IssueAnalysis, IssueDevelopment, IssueEstimation, IssueLifecycle
 
 _calls: list[str] = []
 
@@ -87,12 +88,30 @@ async def escalate(issue: IssueInput, reason: str = "") -> None:
 
 
 @activity.defn(name="trigger_openhands_resolver")
-async def trigger_build(issue: IssueInput) -> None: ...
+async def trigger_build(issue: IssueInput, root_issue: int | None = None,
+                        branch: str | None = None) -> None: ...
+
+
+# Разработка ушла в дочерний воркфлоу `IssueDevelopment` (#FNR-6):
+# `_start_development` под маркером патча (в тесте он всегда взведён) зовёт
+# его вместо `trigger_openhands_resolver` напрямую. Незарегистрированный
+# дочерний воркфлоу не даёт быстрой ошибки — родитель просто ждёт исполнителя,
+# которого нет, и тест висит до таймаута. Режим "dispatch" воспроизводит
+# прежнее поведение стаба (`None` → работа ушла на чужую сторону, ждём
+# `in-development`) — этот файл проверяет цепочку событий ВНЕШНЕГО агента, а
+# не сам прогон разработки.
+@activity.defn(name="dev_begin")
+async def dev_begin_dispatch(issue: IssueInput) -> DevelopPlan:
+    return DevelopPlan(mode="dispatch", branch="")
+
+
+@activity.defn(name="dev_dispatch")
+async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
 
 
 ACTIVITIES = [prefilter_ok, protocol_default, deadlines_stub, set_phase_stub,
               gate_ok, classify_bug, duplicate_none, score_p1, post_priority,
-              escalate, trigger_build]
+              escalate, trigger_build, dev_begin_dispatch, dev_dispatch_stub]
 
 
 def _issue() -> IssueInput:
@@ -107,7 +126,8 @@ def _event(phase: str, status: str = STARTED, ref: str = "42",
 
 def _worker(env, tq):
     return Worker(env.client, task_queue=tq,
-                  workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                  workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                             IssueDevelopment],
                   activities=[*ACTIVITIES, awaiting_stub])
 
 

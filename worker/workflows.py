@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
@@ -30,7 +30,9 @@ with workflow.unsafe.imports_passed_through():
     from shared.workflow_ids import (
         analysis_workflow_id,
         bft_workflow_id,
+        development_workflow_id,
         estimate_workflow_id,
+        pr_fix_workflow_id,
     )
     from shared import agent_events, awaiting as awaiting_mod
     from shared.agent_events import AgentEvent
@@ -40,7 +42,9 @@ with workflow.unsafe.imports_passed_through():
         BftRequest,
         ClassificationResult,
         CommentAckInput,
+        CommentIntent,
         Deadlines,
+        DevelopPlan,
         EstimateRequest,
         EstimateResult,
         IssueInput,
@@ -67,6 +71,10 @@ MAX_CLARIFICATION_ROUNDS = 2
 # возьмёт задачу.
 MAX_ANALYSIS_CLARIFY_ROUNDS = 2
 
+# Потолок возвратов этапа на пересборку. Человек может вернуть этап много раз,
+# но каждый круг — это полный прогон триажа/аналитики, который стоит денег.
+MAX_REWORK_ROUNDS = 2
+
 # Запрос на прогон аналитики, доставленный в общую очередь сигналов. Та же
 # схема, что у реплики человека (`UserComment`): одна очередь, разные виды
 # событий, и обработчик фазы решает, что с ними делать.
@@ -87,24 +95,56 @@ SEEN_EVENTS_KEPT = 50
 HISTORY_EVENT_THRESHOLD = 800
 
 
+# Потолок разворота `.cause` в `_failure_reason`. Сегодняшняя цепочка стадии
+# разработки — три уровня (ChildWorkflowError → ActivityError →
+# ApplicationError), но число — не память самой длинной ожидаемой цепочки, а
+# защита от зацикливания: `.cause` — обычный settable-атрибут, и ничто не
+# мешает ему сослаться само на себя или на предка. Без потолка такая цепочка
+# крутила бы разворот вечно вместо того, чтобы вернуть хоть какую-то причину.
+_MAX_CAUSE_UNWRAP = 10
+
+
 def _failure_reason(e: BaseException) -> str:
     """"ExcType: message" из ПЕРВОПРИЧИНЫ для тегов/группировки Sentry.
 
-    catch-ветки ловят обёртку Temporal (ActivityError «Activity task failed»),
-    а не исходное исключение activity. Разворачиваем `.cause`: у ApplicationError
-    есть `.type` = имя исходного класса (RuntimeError/ValidationError/…), это и
-    даёт осмысленный fingerprint вместо единственного «ActivityError» на всё.
-    Чистые операции над атрибутами — детерминированы, безопасны в workflow-коде.
+    catch-ветки ловят обёртку Temporal, а не исходное исключение activity —
+    но глубина обёртки зависит от того, ЧТО сорвалось. Активность внутри
+    воркфлоу даёт `ActivityError`; с тех пор как дорогие стадии стали
+    дочерними воркфлоу, тот же сбой активности ВНУТРИ ребёнка приходит уже
+    как `ChildWorkflowError` поверх `ActivityError`. Разворачиваем `.cause` В
+    ЦИКЛЕ, а не один раз: единственный разворот `ChildWorkflowError` даёт
+    `ActivityError`, у которого своего `.type` нет — наружу уходило бы одно
+    и то же «ActivityError: Activity task failed» на любую причину сбоя
+    разработки (выключенный DEVELOP_ENABLED, код 137, отказ пуша, красные
+    тесты — всё в одном ведре без текста причины). Останавливаемся на первом
+    `ApplicationError` (у него есть `.type` = имя исходного класса) либо на
+    исключении без дальнейшей причины. Чистые операции над атрибутами —
+    детерминированы, безопасны в workflow-коде.
     """
     cause = getattr(e, "cause", None) or e
-    exc_type = getattr(cause, "type", None)
-    # `.type` — имя класса ТОЛЬКО у ApplicationError. У TimeoutError то же имя
-    # атрибута занято перечислением TimeoutType, и его значение — число: в
-    # Sentry уезжал тег `exc_type: 1` и fingerprint по этой единице
-    # (ISSUE-AGENT-B). Всё, что не строка, для группировки бесполезно.
-    if not isinstance(exc_type, str):
-        exc_type = type(cause).__name__
-    return f"{exc_type}: {cause}"
+    for _ in range(_MAX_CAUSE_UNWRAP):
+        exc_type = getattr(cause, "type", None)
+        # `.type` — имя класса ТОЛЬКО у ApplicationError. Оно и есть искомая
+        # первопричина: дальше разворачивать нечего.
+        if isinstance(exc_type, str):
+            return f"{exc_type}: {cause}"
+        # `.type` есть, но не строка — это TimeoutError: там тем же именем
+        # занято перечисление TimeoutType, и его значение число. В Sentry
+        # уезжал тег `exc_type: 1` и fingerprint по этой единице
+        # (ISSUE-AGENT-B), поэтому число как тип не годится.
+        #
+        # Но и разворачивать глубже НЕЛЬЗЯ. Temporal кладёт причиной таймаута
+        # сбой ПОСЛЕДНЕЙ попытки, и на шаге с тремя попытками «упал один раз,
+        # потом встал» доложилось бы тем первым падением: человек в Issue и
+        # отпечаток в Sentry указывали бы на ошибку, которая на самом деле
+        # была пережита, а настоящая причина — таймаут — исчезала бы.
+        if exc_type is not None:
+            break
+        deeper = getattr(cause, "cause", None)
+        if deeper is None:
+            break
+        cause = deeper
+    return f"{type(cause).__name__}: {cause}"
 
 
 async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
@@ -343,6 +383,11 @@ class IssueLifecycle:
         self._followup_rounds = 0
         self._answered_comment_ids: list[int] = []
         self._followup_max_rounds = Deadlines().followup_max_rounds
+        # Сколько раз человек вернул этап на пересборку (rework intent).
+        # Потолок нужен, чтобы пара «переделай» ↔ «переделал» не стояла по
+        # LLM-прогону за круг без конца.
+        self._rework_rounds = 0
+        self._rework_max_rounds = MAX_REWORK_ROUNDS
         self._generation = 0
         # Момент входа в текущую фазу. Проставляется в run() до первого await;
         # None только пока воркфлоу не начал исполняться.
@@ -691,6 +736,7 @@ class IssueLifecycle:
             self._clarify_rounds = carried.clarify_rounds
             self._followup_rounds = carried.followup_rounds
             self._answered_comment_ids = list(carried.answered_comment_ids)
+            self._rework_rounds = carried.rework_rounds
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -722,6 +768,7 @@ class IssueLifecycle:
             clarify_rounds=self._clarify_rounds,
             followup_rounds=self._followup_rounds,
             answered_comment_ids=list(self._answered_comment_ids),
+            rework_rounds=self._rework_rounds,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -1333,12 +1380,17 @@ class IssueLifecycle:
             # Явная команда человека сильнее гварда по типу Issue: он защищает
             # от неудачно поставленной метки, а не от прямого `/analyze`.
             return await self._analysis_requested(issue)
-        if isinstance(decision, UserComment) and workflow.patched(
-                "issue-lifecycle-followup-answer"):
-            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
-            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
-            # активность, которой там нет, — реплей упал бы недетерминизмом.
-            return await self._answer_followup(issue, decision)
+        if isinstance(decision, UserComment):
+            # Разбор намерения из реплики человека
+            intent = await workflow.execute_activity(
+                activities.interpret_user_comment,
+                args=[issue, decision.text, self._phase, self._classification_label,
+                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            
+            return await self._handle_comment_intent(issue, decision, intent, deadlines)
 
         # `classification_label is None` — сокращённый триаж (Issue от агента):
         # он уже классифицирован на стороне создателя, гвард проверять не на чем.
@@ -1546,6 +1598,107 @@ class IssueLifecycle:
             workflow.logger.warning("не ответил на реплику: %s", _failure_reason(exc))
         return (self._phase, self._stage, False)
 
+    async def _handle_comment_intent(self, issue: IssueInput, comment: UserComment,
+                                   intent: CommentIntent, deadlines) -> tuple:
+        """Обработка намерения, извлечённого из реплики человека.
+        
+        Реагирует на comment intent в зависимости от текущей фазы и типа намерения.
+        """
+        # Защита от повторной доставки: уже отвеченные комментарии игнорируем
+        if comment.comment_id is not None and comment.comment_id in self._answered_comment_ids:
+            workflow.logger.info("комментарий #%s уже обработан — пропускаю", comment.comment_id)
+            return (self._phase, self._stage, False)
+        
+        # Отмечаем комментарий как обработанный
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        
+        # Обработка по типу намерения
+        if intent.intent == "proceed":
+            # Человек подтвердил продолжение — двигаем фазу по основному пути
+            if self._phase == lifecycle.CLASSIFIED:
+                label = self._classification_label
+                feature = label is None or label == "advisor:feature-request"
+                bug = label is None or label == "advisor:bug"
+                
+                if feature:
+                    return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
+                if bug:
+                    return (lifecycle.READY_FOR_DEV, "bug", True)
+            
+            # В других фазах proceed — просто ответ, что продолжаем
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, intent.reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "rework":
+            # Проверяем потолок возвратов этапа
+            if self._rework_rounds >= self._rework_max_rounds:
+                # Потолок исчерпан — отвечаем, что больше не переделываем
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                 "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                return (self._phase, self._stage, False)
+            
+            self._rework_rounds += 1
+            
+            # Возврат в created с репликой в контексте
+            if self._phase == lifecycle.CLASSIFIED:
+                # Возвращаемся в created, триаж перезапустится
+                return (lifecycle.CREATED, "rework", True)
+            
+            # В других фазах rework не поддерживаем — отвечаем, что не можем
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                             "Продолжай работу или поставь метку для перехода."],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "question":
+            # Вопрос — отвечаем, парковку держим
+            if self._followup_rounds >= self._followup_max_rounds:
+                workflow.logger.info("потолок реплик исчерпан (%s) — отвечаю молчанием",
+                                     self._followup_max_rounds)
+                return (self._phase, self._stage, False)
+            self._followup_rounds += 1
+            try:
+                await workflow.execute_activity(
+                    activities.answer_followup,
+                    args=[issue, comment.text],
+                    start_to_close_timeout=timedelta(seconds=180),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as exc:
+                workflow.logger.warning("не ответил на вопрос: %s", _failure_reason(exc))
+            return (self._phase, self._stage, False)
+        
+        elif intent.intent == "ack":
+            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные ходы
+            await workflow.execute_activity(
+                activities.ack_comment_seen,
+                args=[issue, intent.reason],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            return (self._phase, self._stage, False)
+        
+        else:
+            # Неизвестный intent — логируем и игнорируем
+            workflow.logger.warning("неизвестный intent: %s", intent.intent)
+            return (self._phase, self._stage, False)
+
     async def _phase_await_build(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `ready-for-dev`: ждём, возьмут ли задачу в разработку.
 
@@ -1609,28 +1762,64 @@ class IssueLifecycle:
         Одна точка на оба входа — решение человека `build-me` и автостарт. Две
         копии этого вызова разъехались бы на первой же правке ретраев, и один из
         входов молча остался бы со старым поведением.
+        
+        ISSUE-113: для подзадачи плана передаём root_issue и ветку родителя.
         """
+        # ISSUE-113 пункт 2: вычисляем ветку так же, как в _phase_handoff
+        source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
+        
         try:
-            pr_number = await workflow.execute_activity(
-                activities.trigger_openhands_resolver,
-                issue,
-                # Прогон агента идёт десятками минут, поэтому потолок общий на
-                # весь шаг, а живость сообщается heartbeat'ом: без него сервер
-                # счёл бы активность мёртвой на первой же долгой стадии.
-                start_to_close_timeout=timedelta(seconds=3600),
-                heartbeat_timeout=timedelta(seconds=300),
-                # ОДНА попытка, как у круга правок: активность недетерминирована,
-                # идёт десятками минут и стоит денег, а её побочные эффекты
-                # видны человеку — комментарий о передаче, ветка, PR.
-                #
-                # Три попытки выглядели дешёвой страховкой от сетевого сбоя, но
-                # ретрай повторяет активность ЦЕЛИКОМ, включая прогон агента.
-                # На живом прогоне #39 пуш падал на последнем шаге — уже после
-                # работы агента, — и контур трижды объявил о передаче задачи и
-                # трижды прогнал агента заново. Сбой сети на фоне такой цены
-                # ничтожен: повтор инициирует человек, а не политика ретраев.
-                retry_policy=RetryPolicy(maximum_attempts=1),
-            )
+            if workflow.patched("issue-lifecycle-develop-child"):
+                # Дочерний прогон: у стадии появляется свой WorkflowId, а
+                # значит строка в `workflow list` и след, переживающий её
+                # завершение. Одна попытка на уровне стадии — ретраи живут
+                # внутри, на отдельных шагах.
+                pr_number = await workflow.execute_child_workflow(
+                    IssueDevelopment.run, issue,
+                    id=development_workflow_id(issue.repo, issue.issue_number),
+                    # Прогон агента идёт до 45 минут. Ни continue-as-new
+                    # родителя, ни его завершение не должны его убивать.
+                    parent_close_policy=ParentClosePolicy.ABANDON,
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+            else:
+                pr_number = await workflow.execute_activity(
+                    activities.trigger_openhands_resolver,
+                    args=[issue, self._root_issue, branch],
+                    # Прогон агента идёт десятками минут, поэтому потолок общий
+                    # на весь шаг, а живость сообщается heartbeat'ом.
+                    start_to_close_timeout=timedelta(seconds=3600),
+                    heartbeat_timeout=timedelta(seconds=300),
+                    # Ретрай повторяет активность ЦЕЛИКОМ, включая прогон
+                    # агента: на прогоне #39 контур трижды объявил о передаче
+                    # задачи и трижды прогнал агента заново.
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+        except WorkflowAlreadyStartedError:
+            # Разработка по этому Issue уже идёт — второй дорогой прогон не
+            # нужен. Но вернуть ТЕКУЩУЮ фазу здесь нельзя: `_enter` на той же
+            # фазе — короткое замыкание без единого await (ни активности, ни
+            # таймера, см. начало метода), а автостарт вызывает этот метод
+            # СНОВА на следующем же витке `while True`, без парковки между
+            # попытками. Получался бы спин на скорости round-trip к серверу:
+            # WorkflowAlreadyStarted на каждой попытке, история распухает до
+            # continue-as-new и после него — по новой, потому что причина
+            # (чужой прогон всё ещё жив) никуда не делась.
+            #
+            # Разработка ПО ФАКТУ идёт — иначе не было бы этой ошибки, просто
+            # ведёт её не этот прогон (человек снял зависший `IssueLifecycle`,
+            # а дочерний `develop-*` пережил его благодаря ParentClosePolicy.
+            # ABANDON). Честная фаза — `in-development`, тот же исход, что и
+            # у режима `dispatch` ниже: результат придёт событием, а не
+            # прямым возвратом. Переход `ready-for-dev -> in-development`
+            # уже есть в таблице `shared/lifecycle.py` (инициатор `human`, но
+            # `transition()` не проверяет, кто зовёт). Дальше фаза уходит в
+            # `_phase_park` и честно ждёт сигнала — спин обрывается самим
+            # устройством цикла, а не таймаутом.
+            workflow.logger.info("development already running for %s#%s",
+                                 issue.repo, issue.issue_number)
+            return (lifecycle.IN_DEVELOPMENT, "in-development", True)
         except Exception as e:
             # Раньше NotImplementedError отсюда ронял весь воркфлоу: цикл
             # исчезал, и Issue терял владельца состояния.
@@ -1673,15 +1862,26 @@ class IssueLifecycle:
         while rounds < deadlines.pr_fix_max_rounds:
             rounds += 1
             try:
-                outcome = await workflow.execute_activity(
-                    activities.run_pr_fix_round,
-                    args=[issue.repo, self._pr_number, rounds],
-                    start_to_close_timeout=timedelta(seconds=3600),
-                    heartbeat_timeout=timedelta(seconds=300),
-                    # Круг недетерминирован и стоит денег: повтор инициирует
-                    # следующая итерация, а не политика ретраев.
-                    retry_policy=RetryPolicy(maximum_attempts=1),
-                )
+                if workflow.patched("issue-lifecycle-prfix-child"):
+                    outcome = await workflow.execute_child_workflow(
+                        IssuePrFix.run,
+                        args=[issue.repo, self._pr_number, rounds],
+                        id=pr_fix_workflow_id(issue.repo, self._pr_number, rounds),
+                        # Круг идёт до 45 минут: завершение родителя не должно
+                        # обрывать начатую доводку PR.
+                        parent_close_policy=ParentClosePolicy.ABANDON,
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
+                else:
+                    outcome = await workflow.execute_activity(
+                        activities.run_pr_fix_round,
+                        args=[issue.repo, self._pr_number, rounds],
+                        start_to_close_timeout=timedelta(seconds=3600),
+                        heartbeat_timeout=timedelta(seconds=300),
+                        # Круг недетерминирован и стоит денег: повтор инициирует
+                        # следующая итерация, а не политика ретраев.
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
             except Exception as e:
                 workflow.logger.warning("круг правок сорвался: %s", _failure_reason(e))
                 break
@@ -1740,12 +1940,17 @@ class IssueLifecycle:
             # Команда работает и на припаркованном Issue: из бокового состояния
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
-        if isinstance(signal, UserComment) and workflow.patched(
-                "issue-lifecycle-followup-answer"):
-            # Маркер обязателен: у припаркованных прогонов отброшенные реплики
-            # УЖЕ лежат в истории, и новый код запланировал бы на их месте
-            # активность, которой там нет, — реплей упал бы недетерминизмом.
-            return await self._answer_followup(issue, signal)
+        if isinstance(signal, UserComment):
+            # Разбор намерения из реплики человека
+            intent = await workflow.execute_activity(
+                activities.interpret_user_comment,
+                args=[issue, signal.text, self._phase, self._classification_label,
+                      awaiting_mod.reason_for_phase(self._phase)],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            
+            return await self._handle_comment_intent(issue, signal, intent, deadlines)
         
         # Обработка специфических сигналов для фазы DUPLICATE
         if self._phase == lifecycle.DUPLICATE:
@@ -2060,6 +2265,128 @@ class IssueLifecycle:
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
         self._stage = "done"
+
+
+@workflow.defn(name="IssueDevelopment")
+class IssueDevelopment:
+    """Разработка по подготовленному Issue — дочерний прогон цикла.
+
+    Отдельным воркфлоу, а не активностью, по двум причинам сразу.
+
+    Первая — видимость. Активность внутри родителя не имеет своего
+    WorkflowId: в `workflow list` строки нет, а после завершения не остаётся
+    и следа — операционная история собиралась логами контейнера и `docker ps`.
+
+    Вторая — ретраи. Одна активность на четыре шага повторялась целиком: на
+    прогоне #39 падал только `git push`, уже после работы агента, а заново шёл
+    весь прогон, и контур трижды объявил о передаче задачи. Здесь у каждого
+    шага своя политика: дорогие и недетерминированные (агент, тесты) идут в
+    одну попытку, дешёвые и повторяемые (клон, публикация) — в три.
+
+    Идентификатор фиксирован (`develop-<repo>-<n>`), поэтому повторный запуск
+    при идущем прогоне упирается в WorkflowAlreadyStarted, а не поднимает
+    второго агента в тот же рабочий каталог.
+    """
+
+    @workflow.run
+    async def run(self, issue: IssueInput) -> int | None:
+        """Возвращает номер PR (`local`) либо None (`dispatch`).
+
+        `None` родитель читает как «работа идёт на чужой стороне, жди события
+        `pr-open`», а не как отказ.
+        """
+        cheap = RetryPolicy(maximum_attempts=3)
+        # Одна попытка там, где шаг недетерминирован, идёт десятками минут и
+        # стоит денег. Повтор такого инициирует человек, а не политика ретраев.
+        once = RetryPolicy(maximum_attempts=1)
+
+        plan = await workflow.execute_activity(
+            activities.dev_begin, issue,
+            start_to_close_timeout=timedelta(seconds=120),
+            retry_policy=cheap,
+        )
+
+        if plan.mode == "dispatch":
+            await workflow.execute_activity(
+                activities.dev_dispatch, args=[issue, plan.branch],
+                start_to_close_timeout=timedelta(seconds=120),
+                retry_policy=cheap,
+            )
+            return None
+
+        # Порядок не косметический: сначала клон и постановка — они
+        # единственные могут не состояться до того, как что-либо сказано
+        # человеку.
+        await workflow.execute_activity(
+            activities.dev_prepare, args=[issue, plan.branch],
+            start_to_close_timeout=timedelta(seconds=600),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=cheap,
+        )
+        await workflow.execute_activity(
+            activities.dev_announce, args=[issue, plan.branch],
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=cheap,
+        )
+        await workflow.execute_activity(
+            activities.dev_run_agent, issue,
+            start_to_close_timeout=timedelta(seconds=3600),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=once,
+        )
+        # Находки — ДО тестов и публикации: файл находок обязан исчезнуть из
+        # рабочего дерева раньше коммита, иначе уедет в PR как мусор, а на
+        # следующем круге правок агент прочитает свои прошлые находки как новые.
+        await workflow.execute_activity(
+            activities.dev_followups, issue,
+            start_to_close_timeout=timedelta(seconds=300),
+            retry_policy=cheap,
+        )
+        await workflow.execute_activity(
+            activities.dev_tests, issue,
+            start_to_close_timeout=timedelta(seconds=1800),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=once,
+        )
+        number = await workflow.execute_activity(
+            activities.dev_publish, args=[issue, plan.branch],
+            start_to_close_timeout=timedelta(seconds=600),
+            heartbeat_timeout=timedelta(seconds=300),
+            retry_policy=cheap,
+        )
+
+        if number is None:
+            raise ApplicationError("агент не изменил ни одного файла — открывать нечего")
+        return number
+
+
+@workflow.defn(name="IssuePrFix")
+class IssuePrFix:
+    """Один круг правок по замечаниям ревью — дочерний прогон цикла.
+
+    Отдельный воркфлоу на КАЖДЫЙ круг, а не на цикл целиком: круги разделены
+    ожиданием внешнего доклада ревью, и объединение их в один прогон дало бы
+    воркфлоу, большую часть жизни простаивающий в ожидании чужого сигнала.
+    Ожиданием по-прежнему управляет родитель — он владеет состоянием задачи.
+    """
+
+    @workflow.run
+    async def run(self, repo: str, pr_number: int, round_number: int) -> bool | str:
+        """`True` — правки внесены и запрошена перепроверка. Строка — правок не
+        потребовалось, и это её разбор.
+
+        Разные типы возврата намеренно: «сделали» и «не потребовалось» — разные
+        исходы, и сводить их к булеву значению значило бы потерять объяснение.
+        """
+        return await workflow.execute_activity(
+            activities.run_pr_fix_round,
+            args=[repo, pr_number, round_number],
+            start_to_close_timeout=timedelta(seconds=3600),
+            heartbeat_timeout=timedelta(seconds=300),
+            # Круг недетерминирован и стоит денег: повтор инициирует следующая
+            # итерация родителя, а не политика ретраев.
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
 
 
 @workflow.defn(name="IssueAnalysis")

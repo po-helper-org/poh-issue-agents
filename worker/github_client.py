@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+from collections.abc import Sequence
 
 import jwt
 import requests
@@ -143,13 +144,17 @@ def post_comment(repo: str, issue_number: int, body: str) -> None:
     resp.raise_for_status()
 
 
+def _post_labels(repo: str, issue_number: int, labels: list[str]) -> None:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
+    resp = requests.post(url, headers=_auth_headers(repo), json={"labels": labels}, timeout=30)
+    resp.raise_for_status()
+
+
 def add_label(repo: str, issue_number: int, label: str) -> None:
     if _dry_run():
         _log.info("[DRY_RUN] label %s#%s += %s", repo, issue_number, label)
         return
-    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/labels"
-    resp = requests.post(url, headers=_auth_headers(repo), json={"labels": [label]}, timeout=30)
-    resp.raise_for_status()
+    _post_labels(repo, issue_number, [label])
 
 
 def remove_label(repo: str, issue_number: int, label: str) -> None:
@@ -169,6 +174,96 @@ def remove_label(repo: str, issue_number: int, label: str) -> None:
     if resp.status_code == 404:
         return
     resp.raise_for_status()
+
+
+def set_labels(repo: str, issue_number: int, *,
+               add: Sequence[str] = (), remove: Sequence[str] = ()) -> None:
+    """Приводит набор меток к нужному виду одной операцией.
+
+    Порядок намеренный: сначала ставим целевые, потом снимаем лишние. При
+    обратном порядке между двумя запросами есть окно, в котором меток `phase:*`
+    нет вовсе — `lifecycle.phase_from_labels` вернёт None, и Issue будет
+    выглядеть как не входивший в жизненный цикл. Две метки в том же окне
+    противоречивы, но видны и восстановимы.
+
+    Снятие выполняется В ЛЮБОМ СЛУЧАЕ — даже если постановка упала. Раньше
+    сбой POST обрывал функцию до снятия, и 5xx на постановке итоговой метки
+    оставлял `run:analyze` на Issue навсегда: выборка «прогон идёт» показывала
+    завершённый прогон, а activity тем временем рапортовала успех. Постановка
+    и снятие всё равно различаются по строгости, и это не случайность.
+    Непоставленная метка — потерянное состояние, поэтому её ошибка
+    поднимается — но только ПОСЛЕ того, как снятие отработало. Неснятая —
+    мусор в выборке, из-за которого не стоит ронять прогон; она уходит в лог,
+    как это делал `set_phase`.
+
+    У второго провайдера операция схлопывается в один запрос: GitLab
+    обновляет метки одним `PUT` с `add_labels` / `remove_labels`. Здесь она
+    описана одним местом ровно для того, чтобы драйверу было что реализовать.
+    """
+    add = [label for label in add if label]
+    keep = set(add)
+    remove = [label for label in remove if label and label not in keep]
+    if not add and not remove:
+        return
+    if _dry_run():
+        _log.info("[DRY_RUN] labels %s#%s += %s -= %s", repo, issue_number, add, remove)
+        return
+    add_error: Exception | None = None
+    if add:
+        try:
+            _post_labels(repo, issue_number, add)
+        except Exception as exc:
+            add_error = exc
+    for label in remove:
+        try:
+            remove_label(repo, issue_number, label)
+        except Exception as exc:
+            _log.warning("не снял метку %s с %s#%s: %s", label, repo, issue_number, exc)
+    if add_error is not None:
+        raise add_error
+
+
+def ensure_labels_exist(repo: str, specs) -> int:
+    """Заводит недостающие метки. Возвращает число созданных.
+
+    Трекеры создают метку сами при первом применении — и GitHub, и GitLab
+    (проверено 2026-08-21). Проблема не в отказе, а в тишине: опечатка в имени
+    оседает новой меткой вместо ошибки, и выборка тихо перестаёт находить то,
+    что искала. Явное заведение делает набор конечным и заодно даёт цвета.
+
+    Идемпотентна: существующая метка не трогается, цвет ей не переписывается —
+    человек мог поправить его руками, и спорить с ним незачем.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] ensure labels %s: %s", repo, [s.name for s in specs])
+        return 0
+    url = f"https://api.github.com/repos/{repo}/labels"
+    existing: set[str] = set()
+    page = 1
+    while True:
+        resp = requests.get(url, headers=_auth_headers(repo),
+                            params={"per_page": 100, "page": page}, timeout=30)
+        resp.raise_for_status()
+        chunk = resp.json()
+        existing.update(item["name"] for item in chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+
+    created = 0
+    for spec in specs:
+        if spec.name in existing:
+            continue
+        resp = requests.post(url, headers=_auth_headers(repo), timeout=30, json={
+            "name": spec.name,
+            "color": spec.color.lstrip("#"),
+            "description": spec.description,
+        })
+        if resp.status_code == 422:
+            continue  # завелась параллельно — не наша забота
+        resp.raise_for_status()
+        created += 1
+    return created
 
 
 def create_issue(repo: str, title: str, body: str, labels: list[str] | None = None) -> int:
@@ -527,16 +622,33 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
 
     git = _git_runner(clone_dir, env)
 
+    # ДО checkout: ветка уже существует ЛОКАЛЬНО только если по этому же
+    # clone_dir сюда уже заходил предыдущий вызов этой функции. `dev_prepare`
+    # клонирует репозиторий заново на каждый прогон СТАДИИ (а не на каждую
+    # попытку публикации), поэтому в пределах ретраев `dev_publish` рабочее
+    # дерево — то же самое: если ветка уже есть, коммит на ней, скорее всего,
+    # уже сделан прошлой попыткой, и упал только пуш (или сам PR). На старом
+    # линейном пути (`trigger_openhands_resolver`, ретраев нет) `dev_prepare`
+    # отрабатывает заново при каждом вызове — там ветки здесь никогда не будет,
+    # и поведение не меняется.
+    branch_existed = git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
+                         check=False).returncode == 0
+
     git("checkout", "-B", branch)
     git("add", "-A")
-    # Пустой коммит не делаем: PR без диффа ревьюить нечего, а фаза задачи от
-    # него сдвинулась бы как от настоящей работы.
+    # Пустой ИНДЕКС — не то же самое, что «агент ничего не менял»: если ветка
+    # уже существовала до этого вызова, значит, коммит уехал в прошлой попытке,
+    # а сорвался только пуш (или создание PR) — публикацию нужно довести, а не
+    # объявлять «нет диффа». Пустой коммит по-прежнему не делаем: PR без диффа
+    # ревьюить нечего, а фаза задачи от него сдвинулась бы как от настоящей
+    # работы — это по-прежнему верно для ПЕРВОЙ попытки на новой ветке.
     if git("diff", "--cached", "--quiet", check=False).returncode == 0:
-        _log.warning("%s: агент не изменил ни одного файла", repo)
-        return None
-
-    git("commit", "-m", message, "-m",
-        "Автор изменений — OpenHands, запущен активностью Develop.")
+        if not branch_existed:
+            _log.warning("%s: агент не изменил ни одного файла", repo)
+            return None
+    else:
+        git("commit", "-m", message, "-m",
+            "Автор изменений — OpenHands, запущен активностью Develop.")
     git("push", "--force-with-lease", "-u", "origin", branch)
 
     resp = requests.post(

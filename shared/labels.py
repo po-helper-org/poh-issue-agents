@@ -89,6 +89,16 @@ FLAT_LABELS = frozenset({
     POSSIBLE_DUPLICATE,
     ESTIMATED,
 })
+# --- Точки решения человека ---
+# Метки, которыми человек отвечает контуру на прямой вопрос: `research-me` /
+# `bug-me` — куда вести Issue после триажа, `build-me` — запускать ли
+# разработку, `not-duplicate` / `confirm-duplicate` — решение по дублю.
+# Единственный список: его читает вебхук (какие лейблы поднимают дорогой
+# прогон через signal-with-start) и каталог меток (shared/label_catalog.py).
+# Разъехавшись, они тихо теряют одну метку — она всё равно заведётся при
+# первом применении, просто серой и без описания, а решение человека до
+# контура не дойдёт.
+HUMAN_DECISION_LABELS = {"research-me", "bug-me", "build-me", "not-duplicate", "confirm-duplicate"}
 
 # Сквозной ключ цепочки: строка `root-issue: #N` в теле follow-up Issue
 # (AGENT-PROTOCOL.md, раздел 3). По ней Issue-Agent находит исходную задачу и

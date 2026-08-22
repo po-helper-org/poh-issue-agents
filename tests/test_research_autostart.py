@@ -23,13 +23,14 @@ from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     GateResult,
     IssueInput,
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
+from workflows import IssueAnalysis, IssueDevelopment, IssueEstimation, IssueLifecycle
 
 _calls: list[str] = []
 
@@ -133,7 +134,8 @@ async def ready(issue: IssueInput, priority_tier: str, branch: str) -> None:
 
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop(issue: IssueInput) -> None:
+async def develop(issue: IssueInput, root_issue: int | None = None,
+                   branch: str | None = None) -> None:
     _calls.append("develop")
 
 
@@ -153,6 +155,16 @@ async def no_questions(repo: str, branch: str) -> list[str]:
     return []
 
 
+@activity.defn(name="dev_begin")
+async def child_develop_begin(issue: IssueInput) -> DevelopPlan:
+    return DevelopPlan(mode="dispatch", branch="")
+
+
+@activity.defn(name="dev_dispatch")
+async def child_develop_dispatch(issue: IssueInput, branch: str) -> None:
+    _calls.append("develop")
+
+
 def _deadlines(research: bool, develop: bool = False):
     @activity.defn(name="read_deadlines")
     async def stub() -> Deadlines:
@@ -166,14 +178,16 @@ async def _run_until_phase(research_autostart: bool, develop_autostart: bool = F
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueDevelopment,
+                                     IssueEstimation],
                           activities=[awaiting_stub, prefilter_ok, protocol_default,
                                       _deadlines(research_autostart, develop_autostart), 
                                       gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
                                       ready, develop, decompose, publish_plan, 
-                                      phase_stub, no_questions]):
+                                      phase_stub, no_questions, child_develop_begin,
+                                      child_develop_dispatch]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 
@@ -184,7 +198,7 @@ async def _run_until_phase(research_autostart: bool, develop_autostart: bool = F
             # "query deadline exceeded".
             with env.auto_time_skipping_disabled():
                 # Ждём либо до парковки, либо до запуска разработки
-                for _ in range(200):
+                for _ in range(600):
                     # Развилась ли до готовности к разработке
                     if any(c.startswith("ready-for-dev") for c in _calls):
                         # Проверим, парковка ли это

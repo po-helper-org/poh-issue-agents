@@ -86,7 +86,13 @@ Instructor поверх OpenAI-совместимого эндпоинта z.ai.
     Стадии: `repowise` (сбор контекста из индекса кода) → `task` →
     `concept` → `debate` → `sysreq` → `validate`.
 11. **Ожидание сигнала** `human_decision`.
-12. Человек ставит `build-me` → `trigger_openhands_resolver`.
+12. Человек ставит `build-me` (либо срабатывает `DEVELOP_AUTOSTART`) →
+    развилка под маркером патча ведёт в дочерний воркфлоу `IssueDevelopment`
+    с каноническим id `develop-<repo>-<n>` (повторный запуск при идущем
+    прогоне упирается в `WorkflowAlreadyStarted`, а не поднимает второго
+    агента). Прежний путь через активность `trigger_openhands_resolver`
+    сохранён нетронутым — по нему идёт реплей прогонов, начатых до выкладки
+    дочернего воркфлоу.
 
 ## Второй workflow: `IssueEstimation`
 

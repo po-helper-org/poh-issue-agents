@@ -18,13 +18,19 @@ from shared.workflow_types import (
     AnalyzeInput,
     ClassificationResult,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     GateResult,
     IssueInput,
     PriorityResult,
     ProtocolState,
 )
-from workflows import IssueAnalysis, IssueEstimation, IssueLifecycle
+from workflows import (
+    IssueAnalysis,
+    IssueDevelopment,
+    IssueEstimation,
+    IssueLifecycle,
+)
 
 _calls: list[str] = []
 
@@ -141,6 +147,66 @@ async def develop(issue: IssueInput) -> None:
     _calls.append("develop")
 
 
+# --- Шаги разработки: стадия уехала в дочерний воркфлоу ---
+#
+# Прежде вся разработка была одной активностью, и её хватало застабить целиком.
+# Теперь `_start_development` под маркером патча запускает `IssueDevelopment`, а
+# тот зовёт шаги по одному. Незарегистрированный дочерний воркфлоу не даёт
+# ошибки — родитель просто ждёт исполнителя, которого нет, и тест висит до
+# таймаута. Поэтому стабы шагов и регистрация воркфлоу обязательны.
+#
+# Отметку «develop» ставит именно прогон агента: остальные шаги — обвязка, а
+# существующие проверки говорят о том, что агент действительно поработал.
+
+@activity.defn(name="dev_begin")
+async def dev_begin_local(issue: IssueInput) -> DevelopPlan:
+    return DevelopPlan(mode="local", branch=f"research/issue-{issue.issue_number}")
+
+
+@activity.defn(name="dev_dispatch")
+async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
+
+
+@activity.defn(name="dev_prepare")
+async def dev_prepare_ok(issue: IssueInput, branch: str) -> int:
+    return 1780
+
+
+@activity.defn(name="dev_announce")
+async def dev_announce_ok(issue: IssueInput, branch: str) -> None:
+    _calls.append("announce")
+
+
+@activity.defn(name="dev_run_agent")
+async def dev_agent_ok(issue: IssueInput) -> None:
+    _calls.append("develop")
+
+
+@activity.defn(name="dev_followups")
+async def dev_followups_ok(issue: IssueInput) -> list[int]:
+    return []
+
+
+@activity.defn(name="dev_tests")
+async def dev_checks_ok(issue: IssueInput) -> None: ...
+
+
+@activity.defn(name="dev_publish")
+async def dev_publish_ok(issue: IssueInput, branch: str) -> int | None:
+    return 101
+
+
+# Восемь шагов стадии одним именем: списки активностей в тестах и без того
+# длинные, а забытый шаг проявляется висяком, а не понятной ошибкой.
+DEV_STEPS = [dev_begin_local, dev_dispatch_stub, dev_prepare_ok, dev_announce_ok,
+             dev_agent_ok, dev_followups_ok, dev_checks_ok, dev_publish_ok]
+
+
+@activity.defn(name="read_open_questions")
+async def no_questions(repo: str, branch: str) -> list[str]:
+    return []
+
+
 @activity.defn(name="decompose_issue")
 async def decompose(issue: IssueInput, branch: str) -> dict:
     _calls.append("decompose")
@@ -170,12 +236,14 @@ async def _run_until_parked(autostart: bool) -> None:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[awaiting_stub, prefilter_ok, protocol_default,
                                       _deadlines(autostart), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
-                                      ready, develop, decompose, publish_plan, phase_stub]):
+                                      ready, develop, decompose, publish_plan, phase_stub,
+                                      *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -233,12 +301,14 @@ async def test_own_run_label_does_not_start_a_second_analysis():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[awaiting_stub, prefilter_ok, protocol_default,
                                       _deadlines(False), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish,
                                       slow_ack, prepare, stage_ok, publish, cleanup,
-                                      publish_error, ready, develop_noop, phase_stub]):
+                                      publish_error, ready, develop_noop, phase_stub,
+                                      *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -286,12 +356,14 @@ async def _run_closed_loop(classification: str) -> list[str]:
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[awaiting_stub, prefilter_ok, protocol_default,
                                       _deadlines(True, research=True), gate, classify_as,
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_ok, publish, cleanup,
-                                      publish_error, ready, develop, phase_stub]):
+                                      publish_error, ready, develop, phase_stub,
+                                      *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -346,13 +418,14 @@ async def test_subissue_of_a_plan_does_not_start_its_own_development():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[awaiting_stub, prefilter_ok, subissue_state,
                                       _deadlines(True, research=True), gate, classify,
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_ok, publish, cleanup,
                                       publish_error, ready, develop, decompose,
-                                      publish_plan, phase_stub]):
+                                      publish_plan, phase_stub, *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -398,13 +471,14 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[awaiting_stub, prefilter_ok, subissue_state,
                                       _deadlines(True, research=True), gate, classify,
                                       duplicate, score, post_priority, mark_running,
                                       finish, ack, prepare, stage_forbidden, publish,
                                       cleanup, publish_error, ready, develop, decompose,
-                                      publish_plan, phase_stub]):
+                                      publish_plan, phase_stub, *DEV_STEPS, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             for _ in range(200):
@@ -423,14 +497,27 @@ async def test_subissue_of_a_plan_skips_its_own_business_analysis():
 # --- Сорванная передача не повторяет прогон агента ---
 
 @activity.defn(name="trigger_openhands_resolver")
-async def develop_failing(issue: IssueInput) -> None:
-    """Падение на последнем шаге активности — как пуш на живом прогоне #39.
-
-    Ретрай повторил бы её ЦЕЛИКОМ: объявление о передаче, прогон агента,
-    тесты. Именно так контур трижды объявил о работе и трижды прогнал агента.
-    """
+async def develop_failing(issue: IssueInput, root_issue: int | None = None,
+                          branch: str | None = None) -> None:
+    """Прежний путь одной активностью — оставлен для ветки без маркера патча."""
     _calls.append("develop")
     raise RuntimeError("git push → код 1: remote: Permission denied")
+
+
+@activity.defn(name="dev_publish")
+async def dev_publish_failing(issue: IssueInput, branch: str) -> int | None:
+    """Срыв ПОСЛЕДНЕГО шага — ровно пуш на живом прогоне #39.
+
+    Раньше вся разработка была одной активностью, и её ретрай повторял стадию
+    ЦЕЛИКОМ: объявление о передаче, прогон агента, тесты. Так контур трижды
+    объявил о работе и трижды прогнал двадцатиминутного агента. Теперь
+    повторяется только публикация — это и проверяет тест ниже.
+    """
+    _calls.append("publish-attempt")
+    raise RuntimeError("git push → код 1: remote: Permission denied")
+
+
+DEV_STEPS_FAILING_PUBLISH = [*DEV_STEPS[:-1], dev_publish_failing]
 
 
 @activity.defn(name="post_error_label")
@@ -444,13 +531,15 @@ async def test_failed_handoff_runs_the_agent_once_and_reports():
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
         async with Worker(env.client, task_queue=tq,
-                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
                           activities=[awaiting_stub, prefilter_ok, protocol_default,
                                       _deadlines(True), gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
                                       ready, develop_failing, decompose, publish_plan,
-                                      phase_stub, error_label]):
+                                      phase_stub, error_label,
+                                      *DEV_STEPS_FAILING_PUBLISH, no_questions]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await handle.signal(IssueLifecycle.human_decision, "research-me")
@@ -462,4 +551,10 @@ async def test_failed_handoff_runs_the_agent_once_and_reports():
 
     assert _calls.count("develop") == 1, (
         f"прогон агента повторился: {_calls.count('develop')} раз(а)")
+    # Ради этого стадию и резали на шаги: повтор достаётся тому шагу, который
+    # упал, а не всей стадии вместе с агентом.
+    assert _calls.count("publish-attempt") > 1, (
+        "публикация не повторилась — ретрай достался не тому шагу")
+    assert _calls.count("announce") == 1, (
+        f"контур объявил о передаче {_calls.count('announce')} раз(а)")
     assert any(c.startswith("error:") for c in _calls), "срыв передачи остался молчаливым"

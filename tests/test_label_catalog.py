@@ -12,7 +12,7 @@
 
 import pytest
 
-from shared import label_catalog, labels, lifecycle, commands
+from shared import label_catalog, labels, lifecycle, commands, develop, pr_closing
 
 
 # --- advisor:* метки ---
@@ -63,15 +63,19 @@ def test_catalog_has_no_extra_priority_labels():
 
 def test_priority_labels_match_toml_config():
     """priority:* метки должны соответствовать записям в config/priority-weights.toml."""
-    import tomli
     import pathlib
+
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python < 3.11
+        import tomli as tomllib
     
     config_path = pathlib.Path(__file__).parent.parent / "config" / "priority-weights.toml"
     if not config_path.exists():
         pytest.skip("config/priority-weights.toml не найден")
     
     with open(config_path, "rb") as f:
-        config = tomli.load(f)
+        config = tomllib.load(f)
     
     # Config имеет thresholds (p0_min, p1_min, p2_min) и bug_severity_override
     thresholds = set(config.get("thresholds", {}).keys())
@@ -153,7 +157,7 @@ def test_command_labels_match_commands_constant():
 def test_catalog_includes_all_command_labels():
     """Новая команда в commands._COMMANDS должна быть и в каталоге."""
     catalog = label_catalog.all_labels()
-    for cmd in commands._COMMANDS:
+    for cmd in commands._COMMANDS.values():
         assert commands.run_label(cmd) in catalog, f"run:{cmd} отсутствует в каталоге"
         assert commands.done_label(cmd) in catalog, f"done:{cmd} отсутствует в каталоге"
         assert commands.failed_label(cmd) in catalog, f"failed:{cmd} отсутствует в каталоге"
@@ -170,7 +174,7 @@ def test_catalog_has_no_extra_command_labels():
 def _build_expected_command_labels():
     """Вспомогательная функция: собрать все командные метки из констант."""
     result = set()
-    for cmd in commands._COMMANDS:
+    for cmd in commands._COMMANDS.values():
         result.add(commands.run_label(cmd))
         result.add(commands.done_label(cmd))
         result.add(commands.failed_label(cmd))
@@ -276,7 +280,7 @@ def test_catalog_grows_with_commands():
     Аналогично test_catalog_grows_with_lifecycle, но для команд.
     """
     catalog = label_catalog.all_labels()
-    for cmd in commands._COMMANDS:
+    for cmd in commands._COMMANDS.values():
         assert commands.run_label(cmd) in catalog, (
             f"команда {cmd} из commands._COMMANDS отсутствует в каталоге. "
             f"Добавь её в commands._COMMANDS или обнови каталог."
@@ -317,3 +321,58 @@ def test_catalog_grows_with_flat_labels():
             f"плоская метка {label} отсутствует в каталоге. "
             f"Добавь её в labels.FLAT_LABELS или обнови каталог."
         )
+# --- Rich catalog checks from main ---
+"""Каталог меток собирается из кода, а не переписывается руками."""
+
+from shared import commands, develop, lifecycle, pr_closing
+from shared import labels as L
+from shared.label_catalog import TRIGGERS, catalog
+
+
+def test_every_phase_is_present():
+    names = catalog()
+    for phase in lifecycle.PHASES:
+        assert lifecycle.phase_label(phase) in names
+
+
+def test_command_labels_cover_all_three_outcomes():
+    names = catalog()
+    for command in commands._COMMANDS.values():
+        assert f"{commands.RUN_PREFIX}{command}" in names
+        assert f"{commands.DONE_PREFIX}{command}" in names
+        assert f"{commands.FAILED_PREFIX}{command}" in names
+
+
+def test_control_labels_are_present():
+    names = catalog()
+    for label in (L.NEEDS_HUMAN_TRIAGE, L.ORIGIN_AGENT, L.AGENTS_OFF,
+                  L.READY_FOR_DEV, pr_closing.NEEDS_HUMAN_PR,
+                  develop.IN_DEVELOPMENT_LABEL):
+        assert label in names
+
+
+def test_trigger_labels_are_present():
+    """Каждая метка из HUMAN_DECISION_LABELS (единый список с вебхуком) обязана
+    попасть в каталог: новая точка решения человека, забытая здесь, должна
+    ронять этот тест.
+
+    Забытое описание ловит не этот тест, а сам импорт модуля: TRIGGERS строится
+    как {name: _HUMAN_DECISION_DESCRIPTIONS[name] for name in
+    L.HUMAN_DECISION_LABELS} (shared/label_catalog.py), так что метка без
+    описания роняет KeyError раньше, чем мы сюда доберёмся."""
+    names = catalog()
+    for label in L.HUMAN_DECISION_LABELS:
+        assert label in names
+
+
+def test_every_entry_has_colour_and_description():
+    for name, spec in catalog().items():
+        assert spec.color.startswith("#"), name
+        assert spec.description.strip(), name
+
+
+def test_rich_catalog_grows_with_lifecycle():
+    """Новая фаза попадает в каталог сама — иначе он разъедется с контуром."""
+    assert len([n for n in catalog() if n.startswith(lifecycle.PHASE_PREFIX)]) \
+        == len(lifecycle.PHASES)
+# End of rich catalog checks.
