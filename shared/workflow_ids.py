@@ -46,3 +46,20 @@ def analysis_workflow_id(repo_full_name: str, issue_number: int) -> str:
     # Фиксированный id (без comment_id): повторный /analyze при идущем прогоне
     # упирается в WorkflowAlreadyStarted вместо второго дорогого прогона.
     return f"analysis-{repo_full_name}-{issue_number}"
+
+
+def development_workflow_id(repo_full_name: str, issue_number: int) -> str:
+    # Номера попытки в ключе НЕТ намеренно: разработка по одному Issue идёт в
+    # один момент времени в одном экземпляре, и повторный запуск при идущем
+    # прогоне обязан упереться в WorkflowAlreadyStarted. Иначе на репозитории
+    # окажется два агента в одном рабочем каталоге — имя контейнера раннера
+    # тоже выводится из номера Issue (`shared/develop.py:131`).
+    return f"develop-{repo_full_name}-{issue_number}"
+
+
+def pr_fix_workflow_id(repo_full_name: str, pr_number: int, round_number: int) -> str:
+    # Номер круга в ключе, в отличие от разработки: круги разделены ожиданием
+    # доклада ревью, и второй круг — честно новый прогон со своей историей.
+    # Без номера он упирался бы в id первого, и доводка PR вставала бы после
+    # первого же круга.
+    return f"prfix-{repo_full_name}-{pr_number}-{round_number}"

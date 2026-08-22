@@ -15,7 +15,7 @@
 - **Импорты в тестах плоские**: `tests/conftest.py` кладёт `worker/` и корень в `sys.path`, поэтому `import github_client`, а не `from worker import github_client`.
 - **Модуль `github_client` перезагружается в тестах** через `importlib.reload` после установки переменных окружения — константы уровня модуля (`DRY_RUN`) читаются при импорте.
 - **Ветка одна на весь план**, PR в `main`. Прямой пуш в `main` запрещён.
-- **`shared/*` остаются чистыми**: ни сети, ни Temporal, ни обращений к трекеру. Это зафиксировано в docstring каждого модуля и проверяется тестом `tests/test_repowise_client.py:102`.
+- **`shared/*` остаются чистыми**: ни сети, ни Temporal, ни обращений к трекеру. Это зафиксировано в docstring каждого модуля. Тест `tests/test_repowise_client.py:102` проверяет только `shared/repowise.py`; общего теста на все `shared/*` пока нет.
 - **Провайдер в этом этапе один — GitHub.** Строки `"gitlab"` появляются только там, где это прямо предписано задачей.
 
 ---
@@ -205,7 +205,7 @@ def test_pat_beats_app_in_auth_header(capture):
 - [ ] **Step 4: Запустить — тесты должны пройти на текущем коде**
 
 Run: `.venv/bin/pytest tests/test_github_client_contract.py -q`
-Expected: PASS, 11 тестов.
+Expected: PASS, 10 тестов.
 
 Это характеризующие тесты: они описывают то, что уже есть. Красный тест здесь означает, что я неверно прочитал код, а не что код плох — сверить с `worker/github_client.py` и поправить **тест**, не клиент.
 

@@ -20,7 +20,8 @@
 | Артефакт диалога | `repowise-dialog.md` | Транскрипт, отрендеренный прокси из журнала. Модель его не пишет — полнота получается построением |
 | Деградация стадии | `outcome: degraded` в отчёте `run_fnr_stage` | Индекс недоступен: артефакт создан, конвейер идёт дальше. Штатный режим, не отказ |
 | Bug-пайплайн | `run_bug_pipeline` (`worker/activities.py`) | **Не реализовано** (`NotImplementedError`). Диагностика бага (SA-helper) |
-| Агент разработки | одноразовый контейнер OpenHands (`shared/develop.py`) | Реализован режимом `local`; `trigger_openhands_resolver` в коде нет |
+| Агент разработки | одноразовый контейнер OpenHands (`shared/develop.py`) | Реализован режимом `local`; `trigger_openhands_resolver` — прежний линейный путь, сохранённый ради реплея, а `IssueDevelopment` — дочерний воркфлоу с отдельными шагами |
+| Круг правок по ревью | `IssuePrFix` (`worker/workflows.py`) | Дочерний воркфлоу, id `prfix-<repo>-<pr>-<round>`; один прогон на круг — круги разделены ожиданием доклада ревью |
 | Скилл (навык) | po-helper / SA-helper Claude Code skill | Набор инструкций для `claude -p`; вызывается тяжёлыми стадиями |
 | Сигнал решения человека | `human_decision` signal (`worker/workflows.py:34`) | Лейблы `research-me`/`bug-me`/`build-me` как Temporal-сигналы |
 | Бэкенд-модель (skills) | z.ai Anthropic-эндпоинт | `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN` (`.env.example:20-21`) |

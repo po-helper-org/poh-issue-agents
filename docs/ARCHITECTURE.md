@@ -70,6 +70,13 @@ Instructor поверх OpenAI-совместимого эндпоинта z.ai.
 Аутентификация как GitHub App (генерация installation-токена, живёт ~1ч).
 Отличие от исходной версии на Actions (там был готовый GITHUB_TOKEN).
 
+Метки ISSUE-агента определены в `shared/labels.py` в виде констант,
+которые используются как в коде, так и для документации. Операции с метками
+выполняются через парные `add_label`/`remove_label`; есть набор фейков для
+тестов, который подменяет клиента целиком.
+
+Разбор ссылки на репозиторий (`owner/name`) живёт в `shared/repos.py`.
+
 ## Поток обработки (happy path для FEATURE)
 
 1. `issues.opened` → старт workflow.
@@ -86,7 +93,13 @@ Instructor поверх OpenAI-совместимого эндпоинта z.ai.
     Стадии: `repowise` (сбор контекста из индекса кода) → `task` →
     `concept` → `debate` → `sysreq` → `validate`.
 11. **Ожидание сигнала** `human_decision`.
-12. Человек ставит `build-me` → `trigger_openhands_resolver`.
+12. Человек ставит `build-me` (либо срабатывает `DEVELOP_AUTOSTART`) →
+    развилка под маркером патча ведёт в дочерний воркфлоу `IssueDevelopment`
+    с каноническим id `develop-<repo>-<n>` (повторный запуск при идущем
+    прогоне упирается в `WorkflowAlreadyStarted`, а не поднимает второго
+    агента). Прежний путь через активность `trigger_openhands_resolver`
+    сохранён нетронутым — по нему идёт реплей прогонов, начатых до выкладки
+    дочернего воркфлоу.
 
 ## Второй workflow: `IssueEstimation`
 
