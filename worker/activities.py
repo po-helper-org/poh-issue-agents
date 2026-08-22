@@ -52,7 +52,9 @@ from shared.workflow_types import (
     BftRequest,
     ClassificationResult,
     CommentAckInput,
+    CommentIntent,
     Deadlines,
+    DevelopPlan,
     DuplicateResult,
     EstimateRequest,
     EstimateResult,
@@ -108,6 +110,12 @@ class PriorityExtraction(BaseModel):
     who: str = ""
     risks: list[str] = []
     goal_impact: str = ""
+
+
+class CommentIntentExtraction(BaseModel):
+    intent: str = Field(description="proceed | rework | question | ack")
+    reason: str = Field(description="обоснование для комментария-ответа")
+    rework_note: str = Field(description="что именно переделывать (только для rework)", default="")
 
 
 # --- Zero-cost предфильтры ---
@@ -204,6 +212,10 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
 
     Допустимость самого перехода проверяет воркфлоу (у него есть предыдущая
     фаза); здесь — только запись, идемпотентная по построению.
+
+    Целевая метка ставится раньше снятия прежних: окно, в котором меток
+    `phase:*` нет вовсе, хуже окна, в котором их две. Атомарно это делается
+    только на провайдере, умеющем менять набор одним запросом.
     """
     target = lifecycle.phase_label(phase)
     stale_labels = [lifecycle.phase_label(other) for other in lifecycle.PHASES]
@@ -213,14 +225,7 @@ def set_phase(repo: str, issue_number: int, phase: str) -> None:
     # завершилась; единственная точка, которая знает о смене состояния, — здесь.
     if phase != lifecycle.IN_DEVELOPMENT:
         stale_labels.append(develop.IN_DEVELOPMENT_LABEL)
-    for stale in stale_labels:
-        if stale != target:
-            try:
-                github_client.remove_label(repo, issue_number, stale)
-            except Exception as exc:
-                logger.warning("не снял метку фазы %s с %s#%s: %s",
-                               stale, repo, issue_number, exc)
-    github_client.add_label(repo, issue_number, target)
+    github_client.set_labels(repo, issue_number, add=[target], remove=stale_labels)
 
 
 @activity.defn
@@ -234,16 +239,18 @@ def mark_awaiting(repo: str, issue_number: int, waiting=None) -> None:
     Ожидание машины (стенд, соседний сервис) метку НЕ ставит: задача, по которой
     человеку делать нечего, в его очереди — шум, из-за которого перестают
     смотреть на саму выборку.
+
+    Асимметрия обработки ошибок: постановка метки падает при сбое, снятие
+    проглатывается (ошибка уходит в лог, но наружу не пробрасывается). Это
+    поведение гарантирует, что неудачное снятие не заблокирует продолжение
+    потока, который уже ушёл дальше.
     """
     if waiting is not None and isinstance(waiting, dict):
         waiting = Awaiting(**waiting)
     if waiting is not None and waiting.blocks_on_human:
-        github_client.add_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
+        github_client.set_labels(repo, issue_number, add=[labels.NEEDS_HUMAN_TRIAGE])
         return
-    try:
-        github_client.remove_label(repo, issue_number, labels.NEEDS_HUMAN_TRIAGE)
-    except Exception as exc:
-        logger.warning("не снял метку ожидания с %s#%s: %s", repo, issue_number, exc)
+    github_client.set_labels(repo, issue_number, remove=[labels.NEEDS_HUMAN_TRIAGE])
 
 
 @activity.defn
@@ -502,9 +509,13 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     Неуспех получает СВОЮ метку, а не просто снятый `run:*`: молча снятая метка
     неотличима от «никто не запускал», а именно это и нужно увидеть в ленте.
 
-    Best-effort по каждой метке: прогон уже состоялся, и провал косметики не
-    должен превращать успешный анализ в проваленный. Ошибка уходит в лог, но
-    наружу не пробрасывается — activity зовётся из терминальных веток воркфлоу.
+    Best-effort по операции целиком, а не по каждой метке отдельно:
+    `set_labels` снимает `run:*` и предыдущий исход даже если постановка новой
+    метки исхода упала — иначе 5xx на POST оставлял бы `run:analyze` на Issue
+    навсегда. Ошибка от `set_labels` (если постановка всё же не удалась)
+    гасится здесь же: прогон уже состоялся, и провал косметики не должен
+    превращать успешный анализ в проваленный. Наружу не пробрасывается —
+    activity зовётся из терминальных веток воркфлоу.
     """
     outcome = done_label(command) if ok else failed_label(command)
     # Исход ПРЕДЫДУЩЕГО прогона снимается вместе с «идёт»: `done:analyze` рядом
@@ -512,15 +523,13 @@ async def finish_command_labels(repo: str, issue_number: int, command: str, ok: 
     # сказать, чем кончился последний прогон, и выборка `label:failed:*`
     # показывает задачи, которые давно починены повторным запуском.
     previous = failed_label(command) if ok else done_label(command)
-    for stale in (*running_labels(command), previous):
-        try:
-            await asyncio.to_thread(github_client.remove_label, repo, issue_number, stale)
-        except Exception as exc:
-            logger.warning("не снял метку %s с %s#%s: %s", stale, repo, issue_number, exc)
     try:
-        await asyncio.to_thread(github_client.add_label, repo, issue_number, outcome)
+        await asyncio.to_thread(
+            github_client.set_labels, repo, issue_number,
+            add=[outcome], remove=[*running_labels(command), previous])
     except Exception as exc:
-        logger.warning("не поставил метку %s на %s#%s: %s", outcome, repo, issue_number, exc)
+        logger.warning("не привёл метки команды на %s#%s к виду %s: %s",
+                       repo, issue_number, outcome, exc)
 
 
 # --- Классификация ---
@@ -639,6 +648,51 @@ def answer_followup(issue: IssueInput, question: str) -> None:
         # выглядел бы как ответ и закрывал бы вопрос ничем.
         raise RuntimeError("модель вернула пустой ответ на реплику")
     github_client.post_comment(issue.repo, issue.issue_number, answer)
+
+
+@activity.defn
+def interpret_user_comment(issue: IssueInput, comment_text: str, current_phase: str,
+                          classification_label: str | None, awaiting_reason: str | None,
+                          recent_artifacts: dict[str, str] | None = None) -> CommentIntent:
+    """Разбор намерения из реплики человека.
+    
+    Анализирует комментарий и определяет, чего хочет человек: продолжить работу,
+    переделать этап, задать вопрос или просто подтвердить получение.
+    """
+    capabilities = (WORKSPACE_DIR / "capabilities.md").read_text(encoding="utf-8") \
+        if (WORKSPACE_DIR / "capabilities.md").exists() else "(пусто)"
+    
+    thread = _followup_thread(issue.repo, issue.issue_number)
+    
+    parts = [
+        f"# Issue {issue.repo}#{issue.issue_number}: {issue.title}", "",
+        "## Описание", "", issue.body.strip() or "(тело пустое)", "",
+        "## Текущая фаза", "", current_phase, "",
+        "## Метка классификации", "", classification_label or "(нет)", "",
+        "## Чего ждёт Issue", "", awaiting_reason or "(ожидания нет)", "",
+        "## Известный функционал", "", capabilities
+    ]
+    
+    if thread:
+        parts += ["", "## Переписка Issue", "", thread]
+    
+    if recent_artifacts:
+        parts += ["", "## Последние артефакты этапа", ""]
+        for name, content in recent_artifacts.items():
+            parts += [f"### {name}", "", content[:1000]]  # Ограничиваем размер
+    
+    parts += ["", "## Реплика для разбора", "", comment_text.strip()]
+    
+    result = llm.extract(
+        _load_prompt("system_comment_intent.md"), "\n".join(parts), CommentIntentExtraction,
+        model=llm.MODEL_GATE,
+    )
+    
+    return CommentIntent(
+        intent=result.intent,
+        reason=result.reason,
+        rework_note=result.rework_note or ""
+    )
 
 
 # --- Duplicate Check ---
@@ -771,6 +825,11 @@ CONTEXT_COMMENT_LIMIT = 20      # свежих комментариев в бр�
 CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментария
 CONTEXT_PR_LIMIT = 20           # связанных PR
 CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
+
+# Потолок размера постановки для агента разработки (ISSUE-113)
+DEV_TASK_MAX_CHARS = 50000      # общий размер .task.md
+DEV_ARTIFACT_MAX_CHARS = 10000  # отдельный артефакт FNR
+DEV_COMMENT_CHARS = 1000        # обрезка одного комментария для разработки
 
 
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
@@ -1082,6 +1141,115 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + " …[обрезано]"
+
+
+def _fetch_decomposition_plan(issue: IssueInput) -> str:
+    """Получает план декомпозиции из комментария родителя.
+    
+    Если родитель содержит комментарий с декомпозицией (есть маркер "🧩 Декомпозиция"),
+    возвращает этот текст. Иначе — пустую строку.
+    """
+    try:
+        comments = github_client.list_comments(issue.repo, issue.issue_number, limit=50)
+        for comment in reversed(comments):  # Сначала свежие
+            body = comment.get("body") or ""
+            if "🧩 Декомпозиция" in body:
+                return body
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать декомпозицию #%s: %s", issue.issue_number, exc)
+    return ""
+
+
+def _fetch_subtasks(issue: IssueInput) -> list[dict]:
+    """Получает подзадачи плана: номера, заголовки, тела и релизы.
+    
+    Читает все открытые Issue и фильтрует те, что содержат ссылку на родителя.
+    Это медленно, но работает без search API. Для оптимизации нужно индексирование.
+    """
+    try:
+        all_issues = github_client.list_open_issues(issue.repo, limit=500)
+        subtasks = []
+        for item in all_issues:
+            body = item.get("body") or ""
+            # Проверяем, что это подзадача этого родителя
+            if f"root-issue: #{issue.issue_number}" in body:
+                # Дополнительно проверяем наличие метки релиза (release:*)
+                labels = item.get("labels", [])
+                if any(str(l).startswith("release:") for l in labels):
+                    subtasks.append({
+                        "number": item.get("number"),
+                        "title": item.get("title"),
+                        "body": body,
+                        "state": item.get("state"),
+                    })
+        return subtasks
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать подзадачи #%s: %s", issue.issue_number, exc)
+        return []
+
+
+def _fetch_dev_comments(issue: IssueInput) -> list[str]:
+    """Свежие комментарии для постановки разработки (аналогично _fetch_comment_blocks).
+    
+    Отфильтровывает командный шум, обрезает по DEV_COMMENT_CHARS, возвращает от
+    старых к свежим.
+    """
+    try:
+        comments = github_client.list_comments(
+            issue.repo, issue.issue_number, limit=50
+        )
+        kept = [c for c in comments if parse_command(c.get("body") or "") is None]
+        blocks: list[str] = []
+        for c in kept[-10:]:  # До 10 свежих комментариев для разработки
+            user = (c.get("user") or {}).get("login", "?")
+            date = (c.get("created_at") or "")[:10]
+            body = _truncate(c.get("body") or "", DEV_COMMENT_CHARS)
+            blocks.append(f"**@{user} ({date}):**\n{body}")
+        return blocks
+    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
+        logger.warning("list_comments failed for #%s: %s", issue.issue_number, exc)
+        return []
+
+
+def _refresh_issue_body(issue: IssueInput) -> str:
+    """Перечитывает тело Issue из GitHub вместо устаревшего снимка.
+    
+    Снимок в `IssueInput` создается вебхуком один раз и устаревает для
+    долгоживущих задач в `ready-for-dev`.
+    """
+    try:
+        fresh = github_client.get_issue(issue.repo, issue.issue_number)
+        return fresh.get("body") or ""
+    except Exception as exc:  # noqa: BLE001 — деградация к старому снимку
+        logger.warning("не удалось обновить тело #%s, используется снимок: %s",
+                       issue.issue_number, exc)
+        return issue.body
+
+
+def _apply_size_limit(parts: list[str], limit: int, priority_order: list[int] | None = None) -> list[str]:
+    """Обрезает части постановки по лимиту, удаляя от старого к свежему.
+    
+    `priority_order` — индексы частей, которые обрезаются в последнюю очередь.
+    Если не задан, все части равноправны.
+    """
+    if priority_order is None:
+        priority_order = []
+    
+    # Сортируем индексы по приоритету (сначала низкий приоритет)
+    indices = list(range(len(parts)))
+    indices.sort(key=lambda i: priority_order.index(i) if i in priority_order else -1)
+    
+    total = "\n\n".join(parts)
+    while len(total) > limit and len(parts) > 1:
+        # Удаляем часть с самым низким приоритетом
+        for idx in indices:
+            if idx < len(parts):
+                removed = parts.pop(idx)
+                total = "\n\n".join(parts)
+                logger.debug("обрезка постановки: удалена часть %d (%d симв.), осталось %d",
+                           idx, len(removed), len(total))
+                break
+    return parts
 
 
 def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
@@ -1467,6 +1635,13 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     Постановка собирается ЗДЕСЬ, а не в промпте агента: то, что уехало в
     работу, должно быть видно дословно. Иначе на разборе «почему агент сделал
     не то» предъявить нечего.
+    
+    ISSUE-113: в постановку включается:
+    - свежее тело Issue (вместо устаревшего снимка);
+    - план декомпозиции и подзадачи (если есть);
+    - обсуждение Issue (комментарии);
+    - все артефакты FNR, включая repowise-dialog.md и validation.md;
+    - применён общий потолок размера с усечением по приоритету.
     """
     root, clone_dir = _dev_paths(issue)
     shutil.rmtree(root, ignore_errors=True)
@@ -1474,21 +1649,64 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     _clone_repo(issue.repo, str(clone_dir))
     _write_runner_mcp_config(issue, root)
 
+    # 1. Свежее тело Issue вместо устаревшего снимка (ISSUE-113 пункт 5)
+    fresh_body = _refresh_issue_body(issue)
+    
     parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
-             "", f"## {issue.title}", "", issue.body or "(тело пустое)", ""]
+             "", f"## {issue.title}", "", fresh_body or "(тело пустое)", ""]
 
+    # 2. План декомпозиции и подзадачи (ISSUE-113 пункт 1)
+    plan = _fetch_decomposition_plan(issue)
+    if plan:
+        parts.append("## План декомпозиции")
+        parts.append("")
+        parts.append(plan)
+        parts.append("")
+        
+        # Подзадачи плана с телами
+        subtasks = _fetch_subtasks(issue)
+        if subtasks:
+            parts.append("### Подзадачи плана")
+            parts.append("")
+            for sub in subtasks:
+                parts.append(f"#### #{sub['number']} — {sub['title']}")
+                parts.append("")
+                parts.append(sub['body'])
+                parts.append("")
+
+    # 3. Артефакты FNR — все пять, включая отброшенные (ISSUE-113 пункт 4)
     if branch:
-        # Требования идут ПЕРВЫМИ: то, что агент прочитает раньше, весит
-        # больше, а task/concept — путь к требованиям, а не сами требования.
         parts.append("## Системные требования (аналитика Issue-Agent)")
         parts.append("")
+        
+        # Три основных артефакта (как было)
         for name in ("system_requirements.md", "task.md", "concept.md"):
             text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
             if text:
+                # Обрезаем каждый артефакт отдельно, если слишком большой
+                if len(text) > DEV_ARTIFACT_MAX_CHARS:
+                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
+                parts += [f"### {name}", "", text, ""]
+        
+        # Два дополнительных артефакта (ISSUE-113 пункт 3)
+        for name in ("repowise-dialog.md", "validation.md"):
+            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
+            if text:
+                if len(text) > DEV_ARTIFACT_MAX_CHARS:
+                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
                 parts += [f"### {name}", "", text, ""]
     else:
         parts += ["## Аналитики по задаче нет — работай от тела Issue.", ""]
 
+    # 4. Обсуждение Issue (ISSUE-113 пункт 2)
+    comments = _fetch_dev_comments(issue)
+    if comments:
+        parts.append("## Обсуждение Issue")
+        parts.append("")
+        parts.extend(comments)
+        parts.append("")
+
+    # 5. Правила репозитория и Repowise (как было)
     rules = (clone_dir / ".openhands" / "task-rules.md")
     parts.append(rules.read_text(encoding="utf-8") if rules.exists() else _DEV_FALLBACK_RULES)
     # Дописывается ПОСЛЕ правил репозитория, а не вместо: правила проекта
@@ -1497,7 +1715,47 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     if repowise.enabled():
         parts.append(_DEV_REPOWISE_RULES)
 
-    task = "\n".join(parts)
+    # 6. Применение потолка размера с усечением по приоритету (ISSUE-113 пункт 6)
+    # Приоритет: заголовок/тело > план > артефакты > обсуждение > правила
+    task_parts = []
+    current_section = []
+    section_name = ""
+    
+    for part in parts:
+        # Определяем заголовок секции (начинается с #)
+        if part.startswith("#") and not part.startswith("##"):  # Главный заголовок
+            if current_section:
+                task_parts.append((section_name, "\n".join(current_section)))
+            section_name = part
+            current_section = []
+        elif part.startswith("##"):  # Заголовок уровня 2
+            if current_section:
+                task_parts.append((section_name, "\n".join(current_section)))
+            section_name = part
+            current_section = []
+        else:
+            current_section.append(part)
+    
+    if current_section:
+        task_parts.append((section_name, "\n".join(current_section)))
+    
+    # Применяем лимит с приоритетом
+    priority_order = []
+    for i, (name, _) in enumerate(task_parts):
+        if name == f"# Задача: реализовать Issue #{issue.issue_number}" or name == f"## {issue.title}":
+            priority_order.append(i)
+        elif name.startswith("## План декомпозиции"):
+            priority_order.append(i)
+        elif name.startswith("## Системные требования"):
+            priority_order.append(i)
+    
+    final_parts = []
+    for name, content in task_parts:
+        final_parts.append(content)
+    
+    final_parts = _apply_size_limit(final_parts, DEV_TASK_MAX_CHARS, priority_order)
+    
+    task = "\n\n".join(final_parts)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
     _handover_to_runner(root)
     return task
@@ -1716,8 +1974,48 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     )
 
 
+async def _dev_resolve_branch(issue: IssueInput, root_issue: int | None = None,
+                              branch: str | None = None) -> str:
+    """Выключатель разработки + ветка аналитики — общий вход в стадию.
+
+    Раньше — две дословные копии, в `trigger_openhands_resolver` и в
+    `dev_begin`: правка формата ветки или условия выключателя попала бы в
+    одну и была бы забыта в другой, и линейный путь молча разошёлся бы с
+    путём через дочерний воркфлоу.
+    """
+    if not develop.enabled():
+        raise RuntimeError(
+            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
+
+    if branch is None:
+        source = root_issue if root_issue else issue.issue_number
+        branch = f"research/issue-{source}"
+    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
+        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
+        # агент работает от тела Issue, но знать об этом должен явно.
+        branch = ""
+    return branch
+
+
+async def _dev_dispatch_and_announce(issue: IssueInput, branch: str) -> None:
+    """Режим `dispatch`: запуск в GitHub Actions + объявление человеку.
+
+    Раньше — две дословные копии, в `trigger_openhands_resolver` и в
+    `dev_dispatch`: правка аргументов `dispatch_inputs` или текста объявления
+    попала бы в одну и была бы забыта в другой.
+    """
+    await asyncio.to_thread(
+        github_client.dispatch_workflow,
+        issue.repo, develop.workflow_file(), develop.workflow_ref(),
+        develop.dispatch_inputs(issue.issue_number, branch=branch),
+    )
+    await _dev_announce(issue, branch,
+                        where="запустил OpenHands Resolver в GitHub Actions")
+
+
 @activity.defn
-async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
+async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None = None, 
+                                     branch: str | None = None) -> int | None:
     """Активность Develop: разработка по подготовленному Issue.
 
     Два режима (`shared/develop.py`). `local` — прогон одноразовым контейнером
@@ -1726,24 +2024,15 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
 
     Возвращает номер PR (режим `local`) либо None (`dispatch`: результат
     придёт событием `pr-open`, прогон идёт на чужой стороне).
+    
+    ISSUE-113: для подзадачи плана использует ветку родителя, а не свою.
+    `root_issue` — номер родительской задачи (если это подзадача плана),
+    `branch` — готовая ветка (если вычислена в workflow).
     """
-    if not develop.enabled():
-        raise RuntimeError(
-            "DEVELOP_ENABLED выключен — задача остаётся в очереди к разработчику")
-
-    branch = f"research/issue-{issue.issue_number}"
-    if not await asyncio.to_thread(github_client.branch_exists, issue.repo, branch):
-        # Путь бага: аналитики не было, и ветки с артефактами тоже. Штатно —
-        # агент работает от тела Issue, но знать об этом должен явно.
-        branch = ""
+    branch = await _dev_resolve_branch(issue, root_issue=root_issue, branch=branch)
 
     if develop.mode() == develop.DISPATCH:
-        await asyncio.to_thread(
-            github_client.dispatch_workflow,
-            issue.repo, develop.workflow_file(), develop.workflow_ref(),
-            develop.dispatch_inputs(issue.issue_number, branch=branch),
-        )
-        await _dev_announce(issue, branch, where="запустил OpenHands Resolver в GitHub Actions")
+        await _dev_dispatch_and_announce(issue, branch)
         return None
 
     # Порядок не косметический: сначала клон и постановка — они единственные
@@ -1769,6 +2058,108 @@ async def trigger_openhands_resolver(issue: IssueInput) -> int | None:
     if number is None:
         raise RuntimeError("агент не изменил ни одного файла — открывать нечего")
     return number
+
+
+# --- Разработка дочерним воркфлоу: шаги как отдельные активности ---
+#
+# Прежде вся разработка была ОДНОЙ активностью, и её ретрай повторял четыре
+# внутренних шага целиком. На прогоне #39 падал только `git push` — уже после
+# работы агента, — а заново шёл весь прогон, и контур трижды объявил о передаче
+# задачи. Лечение снижением до одной попытки отменяло ретраи и там, где они
+# уместны. Разрезав стадию на активности, ретраи возвращаются туда, где дёшевы.
+#
+# Приватные `_dev_*` НЕ трогаем: по ним идёт `trigger_openhands_resolver`, а по
+# нему — реплей прогонов, начатых до выкладки, и прежний линейный сценарий.
+
+
+@activity.defn
+async def dev_begin(issue: IssueInput) -> DevelopPlan:
+    """Решения входа в стадию: работаем ли вообще, в каком режиме и от чего.
+
+    Собрано в один шаг намеренно. Выключатель и наличие ветки читаются из
+    окружения и из GitHub — в воркфлоу так нельзя, там решение обязано быть
+    детерминированным при реплее. Один вызов вместо трёх ещё и делает вход в
+    стадию одной строкой в истории.
+    """
+    branch = await _dev_resolve_branch(issue)
+    return DevelopPlan(mode=develop.mode(), branch=branch)
+
+
+@activity.defn
+async def dev_dispatch(issue: IssueInput, branch: str) -> None:
+    """Режим `dispatch`: прогон уезжает в GitHub Actions.
+
+    Своих шагов на этой стороне нет — отсюда и один вызов вместо цепочки.
+    Результат придёт событием `pr-open` от внешнего агента.
+    """
+    await _dev_dispatch_and_announce(issue, branch)
+
+
+@activity.defn
+async def dev_prepare(issue: IssueInput, branch: str) -> int:
+    """Шаг 1: свежий клон и постановка файлом. Возвращает длину постановки.
+
+    Длину, а не текст: постановка уже лежит в `.task.md` в общем томе, и
+    дублировать её в payload Temporal незачем. В лог она уходит целиком — там
+    её и смотрят, когда разбираются «почему агент сделал не то».
+    """
+    task = await _run_with_heartbeat(_dev_prepare, issue, branch, label="dev:prepare")
+    logger.info("Develop %s#%s: постановка (%d симв.)\n%s",
+                issue.repo, issue.issue_number, len(task), task[:2000])
+    return len(task)
+
+
+@activity.defn
+async def dev_announce(issue: IssueInput, branch: str) -> None:
+    """Шаг 2: метка и комментарий о начале работы — best-effort.
+
+    Отдельным шагом, а не частью прогона: объявление обязано случиться ПОСЛЕ
+    успешного клона (иначе контур скажет о работе, которая не началась) и ДО
+    прогона агента (иначе человек двадцать минут не знает, что задача в работе).
+    """
+    await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
+
+
+@activity.defn
+async def dev_run_agent(issue: IssueInput) -> None:
+    """Шаг 3: прогон одноразового контейнера агента.
+
+    Возврата нет: хвост вывода уходит в лог воркера на любом исходе
+    (`_dev_run_agent`), а в историю воркфлоу ему не место — это килобайты
+    текста на прогон.
+    """
+    await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+
+
+@activity.defn
+async def dev_followups(issue: IssueInput) -> list[int]:
+    """Шаг 4: находки агента — отдельными SubIssue.
+
+    Идёт ДО тестов и публикации: файл находок обязан исчезнуть из рабочего
+    дерева раньше коммита, иначе он уедет в PR — в ревью как мусор, а на
+    следующем круге правок агент прочитает свои прошлые находки как новые.
+    """
+    return await collect_dev_followups(issue)
+
+
+@activity.defn
+async def dev_tests(issue: IssueInput) -> None:
+    """Шаг 5: проверки проекта — до пуша.
+
+    Красный код не должен доезжать до PR, а на PR от агента CI может и не
+    запуститься: события от токена Actions не порождают прогонов.
+    """
+    await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
+
+
+@activity.defn
+async def dev_publish(issue: IssueInput, branch: str) -> int | None:
+    """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
+
+    `None` — агент не изменил ни одного файла. Это не сбой шага, а его
+    результат; решение, что делать с пустым прогоном, принимает воркфлоу.
+    """
+    return await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
 
 
 async def collect_dev_followups(issue: IssueInput) -> list[int]:

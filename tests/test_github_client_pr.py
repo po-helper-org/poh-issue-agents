@@ -1,3 +1,7 @@
+import subprocess
+
+import pytest
+
 import github_client
 
 
@@ -71,15 +75,21 @@ def test_git_trusts_the_worktree_the_runner_owned(monkeypatch, tmp_path):
     import github_client as gc
 
     class _Done:
-        returncode = 0  # «диффа нет» — до пуша не доходим, нам нужен только env
-        stdout = ""
-        stderr = ""
+        def __init__(self, returncode=0):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = ""
 
     captured: dict = {}
 
     def fake_run(cmd, **kw):
         captured.setdefault("env", kw.get("env"))
-        return _Done()
+        # `show-ref` — «ветка ещё не существует», иначе пустой диф читался бы
+        # как ретрай, а не как «агент ничего не менял», и код пошёл бы дальше
+        # к пушу, до которого этому тесту дела нет — ему нужен только env.
+        if "show-ref" in cmd:
+            return _Done(1)
+        return _Done(0)  # «диффа нет» — до пуша не доходим, нам нужен только env
 
     monkeypatch.setattr(gc, "_dry_run", lambda: False)
     monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
@@ -92,3 +102,127 @@ def test_git_trusts_the_worktree_the_runner_owned(monkeypatch, tmp_path):
     keys = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
             for i in range(int(env["GIT_CONFIG_COUNT"]))}
     assert keys.get("safe.directory") == str(tmp_path)
+
+
+def test_a_retry_after_a_failed_push_finishes_publishing_instead_of_declaring_no_changes(
+        monkeypatch, tmp_path):
+    """Находка 1: единственный реалистичный сбой публикации — падение пуша ПОСЛЕ
+    успешного коммита. `dev_publish` идёт с `maximum_attempts=3`, и вторая
+    попытка видит то же рабочее дерево: изменения агента уже в коммите,
+    `git add -A` ставить нечего, `diff --cached --quiet` возвращает 0.
+
+    Раньше это читалось буквально как «агент не изменил ни одного файла», и
+    функция возвращала `None` до пуша — воркфлоу ронял стадию с заведомо
+    ложной причиной, а обещание ветки «срыв публикации повторяет публикацию»
+    не выполнялось. Настоящий git нужен здесь, а не мок: сама находка — в
+    точной семантике `checkout -B` на уже созданной ветке (no-op, коммит не
+    теряется), подделать её мокой — рискуя подтвердить не то, что происходит
+    на самом деле.
+    """
+    import github_client as gc
+
+    origin = tmp_path / "origin.git"
+    clone_dir = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(origin)],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(clone_dir)],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(clone_dir), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "config", "user.name", "t"], check=True)
+    # Базовый коммит БЕЗ правки агента — иначе `checkout -B` не от чего будет
+    # отталкиваться, а `a.txt` ниже создаёт ИМЕННО некоммиченное изменение:
+    # реальный агент оставляет файлы на диске, коммит делает уже сама
+    # `publish_worktree`.
+    (clone_dir / "README.md").write_text("baseline")
+    subprocess.run(["git", "-C", str(clone_dir), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "commit", "-m", "seed"],
+                   check=True, capture_output=True)
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 101}
+
+    posts: list = []
+    monkeypatch.setattr(gc.requests, "post",
+                        lambda *a, **k: posts.append((a, k)) or _FakeResp())
+
+    # Реальный `subprocess.run` для всего, кроме первого пуша: имитируем ровно
+    # тот сбой, который описывает находка, — не трогая семантику остальных
+    # git-команд подменой.
+    real_run = subprocess.run
+    push_attempts = {"n": 0}
+
+    def flaky_push(cmd, **kw):
+        if len(cmd) > 3 and cmd[3] == "push":
+            push_attempts["n"] += 1
+            if push_attempts["n"] == 1:
+                class _FailedPush:
+                    returncode = 1
+                    stdout = ""
+                    stderr = "имитация сетевого сбоя на пуше"
+                return _FailedPush()
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(gc.subprocess, "run", flaky_push)
+
+    with pytest.raises(gc.GitCommandError):
+        gc.publish_worktree("o/r", str(clone_dir), "agent/issue-1",
+                            title="t", body="b", message="m")
+
+    # Ретрай: то же рабочее дерево — коммит уже есть, добавлять нечего.
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-1",
+                                 title="t", body="b", message="m")
+
+    assert number == 101, "ретрай не довёл публикацию и не вернул номер PR"
+    assert push_attempts["n"] == 2, "второй пуш не состоялся"
+    assert len(posts) == 1, "PR должен открыться ровно один раз — на удавшемся пуше"
+
+    log = subprocess.run(["git", "-C", str(clone_dir), "log", "--oneline", "agent/issue-1"],
+                         check=True, capture_output=True, text=True).stdout
+    assert len(log.strip().splitlines()) == 2, (
+        "повторная попытка не должна была создать второй коммит поверх первого:\n" + log)
+
+
+def test_a_retry_with_nothing_new_to_add_but_a_fresh_branch_is_still_no_changes(
+        monkeypatch, tmp_path):
+    """Различаем находку 1 от её противоположности: если ветка свежая (агент
+    первый раз тут), пустой индекс — по-прежнему честное «агент ничего не
+    менял», а не повод пытаться пушить нулевой коммит."""
+    import github_client as gc
+
+    class _Done:
+        def __init__(self, returncode=0):
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = ""
+
+    calls: list = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if "show-ref" in cmd:
+            return _Done(1)  # ветки ещё нет — это первая попытка
+        return _Done(0)      # «диффа нет» на первой попытке — агент не менял файлов
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc.subprocess, "run", fake_run)
+
+    number = gc.publish_worktree("o/r", str(tmp_path), "agent/issue-2",
+                                 title="t", body="b", message="m")
+
+    assert number is None
+    assert not any(len(c) > 3 and c[3] == "push" for c in calls), (
+        "пуша быть не должно — открывать нечего")
