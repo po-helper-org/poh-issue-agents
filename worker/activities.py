@@ -84,7 +84,7 @@ class GateExtraction(BaseModel):
 
 
 class ClassificationExtraction(BaseModel):
-    category: str = Field(description="EXISTING | CONSULTATION | BUG | FEATURE")
+    category: str = Field(description="EXISTING | CONSULTATION | BUG | FEATURE | RESEARCH")
     answer: str
 
 
@@ -563,6 +563,7 @@ def classify_issue(issue: IssueInput, bft_on_triage: bool = False) -> Classifica
         "CONSULTATION": labels.ADVISOR_CONSULTATION,
         "BUG": labels.ADVISOR_BUG,
         "FEATURE": labels.ADVISOR_FEATURE,
+        "RESEARCH": labels.ADVISOR_RESEARCH,
     }
     label = label_map.get(result.category, labels.ADVISOR_ANSWERED)
     # The advisor prompt still asks the model to prefix its answer with a

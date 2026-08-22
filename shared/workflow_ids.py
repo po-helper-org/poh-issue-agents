@@ -63,3 +63,12 @@ def pr_fix_workflow_id(repo_full_name: str, pr_number: int, round_number: int) -
     # Без номера он упирался бы в id первого, и доводка PR вставала бы после
     # первого же круга.
     return f"prfix-{repo_full_name}-{pr_number}-{round_number}"
+
+
+def research_workflow_id(repo_full_name: str, issue_number: int, comment_id: int | None = None) -> str:
+    # comment_id=None — запуск меткой `run:research`: комментария-триггера нет,
+    # различителем служит "label". Повторная доставка того же события упирается
+    # в WorkflowAlreadyStarted, а метка, поставленная заново после завершённого
+    # прогона, — честно новый прогон (прошлый закрыт, id свободен).
+    marker = "label" if comment_id is None else comment_id
+    return f"research-{repo_full_name}-{issue_number}-{marker}"

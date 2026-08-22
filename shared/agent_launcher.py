@@ -33,6 +33,7 @@ from shared.workflow_ids import (
     bft_workflow_id,
     estimate_workflow_id,
     issue_workflow_id,
+    research_workflow_id,
 )
 
 _log = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ TASK_QUEUE = "issue-lifecycle"
 ANALYSIS_WORKFLOW = "IssueAnalysis"
 ESTIMATION_WORKFLOW = "IssueEstimation"
 BFT_WORKFLOW = "IssueBft"
+RESEARCH_WORKFLOW = "IssueResearch"
 
 # Режимы — возвращаются вызывающему для лога и тестов.
 CHILD = "child"    # работу ведёт цикл дочерним прогоном
@@ -163,4 +165,40 @@ async def request_estimate(client, issue_input, estimate, *,
     except WorkflowAlreadyStartedError:
         # Тот же вебхук доставлен повторно — оценка уже идёт.
         _log.info("estimate already running for %s#%s", repo, issue_number)
+    return ROOT
+
+
+async def request_research(client, issue_input, analyze, *,
+                          search_attributes=None) -> str:
+    """`/research` или метка `run:research` — продуктовое исследование по Issue.
+
+    Продуктовое исследование фазу двигает: это отдельная стадия `product-research`,
+    предшествующая бизнес-анализу. Цикл поднимает её дочерним прогоном.
+    """
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    repo, issue_number = analyze.repo, analyze.issue_number
+    handle = await client.start_workflow(
+        "IssueLifecycle",
+        issue_input,
+        id=issue_workflow_id(repo, issue_number),
+        task_queue=TASK_QUEUE,
+        search_attributes=search_attributes,
+        start_signal="research_requested",
+        start_signal_args=[analyze.comment_id],
+    )
+    if await _cycle_handles_agents(handle, repo, issue_number):
+        return CHILD
+
+    try:
+        await client.start_workflow(
+            RESEARCH_WORKFLOW, analyze,
+            id=research_workflow_id(repo, issue_number, analyze.comment_id or 0),
+            task_queue=TASK_QUEUE,
+            search_attributes=search_attributes,
+        )
+    except WorkflowAlreadyStartedError:
+        # Прогон по этому Issue уже идёт: пользователь видел ack первого
+        # запуска, второй ack был бы шумом. Webhook — чистый транспорт.
+        _log.info("research already running for %s#%s", repo, issue_number)
     return ROOT

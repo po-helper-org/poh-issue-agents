@@ -22,7 +22,7 @@ TRIGGER_COLOR = "#2DA160"
 NEUTRAL_COLOR = "#666666"
 
 ADVISOR_KINDS = ("answered", "bug", "consultation", "error",
-                 "existing-functionality", "feature-request")
+                 "existing-functionality", "feature-request", "product-research")
 PRIORITY_LEVELS = ("P0", "P1", "P2", "P3")
 
 _HUMAN_DECISION_DESCRIPTIONS = {
