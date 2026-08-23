@@ -22,6 +22,7 @@ class FakeHandle:
         self._sink = sink
         self._fail = fail
         self._handles_agents = handles_agents
+        self.first_execution_run_id = "test-run-123"
 
     async def signal(self, name, *args, **kwargs):
         if self._fail:
@@ -266,3 +267,51 @@ def test_quoted_command_does_not_run(webhook):
 
     assert [c["workflow"] for c in fake.started] == ["CommentAck"]
     assert ("user_comment", ("> /analyze\n\nсогласен", 555)) in fake.signals
+
+
+def test_triage_command_starts_issue_lifecycle(webhook):
+    """Команда `/triage` запускает полный жизненный цикл Issue с начала."""
+    fake, app_client = webhook()
+
+    assert _post(app_client, _comment("/triage")).status_code == 200
+
+    assert [c["workflow"] for c in fake.started] == ["CommentAck", "IssueLifecycle"]
+    call = fake.started[1]
+    assert call["workflow"] == "IssueLifecycle"
+    assert call["id"] == "issue-acme/widgets-7"
+    assert call["arg"].interactive is True, "команда из треда — есть кому отвечать"
+    assert call["start_signal"] is None, "triage не использует signal-with-start"
+
+
+def test_triage_already_running_clearly_explains(webhook):
+    """Повторный `/triage` не запускает второй прогон и объясняет это."""
+    fake, app_client = webhook(already={"IssueLifecycle"})
+
+    assert _post(app_client, _comment("/triage")).status_code == 200
+
+    # IssueLifecycle уже запущен — не стартуем его снова
+    assert not any(c["workflow"] == "IssueLifecycle" for c in fake.started)
+
+
+def test_triage_from_label_starts_issue_lifecycle(make_client):
+    """Метка `run:triage` запускает жизненный цикл без интерактивности."""
+    fake, app_client = make_client()
+
+    assert _post(app_client, _labeled("run:triage")).status_code == 200
+
+    assert len(fake.started) == 1
+    call = fake.started[0]
+    assert call["workflow"] == "IssueLifecycle"
+    assert call["id"] == "issue-acme/widgets-7"
+    assert call["arg"].interactive is False, "метка — некому отвечать на уточнения"
+    assert call["start_signal"] is None, "triage не использует signal-with-start"
+
+
+def test_triage_from_label_already_running_clearly_explains(make_client):
+    """Повторная метка `run:triage` не запускает второй прогон."""
+    fake, app_client = make_client(already_started={"IssueLifecycle"})
+
+    assert _post(app_client, _labeled("run:triage")).status_code == 200
+
+    assert len(fake.started) == 0, "уже запущен — второй прогон не нужен"
+

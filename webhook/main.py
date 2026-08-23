@@ -21,6 +21,7 @@ Webhook receiver: единственная точка входа для GitHub. 
 Ничего из бизнес-логики здесь нет — это чистый транспортный слой.
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -37,6 +38,7 @@ from shared.commands import (
     BFT,
     BFT_DEEP,
     ESTIMATE,
+    TRIAGE,
     bft_mode,
     build_analyze_input,
     build_bft_request,
@@ -44,7 +46,7 @@ from shared.commands import (
     parse_label_command,
 )
 from shared.agent_comment import is_agent_comment
-from shared.agent_launcher import request_analysis, request_bft, request_estimate
+from shared.agent_launcher import request_analysis, request_bft, request_estimate, request_triage
 from shared.authz import may_trigger, trigger_allowlist
 from shared.labels import HUMAN_DECISION_LABELS, parse_root_issue
 from shared.repos import allowed_specs, is_allowed
@@ -515,10 +517,40 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                     # Отвечать на уточняющий вопрос тут некому: триггер — метка.
                     _issue_input(payload, interactive=False),
                     # Без comment_id и без уточнений: метка несёт только сам факт
-                    # запуска, и это законно — «пересобери по тому, что в Issue».
+                    # запуска, и это законно — «пересобри по тому, что в Issue».
                     build_bft_request(payload, bft_mode(command)),
                     search_attributes=_search_attributes(repo, payload, issue_number),
                 )
+                return {"ok": True}
+
+            if command == TRIAGE:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                # Отвечать на уточняющий вопрос тут некому: триггер — метка.
+                wf_id = issue_workflow_id(repo, issue_number)
+                started = await request_triage(
+                    client,
+                    _issue_input(payload, interactive=False),
+                    repo,
+                    issue_number,
+                    search_attributes=_search_attributes(repo, payload, issue_number),
+                )
+                if not started:
+                    # Цикл уже идёт — ставим понятный комментарий в Issue.
+                    try:
+                        from worker import github_client
+                        handle = client.get_workflow_handle(wf_id)
+                        run_id = handle.first_execution_run_id if hasattr(handle, "first_execution_run_id") else "неизвестен"
+                        message = (f"⚠️ Триаж уже запущен для этого Issue (RunID: {run_id}). "
+                                 f"Повторный запуск не требуется.")
+                        await asyncio.to_thread(
+                            github_client.add_comment,
+                            repo,
+                            issue_number,
+                            message
+                        )
+                    except Exception as exc:
+                        _log.warning("не удалось сообщить о уже запущенном триаже: %s", exc)
                 return {"ok": True}
 
             if label in HUMAN_DECISION_LABELS:
@@ -616,6 +648,37 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                 build_analyze_input(payload),
                 search_attributes=_search_attributes(repo, payload, issue_number),
             )
+            return {"ok": True}
+
+        if command == TRIAGE:
+            if not _may_start_expensive(payload, "/triage", repo, issue_number):
+                return {"ok": True}
+            comment_id = payload["comment"]["id"]
+            wf_id = workflow_id_for(repo, issue_number)
+            started = await request_triage(
+                client,
+                _issue_input(payload, interactive=True),
+                repo,
+                issue_number,
+                comment_id=comment_id,
+                search_attributes=_search_attributes(repo, payload, issue_number),
+            )
+            if not started:
+                # Цикл уже идёт — ставим понятный комментарий в Issue.
+                try:
+                    from worker import github_client
+                    handle = client.get_workflow_handle(wf_id)
+                    run_id = handle.first_execution_run_id if hasattr(handle, "first_execution_run_id") else "неизвестен"
+                    message = (f"⚠️ Триаж уже запущен для этого Issue (RunID: {run_id}). "
+                             f"Повторный запуск не требуется.")
+                    await asyncio.to_thread(
+                        github_client.add_comment,
+                        repo,
+                        issue_number,
+                        message
+                    )
+                except Exception as exc:
+                    _log.warning("не удалось сообщить о уже запущенном триаже: %s", exc)
             return {"ok": True}
 
         wf_id = workflow_id_for(repo, issue_number)

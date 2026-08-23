@@ -164,3 +164,34 @@ async def request_estimate(client, issue_input, estimate, *,
         # Тот же вебхук доставлен повторно — оценка уже идёт.
         _log.info("estimate already running for %s#%s", repo, issue_number)
     return ROOT
+
+
+async def request_triage(client, issue_input, repo: str, issue_number: int,
+                        *, comment_id: int | None = None,
+                        search_attributes=None) -> bool:
+    """`/triage` или метка `run:triage` — запустить триаж Issue с начала.
+
+    Запускает сам жизненный цикл IssueLifecycle, как при событии issues.opened.
+    Возвращает True если workflow успешно запущен, False если уже был запущен.
+    """
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    wf_id = issue_workflow_id(repo, issue_number)
+    try:
+        await client.start_workflow(
+            "IssueLifecycle",
+            issue_input,
+            id=wf_id,
+            task_queue=TASK_QUEUE,
+            search_attributes=search_attributes,
+        )
+        _log.info("triage started for %s#%s (workflow_id=%s, interactive=%s)",
+                 repo, issue_number, wf_id, issue_input.interactive)
+        return True
+    except WorkflowAlreadyStartedError:
+        # Цикл уже идёт — это штатно, например при повторной доставке
+        # метки или при повторном вызове команды.
+        _log.info("triage already running for %s#%s (workflow_id=%s)",
+                 repo, issue_number, wf_id)
+        return False
+

@@ -18,13 +18,14 @@ from shared.workflow_types import AnalyzeInput, BftRequest
 
 ESTIMATE = "estimate"
 ANALYZE = "analyze"
+TRIAGE = "triage"
 # БФТ двумя командами, а не одной с флагом: цена у них разная на два порядка
 # (один вызов модели против пайплайна в клоне репозитория), и человек обязан
 # видеть, что именно он запускает, ещё до запуска.
 BFT = "bft"
 BFT_DEEP = "bft-deep"
 
-_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE,
+_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE, "/triage": TRIAGE,
              "/bft": BFT, "/bft-deep": BFT_DEEP}
 
 # Схема имён — namespace через двоеточие, как в протоколе агентов v1
