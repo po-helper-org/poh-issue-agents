@@ -15,6 +15,7 @@ logging.basicConfig(
 
 import activities
 import consolidation_activities as ca
+import delivery_bridge
 from consolidation_workflow import ConsolidationWorkflow
 from shared import sentry_setup
 from shared.temporal_client import connect_temporal
@@ -48,6 +49,39 @@ DEVELOP_ACTIVITIES = [
     activities.dev_tests,
     activities.dev_publish,
 ]
+
+
+_log = logging.getLogger("worker")
+
+
+def _delivery_worker(client) -> Worker | None:
+    """Воркер Delivery-Agent — отдельная очередь и отдельный пул потоков.
+
+    Отдельная очередь, а не общая: один шаг релиза держит активность минутами
+    (мерж, выкатка, проверки живого сервиса), и на общем пуле из трёх слотов
+    релиз вытеснял бы триаж Issue. Разводка по очередям решает это без
+    приоритетов и без настроек.
+
+    Нет пакета — не отказ старта: контур обязан подниматься и без Delivery-Agent,
+    иначе несобравшийся модуль-сосед останавливает всю обработку Issue.
+    """
+    try:
+        from poh_delivery import integration as delivery
+    except ImportError:
+        _log.warning("poh_delivery не установлен — релизы отключены, остальной контур работает")
+        return None
+
+    delivery_bridge.install()
+    return Worker(
+        client,
+        task_queue=delivery.TASK_QUEUE,
+        workflows=delivery.WORKFLOWS,
+        activities=delivery.ACTIVITIES,
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        activity_executor=ThreadPoolExecutor(max_workers=2),
+        max_concurrent_activities=2,
+        debug_mode=True,
+    )
 
 
 async def main() -> None:
@@ -131,6 +165,9 @@ async def main() -> None:
             ca.slice_zone,
             ca.synthesize_unifying_issue,
             ca.write_consolidation_pr,
+            # Активность Harness, которую зовёт воркфлоу релиза: конфликт в
+            # ветке чинит тот же агент разработки, что пишет код по задачам.
+            delivery_bridge.fix_conflicts,
         ],
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
@@ -151,8 +188,14 @@ async def main() -> None:
         # draining meaningfully faster than serial.
         max_concurrent_activities=3,
     )
-    print("Worker started, listening on task queue 'issue-lifecycle'")
-    await worker.run()
+    delivery = _delivery_worker(client)
+    if delivery is None:
+        print("Worker started, listening on task queue 'issue-lifecycle'")
+        await worker.run()
+        return
+
+    print("Worker started, listening on task queues 'issue-lifecycle' and 'delivery'")
+    await asyncio.gather(worker.run(), delivery.run())
 
 
 if __name__ == "__main__":
