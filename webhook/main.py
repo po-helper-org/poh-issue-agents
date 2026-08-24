@@ -17,6 +17,8 @@ Webhook receiver: единственная точка входа для GitHub. 
                                build-me) идут через signal-with-start: воркфлоу
                                триажа может не существовать, тогда он
                                поднимается тем же вызовом
+- `/release` и `run:release` -> старт DeliveryRelease на очереди Delivery-Agent:
+                               релиз репозитория, а не работа по одному Issue
 
 Ничего из бизнес-логики здесь нет — это чистый транспортный слой.
 """
@@ -37,6 +39,7 @@ from shared.commands import (
     BFT,
     BFT_DEEP,
     ESTIMATE,
+    RELEASE,
     bft_mode,
     build_analyze_input,
     build_bft_request,
@@ -51,6 +54,7 @@ from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import (
     comment_ack_workflow_id,
+    delivery_workflow_id,
     estimate_workflow_id,
     issue_workflow_id,
 )
@@ -411,6 +415,39 @@ async def github_webhook(
         return {"ok": True}
 
 
+DELIVERY_TASK_QUEUE = os.environ.get("DELIVERY_TASK_QUEUE", "delivery")
+
+
+async def _start_release(client, repo: str, payload: dict, issue_number: int,
+                         comment_id: int | None) -> None:
+    """Старт релиза Delivery-Agent.
+
+    Воркфлоу зовётся СТРОКОЙ, а вход уезжает словарём: вебхуку не нужен ни сам
+    модуль Delivery-Agent, ни его типы — он остаётся транспортом, а модуль
+    ставится только в образ воркера. Ключи словаря — поля `DeliveryRequest`,
+    их разбирает конвертер Temporal на стороне воркера.
+    """
+    sender = (payload.get("sender") or {}).get("login", "")
+    try:
+        await client.start_workflow(
+            "DeliveryRelease",
+            {
+                "repo": repo,
+                "requested_by": sender,
+                "issue_number": issue_number,
+                "comment_id": comment_id or 0,
+                "dry_run": False,
+            },
+            id=delivery_workflow_id(repo),
+            task_queue=DELIVERY_TASK_QUEUE,
+        )
+        _log.info("релиз %s запущен по просьбе %s", repo, sender or "?")
+    except WorkflowAlreadyStartedError:
+        # Второй релиз в том же репозитории — не сбой доставки, а попытка
+        # запустить выкатку поверх идущей. Отвечаем 200: GitHub ретраить нечего.
+        _log.info("релиз %s уже идёт — повторная команда проигнорирована", repo)
+
+
 async def _handle_delivery(payload: dict, x_github_event: str,
                            x_github_delivery: str | None):
     # Allowlist: действуем только на репозитории из ISSUE_AGENT_REPOS (пусто/* —
@@ -492,6 +529,12 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                     build_analyze_input(payload),  # без comment_id: триггер — метка
                     search_attributes=_search_attributes(repo, payload, issue_number),
                 )
+                return {"ok": True}
+
+            if command == RELEASE:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                await _start_release(client, repo, payload, issue_number, None)
                 return {"ok": True}
 
             if command == ESTIMATE:
@@ -576,6 +619,13 @@ async def _handle_delivery(payload: dict, x_github_event: str,
         # команда НЕ уходит в user_comment, иначе её съел бы цикл уточнений
         # intake gate как ответ на уточняющий вопрос.
         command = parse_command(payload["comment"].get("body") or "")
+
+        if command == RELEASE:
+            if not _may_start_expensive(payload, "/release", repo, issue_number):
+                return {"ok": True}
+            await _start_release(client, repo, payload, issue_number,
+                                 payload["comment"]["id"])
+            return {"ok": True}
 
         if command == ESTIMATE:
             if not _may_start_expensive(payload, "/estimate", repo, issue_number):

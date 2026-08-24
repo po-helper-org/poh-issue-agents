@@ -63,3 +63,15 @@ def pr_fix_workflow_id(repo_full_name: str, pr_number: int, round_number: int) -
     # Без номера он упирался бы в id первого, и доводка PR вставала бы после
     # первого же круга.
     return f"prfix-{repo_full_name}-{pr_number}-{round_number}"
+
+
+def delivery_workflow_id(repo_full_name: str) -> str:
+    """Релиз в репозитории — ровно один за раз.
+
+    Ключ по репозиторию, без номера Issue и без комментария: два одновременных
+    релиза мержили бы в одну ветку по двум разным планам, и ни один из них не
+    смог бы честно сказать, что он выкатил. Повторная команда при идущем
+    релизе упирается в WorkflowAlreadyStarted — это и есть нужный ответ
+    «релиз уже идёт», а не второй прогон.
+    """
+    return f"delivery-{repo_full_name}"
