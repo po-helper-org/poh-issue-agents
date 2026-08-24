@@ -55,3 +55,27 @@ def test_paths_live_under_shared_workspace():
     root, clone = delivery_bridge._paths("acme/widgets", 7)
     assert clone == root / "repo"
     assert str(root).endswith("delivery-acme__widgets-7")
+
+
+def test_review_request_carries_the_command_first(monkeypatch):
+    """`/review` обязана быть ПЕРВОЙ строкой — по ней срабатывает workflow ревью.
+
+    Команда в конце текста читается человеком как просьба, а автоматикой — никак:
+    круг вносил правки и ждал ревью, которое не начиналось.
+    """
+    assert delivery_bridge.REVIEW_REQUEST.startswith("/review")
+
+
+def test_review_is_fresh_only_for_the_current_head(monkeypatch):
+    comments = [{"body": "Persistent review updated to latest commit abc1234"}]
+    monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
+                        lambda repo, n, limit=100: comments)
+    assert delivery_bridge._review_is_fresh("o/r", 1, "abc1234def567890")
+    assert not delivery_bridge._review_is_fresh("o/r", 1, "9999999aaaa")
+
+
+def test_review_without_any_mark_is_not_fresh(monkeypatch):
+    """Ревью не проводилось — значит вердикта нет, а не «всё хорошо»."""
+    monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
+                        lambda repo, n, limit=100: [{"body": "просто комментарий"}])
+    assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")

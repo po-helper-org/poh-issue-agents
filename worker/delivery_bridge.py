@@ -25,11 +25,17 @@ from pathlib import Path
 from temporalio import activity
 
 import github_client
-from shared import develop
+from shared import develop, pr_closing
 
 _log = logging.getLogger(__name__)
 
 MERGE_MESSAGE = "merge: {base} в ветку PR #{pr} (разрешение конфликтов Delivery-Agent)"
+
+REVIEW_REQUEST = (
+    f"{pr_closing.REVIEW_COMMAND}\n\n"
+    "Delivery-Agent: ветка обновилась, прошу ревью текущего коммита. "
+    "Пока вердикта по нему нет, PR в релиз не берётся."
+)
 
 
 def token_provider(repo: str) -> str:
@@ -257,4 +263,73 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
     return f"конфликт разрешён агентом разработки в {len(files)} файл(ах)"
 
 
-HARNESS_ACTIVITIES = [fix_conflicts]
+
+
+
+# --- круг ревью: вердикт как условие мержа ---
+
+def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
+    """Ревью относится к текущему коммиту ветки, а не к прежнему.
+
+    Проверяется по отметке PR-Agent («Review updated until commit …»): ревью
+    вчерашнего кода — не разрешение влить сегодняшний.
+    """
+    from poh_delivery import review as review_module
+
+    comments = github_client.list_comments(repo, pr_number, limit=100)
+    notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
+    seen = review_module.review_head(notes)
+    if not seen:
+        return False
+    return head_sha.startswith(seen) or seen.startswith(head_sha[:7])
+
+
+@activity.defn(name="delivery_review_round")
+async def review_round(repo: str, pr_number: int, round_number: int):
+    """Один круг «ревью → правки» по требованию Delivery-Agent.
+
+    Тот же круг, что ведёт цикл Issue в фазе `pr-review`, только позванный
+    релизом. Возврат — вердикт круга, по которому релиз решает, вливать ли:
+
+    - ревью на текущий коммит ещё нет → просим `/review` и ждём (`changed=False`,
+      `settled=False`);
+    - агент внёс правки → нужен новый круг (`changed=True`);
+    - агент не нашёл, что исправлять → это и есть «замечаний нет», итог
+      публикуется комментарием и становится машинно читаемым вердиктом.
+    """
+    import activities
+    from poh_delivery.model import ReviewRound
+
+    pull = await asyncio.to_thread(github_client.get_pull, repo, pr_number)
+    head_sha = pull["head"]["sha"]
+
+    if not await asyncio.to_thread(_review_is_fresh, repo, pr_number, head_sha):
+        await asyncio.to_thread(github_client.post_comment, repo, pr_number, REVIEW_REQUEST)
+        return ReviewRound(settled=False, changed=False,
+                           detail="запрошено ревью текущего коммита")
+
+    result = await activities.run_pr_fix_round(repo, pr_number, round_number)
+    if result is True:
+        # Правки уже запушены, и круг сам попросил перепроверку — новый коммит
+        # обнулит свежесть ревью, следующий круг это увидит.
+        return ReviewRound(settled=False, changed=True,
+                           detail=f"круг {round_number}: правки внесены, ревью запрошено")
+
+    verdict_text = result if isinstance(result, str) else ""
+    await asyncio.to_thread(
+        github_client.post_comment, repo, pr_number,
+        pr_closing.settled_comment(round_number, verdict=verdict_text))
+    return ReviewRound(settled=True, changed=False,
+                       detail=f"круг {round_number}: замечаний, требующих правок, нет")
+
+
+@activity.defn(name="delivery_review_exhausted")
+async def review_exhausted(repo: str, pr_number: int, rounds: int) -> None:
+    """Круги кончились, вердикта нет — PR уходит человеку, а не в релиз."""
+    await asyncio.to_thread(
+        github_client.post_comment, repo, pr_number, pr_closing.exhausted_comment(rounds))
+    await asyncio.to_thread(
+        github_client.add_label, repo, pr_number, pr_closing.NEEDS_HUMAN_PR)
+
+
+HARNESS_ACTIVITIES = [fix_conflicts, review_round, review_exhausted]

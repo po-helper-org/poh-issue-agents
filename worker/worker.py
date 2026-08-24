@@ -167,9 +167,12 @@ async def main() -> None:
             ca.slice_zone,
             ca.synthesize_unifying_issue,
             ca.write_consolidation_pr,
-            # Активность Harness, которую зовёт воркфлоу релиза: конфликт в
-            # ветке чинит тот же агент разработки, что пишет код по задачам.
+            # Активности Harness, которые зовёт воркфлоу релиза: конфликт в
+            # ветке и круг правок по ревью ведёт тот же агент разработки, что
+            # пишет код по задачам.
             delivery_bridge.fix_conflicts,
+            delivery_bridge.review_round,
+            delivery_bridge.review_exhausted,
         ],
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
