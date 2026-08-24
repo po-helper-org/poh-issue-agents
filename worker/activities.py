@@ -2189,7 +2189,9 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     Агенту токен не давали намеренно; здесь он уже не нужен агенту, а нужен
     контуру. Возвращает номер PR либо None, если агент ничего не изменил.
     """
-    _, clone_dir = _dev_paths(issue)
+    # Корень задачи нужен не только клону: туда перекладывается файл намерений,
+    # чтобы пережить снятие из рабочего дерева.
+    root, clone_dir = _dev_paths(issue)
     # Постановка — вход контура, а не часть правки. Она лежит в рабочем дереве, и
     # `git add -A` забирает её вместе с кодом: на живом прогоне это дало PR из
     # одного файла на 1721 строку — нашей же постановки. Хуже того, дифф из неё
@@ -2197,7 +2199,7 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     # прогону, в котором агент не тронул ни одного файла.
     # Одна точка снятия на весь контур: перечень служебных файлов живёт в
     # `shared/develop.py`, а не переписывается в каждой функции заново.
-    removed = develop.clear_service_files(clone_dir)
+    removed = develop.clear_service_files(clone_dir, keep_dir=root)
     if removed:
         logger.info("Develop %s#%s: сняты служебные файлы: %s",
                     issue.repo, issue.issue_number, ", ".join(removed))
@@ -2421,7 +2423,10 @@ async def capture_episode(issue: IssueInput, branch: str,
         return False
 
     root, clone_dir = _dev_paths(issue)
-    reflect = _read_reflect_note(clone_dir)
+    # Из КОРНЯ: к этому моменту публикация уже сняла файл из рабочего дерева и
+    # переложила сюда. Чтение из клона давало пустое намерение при исправном
+    # агенте — файл удалялся за секунды до чтения.
+    reflect = _read_reflect_note(root) or _read_reflect_note(clone_dir)
 
     episode = {
         "run_id": activity.info().workflow_id,

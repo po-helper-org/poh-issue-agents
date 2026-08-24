@@ -110,20 +110,47 @@ SERVICE_FILES = (
 )
 
 
-def clear_service_files(clone_dir) -> list[str]:
+# Служебные файлы, содержимое которых нужно ПОСЛЕ снятия.
+#
+# «Снять из рабочего дерева» и «уничтожить» — разные вещи, и путать их дорого.
+# `.reflect.md` обязан исчезнуть из клона до коммита, но его читает запись об
+# итерации, а она идёт после публикации. Первый живой прогон это и показал:
+#
+#   17:50:28  сняты служебные файлы: .task.md, .reflect.md
+#   17:50:32  запись об итерации отдана слою памяти
+#
+# Агент инструкцию выполнил, файл написал — и он был удалён за четыре секунды
+# до чтения. Намерение в записи оказалось пустым при исправном агенте.
+PRESERVED_FILES = (".reflect.md",)
+
+
+def clear_service_files(clone_dir, keep_dir=None) -> list[str]:
     """Снять служебные файлы из рабочего дерева. Возвращает имена снятых.
 
     Вызывается ПЕРЕД коммитом на обоих путях — и в разработке, и в круге
     правок. Одна точка снятия вместо разрозненных: пропущенный файл здесь
     означает не ошибку сборки, а тихо испорченный пул-реквест.
+
+    `keep_dir` — куда переложить файлы из `PRESERVED_FILES` вместо удаления.
+    Обычно это корень задачи: он лежит ВНЕ рабочего дерева git, поэтому в
+    коммит содержимое не попадёт, а прочитать его позже можно.
     """
     from pathlib import Path
     removed = []
     for name in SERVICE_FILES:
         path = Path(clone_dir) / name
-        if path.exists():
-            path.unlink(missing_ok=True)
-            removed.append(name)
+        if not path.exists():
+            continue
+        if keep_dir is not None and name in PRESERVED_FILES:
+            target = Path(keep_dir) / name
+            try:
+                target.write_bytes(path.read_bytes())
+            except OSError:
+                # Не сохранили — не повод оставить файл в дереве: в коммите он
+                # опаснее, чем потеря его содержимого.
+                pass
+        path.unlink(missing_ok=True)
+        removed.append(name)
     return removed
 
 
