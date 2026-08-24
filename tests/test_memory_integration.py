@@ -129,11 +129,17 @@ def test_reflect_note_instruction_is_its_own_block():
     assert a.REFLECT_NOTE_FILE not in a._DEV_FALLBACK_RULES
 
 
-def test_reflect_note_block_survives_section_parsing():
-    """Блок с решётки стал бы именем секции и исчез."""
-    assert a._DEV_REFLECT_NOTE_RULE.startswith("\n")
-    task = a._join_sections(a._split_sections([a._DEV_REFLECT_NOTE_RULE]))
-    assert a.REFLECT_NOTE_FILE in task
+def test_reflect_note_block_is_its_own_contour_section():
+    """Своей секцией, а не довеском к соседней.
+
+    Приклеенный блок делит судьбу соседа при усечении — так на прогоне #105
+    правила организации утащили за собой инструкции контура.
+    """
+    secs = a._split_sections([a._DEV_REFLECT_NOTE_RULE])
+    assert len(secs) == 1
+    assert secs[0][0] == "## След решения"
+    assert a.REFLECT_NOTE_FILE in a._join_sections(secs)
+    assert a._section_rank("## След решения", 1, "T") == a._RANK_CONTOUR
 
 
 def test_reflect_note_instruction_survives_repo_own_rules():
