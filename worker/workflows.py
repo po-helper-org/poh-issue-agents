@@ -2355,6 +2355,32 @@ class IssueDevelopment:
             retry_policy=cheap,
         )
 
+        # Запись об итерации — слою саморефлексии, если он подключён.
+        #
+        # ПОД МАРКЕРОМ, а не просто вызовом: новая команда в теле воркфлоу
+        # роняет недетерминизмом прогоны, начатые до выкладки, а прогон агента
+        # идёт до 45 минут и выкладку переживает. Прецедент в этом же файле:
+        # реплей без маркера падает `Timer machine does not handle
+        # ActivityTaskScheduled` — так легли подзадачи #20–#27 на стенде.
+        #
+        # ПОСЛЕ публикации и ДО проверки на `None`: запись нужна и о прогоне,
+        # который не дал ни одного изменённого файла. Это самый интересный для
+        # разбора исход, и терять его было бы ровно наоборот замыслу.
+        if workflow.patched("issue-lifecycle-capture-episode"):
+            try:
+                await workflow.execute_activity(
+                    activities.capture_episode, args=[issue, plan.branch, number],
+                    start_to_close_timeout=timedelta(seconds=60),
+                    # Активность детерминирована и дёшева: три попытки уместны.
+                    retry_policy=cheap,
+                )
+            except Exception as e:                       # noqa: BLE001 — см. ниже
+                # Слой саморефлексии ОПЦИОНАЛЕН, и его отказ не имеет права
+                # стоить прогона разработки. Работа сделана, пул-реквест открыт;
+                # потеря записи — досадно, потеря прогона — недопустимо.
+                workflow.logger.warning(
+                    "запись об итерации не отдана слою памяти: %s", _failure_reason(e))
+
         if number is None:
             raise ApplicationError("агент не изменил ни одного файла — открывать нечего")
         return number

@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -31,6 +32,7 @@ from shared import (
     develop,
     labels,
     lifecycle,
+    memory,
     pr_closing,
     repowise,
     sentry_setup,
@@ -1230,30 +1232,100 @@ def _refresh_issue_body(issue: IssueInput) -> str:
         return issue.body
 
 
-def _apply_size_limit(parts: list[str], limit: int, priority_order: list[int] | None = None) -> list[str]:
-    """Обрезает части постановки по лимиту, удаляя от старого к свежему.
-    
-    `priority_order` — индексы частей, которые обрезаются в последнюю очередь.
-    Если не задан, все части равноправны.
+def _split_sections(parts: list[str]) -> list[tuple[str, str]]:
+    """Разложить куски постановки на секции `(заголовок, содержимое)`.
+
+    Заголовком считается ПЕРВАЯ СТРОКА куска, начинающегося с решётки, а не
+    весь кусок. Раньше весь кусок целиком становился именем секции, и его
+    содержимое исчезало: так терялся весь блок правил репозитория
+    (`_DEV_FALLBACK_RULES`) вместе с инструкцией писать находки в
+    `.followups.md`, которую `collect_dev_followups` затем честно читал.
+    Уцелевал ровно один блок — тот, что начинается с перевода строки.
     """
-    if priority_order is None:
-        priority_order = []
-    
-    # Сортируем индексы по приоритету (сначала низкий приоритет)
-    indices = list(range(len(parts)))
-    indices.sort(key=lambda i: priority_order.index(i) if i in priority_order else -1)
-    
-    total = "\n\n".join(parts)
-    while len(total) > limit and len(parts) > 1:
-        # Удаляем часть с самым низким приоритетом
-        for idx in indices:
-            if idx < len(parts):
-                removed = parts.pop(idx)
-                total = "\n\n".join(parts)
-                logger.debug("обрезка постановки: удалена часть %d (%d симв.), осталось %d",
-                           idx, len(removed), len(total))
-                break
-    return parts
+    sections: list[tuple[str, str]] = []
+    name = ""
+    body: list[str] = []
+
+    def flush() -> None:
+        if name or body:
+            sections.append((name, "\n".join(body).strip("\n")))
+
+    for part in parts:
+        if part.startswith("#"):
+            flush()
+            head, _, rest = part.partition("\n")
+            name, body = head.strip(), ([rest] if rest.strip() else [])
+        else:
+            body.append(part)
+    flush()
+    return sections
+
+
+# Порядок вытеснения при переполнении. Меньше — важнее, вытесняется позже.
+# Соответствует заявленному приоритету: заголовок и тело задачи > план >
+# артефакты аналитики > обсуждение > правила.
+_RANK_TASK, _RANK_PLAN, _RANK_ARTIFACTS, _RANK_DISCUSSION, _RANK_RULES = range(5)
+
+
+def _section_rank(name: str, issue_number: int, title: str) -> int:
+    """Насколько секция важна. Больше — вытесняется раньше."""
+    if not name or name == f"# Задача: реализовать Issue #{issue_number}" \
+            or name == f"## {title}":
+        return _RANK_TASK
+    if name.startswith("## План декомпозиции") or name.startswith("### Подзадачи"):
+        return _RANK_PLAN
+    if name.startswith("## Системные требования") or name.startswith("###"):
+        return _RANK_ARTIFACTS
+    if name.startswith("## Обсуждение"):
+        return _RANK_DISCUSSION
+    return _RANK_RULES
+
+
+def _apply_size_limit(sections: list[tuple[str, str]], limit: int,
+                      issue_number: int, title: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Уложить постановку в потолок, вытесняя наименее важные секции.
+
+    Возвращает `(оставленные, имена вытесненных)`.
+
+    Раньше здесь был дефект, из-за которого приоритет не работал вовсе: список
+    индексов строился один раз и не пересчитывался после удаления, а цикл
+    брал первый подходящий индекс — всегда один и тот же. Усечение вырождалось
+    в отрезание от фиксированного места вперёд, и артефакты аналитики уходили
+    целиком независимо от объявленного порядка.
+
+    Переполнение достижимо штатно: сумма жёстких потолков артефактов равна
+    общему потолку постановки.
+    """
+    kept = list(sections)
+    dropped: list[str] = []
+
+    def total() -> int:
+        return len(_join_sections(kept))
+
+    while total() > limit and len(kept) > 1:
+        # Кандидат на вытеснение: самый неважный; среди равных — последний.
+        victim = max(range(len(kept)),
+                     key=lambda i: (_section_rank(kept[i][0], issue_number, title), i))
+        if _section_rank(kept[victim][0], issue_number, title) == _RANK_TASK:
+            break                      # тело задачи не вытесняем, лучше превысить
+        name, content = kept.pop(victim)
+        dropped.append(name or "(без заголовка)")
+
+    return kept, dropped
+
+
+def _join_sections(sections: list[tuple[str, str]]) -> str:
+    """Собрать постановку обратно, СОХРАНЯЯ заголовки секций.
+
+    Заголовки нужны агенту: без них постановка превращается в поток текста, где
+    неотличимы тело задачи, артефакты аналитики и правила работы.
+    """
+    out: list[str] = []
+    for name, content in sections:
+        block = "\n".join(x for x in (name, content) if x)
+        if block.strip():
+            out.append(block)
+    return "\n\n".join(out)
 
 
 def _fetch_comment_blocks(analyze: AnalyzeInput) -> list[str]:
@@ -1340,6 +1412,16 @@ def _build_task_context(analyze: AnalyzeInput) -> str:
         parts.append(comments)
     if prs:
         parts.append(prs)
+
+    # Правила организации для роли исследования и аналитики: как формулировать
+    # требования, как считать приоритет, что уточнять до разработки. Блок
+    # дописывается последним и не начинается с заголовка — так же, как в
+    # постановке разработки. Слой выключен — текст пуст, контекст не меняется.
+    org_rules = memory.rules(memory.ISSUE, repo=analyze.repo,
+                             query=f"{analyze.title}\n{analyze.body or ''}")
+    if org_rules.text:
+        parts.append(org_rules.text)
+
     return "\n\n".join(parts)
 
 
@@ -1633,8 +1715,13 @@ def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
     return root, root / "repo"
 
 
-def _dev_prepare(issue: IssueInput, branch: str) -> str:
-    """Свежий клон + постановка файлом. Возвращает текст постановки.
+def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
+    """Свежий клон + постановка файлом.
+
+    Возвращает текст постановки и перечень идентификаторов правил, подсыпанных
+    слоем саморефлексии. Перечень нужен записи об итерации: без него нельзя
+    отличить «правило сработало» от «правило не читали», и счётчики
+    подтверждения на стороне слоя теряют смысл.
 
     Постановка собирается ЗДЕСЬ, а не в промпте агента: то, что уехало в
     работу, должно быть видно дословно. Иначе на разборе «почему агент сделал
@@ -1719,50 +1806,66 @@ def _dev_prepare(issue: IssueInput, branch: str) -> str:
     if repowise.enabled():
         parts.append(_DEV_REPOWISE_RULES)
 
-    # 6. Применение потолка размера с усечением по приоритету (ISSUE-113 пункт 6)
+    # 7. Правила и накопленный опыт организации — слой саморефлексии.
+    #
+    # Отбор идёт ЗДЕСЬ, а не отдельной активностью перед этой. Отдельная
+    # активность повезла бы текст правил через полезную нагрузку Temporal, а
+    # это против решения, закреплённого `tests/test_develop_child.py`: между
+    # шагами едут числа и пути, не содержимое, потолок 4 КБ.
+    #
+    # Блок дописывается ПОСЛЕДНИМ и НЕ начинается с заголовка: разбор на
+    # секции ниже сделал бы его именем секции без содержимого. При выключенном
+    # слое текст пуст, и постановка не меняется ни на символ.
+    memory_rules = memory.rules(memory.DEVELOP, repo=issue.repo,
+                                query=f"{issue.title}\n{fresh_body or ''}")
+    if memory_rules.text:
+        parts.append(memory_rules.text)
+
+    # 8. Потолок размера с усечением по приоритету (ISSUE-113 пункт 6)
     # Приоритет: заголовок/тело > план > артефакты > обсуждение > правила
-    task_parts = []
-    current_section = []
-    section_name = ""
-    
-    for part in parts:
-        # Определяем заголовок секции (начинается с #)
-        if part.startswith("#") and not part.startswith("##"):  # Главный заголовок
-            if current_section:
-                task_parts.append((section_name, "\n".join(current_section)))
-            section_name = part
-            current_section = []
-        elif part.startswith("##"):  # Заголовок уровня 2
-            if current_section:
-                task_parts.append((section_name, "\n".join(current_section)))
-            section_name = part
-            current_section = []
-        else:
-            current_section.append(part)
-    
-    if current_section:
-        task_parts.append((section_name, "\n".join(current_section)))
-    
-    # Применяем лимит с приоритетом
-    priority_order = []
-    for i, (name, _) in enumerate(task_parts):
-        if name == f"# Задача: реализовать Issue #{issue.issue_number}" or name == f"## {issue.title}":
-            priority_order.append(i)
-        elif name.startswith("## План декомпозиции"):
-            priority_order.append(i)
-        elif name.startswith("## Системные требования"):
-            priority_order.append(i)
-    
-    final_parts = []
-    for name, content in task_parts:
-        final_parts.append(content)
-    
-    final_parts = _apply_size_limit(final_parts, DEV_TASK_MAX_CHARS, priority_order)
-    
-    task = "\n\n".join(final_parts)
+    sections = _split_sections(parts)
+    sections, dropped = _apply_size_limit(
+        sections, DEV_TASK_MAX_CHARS, issue.issue_number, issue.title)
+
+    if dropped:
+        # Уровень warning, а не debug: молча укоротить постановку — значит
+        # изменить задачу агента и не сказать об этом никому.
+        logger.warning("Develop %s#%s: постановка не вместилась, вытеснены секции: %s",
+                       issue.repo, issue.issue_number, "; ".join(dropped))
+
+    task = _join_sections(sections)
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
+
+    # Перечень подсыпанных правил — файлом в КОРНЕ задачи, а не в клоне.
+    # Корень лежит вне рабочего дерева git, поэтому файл физически не может
+    # уехать в коммит: `git add -A` его не видит. Через полезную нагрузку
+    # Temporal перечень не везём — между шагами едут числа и пути.
+    _write_injected_rules(root, memory_rules.ids)
+
     _handover_to_runner(root)
-    return task
+    return task, memory_rules.ids
+
+
+INJECTED_RULES_FILE = ".reflect-rules.json"
+"""Имя файла с перечнем подсыпанных правил. Лежит в корне задачи, вне клона."""
+
+
+def _write_injected_rules(root: Path, ids: list[str]) -> None:
+    """Сохранить перечень. Отказ записи не срывает подготовку постановки."""
+    try:
+        (root / INJECTED_RULES_FILE).write_text(
+            json.dumps(ids, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        logger.warning("перечень подсыпанных правил не сохранён: %s", e)
+
+
+def _read_injected_rules(root: Path) -> list[str]:
+    """Прочитать перечень. Нет файла — пустой список, это обычный ход событий."""
+    try:
+        raw = json.loads((root / INJECTED_RULES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(x) for x in raw] if isinstance(raw, list) else []
 
 
 _DEV_REPOWISE_RULES = """
@@ -1794,6 +1897,10 @@ _DEV_REPOWISE_RULES = """
 """
 
 
+REFLECT_NOTE_FILE = ".reflect.md"
+"""Файл намерений агента. Входит в перечень служебных файлов и не коммитится."""
+
+
 _DEV_FALLBACK_RULES = f"""## Как работать
 
 Правила репозитория — в `AGENTS.md` и `CLAUDE.md`, они обязательны.
@@ -1807,6 +1914,12 @@ _DEV_FALLBACK_RULES = f"""## Как работать
    токена у тебя нет намеренно. Ничего не нашёл — файл не создавай.
 3. **Тесты.** Прогоняй проверки проекта; красный прогон в PR не отдаём.
 4. **Коммитить самому не надо** — коммит, пуш и PR делает контур после тебя.
+5. **Оставь след решения.** В конце запиши `{REFLECT_NOTE_FILE}` в корне
+   рабочего каталога тремя разделами: `## Намерение` — что ты решил сделать и
+   почему именно так; `## Допущения` — что принял на веру, не проверив;
+   `## Сомнения` — где не уверен и что стоит перепроверить человеку. По строке
+   на пункт. Это не отчёт о работе: дифф и так виден. Это то, чего по диффу не
+   восстановить — почему сделано так, а не иначе. Файл в коммит не попадёт.
 """
 
 
@@ -1968,7 +2081,12 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     # одного файла на 1721 строку — нашей же постановки. Хуже того, дифф из неё
     # обманывал гвард «изменений нет — открывать нечего», и PR открывался по
     # прогону, в котором агент не тронул ни одного файла.
-    (clone_dir / ".task.md").unlink(missing_ok=True)
+    # Одна точка снятия на весь контур: перечень служебных файлов живёт в
+    # `shared/develop.py`, а не переписывается в каждой функции заново.
+    removed = develop.clear_service_files(clone_dir)
+    if removed:
+        logger.info("Develop %s#%s: сняты служебные файлы: %s",
+                    issue.repo, issue.issue_number, ", ".join(removed))
     work = develop.work_branch(issue.issue_number)
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
@@ -2041,9 +2159,10 @@ async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None =
 
     # Порядок не косметический: сначала клон и постановка — они единственные
     # могут не состояться до того, как что-либо сказано человеку.
-    task = await _run_with_heartbeat(_dev_prepare, issue, branch, label="dev:prepare")
-    logger.info("Develop %s#%s: постановка (%d симв.)\n%s",
-                issue.repo, issue.issue_number, len(task), task[:2000])
+    task, rule_ids = await _run_with_heartbeat(_dev_prepare, issue, branch,
+                                               label="dev:prepare")
+    logger.info("Develop %s#%s: постановка (%d симв.), правил подсыпано %d\n%s",
+                issue.repo, issue.issue_number, len(task), len(rule_ids), task[:2000])
     await _dev_announce(issue, branch, where="запустил OpenHands на своём сервере")
 
     try:
@@ -2107,9 +2226,10 @@ async def dev_prepare(issue: IssueInput, branch: str) -> int:
     дублировать её в payload Temporal незачем. В лог она уходит целиком — там
     её и смотрят, когда разбираются «почему агент сделал не то».
     """
-    task = await _run_with_heartbeat(_dev_prepare, issue, branch, label="dev:prepare")
-    logger.info("Develop %s#%s: постановка (%d симв.)\n%s",
-                issue.repo, issue.issue_number, len(task), task[:2000])
+    task, rule_ids = await _run_with_heartbeat(_dev_prepare, issue, branch,
+                                               label="dev:prepare")
+    logger.info("Develop %s#%s: постановка (%d симв.), правил подсыпано %d\n%s",
+                issue.repo, issue.issue_number, len(task), len(rule_ids), task[:2000])
     return len(task)
 
 
@@ -2164,6 +2284,93 @@ async def dev_publish(issue: IssueInput, branch: str) -> int | None:
     результат; решение, что делать с пустым прогоном, принимает воркфлоу.
     """
     return await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+
+
+@activity.defn
+async def capture_episode(issue: IssueInput, branch: str,
+                          pr_number: int | None) -> bool:
+    """Шаг 7: запись об итерации — слою саморефлексии.
+
+    Горячий такт: фиксируется то, что уже известно коду, БЕЗ обращения к
+    модели. Оценивать в этот момент нечего — фактов об исходе ещё нет, их
+    соберёт отложенный проход рефлексии, когда пул-реквест доедет до слияния
+    или будет закрыт.
+
+    Намерение агента берётся из файла `.reflect.md`, если тот его написал.
+    Отсутствие файла НЕ срывает шаг: запись уходит без намерения, а сигналы и
+    дифф остаются. Требовать от агента файл под угрозой падения стадии значило
+    бы обменять работающую разработку на полноту записи.
+
+    Возврат — успех отправки. Неуспех не роняет прогон: слой опционален.
+    """
+    if not memory.enabled():
+        return False
+
+    root, clone_dir = _dev_paths(issue)
+    reflect = _read_reflect_note(clone_dir)
+
+    episode = {
+        "run_id": activity.info().workflow_id,
+        "repo": issue.repo,
+        "issue": issue.issue_number,
+        "phase": "develop",
+        "agent": memory.DEVELOP,
+        "branch": develop.work_branch(issue.issue_number),
+        "pr_number": pr_number,
+        "model": os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "rules_injected": _read_injected_rules(root),
+        # Число попыток активности: правило контура «Attempt > 1 у долгой
+        # активности — уже беда» до сих пор нигде не читалось кодом.
+        "artifacts": {"activity_attempt": activity.info().attempt},
+        **reflect,
+    }
+    ok = await asyncio.to_thread(memory.put_episode, episode)
+    if ok:
+        logger.info("Develop %s#%s: запись об итерации отдана слою памяти",
+                    issue.repo, issue.issue_number)
+    return ok
+
+
+def _read_reflect_note(clone_dir: Path) -> dict:
+    """Разобрать `.reflect.md`, если агент его написал.
+
+    Формат нарочно простой — заголовки второго уровня «Намерение»,
+    «Допущения», «Сомнения». Требовать от агента строгий JSON значило бы
+    получать пустой файл там, где сейчас получается частичный.
+    """
+    path = clone_dir / REFLECT_NOTE_FILE
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+
+    buckets: dict[str, list[str]] = {}
+    current = None
+    for line in text.split("\n"):
+        head = line.strip().lstrip("#").strip().lower()
+        if line.startswith("#") and head:
+            current = head
+            buckets[current] = []
+        elif current:
+            item = line.strip().lstrip("-").strip()
+            if item:
+                buckets[current].append(item)
+
+    def pick(*names: str) -> list[str]:
+        for n in names:
+            for key, items in buckets.items():
+                if key.startswith(n):
+                    return items
+        return []
+
+    intent = pick("намерение", "intent")
+    return {
+        "intent": " ".join(intent) or None,
+        "assumptions": pick("допущения", "assumptions"),
+        "uncertainty": pick("сомнения", "uncertainty"),
+        "alternatives_rejected": pick("отброшен", "alternatives"),
+    }
 
 
 async def collect_dev_followups(issue: IssueInput) -> list[int]:
@@ -2404,6 +2611,13 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     task = pr_closing.build_task(pr_number, review=review, round_number=round_number,
                                  max_rounds_=pr_closing.max_rounds())
 
+    # Правила организации для роли ревью: что считать замечанием по существу и
+    # как его формулировать. Блок дописывается к постановке здесь, а не в
+    # `pr_closing.build_task`: тот модуль намеренно чистый и в сеть не ходит.
+    org_rules = memory.rules(memory.REVIEW, repo=repo, query=review[:500])
+    if org_rules.text:
+        task += "\n" + org_rules.text
+
     await _run_with_heartbeat(_prfix_prepare, repo, pr_number, branch, task,
                               label="prfix:prepare")
 
@@ -2437,8 +2651,7 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     # докладывал «правки внесены». Исход «замечаний нет, PR готов к merge»
     # становился недостижим: цикл сжигал все три круга и отдавал PR человеку, а
     # настоящий вердикт агента терялся.
-    verdict_path.unlink(missing_ok=True)
-    (clone_dir / ".task.md").unlink(missing_ok=True)
+    develop.clear_service_files(clone_dir)
 
     pushed = await _run_with_heartbeat(
         github_client.push_fixes, repo, str(clone_dir), branch,

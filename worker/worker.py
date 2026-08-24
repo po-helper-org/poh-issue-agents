@@ -47,6 +47,7 @@ DEVELOP_ACTIVITIES = [
     activities.dev_followups,
     activities.dev_tests,
     activities.dev_publish,
+    activities.capture_episode,
 ]
 
 
@@ -118,6 +119,7 @@ async def main() -> None:
             activities.dev_followups,
             activities.dev_tests,
             activities.dev_publish,
+            activities.capture_episode,
             activities.ack_estimate_command,
             activities.collect_estimation_context,
             activities.extract_estimation_facts,
