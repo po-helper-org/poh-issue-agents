@@ -27,32 +27,37 @@ def test_truncate_long_text():
 
 
 def test_apply_size_limit_no_limit():
-    """Без лимита все части сохраняются."""
-    parts = ["Part 1", "Part 2", "Part 3"]
-    result = _apply_size_limit(parts, 1000)
-    assert result == parts
+    """Без лимита все секции сохраняются."""
+    secs = [("# Задача: реализовать Issue #1", "тело"), ("## Обсуждение", "разговор")]
+    kept, dropped = _apply_size_limit(secs, 1000, 1, "T")
+    assert kept == secs and dropped == []
 
 
 def test_apply_size_limit_with_limit():
-    """С лимитом части удаляются по приоритету."""
-    parts = ["AAA", "BBB", "CCC", "DDD"]
-    result = _apply_size_limit(parts, 5, priority_order=[0, 1])  # AAA и BBB приоритетны
-    # При ограничении в 5 символов сохранятся только приоритетные части
-    assert len(result) >= 1  # Хотя бы одна часть останется
+    """С лимитом секции вытесняются, и вытесненные НАЗЫВАЮТСЯ.
+
+    Прежняя редакция писала факт усечения в отладочный лог: постановка молча
+    укорачивалась, и по прогону этого было не видно.
+    """
+    secs = [("# Задача: реализовать Issue #1", "AAA"), ("## Обсуждение", "BBB"),
+            ("## Как работать", "CCC")]
+    kept, dropped = _apply_size_limit(secs, 40, 1, "T")
+    assert len(kept) >= 1
+    assert dropped, "вытеснение обязано быть названо, а не только случиться"
 
 
 def test_apply_size_limit_preserves_priority():
-    """Приоритетные части сохраняются в последнюю очередь."""
-    parts = ["AAA", "BBB", "CCC", "DDD"]
-    result = _apply_size_limit(parts, 10, priority_order=[0])  # AAA самый приоритетный
-    # AAA должна остаться в конце (если всё ещё есть что удалять)
-    assert "AAA" in result
+    """Тело задачи вытесняется последним, правила — первыми."""
+    secs = [("# Задача: реализовать Issue #1", "AAA"), ("## Как работать", "CCC")]
+    kept, dropped = _apply_size_limit(secs, 40, 1, "T")
+    assert "# Задача: реализовать Issue #1" in [n for n, _ in kept]
+    assert dropped == ["## Как работать"]
 
 
 def test_apply_size_limit_empty_list():
     """Пустой список не должен вызывать ошибку."""
-    result = _apply_size_limit([], 100)
-    assert result == []
+    kept, dropped = _apply_size_limit([], 100, 1, "T")
+    assert kept == [] and dropped == []
 
 
 def test_fetch_decomposition_plan_no_marker(monkeypatch):
