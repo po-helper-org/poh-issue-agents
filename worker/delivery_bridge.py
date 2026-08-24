@@ -17,6 +17,7 @@ Delivery-Agent живёт в своём репозитории (`po-helper-org/p
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -109,6 +110,47 @@ def _conflicted_files(clone_dir: Path, repo: str) -> list[str]:
     return [line for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+# Маркеры конфликта в самом файле. `=======` намеренно НЕ маркер: он живёт в
+# обычном markdown как подчёркивание заголовка.
+_MARKER_RE = re.compile(r"^(<<<<<<< |>>>>>>> )", re.MULTILINE)
+
+
+def _files_still_conflicted(clone_dir: Path, files: list[str]) -> list[str]:
+    """Файлы, где маркеры конфликта остались.
+
+    Проверяем СОДЕРЖИМОЕ, а не индекс git. Индекс держит путь «неслитым» до
+    `git add`, а агент разработки правит файлы и ничего не индексирует — по
+    индексу успешно разрешённый конфликт выглядел бы неразрешённым. Живой
+    прогон именно так и провалился: маркеров в файле не осталось, agent
+    отработал, а активность доложила «конфликт остался».
+    """
+    left = []
+    for name in files:
+        path = clone_dir / name
+        if not path.exists():
+            continue
+        if _MARKER_RE.search(path.read_text(encoding="utf-8", errors="ignore")):
+            left.append(name)
+    return left
+
+
+def _lost_lines(clone_dir: Path, repo: str, before: str, files: list[str]) -> int:
+    """Сколько строк ветки PR исчезло при разрешении конфликта.
+
+    Разрешение «оставить чужую версию целиком» выкидывает работу самого PR и не
+    ломает ни тестов, ни проверок — оно просто тихо теряет функциональность.
+    Число попадает в комментарий PR, чтобы у ревью был повод посмотреть.
+    """
+    result = _git(clone_dir, "diff", "--numstat", f"{before}..HEAD", "--", *files,
+                  repo=repo, check=False)
+    lost = 0
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[1].isdigit():
+            lost += int(parts[1])
+    return lost
+
+
 def _conflict_task(repo: str, pr_number: int, base: str, files: list[str]) -> str:
     listing = "\n".join(f"- `{name}`" for name in files)
     return f"""# Разрешить конфликт слияния
@@ -153,6 +195,7 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
     clone_dir = await activities._run_with_heartbeat(
         _prepare_clone, repo, pr_number, branch, base, label="conflict:clone")
 
+    head_before = _git(clone_dir, "rev-parse", "HEAD", repo=repo).stdout.strip()
     merge = _git(clone_dir, "merge", "--no-edit", f"origin/{base}", repo=repo, check=False)
     if merge.returncode == 0:
         _git(clone_dir, "push", "origin", f"HEAD:{branch}", repo=repo)
@@ -188,21 +231,29 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
 
     await activities._run_with_heartbeat(_run, label="conflict:agent")
 
-    still = _conflicted_files(clone_dir, repo)
+    still = _files_still_conflicted(clone_dir, files)
     if still:
         _git(clone_dir, "merge", "--abort", repo=repo, check=False)
-        raise RuntimeError("после круга правок конфликт остался в: " + ", ".join(still))
+        raise RuntimeError("после круга правок маркеры конфликта остались в: " + ", ".join(still))
 
     (clone_dir / ".task.md").unlink(missing_ok=True)
     _git(clone_dir, "add", "-A", repo=repo)
     _git(clone_dir, "commit", "--no-edit", "-m",
          MERGE_MESSAGE.format(base=base, pr=pr_number), repo=repo)
+    lost = _lost_lines(clone_dir, repo, head_before, files)
     _git(clone_dir, "push", "origin", f"HEAD:{branch}", repo=repo)
+
+    warning = ""
+    if lost:
+        warning = (f"\n\n⚠️ При разрешении из ветки PR исчезло строк: **{lost}**. "
+                   f"Разрешение «оставить чужую версию целиком» тестов не ломает — оно молча "
+                   f"теряет работу самого PR. Ревью стоит посмотреть именно на это.")
     await asyncio.to_thread(
         github_client.post_comment, repo, pr_number,
         f"**Delivery-Agent: конфликт с `{base}` разрешён.**\n\n"
         f"Файлы: {', '.join(f'`{name}`' for name in files)}. "
-        f"Ветка обновлена, PR возвращается в релизную очередь после перепроверки.")
+        f"Ветка обновлена, проверки перезапущены; PR вернётся в релизную очередь, "
+        f"когда они станут зелёными." + warning)
     return f"конфликт разрешён агентом разработки в {len(files)} файл(ах)"
 
 
