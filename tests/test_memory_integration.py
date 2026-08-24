@@ -117,10 +117,32 @@ def test_partial_reflect_note_yields_what_there_is(tmp_path):
     assert got["assumptions"] == [] and got["uncertainty"] == []
 
 
-def test_reflect_note_instruction_reaches_the_agent():
-    """Инструкция бесполезна, если блок правил до агента не доходит."""
-    assert a.REFLECT_NOTE_FILE in a._DEV_FALLBACK_RULES
-    task = a._join_sections(a._split_sections([a._DEV_FALLBACK_RULES]))
+def test_reflect_note_instruction_is_its_own_block():
+    """Правила репозитория подменяются его собственными ЦЕЛИКОМ.
+
+    Пока инструкция жила внутри запасных правил, она доходила только до
+    репозиториев БЕЗ своих правил — то есть до самых редких. Найдено живым
+    прогоном: демо-репозиторий имеет свои правила, и файл намерений не
+    появился ни разу.
+    """
+    assert a.REFLECT_NOTE_FILE in a._DEV_REFLECT_NOTE_RULE
+    assert a.REFLECT_NOTE_FILE not in a._DEV_FALLBACK_RULES
+
+
+def test_reflect_note_block_survives_section_parsing():
+    """Блок с решётки стал бы именем секции и исчез."""
+    assert a._DEV_REFLECT_NOTE_RULE.startswith("\n")
+    task = a._join_sections(a._split_sections([a._DEV_REFLECT_NOTE_RULE]))
+    assert a.REFLECT_NOTE_FILE in task
+
+
+def test_reflect_note_instruction_survives_repo_own_rules():
+    """Свои правила репозитория не должны вытеснять требование контура."""
+    parts = ["# Задача: реализовать Issue #1", "тело",
+             "## Свои правила репозитория\nделай по-нашему",
+             a._DEV_REFLECT_NOTE_RULE]
+    task = a._join_sections(a._split_sections(parts))
+    assert "делай по-нашему" in task
     assert a.REFLECT_NOTE_FILE in task
 
 
