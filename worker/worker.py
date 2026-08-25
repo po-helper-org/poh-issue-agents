@@ -15,6 +15,8 @@ logging.basicConfig(
 
 import activities
 import consolidation_activities as ca
+import delivery_bridge
+import howtodemo_bridge
 from consolidation_workflow import ConsolidationWorkflow
 from shared import sentry_setup
 from shared.temporal_client import connect_temporal
@@ -48,7 +50,74 @@ DEVELOP_ACTIVITIES = [
     activities.dev_followups,
     activities.dev_tests,
     activities.dev_publish,
+    activities.capture_episode,
 ]
+
+
+_log = logging.getLogger("worker")
+
+
+def _delivery_worker(client) -> Worker | None:
+    """Воркер Delivery-Agent — отдельная очередь и отдельный пул потоков.
+
+    Отдельная очередь, а не общая: один шаг релиза держит активность минутами
+    (мерж, выкатка, проверки живого сервиса), и на общем пуле из трёх слотов
+    релиз вытеснял бы триаж Issue. Разводка по очередям решает это без
+    приоритетов и без настроек.
+
+    Нет пакета — не отказ старта: контур обязан подниматься и без Delivery-Agent,
+    иначе несобравшийся модуль-сосед останавливает всю обработку Issue.
+    """
+    try:
+        from poh_delivery import integration as delivery
+    except ImportError:
+        _log.warning("poh_delivery не установлен — релизы отключены, остальной контур работает")
+        return None
+
+    delivery_bridge.install()
+    return Worker(
+        client,
+        task_queue=delivery.TASK_QUEUE,
+        workflows=delivery.WORKFLOWS,
+        activities=delivery.ACTIVITIES,
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        activity_executor=ThreadPoolExecutor(max_workers=2),
+        max_concurrent_activities=2,
+        debug_mode=True,
+    )
+
+
+def _howtodemo_worker(client) -> Worker | None:
+    """Воркер HowToDemo-Agent — отдельная очередь и отдельный пул потоков.
+
+    Отдельная очередь по той же причине, что у релиза: один прогон приёмки
+    держит активность десятками минут (подъём стенда, проходка по шагам,
+    сбор улик), и на общем пуле из трёх слотов он вытеснял бы триаж Issue.
+
+    Нет пакета — не отказ старта: контур обязан подниматься и без приёмщика.
+
+    Слот ровно один: приёмка поднимает контейнер со стендом, а на хосте
+    свободной памяти меньше гигабайта и нет свопа — две одновременные приёмки
+    выбрали бы её вместе с чужим прод-сервисом, живущим рядом.
+    """
+    try:
+        from poh_howtodemo import integration as howtodemo
+    except ImportError:
+        _log.warning("poh_howtodemo не установлен — приёмка отключена, "
+                     "остальной контур работает")
+        return None
+
+    howtodemo_bridge.install()
+    return Worker(
+        client,
+        task_queue=howtodemo.TASK_QUEUE,
+        workflows=howtodemo.WORKFLOWS,
+        activities=howtodemo.ACTIVITIES,
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        activity_executor=ThreadPoolExecutor(max_workers=1),
+        max_concurrent_activities=1,
+        debug_mode=True,
+    )
 
 
 async def main() -> None:
@@ -119,6 +188,7 @@ async def main() -> None:
             activities.dev_followups,
             activities.dev_tests,
             activities.dev_publish,
+            activities.capture_episode,
             activities.ack_estimate_command,
             activities.collect_estimation_context,
             activities.extract_estimation_facts,
@@ -132,6 +202,12 @@ async def main() -> None:
             ca.slice_zone,
             ca.synthesize_unifying_issue,
             ca.write_consolidation_pr,
+            # Активности Harness, которые зовёт воркфлоу релиза: конфликт в
+            # ветке и круг правок по ревью ведёт тот же агент разработки, что
+            # пишет код по задачам.
+            delivery_bridge.fix_conflicts,
+            delivery_bridge.review_round,
+            delivery_bridge.review_exhausted,
         ],
         # Our workflow code is trusted first-party code; unsandboxed avoids the
         # per-task re-import of heavy modules (instructor/openai/pydantic).
@@ -152,8 +228,14 @@ async def main() -> None:
         # draining meaningfully faster than serial.
         max_concurrent_activities=3,
     )
-    print("Worker started, listening on task queue 'issue-lifecycle'")
-    await worker.run()
+    # Модули-соседи необязательны поштучно: несобравшийся сосед не должен
+    # останавливать обработку Issue, поэтому каждый отсутствующий просто не
+    # попадает в список очередей.
+    side = [w for w in (_delivery_worker(client), _howtodemo_worker(client))
+            if w is not None]
+    queues = ", ".join(f"'{w.task_queue}'" for w in [worker, *side])
+    print(f"Worker started, listening on task queues {queues}")
+    await asyncio.gather(worker.run(), *(w.run() for w in side))
 
 
 if __name__ == "__main__":

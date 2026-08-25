@@ -72,3 +72,30 @@ def research_workflow_id(repo_full_name: str, issue_number: int, comment_id: int
     # прогона, — честно новый прогон (прошлый закрыт, id свободен).
     marker = "label" if comment_id is None else comment_id
     return f"research-{repo_full_name}-{issue_number}-{marker}"
+
+
+def delivery_workflow_id(repo_full_name: str) -> str:
+    """Релиз в репозитории — ровно один за раз.
+
+    Ключ по репозиторию, без номера Issue и без комментария: два одновременных
+    релиза мержили бы в одну ветку по двум разным планам, и ни один из них не
+    смог бы честно сказать, что он выкатил. Повторная команда при идущем
+    релизе упирается в WorkflowAlreadyStarted — это и есть нужный ответ
+    «релиз уже идёт», а не второй прогон.
+    """
+    return f"delivery-{repo_full_name}"
+
+
+def howtodemo_workflow_id(repo_full_name: str, issue_number: int) -> str:
+    """Приёмка Issue — ровно одна за раз.
+
+    Ключ по Issue, а не по репозиторию: приёмок в репозитории может идти
+    несколько (по разным задачам), но по одной задаче два прогона одновременно
+    гоняли бы один и тот же сценарий по одному и тому же стенду, и второй снёс
+    бы контейнер первого. Повторная команда при идущей приёмке упирается в
+    WorkflowAlreadyStarted — это и есть нужный ответ «приёмка уже идёт».
+
+    Без номера комментария: осознанный перепрогон делается после того, как
+    предыдущий завершился, а не поверх него.
+    """
+    return f"howtodemo-{repo_full_name}-{issue_number}"
