@@ -94,20 +94,20 @@ def test_review_with_matching_commit_id_is_fresh(monkeypatch):
     """Ревю с совпадающим commit_id считается свежим — точнее времени."""
     commit_time = "2026-01-01T10:00:00Z"
     review_time = "2026-01-02T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{"body": "просто комментарий", "user": {"type": "User"}}])
     monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
                         lambda repo, sha: commit_time)
     monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
                         lambda repo, n, limit=100: [{
-                            "submitted_at": review_time, 
+                            "submitted_at": review_time,
                             "state": "APPROVED",
                             "commit_id": "abc1234def567890"
                         }])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     assert delivery_bridge._review_is_fresh("o/r", 1, "abc1234def567890")
 
 
@@ -115,23 +115,23 @@ def test_review_without_mark_but_submitted_after_commit_is_fresh(monkeypatch):
     """Ревю без отметки PR-Agent, отправленное ПОСЛЕ коммита — свежее."""
     # Время коммита — 1 января 2026
     commit_time = "2026-01-01T10:00:00Z"
-    
+
     # Ревю отправлено ПОСЛЕ коммита — 2 января 2026
     review_time = "2026-01-02T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{"body": "просто комментарий", "user": {"type": "User"}}])
     monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
                         lambda repo, sha: commit_time)
     monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
                         lambda repo, n, limit=100: [{
-                            "submitted_at": review_time, 
+                            "submitted_at": review_time,
                             "state": "APPROVED",
                             "commit_id": "differentcommit"
                         }])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     assert delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
 
@@ -139,23 +139,23 @@ def test_review_without_mark_but_submitted_before_commit_is_not_fresh(monkeypatc
     """Ревю без отметки PR-Agent, отправленное ДО коммита — несвежее."""
     # Время коммита — 2 января 2026
     commit_time = "2026-01-02T10:00:00Z"
-    
+
     # Ревю отправлено ДО коммита — 1 января 2026
     review_time = "2026-01-01T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{"body": "просто комментарий", "user": {"type": "User"}}])
     monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
                         lambda repo, sha: commit_time)
     monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
                         lambda repo, n, limit=100: [{
-                            "submitted_at": review_time, 
+                            "submitted_at": review_time,
                             "state": "APPROVED",
                             "commit_id": "oldcommit"
                         }])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
 
@@ -163,7 +163,7 @@ def test_review_with_mark_pointing_to_different_commit_still_checks_time(monkeyp
     """Устаревшая отметка не блокирует проверку по времени — может быть свежее ревю."""
     commit_time = "2026-01-02T10:00:00Z"
     review_time = "2026-01-03T12:00:00Z"
-    
+
     comments = [{"body": "Review updated until commit old123"}]
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: comments)
@@ -171,13 +171,13 @@ def test_review_with_mark_pointing_to_different_commit_still_checks_time(monkeyp
                         lambda repo, sha: commit_time)
     monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
                         lambda repo, n, limit=100: [{
-                            "submitted_at": review_time, 
+                            "submitted_at": review_time,
                             "state": "APPROVED",
                             "commit_id": "newcommit"
                         }])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     # Должно вернуть True, потому что есть свежее ревю, несмотря на устаревшую отметку
     assert delivery_bridge._review_is_fresh("o/r", 1, "new456def789")
 
@@ -186,20 +186,20 @@ def test_pending_review_is_ignored(monkeypatch):
     """PENDING-ревю не считается — оно ещё не отправлено."""
     commit_time = "2026-01-01T10:00:00Z"
     review_time = "2026-01-02T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{"body": "просто комментарий", "user": {"type": "User"}}])
     monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
                         lambda repo, sha: commit_time)
     monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
                         lambda repo, n, limit=100: [{
-                            "submitted_at": review_time, 
+                            "submitted_at": review_time,
                             "state": "PENDING",
                             "commit_id": "abc1234"
                         }])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
 
@@ -207,27 +207,27 @@ def test_dismissed_review_is_ignored(monkeypatch):
     """DISMISSED-ревю не считается даже если оно свежее."""
     commit_time = "2026-01-01T10:00:00Z"
     review_time = "2026-01-02T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{"body": "просто комментарий", "user": {"type": "User"}}])
     monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
                         lambda repo, sha: commit_time)
     monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
                         lambda repo, n, limit=100: [{
-                            "submitted_at": review_time, 
+                            "submitted_at": review_time,
                             "state": "DISMISSED",
                             "commit_id": "abc1234"
                         }])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
 
 def test_inline_comment_with_matching_commit_id_is_fresh(monkeypatch):
     """Построчное замечание с совпадающим commit_id считается свежим."""
     commit_time = "2026-01-01T10:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{"body": "просто комментарий", "user": {"type": "User"}}])
     monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
@@ -239,7 +239,7 @@ def test_inline_comment_with_matching_commit_id_is_fresh(monkeypatch):
                             "commit_id": "abc1234def567890",
                             "body": "Fix this"
                         }])
-    
+
     assert delivery_bridge._review_is_fresh("o/r", 1, "abc1234def567890")
 
 
@@ -247,7 +247,7 @@ def test_bot_comment_after_commit_is_fresh(monkeypatch):
     """Комментарий бота после коммита считается свежим ревью."""
     commit_time = "2026-01-01T10:00:00Z"
     bot_comment_time = "2026-01-02T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{
                             "body": "PR Reviewer Guide: please review",
@@ -260,7 +260,7 @@ def test_bot_comment_after_commit_is_fresh(monkeypatch):
                         lambda repo, n, limit=100: [])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     assert delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
 
@@ -268,7 +268,7 @@ def test_agent_command_comment_is_filtered_out(monkeypatch):
     """Служебные комментарии контура не считаются ревью."""
     commit_time = "2026-01-01T10:00:00Z"
     agent_comment_time = "2026-01-02T12:00:00Z"
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{
                             "body": "/review",
@@ -281,28 +281,28 @@ def test_agent_command_comment_is_filtered_out(monkeypatch):
                         lambda repo, n, limit=100: [])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     # Служебный комментарий не должен считаться свежим ревью
     assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
 
 def test_delivery_agent_service_comment_is_filtered_out(monkeypatch):
     """Служебный комментарий Delivery-Agent с маркером <!-- issue-agent --> не считается ревью.
-    
+
     Это критический тест для блокирующего замечания ревьюера. Без этой проверки
     собственный комментарий контура "взял в работу" будет считаться свежим ревю,
     и круг правок начнёт открывать мерж по факту того, что он сам поздоровался.
     """
     commit_time = "2026-01-01T10:00:00Z"
     agent_comment_time = "2026-01-02T12:00:00Z"
-    
+
     # Служебный комментарий Delivery-Agent с HTML-маркером
     service_comment_body = """**Delivery-Agent взял релиз в работу.**
 
 Temporal: …
 
 <!-- issue-agent -->"""
-    
+
     monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                         lambda repo, n, limit=100: [{
                             "body": service_comment_body,
@@ -315,7 +315,7 @@ Temporal: …
                         lambda repo, n, limit=100: [])
     monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                         lambda repo, n, limit=100: [])
-    
+
     # Служебный комментарий НЕ должен считаться свежим ревью
     assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
 
@@ -323,7 +323,7 @@ Temporal: …
 def test_multiple_agent_commands_filtered_correctly(monkeypatch):
     """Все типы служебных комментариев контура должны отсеиваться."""
     commit_time = "2026-01-01T10:00:00Z"
-    
+
     # Различные служебные комментарии с маркером
     agent_comments = [
         "**Delivery-Agent взял релиз в работу.**\n\n<!-- issue-agent -->",
@@ -331,7 +331,7 @@ def test_multiple_agent_commands_filtered_correctly(monkeypatch):
         "шаг 1 отгружен\n\n<!-- issue-agent -->",
         "/review\n\n<!-- issue-agent -->",  # старый формат тоже должен работать
     ]
-    
+
     for comment_body in agent_comments:
         # Используем замыкание для захвата значения comment_body
         def make_list_comments(body):
@@ -340,7 +340,7 @@ def test_multiple_agent_commands_filtered_correctly(monkeypatch):
                 "user": {"type": "Bot"},
                 "created_at": "2026-01-02T12:00:00Z"
             }]
-        
+
         monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
                             make_list_comments(comment_body))
         monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
@@ -349,7 +349,7 @@ def test_multiple_agent_commands_filtered_correctly(monkeypatch):
                             lambda repo, n, limit=100: [])
         monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
                             lambda repo, n, limit=100: [])
-        
+
         # Ни один из служебных комментариев не должен считаться свежим ревью
         assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234"), \
             f"Comment '{comment_body}' was incorrectly treated as fresh review"
