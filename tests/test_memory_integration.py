@@ -384,3 +384,83 @@ def test_empty_statement_travels_as_absent_not_as_blank(monkeypatch, tmp_path):
     issue = IssueInput(repo="o/r", issue_number=77, title="t", body="",
                        author_login="u", author_type="User")
     assert _capture(monkeypatch, tmp_path, issue)["task_body"] is None
+
+
+# ───────── контрольная выборка ─────────
+
+def test_no_control_arm_by_default(monkeypatch):
+    """Умолчание — правила в каждой итерации. Половина прогонов без опыта
+    организации это цена проверки, а не образ жизни."""
+    monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
+    monkeypatch.delenv("MEMORY_CONTROL_MOD", raising=False)
+    assert not any(memory.control_arm(n) for n in range(1, 20))
+
+
+def test_control_arm_takes_every_nth_issue(monkeypatch):
+    monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "2")
+    assert memory.control_arm(94) is True
+    assert memory.control_arm(95) is False
+
+
+def test_control_arm_is_deterministic_not_random(monkeypatch):
+    """Повтор той же задачи обязан попасть в ту же выборку, иначе сравнение
+    сравнивает разные задачи."""
+    monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "3")
+    assert len({memory.control_arm(99) for _ in range(50)}) == 1
+
+
+def test_disabled_layer_has_no_control_arm(monkeypatch):
+    """Без слоя записывать контрольную итерацию некуда, и «без правил»
+    означало бы просто «слоя нет»."""
+    monkeypatch.delenv("MEMORY_BASE_URL", raising=False)
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "2")
+    assert memory.control_arm(94) is False
+
+
+def test_garbage_in_the_knob_disables_it(monkeypatch):
+    """Опечатка в переменной окружения не должна вырубать правила молча."""
+    monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "каждая вторая")
+    assert memory.control_arm(94) is False
+
+
+def test_control_iteration_is_marked_in_the_episode(monkeypatch, tmp_path):
+    """Пустой перечень правил бывает и когда слой лежал. Различение явное."""
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "2")
+    issue = IssueInput(repo="o/r", issue_number=94, title="t", body="b",
+                       author_login="u", author_type="User")
+    assert _capture(monkeypatch, tmp_path, issue)["artifacts"]["control"] is True
+
+
+def test_ordinary_iteration_is_not_marked_control(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "2")
+    issue = IssueInput(repo="o/r", issue_number=95, title="t", body="b",
+                       author_login="u", author_type="User")
+    assert _capture(monkeypatch, tmp_path, issue)["artifacts"]["control"] is False
+
+
+def test_control_iteration_never_asks_the_layer_for_rules(monkeypatch, tmp_path):
+    """Контрольная итерация обязана не только не подсыпать правила, но и не
+    спрашивать их: иначе «без правил» держалось бы на честном слове."""
+    import os
+
+    asked = []
+    monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
+    monkeypatch.setenv("MEMORY_CONTROL_MOD", "2")
+    monkeypatch.setattr(memory, "rules",
+                        lambda *a, **k: asked.append(a) or memory.Rules(text="X", ids=["C-1"]))
+    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(a, "_clone_repo",
+                        lambda repo, dest, branch=None: os.makedirs(dest, exist_ok=True))
+    monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
+    monkeypatch.setattr(a.github_client, "get_file", lambda *args, **kw: "")
+
+    issue = IssueInput(repo="o/r", issue_number=94, title="t", body="b",
+                       author_login="u", author_type="User")
+    task, ids = a._dev_prepare(issue, "research/issue-94")
+
+    assert asked == [], "у слоя спросили правила в контрольной итерации"
+    assert ids == []
+    assert a.ORG_RULES_HEADING not in task
