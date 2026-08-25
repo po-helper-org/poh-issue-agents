@@ -47,6 +47,7 @@ from shared.commands import (
     BFT,
     BFT_DEEP,
     ESTIMATE,
+    HOWTODEMO,
     RELEASE,
     bft_mode,
     build_analyze_input,
@@ -64,6 +65,7 @@ from shared.workflow_ids import (
     comment_ack_workflow_id,
     delivery_workflow_id,
     estimate_workflow_id,
+    howtodemo_workflow_id,
     issue_workflow_id,
 )
 
@@ -541,6 +543,39 @@ async def _start_release(client, repo: str, payload: dict, issue_number: int,
         _log.info("релиз %s уже идёт — повторная команда проигнорирована", repo)
 
 
+HOWTODEMO_TASK_QUEUE = os.environ.get("HOWTODEMO_TASK_QUEUE", "howtodemo")
+
+
+async def _start_howtodemo(client, repo: str, payload: dict, issue_number: int,
+                           pr_number: int) -> None:
+    """Старт приёмки HowToDemo-Agent.
+
+    Как и релиз, воркфлоу зовётся СТРОКОЙ, а вход уезжает словарём: вебхуку не
+    нужен ни сам модуль, ни его типы — он остаётся транспортом, а модуль
+    ставится только в образ воркера.
+
+    Номер PR вебхук не ищет: событий `pull_request` он не слушает вовсе, а
+    гадать по конвенции ветки значило бы дать агенту чужой PR. Ноль означает
+    «прогон без привязки к PR» — агент проверит то, что доступно, и честно
+    напишет в отчёте, что окружения не было.
+    """
+    sender = (payload.get("sender") or {}).get("login", "")
+    try:
+        await client.start_workflow(
+            "HowToDemoVerify",
+            {"repo": repo, "issue": issue_number, "pr_number": pr_number},
+            id=howtodemo_workflow_id(repo, issue_number),
+            task_queue=HOWTODEMO_TASK_QUEUE,
+        )
+        _log.info("приёмка %s#%s запущена по просьбе %s", repo, issue_number,
+                  sender or "?")
+    except WorkflowAlreadyStartedError:
+        # Вторая приёмка того же Issue — не сбой доставки, а попытка запустить
+        # прогон поверх идущего. Отвечаем 200: GitHub ретраить нечего.
+        _log.info("приёмка %s#%s уже идёт — повторная команда проигнорирована",
+                  repo, issue_number)
+
+
 async def _handle_delivery(payload: dict, x_github_event: str,
                            x_github_delivery: str | None):
     # Allowlist: действуем только на репозитории из ISSUE_AGENT_REPOS (пусто/* —
@@ -628,6 +663,12 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                 if not _may_start_expensive(payload, label, repo, issue_number):
                     return {"ok": True}
                 await _start_release(client, repo, payload, issue_number, None)
+                return {"ok": True}
+
+            if command == HOWTODEMO:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                await _start_howtodemo(client, repo, payload, issue_number, 0)
                 return {"ok": True}
 
             if command == ESTIMATE:
@@ -718,6 +759,12 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                 return {"ok": True}
             await _start_release(client, repo, payload, issue_number,
                                  payload["comment"]["id"])
+            return {"ok": True}
+
+        if command == HOWTODEMO:
+            if not _may_start_expensive(payload, "/howtodemo", repo, issue_number):
+                return {"ok": True}
+            await _start_howtodemo(client, repo, payload, issue_number, 0)
             return {"ok": True}
 
         if command == ESTIMATE:
