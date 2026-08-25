@@ -10,7 +10,7 @@ sentry-sdk==2.20.0
 # ПОЛНЫЙ SHA, а не на ветку: BuildKit кэширует git-клон по URL, и после нового
 # коммита в ту же ветку сборка молча берёт прежний код (та же ловушка, что у
 # ISSUE_AGENT_CONTEXT в harness/docker-compose.yml).
-poh-delivery-agent @ git+https://github.com/po-helper-org/poh-delivery-agent@20b74e77be74f49d1e081172b5aefebfa8ccc2d8
+poh-delivery-agent @ git+https://github.com/po-helper-org/poh-delivery-agent@2ad0e3eacf4d7552ab9882c3f037d47b404b986c
 
 # HowToDemo-Agent — модуль приёмки из соседнего репозитория. Пин на ПОЛНЫЙ
 # SHA по той же причине, что и у Delivery-Agent выше.
