@@ -11,3 +11,7 @@ sentry-sdk==2.20.0
 # коммита в ту же ветку сборка молча берёт прежний код (та же ловушка, что у
 # ISSUE_AGENT_CONTEXT в harness/docker-compose.yml).
 poh-delivery-agent @ git+https://github.com/po-helper-org/poh-delivery-agent@20b74e77be74f49d1e081172b5aefebfa8ccc2d8
+
+# HowToDemo-Agent — модуль приёмки из соседнего репозитория. Пин на ПОЛНЫЙ
+# SHA по той же причине, что и у Delivery-Agent выше.
+poh-howtodemo-agent @ git+https://github.com/po-helper-org/poh-howtodemo-agent@80a56e57247ab9bb4c67f83d4820807ff3af83d3
