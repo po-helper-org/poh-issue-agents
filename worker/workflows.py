@@ -399,21 +399,11 @@ class IssueLifecycle:
         self._analyze_comment_id: int | None = None
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
         self._analysis_running = False  # идёт прогон IssueAnalysis
+        # Состояние продуктового исследования (аналогично анализу)
         self._research_comment_id: int | None = None
         self._research_pending = False  # запрос на исследование лежит в очереди
         self._research_running = False  # идёт прогон исследования
         self._research_done = False  # исследование завершено успешно
-        # Прогон аналитики идёт прямо сейчас. Отдельно от `_analyze_pending`:
-        # тот говорит «запрос в очереди», этот — «работа выполняется». Первый
-        # прогон запускает метка `research-me` мимо очереди сигналов, и без
-        # второго флага команда, пришедшая во время такого прогона, вставала
-        # бы в очередь и заводила второй.
-        self._analysis_running = False
-        # Состояние продуктового исследования (аналогично анализу)
-        self._research_pending = False
-        self._research_comment_id: int | None = None
-        self._research_running = False
-        self._research_done = False
         # Номер PR по этой задаче. Известен из доклада внешнего агента либо от
         # локального прогона разработки; нужен фазе доведения.
         self._pr_number: int | None = None
@@ -705,25 +695,6 @@ class IssueLifecycle:
         except WorkflowAlreadyStartedError:
             workflow.logger.info("estimate already running for %s#%s",
                                  req.repo, req.issue_number)
-
-    @workflow.signal
-    async def research_requested(self, comment_id: int | None) -> None:
-        """По Issue запрошено продуктовое исследование.
-
-        В отличие от оценки, исследование фазу ДВИГАЕТ — это отдельная стадия
-        `product-research`, предшествующая бизнес-анализу. Поднимаем дочерний
-        прогон, но фаза двигается только после его завершения через
-        `_phase_research`.
-
-        Прогоны прежнего поколения этот сигнал получают, но обслужить не могут;
-        им лаунчер стартует root-прогон (см. query `handles_agents`), поэтому
-        здесь достаточно молча выйти.
-        """
-        if not workflow.patched("issue-lifecycle-phase-loop"):
-            return
-        await workflow.wait_condition(lambda: self._issue is not None)
-        self._research_comment_id = comment_id
-        self._research_pending = True
 
     async def _wait_for_signal(
             self, timeout: timedelta | None = None) -> str | AgentEvent | UserComment | None:
