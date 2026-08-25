@@ -20,6 +20,7 @@ from temporalio import activity
 
 import activities as activities_module
 import consolidation_activities
+import delivery_bridge
 
 WORKER_DIR = Path(__file__).resolve().parent.parent / "worker"
 
@@ -90,7 +91,10 @@ def test_registered_names_exist_as_activities():
     """Переименовали активность, а в списке осталось старое имя — импорт
     worker.py упал бы только при запуске воркера, не в тестах."""
     known = set()
-    for module in (activities_module, consolidation_activities):
+    # delivery_bridge — активности Harness, которые зовёт воркфлоу релиза из
+    # соседнего репозитория. Тот же класс ошибки: имя в списке регистрации есть,
+    # активности за ним нет — падение на старте воркера, а не в тестах.
+    for module in (activities_module, consolidation_activities, delivery_bridge):
         known |= {n for n in dir(module) if _is_activity(module, n)}
     unknown = _registered() - known
     assert not unknown, f"в списке регистрации имена, которые не являются активностями: {sorted(unknown)}"
