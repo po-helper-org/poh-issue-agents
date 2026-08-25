@@ -2769,10 +2769,13 @@ async def run_pr_fix_round(repo: str, pr_number: int, round_number: int):
     task = pr_closing.build_task(pr_number, review=review, round_number=round_number,
                                  max_rounds_=pr_closing.max_rounds())
 
-    # Правила организации для роли ревью: что считать замечанием по существу и
-    # как его формулировать. Блок дописывается к постановке здесь, а не в
+    # Правила организации для роли РАЗРАБОТКИ, а не ревью. Круг правок — это
+    # агент, который пишет код: он читает замечания и меняет файлы. Правила
+    # роли `review` описывают, как формулировать замечание, — исполнителю они
+    # бесполезны, а нужные ему (как писать код в этой организации) не доезжали
+    # вовсе. Блок дописывается к постановке здесь, а не в
     # `pr_closing.build_task`: тот модуль намеренно чистый и в сеть не ходит.
-    org_rules = memory.rules(memory.REVIEW, repo=repo, query=review[:500])
+    org_rules = memory.rules(memory.DEVELOP, repo=repo, query=review[:500])
     if org_rules.text:
         task += "\n" + org_rules.text
 
