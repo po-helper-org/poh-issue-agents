@@ -246,3 +246,47 @@ def test_round_does_not_commit_its_own_task_statement(monkeypatch, tmp_path):
     asyncio.run(activities_module.run_pr_fix_round("o/r", 35, 2))
 
     assert seen["task_md"] is False, "постановка круга уехала в коммит"
+
+
+def test_round_asks_the_layer_for_developer_rules(monkeypatch, tmp_path):
+    """Круг правок пишет КОД, значит и правила ему нужны роли `develop`.
+
+    До этого он просил роль `review` — правила о том, как формулировать
+    замечание. Исполнителю они бесполезны, а те, что нужны ему (как писать код
+    в этой организации), не доезжали вовсе: слой был подключён, блок в
+    постановке был, и содержал он не то. Отказ бесшумный — ни ошибки, ни
+    пустого блока, поэтому проверяется именно РОЛЬ, а не факт запроса.
+    """
+    import asyncio
+    import pathlib
+
+    import activities as activities_module
+    from shared import memory
+
+    monkeypatch.setenv("DEVELOP_WORKSPACE_MOUNT", str(tmp_path))
+    root = tmp_path / pr_closing.task_slug("o/r", 35)
+    clone = root / "repo"
+    clone.mkdir(parents=True)
+    asked: list = []
+
+    monkeypatch.setattr(memory, "rules",
+                        lambda agent, repo="", query="", max_items=None:
+                            asked.append(agent) or memory.Rules(text="", ids=[]))
+    monkeypatch.setattr(activities_module.github_client, "get_pull",
+                        lambda repo, n: {"head": {"ref": "feature/29-openhands"}})
+    monkeypatch.setattr(activities_module.github_client, "review_text",
+                        lambda repo, n: "PR Reviewer Guide")
+    monkeypatch.setattr(activities_module.github_client, "push_fixes",
+                        lambda repo, clone_dir, branch, message: False)
+    monkeypatch.setattr(activities_module, "_prfix_prepare",
+                        lambda repo, n, branch, task:
+                            (clone / ".task.md").write_text(task, encoding="utf-8"))
+    monkeypatch.setattr(activities_module, "_reap_runner", lambda slug: None)
+    monkeypatch.setattr(activities_module.subprocess, "run",
+                        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "",
+                                                         "stderr": ""})())
+
+    asyncio.run(activities_module.run_pr_fix_round("o/r", 35, 2))
+
+    assert asked == [memory.DEVELOP], (
+        f"круг правок спросил правила роли {asked!r}, а пишет он код")
