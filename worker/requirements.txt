@@ -5,3 +5,13 @@ pydantic==2.10.5
 requests==2.32.3
 pyjwt[crypto]==2.10.1
 sentry-sdk==2.20.0
+
+# Delivery-Agent — модуль релиз-менеджера из соседнего репозитория. Пин на
+# ПОЛНЫЙ SHA, а не на ветку: BuildKit кэширует git-клон по URL, и после нового
+# коммита в ту же ветку сборка молча берёт прежний код (та же ловушка, что у
+# ISSUE_AGENT_CONTEXT в harness/docker-compose.yml).
+poh-delivery-agent @ git+https://github.com/po-helper-org/poh-delivery-agent@20b74e77be74f49d1e081172b5aefebfa8ccc2d8
+
+# HowToDemo-Agent — модуль приёмки из соседнего репозитория. Пин на ПОЛНЫЙ
+# SHA по той же причине, что и у Delivery-Agent выше.
+poh-howtodemo-agent @ git+https://github.com/po-helper-org/poh-howtodemo-agent@f06058db5b5b6495b1b8e91d013ab1a060bd20df
