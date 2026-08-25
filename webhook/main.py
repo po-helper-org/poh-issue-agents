@@ -1,6 +1,12 @@
 """
-Webhook receiver: единственная точка входа для GitHub. Проверяет подпись,
-транслирует событие в вызов Temporal:
+Webhook receiver: вход контура. Проверяет подпись, транслирует событие в
+вызов Temporal.
+
+Два провайдера, два эндпоинта, один обработчик: `/webhook` принимает GitHub,
+`/gitlab/webhook` — GitLab. Различие снимается нормализацией на входе
+(`shared/gitlab_events.py`), дальше по коду едет одна и та же форма события.
+
+События, которые обрабатываются:
 - issues.opened            -> старт нового workflow (ID = repo-issue-N)
 - issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis и
                                через signal-with-start поднимает цикл-владелец
@@ -17,6 +23,8 @@ Webhook receiver: единственная точка входа для GitHub. 
                                build-me) идут через signal-with-start: воркфлоу
                                триажа может не существовать, тогда он
                                поднимается тем же вызовом
+- `/release` и `run:release` -> старт DeliveryRelease на очереди Delivery-Agent:
+                               релиз репозитория, а не работа по одному Issue
 
 Ничего из бизнес-логики здесь нет — это чистый транспортный слой.
 """
@@ -31,12 +39,16 @@ from starlette.requests import ClientDisconnect
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
+from shared import gitlab_events, gitlab_signature
+
 from shared import sentry_setup
 from shared.commands import (
     ANALYZE,
     BFT,
     BFT_DEEP,
     ESTIMATE,
+    HOWTODEMO,
+    RELEASE,
     bft_mode,
     build_analyze_input,
     build_bft_request,
@@ -51,7 +63,9 @@ from shared.repos import allowed_specs, is_allowed
 from shared.temporal_client import connect_temporal
 from shared.workflow_ids import (
     comment_ack_workflow_id,
+    delivery_workflow_id,
     estimate_workflow_id,
+    howtodemo_workflow_id,
     issue_workflow_id,
 )
 
@@ -411,6 +425,157 @@ async def github_webhook(
         return {"ok": True}
 
 
+# --- GitLab ---
+
+GITLAB_WEBHOOK_SECRET = os.environ.get("GITLAB_WEBHOOK_SECRET", "")
+# Режим проверки подлинности задаётся явно и не угадывается по заголовкам:
+# угадывание означало бы, что отправитель сам выбирает, как его проверять.
+# `hmac` доступен с GitLab 19.0 (GA 19.1), `token` — везде и слабее.
+GITLAB_SIGNATURE_MODE = os.environ.get("GITLAB_SIGNATURE_MODE", gitlab_signature.MODE_HMAC)
+# Логин сервисного аккаунта. Поля `user.type` у GitLab нет вовсе, и без этой
+# настройки контур считает автором человека — то есть может принять собственный
+# комментарий за реплику пользователя. Подпись в теле комментария от этого
+# защищает и без логина, но защита в один слой хуже, чем в два.
+GITLAB_BOT_LOGIN = os.environ.get("GITLAB_BOT_LOGIN") or None
+
+
+@app.post("/gitlab/webhook")
+async def gitlab_webhook(request: Request):
+    """Приём доставки GitLab.
+
+    Отказать может только проверка подлинности. Дальше — та же ставка, что и у
+    GitHub-эндпоинта, но здесь она дороже: у GitLab **нет автоматических
+    ретраев**, упавшая доставка теряется навсегда, а четыре подряд провала
+    отключают вебхук с backoff до суток. 5xx отсюда стоит не одного события, а
+    всех последующих.
+
+    Заголовки читаются из `request.headers`, а не объявляются параметрами:
+    имена у GitLab разъезжаются между версиями (`Idempotency-Key` с 17.4,
+    `webhook-*` с 19.0), и отсутствие любого из них не должно превращаться в
+    422 от FastAPI до того, как мы вообще посмотрели на доставку.
+    """
+    body = await request.body()
+    headers = dict(request.headers)
+
+    if not GITLAB_WEBHOOK_SECRET:
+        # Не настроены — не принимаем. Ответить 200 значило бы молча пропускать
+        # неаутентифицированные доставки; отключённый вебхук при отсутствующем
+        # секрете — правильный исход, и он виден в интерфейсе GitLab.
+        _log.error("GITLAB_WEBHOOK_SECRET не задан — доставки GitLab отвергаются")
+        raise HTTPException(status_code=503, detail="GitLab webhook not configured")
+
+    try:
+        gitlab_signature.verify(
+            body, headers, GITLAB_WEBHOOK_SECRET, GITLAB_SIGNATURE_MODE)
+    except gitlab_signature.SignatureError as exc:
+        _log.warning("доставка GitLab отвергнута: %s", exc)
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    event = headers.get("x-gitlab-event") or headers.get("X-Gitlab-Event") or ""
+    # Идентификатор доставки: с 17.4 он консистентен между повторами (ручной
+    # Resend), ниже — только UUID события.
+    delivery_id = (headers.get("idempotency-key")
+                   or headers.get("x-gitlab-event-uuid")
+                   or None)
+
+    payload = await request.json()
+    try:
+        normalized = gitlab_events.normalize(
+            event, payload, bot_login=GITLAB_BOT_LOGIN)
+    except gitlab_events.UnsupportedEvent as exc:
+        # Событие, на которое контур не подписан, — не ошибка доставки.
+        # Подтверждаем, иначе вебхук выключится на том, что нас не касается.
+        _log.info("доставка GitLab пропущена: %s", exc)
+        return {"ok": True}
+    except Exception:
+        _log.exception("не разобрал доставку GitLab %s (%s) — принимаю и ухожу в аудит",
+                       delivery_id or "без id", event)
+        await _audit_dropped_delivery(
+            payload, event, delivery_id,
+            gitlab_events.project_path(payload), ["(ошибка разбора)"])
+        return {"ok": True}
+
+    internal = gitlab_events.internal_event(event)
+    try:
+        return await _handle_delivery(normalized, internal, delivery_id)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("не обработал доставку GitLab %s (%s) — принимаю и ухожу в аудит",
+                       delivery_id or "без id", event)
+        await _audit_dropped_delivery(
+            normalized, internal, delivery_id,
+            (normalized.get("repository") or {}).get("full_name"),
+            ["(ошибка обработки)"])
+        return {"ok": True}
+
+
+DELIVERY_TASK_QUEUE = os.environ.get("DELIVERY_TASK_QUEUE", "delivery")
+
+
+async def _start_release(client, repo: str, payload: dict, issue_number: int,
+                         comment_id: int | None) -> None:
+    """Старт релиза Delivery-Agent.
+
+    Воркфлоу зовётся СТРОКОЙ, а вход уезжает словарём: вебхуку не нужен ни сам
+    модуль Delivery-Agent, ни его типы — он остаётся транспортом, а модуль
+    ставится только в образ воркера. Ключи словаря — поля `DeliveryRequest`,
+    их разбирает конвертер Temporal на стороне воркера.
+    """
+    sender = (payload.get("sender") or {}).get("login", "")
+    try:
+        await client.start_workflow(
+            "DeliveryRelease",
+            {
+                "repo": repo,
+                "requested_by": sender,
+                "issue_number": issue_number,
+                "comment_id": comment_id or 0,
+                "dry_run": False,
+            },
+            id=delivery_workflow_id(repo),
+            task_queue=DELIVERY_TASK_QUEUE,
+        )
+        _log.info("релиз %s запущен по просьбе %s", repo, sender or "?")
+    except WorkflowAlreadyStartedError:
+        # Второй релиз в том же репозитории — не сбой доставки, а попытка
+        # запустить выкатку поверх идущей. Отвечаем 200: GitHub ретраить нечего.
+        _log.info("релиз %s уже идёт — повторная команда проигнорирована", repo)
+
+
+HOWTODEMO_TASK_QUEUE = os.environ.get("HOWTODEMO_TASK_QUEUE", "howtodemo")
+
+
+async def _start_howtodemo(client, repo: str, payload: dict, issue_number: int,
+                           pr_number: int) -> None:
+    """Старт приёмки HowToDemo-Agent.
+
+    Как и релиз, воркфлоу зовётся СТРОКОЙ, а вход уезжает словарём: вебхуку не
+    нужен ни сам модуль, ни его типы — он остаётся транспортом, а модуль
+    ставится только в образ воркера.
+
+    Номер PR вебхук не ищет: событий `pull_request` он не слушает вовсе, а
+    гадать по конвенции ветки значило бы дать агенту чужой PR. Ноль означает
+    «прогон без привязки к PR» — агент проверит то, что доступно, и честно
+    напишет в отчёте, что окружения не было.
+    """
+    sender = (payload.get("sender") or {}).get("login", "")
+    try:
+        await client.start_workflow(
+            "HowToDemoVerify",
+            {"repo": repo, "issue": issue_number, "pr_number": pr_number},
+            id=howtodemo_workflow_id(repo, issue_number),
+            task_queue=HOWTODEMO_TASK_QUEUE,
+        )
+        _log.info("приёмка %s#%s запущена по просьбе %s", repo, issue_number,
+                  sender or "?")
+    except WorkflowAlreadyStartedError:
+        # Вторая приёмка того же Issue — не сбой доставки, а попытка запустить
+        # прогон поверх идущего. Отвечаем 200: GitHub ретраить нечего.
+        _log.info("приёмка %s#%s уже идёт — повторная команда проигнорирована",
+                  repo, issue_number)
+
+
 async def _handle_delivery(payload: dict, x_github_event: str,
                            x_github_delivery: str | None):
     # Allowlist: действуем только на репозитории из ISSUE_AGENT_REPOS (пусто/* —
@@ -492,6 +657,18 @@ async def _handle_delivery(payload: dict, x_github_event: str,
                     build_analyze_input(payload),  # без comment_id: триггер — метка
                     search_attributes=_search_attributes(repo, payload, issue_number),
                 )
+                return {"ok": True}
+
+            if command == RELEASE:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                await _start_release(client, repo, payload, issue_number, None)
+                return {"ok": True}
+
+            if command == HOWTODEMO:
+                if not _may_start_expensive(payload, label, repo, issue_number):
+                    return {"ok": True}
+                await _start_howtodemo(client, repo, payload, issue_number, 0)
                 return {"ok": True}
 
             if command == ESTIMATE:
@@ -576,6 +753,19 @@ async def _handle_delivery(payload: dict, x_github_event: str,
         # команда НЕ уходит в user_comment, иначе её съел бы цикл уточнений
         # intake gate как ответ на уточняющий вопрос.
         command = parse_command(payload["comment"].get("body") or "")
+
+        if command == RELEASE:
+            if not _may_start_expensive(payload, "/release", repo, issue_number):
+                return {"ok": True}
+            await _start_release(client, repo, payload, issue_number,
+                                 payload["comment"]["id"])
+            return {"ok": True}
+
+        if command == HOWTODEMO:
+            if not _may_start_expensive(payload, "/howtodemo", repo, issue_number):
+                return {"ok": True}
+            await _start_howtodemo(client, repo, payload, issue_number, 0)
+            return {"ok": True}
 
         if command == ESTIMATE:
             if not _may_start_expensive(payload, "/estimate", repo, issue_number):
