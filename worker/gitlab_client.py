@@ -281,21 +281,39 @@ def list_open_issues(repo: str) -> list[dict]:
             for i in resp.json()]
 
 
-def search_candidates(repo: str, query: str, limit: int = 20) -> list[dict]:
-    """Поиск задач по тексту — для проверки на дубликат.
+def search_candidates(repo: str, query: str, limit: int = 15) -> list[dict]:
+    """Кандидаты в дубликаты — задачи И merge request'ы.
 
-    Basic search доступен на бесплатном тарифе. Advanced Search, то есть поиск
-    по коду и комментариям, требует Premium — но для дубликата хватает заголовка
-    и описания.
+    Ищутся оба вида, как у GitHub-клиента, и каждый помечается `_kind`.
+    Потребитель (`activities.duplicate_check`) строит по этому полю листинг для
+    модели, и его отсутствие роняет активность — расхождение формы между
+    клиентами обходится дороже, чем недостающая операция: недостающая падает
+    сразу и внятно, а разошедшаяся форма падает позже и в чужом коде.
+
+    Basic search доступен на бесплатном тарифе; Advanced Search, то есть поиск
+    по коду и комментариям, требует Premium — но для дубликата хватает
+    заголовка и описания.
     """
-    resp = _ok(_request("GET", _url(repo, "/issues"),
+    out: list[dict] = []
+    for kind, path in (("issue", "/issues"), ("pr", "/merge_requests")):
+        resp = _request("GET", _url(repo, path),
                         params={"search": query, "in": "title,description",
-                                "per_page": min(limit, 100)}))
-    return [{"number": i.get("iid"), "title": i.get("title") or "",
-             "body": i.get("description") or "", "state": i.get("state"),
-             "url": i.get("web_url"),
-             "labels": [{"name": n} for n in (i.get("labels") or [])]}
-            for i in resp.json()]
+                                "per_page": min(limit, 100)})
+        if not resp.ok:
+            # Один вид не нашёлся — не повод терять второй.
+            _log.warning("поиск %s в %s не удался: %s", kind, repo, resp.status_code)
+            continue
+        for item in resp.json():
+            out.append({
+                "number": item.get("iid"),
+                "title": item.get("title") or "",
+                "body": item.get("description") or "",
+                "state": item.get("state"),
+                "url": item.get("web_url"),
+                "labels": [{"name": n} for n in (item.get("labels") or [])],
+                "_kind": kind,
+            })
+    return out[:limit]
 
 
 # --- ветки и файлы ---

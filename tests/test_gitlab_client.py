@@ -21,6 +21,10 @@ class Resp:
         self.text = text
         self.headers = {}
 
+    @property
+    def ok(self):
+        return self.status_code < 400
+
     def json(self):
         return self._payload
 
@@ -229,3 +233,36 @@ def test_dry_run_не_делает_запросов(gl, monkeypatch, calls):
     g.post_comment("g/p", 7, "текст")
     g.set_labels("g/p", 7, add=["a"])
     g.close_issue("g/p", 7)
+
+
+# --- контракт между клиентами ---
+
+def test_кандидаты_несут_kind_как_у_github(gl, monkeypatch):
+    """`duplicate_check` строит листинг по полю _kind — без него активность падает.
+
+    Расхождение формы между клиентами дороже недостающей операции: недостающая
+    падает сразу и внятно, разошедшаяся — позже и в чужом коде. Именно так и
+    случилось на живом прогоне.
+    """
+    def fake(method, url, **kw):
+        if "merge_requests" in url:
+            return Resp(payload=[{"iid": 4, "title": "MR", "description": "", "state": "opened"}])
+        return Resp(payload=[{"iid": 7, "title": "Задача", "description": "", "state": "opened"}])
+
+    monkeypatch.setattr(gl.requests, "request", fake)
+    out = gl.search_candidates("g/p", "живость")
+    kinds = {c["_kind"] for c in out}
+    assert kinds == {"issue", "pr"}, "должны искаться оба вида, как у GitHub"
+    for c in out:
+        assert set(c) >= {"number", "title", "body", "state", "_kind"}
+
+
+def test_отказ_поиска_одного_вида_не_теряет_второй(gl, monkeypatch):
+    def fake(method, url, **kw):
+        if "merge_requests" in url:
+            return Resp(403)
+        return Resp(payload=[{"iid": 7, "title": "Задача", "description": "", "state": "opened"}])
+
+    monkeypatch.setattr(gl.requests, "request", fake)
+    out = gl.search_candidates("g/p", "живость")
+    assert [c["_kind"] for c in out] == ["issue"]
