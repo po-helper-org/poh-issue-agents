@@ -271,65 +271,114 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
 def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
     """Ревью относится к текущему коммиту ветки, а не к прежнему.
 
-    Свежесть определяется по времени: ревью, созданное после последнего
-    коммита, считается свежим. Отметка PR-Agent («Review updated until
-    commit …») остаётся дополнительным признаком.
+    Свежесть определяется по трём источникам: формальное ревью (submitted_at),
+    построчные замечания и обзорный комментарий бота. Отметка PR-Agent —
+    дополнительный признак, не блокирующий.
     """
     from poh_delivery import review as review_module
 
-    # 1. Получаем время последнего коммита
-    try:
-        commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
-        commit_timestamp = datetime.datetime.fromisoformat(
-            commit_timestamp_str.replace("Z", "+00:00")
-        )
-    except Exception:
-        # Если не удалось получить время коммита, fallback на старую логику
-        _log.warning(f"Не удалось получить время коммита {head_sha} в {repo}")
-        comments = github_client.list_comments(repo, pr_number, limit=100)
-        notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
-        seen = review_module.review_head(notes)
-        if not seen:
-            return False
-        return head_sha.startswith(seen) or seen.startswith(head_sha[:7])
-
-    # 2. Проверяем отметку PR-Agent как дополнительный признак
-    comments = github_client.list_comments(repo, pr_number, limit=100)
-    notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
-    seen = review_module.review_head(notes)
-    
-    if seen:
-        # Если отметка есть и указывает на другой коммит — ревю несвежее
-        if not (head_sha.startswith(seen) or seen.startswith(head_sha[:7])):
-            return False
-        # Отметка совпадает с текущим коммитом — свежее
-        return True
-
-    # 3. Проверяем ревю по времени
+    # 1. Проверяем формальные ревью через GitHub API
     try:
         reviews = github_client.list_reviews(repo, pr_number, limit=100)
         for review in reviews:
-            # Игнорируем dismiss-ревю
-            if review.get("state") == "DISMISSED":
+            # Игнорируем PENDING и DISMISSED ревью
+            state = review.get("state")
+            if state in ("PENDING", "DISMISSED"):
                 continue
             
-            # Берём максимум из created_at и updated_at
-            review_time_str = review.get("updated_at") or review.get("created_at")
-            if not review_time_str:
+            # Сначала проверяем по commit_id — точнее времени
+            review_commit_id = review.get("commit_id")
+            if review_commit_id and review_commit_id == head_sha:
+                return True
+            
+            # Если commit_id не совпал, проверяем по submitted_at
+            submitted_at_str = review.get("submitted_at")
+            if not submitted_at_str:
                 continue
                 
-            review_timestamp = datetime.datetime.fromisoformat(
-                review_time_str.replace("Z", "+00:00")
-            )
-            
-            # Если ревю создано/обновлено после коммита — свежее
-            if review_timestamp >= commit_timestamp:
+            try:
+                commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
+                commit_timestamp = datetime.datetime.fromisoformat(
+                    commit_timestamp_str.replace("Z", "+00:00")
+                )
+                review_timestamp = datetime.datetime.fromisoformat(
+                    submitted_at_str.replace("Z", "+00:00")
+                )
+                
+                if review_timestamp >= commit_timestamp:
+                    return True
+            except Exception:
+                # Не удалось получить время коммита — продолжаем проверку
+                continue
+    except Exception as e:
+        _log.warning("Не удалось получить список ревью для %s#%s: %s", repo, pr_number, e)
+
+    # 2. Проверяем построчные замечания (pull request comments)
+    try:
+        inline_comments = github_client.list_pull_request_comments(repo, pr_number, limit=100)
+        for comment in inline_comments:
+            # Игнорируем устаревшие комментарии
+            if comment.get("commit_id") == head_sha:
                 return True
     except Exception as e:
-        _log.warning(f"Не удалось получить список ревью для {repo}#{pr_number}: {e}")
+        _log.warning("Не удалось получить построчные комментарии для %s#%s: %s", repo, pr_number, e)
 
-    # 4. Нет ревю и нет отметки — просим ревю
+    # 3. Проверяем обзорные комментарии от ботов (issue comments)
+    try:
+        comments = github_client.list_comments(repo, pr_number, limit=100)
+        for comment in comments:
+            # Отфильтровываем служебные комментарии контура
+            if _is_agent_comment(comment.get("body", "")):
+                continue
+            
+            # Проверяем, что это бот
+            user = comment.get("user", {})
+            if user.get("type") == "Bot":
+                # Если бот комментировал после последнего коммита — считаем свежим
+                try:
+                    comment_time_str = comment.get("created_at")
+                    if not comment_time_str:
+                        continue
+                        
+                    commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
+                    commit_timestamp = datetime.datetime.fromisoformat(
+                        commit_timestamp_str.replace("Z", "+00:00")
+                    )
+                    comment_timestamp = datetime.datetime.fromisoformat(
+                        comment_time_str.replace("Z", "+00:00")
+                    )
+                    
+                    if comment_timestamp >= commit_timestamp:
+                        return True
+                except Exception:
+                    continue
+    except Exception as e:
+        _log.warning("Не удалось получить комментарии для %s#%s: %s", repo, pr_number, e)
+
+    # 4. Отметка PR-Agent — дополнительный признак, не блокирующий
+    try:
+        comments = github_client.list_comments(repo, pr_number, limit=100)
+        notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
+        seen = review_module.review_head(notes)
+        
+        if seen and (head_sha.startswith(seen) or seen.startswith(head_sha[:7])):
+            return True
+    except Exception as e:
+        _log.warning("Не удалось проверить отметку PR-Agent для %s#%s: %s", repo, pr_number, e)
+
+    # 5. Нет свежего ревю ни из одного источника
     return False
+
+
+def _is_agent_comment(body: str) -> bool:
+    """Проверяет, является ли комментарий служебным комментарием контура."""
+    if not body:
+        return False
+    
+    # Служебные комментарии начинаются с команд контура
+    agent_commands = ("/review", "/analyze", "/estimate", "/plan")
+    return any(body.strip().startswith(cmd) for cmd in agent_commands)
+
 
 
 

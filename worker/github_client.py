@@ -702,8 +702,9 @@ def get_commit_timestamp(repo: str, commit_sha: str) -> str:
 def list_reviews(repo: str, pull_number: int, limit: int = 50) -> list[dict]:
     """Список ревью PR с временными метками.
 
-    Возвращает список ревью с полями id, user, body, created_at, updated_at,
-    state, commit_id. Используется для определения свежести ревю по времени.
+    Возвращает список ревью с полями id, user, body, submitted_at,
+    state, commit_id. Используется для определения свежести ревю по времени
+    и commit_id.
     """
     url = f"https://api.github.com/repos/{repo}/pulls/{pull_number}/reviews"
     resp = requests.get(
@@ -711,6 +712,22 @@ def list_reviews(repo: str, pull_number: int, limit: int = 50) -> list[dict]:
     )
     resp.raise_for_status()
     return resp.json()[:limit]
+
+def list_pull_request_comments(repo: str, pull_number: int, limit: int = 50) -> list[dict]:
+    """Список построчных комментариев PR с привязкой к коммитам.
+
+    Возвращает список построчных комментариев с полями id, user, body, 
+    created_at, commit_id, path. Используется для определения свежести 
+    ревью по commit_id.
+    """
+    url = f"https://api.github.com/repos/{repo}/pulls/{pull_number}/comments"
+    resp = requests.get(
+        url, headers=_auth_headers(repo), params={"per_page": min(limit, 100)}, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()[:limit]
+
+
 
 
 def review_text(repo: str, number: int, limit: int = 12000) -> str:
