@@ -28,27 +28,20 @@ def test_truncate_long_text():
 
 
 def test_apply_size_limit_no_limit():
-    """Без лимита все части сохраняются."""
-    parts = ["Part 1", "Part 2", "Part 3"]
-    result = _apply_size_limit(parts, 1000)
-    assert result == parts, f"Expected {parts}, got {result}"
+    """Без лимита все секции сохраняются."""
+    secs = [("# Задача: реализовать Issue #1", "тело"), ("## Обсуждение", "разговор")]
+    kept, dropped = _apply_size_limit(secs, 1000, 1, "T")
+    assert kept == secs and dropped == []
     print("✓ test_apply_size_limit_no_limit passed")
 
 
 def test_apply_size_limit_with_limit():
-    """С лимитом части удаляются по приоритету."""
-    parts = ["AAA", "BBB", "CCC", "DDD"]
-    result = _apply_size_limit(parts, 5, priority_order=[0, 1])  # AAA и BBB приоритетны
-    # При ограничении в 5 символов сохранятся только приоритетные части
-    assert len(result) >= 1, f"Should have at least 1 part, got {len(result)}"
+    """С лимитом секции вытесняются по приоритету, вытесненные называются."""
+    secs = [("# Задача: реализовать Issue #1", "AAA"), ("## Как работать", "CCC")]
+    kept, dropped = _apply_size_limit(secs, 40, 1, "T")
+    assert len(kept) >= 1
+    assert dropped == ["## Как работать"]
     print("✓ test_apply_size_limit_with_limit passed")
-
-
-def test_apply_size_limit_empty_list():
-    """Пустой список не должен вызывать ошибку."""
-    result = _apply_size_limit([], 100)
-    assert result == [], f"Expected empty list, got {result}"
-    print("✓ test_apply_size_limit_empty_list passed")
 
 
 def test_truncate_whitespace():

@@ -23,9 +23,18 @@ ANALYZE = "analyze"
 # видеть, что именно он запускает, ещё до запуска.
 BFT = "bft"
 BFT_DEEP = "bft-deep"
+# Релиз — команда РЕПОЗИТОРИЯ, а не Issue: Delivery-Agent сам смотрит все
+# открытые PR. Issue (или PR), из которого её позвали, служит адресом для
+# ответа, и только им.
+RELEASE = "release"
+# Приёмка по HowToDemo — команда ISSUE: агент читает сценарий из его тела (либо
+# из письма БФТ в его треде) и проверяет по нему открытый PR. Отдельная команда,
+# а не флаг у /release: приёмка идёт ДО мержа и не выкатывает ничего.
+HOWTODEMO = "howtodemo"
 
 _COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE,
-             "/bft": BFT, "/bft-deep": BFT_DEEP}
+             "/bft": BFT, "/bft-deep": BFT_DEEP, "/release": RELEASE,
+             "/howtodemo": HOWTODEMO}
 
 # Схема имён — namespace через двоеточие, как в протоколе агентов v1
 # (needs-human:*, origin:agent). `run:*` — идёт прогон, `done:*` — проработано,
