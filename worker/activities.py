@@ -294,6 +294,7 @@ def read_deadlines() -> Deadlines:
         side_state_hours=_hours("PARK_SIDE_STATE_HOURS", 168),
         develop_autostart=_flag("DEVELOP_AUTOSTART"),
         research_autostart=_flag("RESEARCH_AUTOSTART"),
+        howtodemo_autostart=_flag("HOWTODEMO_AUTOSTART"),
         decompose_enabled=decomposition.enabled(),
         pr_fix_enabled=pr_closing.enabled(),
         pr_fix_max_rounds=pr_closing.max_rounds(),
