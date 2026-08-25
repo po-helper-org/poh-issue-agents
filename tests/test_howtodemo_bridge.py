@@ -14,13 +14,9 @@ sys.path.insert(0, str(ROOT / "worker"))
 
 
 @pytest.fixture
-def bridge(monkeypatch, tmp_path):
-    monkeypatch.setenv("PROMPTS_DIR", str(tmp_path))
-    (tmp_path / "system_howtodemo_plan.md").write_text(
-        "СИСТЕМНЫЙ ПРОМПТ ПЛАНА", encoding="utf-8")
+def bridge():
     import howtodemo_bridge
 
-    monkeypatch.setattr(howtodemo_bridge, "PROMPTS_DIR", tmp_path)
     return howtodemo_bridge
 
 
@@ -43,8 +39,22 @@ def test_translator_numbers_the_scenario_for_the_model(bridge, monkeypatch):
     monkeypatch.setattr(bridge.llm, "complete", fake_complete)
     out = bridge.PlanTranslator().translate(["открываю корзину", "вижу итог"])
     assert out == '{"steps": []}'
-    assert calls["system"] == "СИСТЕМНЫЙ ПРОМПТ ПЛАНА"
     assert calls["user"] == "1. открываю корзину\n2. вижу итог"
+
+
+def test_prompt_comes_from_the_agent_package_not_from_this_repository(bridge,
+                                                                     monkeypatch):
+    """Промпт — часть договора агента с моделью. Копия здесь отстанет."""
+    from poh_howtodemo import plan
+
+    calls = {}
+    monkeypatch.setattr(bridge.llm, "complete",
+                        lambda system, user, **kw: calls.update(system=system)
+                        or '{"steps": []}')
+    bridge.PlanTranslator().translate(["шаг"])
+    assert calls["system"] == plan.system_prompt()
+    assert not (ROOT / "prompts" / "system_howtodemo_plan.md").exists(), \
+        "копия промпта в этом репозитории должна быть удалена"
 
 
 def test_translator_uses_complete_not_extract(bridge, monkeypatch):

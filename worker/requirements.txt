@@ -14,4 +14,4 @@ poh-delivery-agent @ git+https://github.com/po-helper-org/poh-delivery-agent@20b
 
 # HowToDemo-Agent — модуль приёмки из соседнего репозитория. Пин на ПОЛНЫЙ
 # SHA по той же причине, что и у Delivery-Agent выше.
-poh-howtodemo-agent @ git+https://github.com/po-helper-org/poh-howtodemo-agent@f06058db5b5b6495b1b8e91d013ab1a060bd20df
+poh-howtodemo-agent @ git+https://github.com/po-helper-org/poh-howtodemo-agent@abb1f06b548b01b6e565968feae7e6f4dc7d1c7b
