@@ -26,7 +26,7 @@ from pathlib import Path
 from temporalio import activity
 
 import github_client
-from shared import develop, pr_closing
+from shared import agent_comment, develop, pr_closing
 
 _log = logging.getLogger(__name__)
 
@@ -277,6 +277,18 @@ def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
     """
     from poh_delivery import review as review_module
 
+    # Получаем время коммита один раз для всех проверок
+    commit_timestamp_str = None
+    commit_timestamp = None
+    try:
+        commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
+        commit_timestamp = datetime.datetime.fromisoformat(
+            commit_timestamp_str.replace("Z", "+00:00")
+        )
+    except Exception as e:
+        _log.warning("Не удалось получить время коммита для %s#%s: %s", repo, pr_number, e)
+        # Продолжаем проверку — может сработать commit_id
+
     # 1. Проверяем формальные ревью через GitHub API
     try:
         reviews = github_client.list_reviews(repo, pr_number, limit=100)
@@ -297,10 +309,9 @@ def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
                 continue
                 
             try:
-                commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
-                commit_timestamp = datetime.datetime.fromisoformat(
-                    commit_timestamp_str.replace("Z", "+00:00")
-                )
+                if commit_timestamp is None:
+                    # Если время коммита не получили, пропускаем проверку по времени
+                    continue
                 review_timestamp = datetime.datetime.fromisoformat(
                     submitted_at_str.replace("Z", "+00:00")
                 )
@@ -328,7 +339,7 @@ def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
         comments = github_client.list_comments(repo, pr_number, limit=100)
         for comment in comments:
             # Отфильтровываем служебные комментарии контура
-            if _is_agent_comment(comment.get("body", "")):
+            if agent_comment.is_agent_comment(comment.get("body", "")):
                 continue
             
             # Проверяем, что это бот
@@ -340,10 +351,9 @@ def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
                     if not comment_time_str:
                         continue
                         
-                    commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
-                    commit_timestamp = datetime.datetime.fromisoformat(
-                        commit_timestamp_str.replace("Z", "+00:00")
-                    )
+                    if commit_timestamp is None:
+                        # Если время коммита не получили, пропускаем проверку по времени
+                        continue
                     comment_timestamp = datetime.datetime.fromisoformat(
                         comment_time_str.replace("Z", "+00:00")
                     )
@@ -370,14 +380,8 @@ def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
     return False
 
 
-def _is_agent_comment(body: str) -> bool:
-    """Проверяет, является ли комментарий служебным комментарием контура."""
-    if not body:
-        return False
-    
-    # Служебные комментарии начинаются с команд контура
-    agent_commands = ("/review", "/analyze", "/estimate", "/plan")
-    return any(body.strip().startswith(cmd) for cmd in agent_commands)
+# Используем общую функцию из shared.agent_comment
+# Она проверяет маркер <!-- issue-agent -->, который есть во всех служебных комментариях
 
 
 

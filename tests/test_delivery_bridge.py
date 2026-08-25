@@ -284,3 +284,72 @@ def test_agent_command_comment_is_filtered_out(monkeypatch):
     
     # Служебный комментарий не должен считаться свежим ревью
     assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
+
+
+def test_delivery_agent_service_comment_is_filtered_out(monkeypatch):
+    """Служебный комментарий Delivery-Agent с маркером <!-- issue-agent --> не считается ревью.
+    
+    Это критический тест для блокирующего замечания ревьюера. Без этой проверки
+    собственный комментарий контура "взял в работу" будет считаться свежим ревю,
+    и круг правок начнёт открывать мерж по факту того, что он сам поздоровался.
+    """
+    commit_time = "2026-01-01T10:00:00Z"
+    agent_comment_time = "2026-01-02T12:00:00Z"
+    
+    # Служебный комментарий Delivery-Agent с HTML-маркером
+    service_comment_body = """**Delivery-Agent взял релиз в работу.**
+
+Temporal: …
+
+<!-- issue-agent -->"""
+    
+    monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
+                        lambda repo, n, limit=100: [{
+                            "body": service_comment_body,
+                            "user": {"type": "Bot"},
+                            "created_at": agent_comment_time
+                        }])
+    monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
+                        lambda repo, sha: commit_time)
+    monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
+                        lambda repo, n, limit=100: [])
+    monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
+                        lambda repo, n, limit=100: [])
+    
+    # Служебный комментарий НЕ должен считаться свежим ревью
+    assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234")
+
+
+def test_multiple_agent_commands_filtered_correctly(monkeypatch):
+    """Все типы служебных комментариев контура должны отсеиваться."""
+    commit_time = "2026-01-01T10:00:00Z"
+    
+    # Различные служебные комментарии с маркером
+    agent_comments = [
+        "**Delivery-Agent взял релиз в работу.**\n\n<!-- issue-agent -->",
+        "PR включён в релиз…\n\n<!-- issue-agent -->",
+        "шаг 1 отгружен\n\n<!-- issue-agent -->",
+        "/review\n\n<!-- issue-agent -->",  # старый формат тоже должен работать
+    ]
+    
+    for comment_body in agent_comments:
+        # Используем замыкание для захвата значения comment_body
+        def make_list_comments(body):
+            return lambda repo, n, limit=100: [{
+                "body": body,
+                "user": {"type": "Bot"},
+                "created_at": "2026-01-02T12:00:00Z"
+            }]
+        
+        monkeypatch.setattr(delivery_bridge.github_client, "list_comments",
+                            make_list_comments(comment_body))
+        monkeypatch.setattr(delivery_bridge.github_client, "get_commit_timestamp",
+                            lambda repo, sha: commit_time)
+        monkeypatch.setattr(delivery_bridge.github_client, "list_reviews",
+                            lambda repo, n, limit=100: [])
+        monkeypatch.setattr(delivery_bridge.github_client, "list_pull_request_comments",
+                            lambda repo, n, limit=100: [])
+        
+        # Ни один из служебных комментариев не должен считаться свежим ревью
+        assert not delivery_bridge._review_is_fresh("o/r", 1, "abc1234"), \
+            f"Comment '{comment_body}' was incorrectly treated as fresh review"
