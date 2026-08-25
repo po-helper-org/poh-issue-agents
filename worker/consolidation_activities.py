@@ -5,7 +5,10 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from temporalio import activity
 
-import github_client
+import forge
+
+# См. комментарий в activities.py: имя историческое, диспетчер настоящий.
+github_client = forge
 import llm
 from shared.workflow_types import (
     ConsolidationInput, DeliveryZone, Increment, IssueInput, SolutionProfile,

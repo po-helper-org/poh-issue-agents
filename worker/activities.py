@@ -24,7 +24,12 @@ from temporalio import activity
 
 import estimate_report
 import estimation
-import github_client
+import forge
+# Историческое имя: его знают 118 вызовов в этом файле и три десятка тестовых
+# файлов. Переименование — отдельная механическая правка; смешивать её с
+# включением второго провайдера значило бы спрятать одно изменение в шуме
+# другого.
+github_client = forge
 import llm
 from shared import (
     bft,
