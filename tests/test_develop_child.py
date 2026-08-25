@@ -100,7 +100,7 @@ async def test_prepare_returns_a_size_not_the_task_text(gh, monkeypatch):
     а история воркфлоу — не хранилище документов. НФТ-01: потолок 4 КБ.
     """
     monkeypatch.setattr(activities_module, "_dev_prepare",
-                        lambda issue, branch: "x" * 5000)
+                        lambda issue, branch: ("x" * 5000, ["R-1", "R-2"]))
 
     size = await activities_module.dev_prepare(_issue(39), "research/issue-39")
 
@@ -145,5 +145,9 @@ def test_all_dev_steps_are_registered_activities():
     expected = [activities_module.dev_begin, activities_module.dev_dispatch,
                 activities_module.dev_prepare, activities_module.dev_announce,
                 activities_module.dev_run_agent, activities_module.dev_followups,
-                activities_module.dev_tests, activities_module.dev_publish]
+                activities_module.dev_tests, activities_module.dev_publish,
+                # Запись об итерации слою саморефлексии. Шаг опционален по
+                # действию (без MEMORY_BASE_URL он ничего не делает), но
+                # зарегистрирован всегда: воркфлоу зовёт его под маркером.
+                activities_module.capture_episode]
     assert names == expected
