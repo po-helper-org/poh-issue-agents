@@ -1506,12 +1506,17 @@ async def run_fnr_stage(analyze: AnalyzeInput, stage_name: str) -> dict:
 
 
 @activity.defn
-async def publish_analysis(analyze: AnalyzeInput, comment_id: int | None = None) -> str:
+async def publish_analysis(analyze: AnalyzeInput, comment_id: int | None = None, run_id: str | None = None) -> str:
     """Финал пайплайна: собрать артефакты, push ветки research/issue-N,
     итоговый коммент. Мутации GitHub гейтятся DRY_RUN внутри github_client.
     
     Теперь использует shared/run_comment.py для реализации «одно сообщение на задачу»:
     публикует результат и удаляет плейсхолдер (если есть).
+    
+    Args:
+        analyze: Параметры анализа
+        comment_id: ID плейсхолдер-комментария для удаления
+        run_id: RunID Temporal-прогона (передаётся из workflow-контекста)
     """
     clone_dir = _require_workspace(analyze, None)
     files = await asyncio.to_thread(_collect_fnr_artifacts, clone_dir)
@@ -1524,9 +1529,11 @@ async def publish_analysis(analyze: AnalyzeInput, comment_id: int | None = None)
         f"docs(sa): анализ issue #{analyze.issue_number} через SA-helper",
     )
     
-    # Получаем RunID для включения в финальное сообщение
-    from temporalio import workflow
-    run_id = workflow.info().run_id
+    # RunID приходит из workflow-контекста (activities не могут вызывать workflow.info())
+    if run_id is None:
+        # Fallback для обратной совместимости, но это не должно происходить
+        logger.warning("publish_analysis вызван без run_id — используйте параметр")
+        run_id = "unknown"
     
     # Строим финальное сообщение
     summary = _build_summary(analyze, branch, files)

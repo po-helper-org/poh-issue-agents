@@ -194,9 +194,11 @@ async def _run_staged_analysis(analyze: AnalyzeInput, comment_id: int | None = N
                     non_retryable_error_types=["RuntimeError"],
                 ),
             )
+        # Получаем RunID в workflow-контексте для передачи в activity
+        run_id = workflow.info().run_id
         await workflow.execute_activity(
             activities.publish_analysis,
-            args=[analyze, comment_id],
+            args=[analyze, comment_id, run_id],
             start_to_close_timeout=timedelta(seconds=120),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
@@ -2411,8 +2413,9 @@ class IssueAnalysis:
     """
     
     def __init__(self):
-        # ID плейсхолдер-комментария прогона для реализации «одно сообщение на задачу»
-        self._run_comment_id: int | None = None
+        # Инициализация пустая — состояние workflow переносится через
+        # параметры вызова, а не через поля класса, чтобы переживать ретраи.
+        pass
 
     @workflow.run
     async def run(self, analyze: AnalyzeInput) -> bool:
@@ -2430,9 +2433,10 @@ class IssueAnalysis:
             start_to_close_timeout=timedelta(seconds=60),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
-        # Сохраняем ID плейсхолдера для последующего управления
-        # (в IssueAnalysis это состояние не persists, но сохраняется для согласованности)
-        self._run_comment_id = comment_id
+        # comment_id сохраняется через контекст выполнения workflow (параметры),
+        # а не через поля класса. Это гарантирует, что ID переживёт ретраи и
+        # continue-as-new: результат activity лежит в Event History и реплеится
+        # при любом перезапуске workflow.
         return await _run_staged_analysis(analyze, comment_id)
 
 
