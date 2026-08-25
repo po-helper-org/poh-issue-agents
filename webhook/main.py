@@ -1,6 +1,12 @@
 """
-Webhook receiver: единственная точка входа для GitHub. Проверяет подпись,
-транслирует событие в вызов Temporal:
+Webhook receiver: вход контура. Проверяет подпись, транслирует событие в
+вызов Temporal.
+
+Два провайдера, два эндпоинта, один обработчик: `/webhook` принимает GitHub,
+`/gitlab/webhook` — GitLab. Различие снимается нормализацией на входе
+(`shared/gitlab_events.py`), дальше по коду едет одна и та же форма события.
+
+События, которые обрабатываются:
 - issues.opened            -> старт нового workflow (ID = repo-issue-N)
 - issue_comment.created    -> `/analyze` запускает workflow IssueAnalysis и
                                через signal-with-start поднимает цикл-владелец
@@ -32,6 +38,8 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from starlette.requests import ClientDisconnect
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
+
+from shared import gitlab_events, gitlab_signature
 
 from shared import sentry_setup
 from shared.commands import (
@@ -412,6 +420,91 @@ async def github_webhook(
             payload, x_github_event, x_github_delivery,
             (payload.get("repository") or {}).get("full_name"),
             ["(ошибка разбора)"])
+        return {"ok": True}
+
+
+# --- GitLab ---
+
+GITLAB_WEBHOOK_SECRET = os.environ.get("GITLAB_WEBHOOK_SECRET", "")
+# Режим проверки подлинности задаётся явно и не угадывается по заголовкам:
+# угадывание означало бы, что отправитель сам выбирает, как его проверять.
+# `hmac` доступен с GitLab 19.0 (GA 19.1), `token` — везде и слабее.
+GITLAB_SIGNATURE_MODE = os.environ.get("GITLAB_SIGNATURE_MODE", gitlab_signature.MODE_HMAC)
+# Логин сервисного аккаунта. Поля `user.type` у GitLab нет вовсе, и без этой
+# настройки контур считает автором человека — то есть может принять собственный
+# комментарий за реплику пользователя. Подпись в теле комментария от этого
+# защищает и без логина, но защита в один слой хуже, чем в два.
+GITLAB_BOT_LOGIN = os.environ.get("GITLAB_BOT_LOGIN") or None
+
+
+@app.post("/gitlab/webhook")
+async def gitlab_webhook(request: Request):
+    """Приём доставки GitLab.
+
+    Отказать может только проверка подлинности. Дальше — та же ставка, что и у
+    GitHub-эндпоинта, но здесь она дороже: у GitLab **нет автоматических
+    ретраев**, упавшая доставка теряется навсегда, а четыре подряд провала
+    отключают вебхук с backoff до суток. 5xx отсюда стоит не одного события, а
+    всех последующих.
+
+    Заголовки читаются из `request.headers`, а не объявляются параметрами:
+    имена у GitLab разъезжаются между версиями (`Idempotency-Key` с 17.4,
+    `webhook-*` с 19.0), и отсутствие любого из них не должно превращаться в
+    422 от FastAPI до того, как мы вообще посмотрели на доставку.
+    """
+    body = await request.body()
+    headers = dict(request.headers)
+
+    if not GITLAB_WEBHOOK_SECRET:
+        # Не настроены — не принимаем. Ответить 200 значило бы молча пропускать
+        # неаутентифицированные доставки; отключённый вебхук при отсутствующем
+        # секрете — правильный исход, и он виден в интерфейсе GitLab.
+        _log.error("GITLAB_WEBHOOK_SECRET не задан — доставки GitLab отвергаются")
+        raise HTTPException(status_code=503, detail="GitLab webhook not configured")
+
+    try:
+        gitlab_signature.verify(
+            body, headers, GITLAB_WEBHOOK_SECRET, GITLAB_SIGNATURE_MODE)
+    except gitlab_signature.SignatureError as exc:
+        _log.warning("доставка GitLab отвергнута: %s", exc)
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    event = headers.get("x-gitlab-event") or headers.get("X-Gitlab-Event") or ""
+    # Идентификатор доставки: с 17.4 он консистентен между повторами (ручной
+    # Resend), ниже — только UUID события.
+    delivery_id = (headers.get("idempotency-key")
+                   or headers.get("x-gitlab-event-uuid")
+                   or None)
+
+    payload = await request.json()
+    try:
+        normalized = gitlab_events.normalize(
+            event, payload, bot_login=GITLAB_BOT_LOGIN)
+    except gitlab_events.UnsupportedEvent as exc:
+        # Событие, на которое контур не подписан, — не ошибка доставки.
+        # Подтверждаем, иначе вебхук выключится на том, что нас не касается.
+        _log.info("доставка GitLab пропущена: %s", exc)
+        return {"ok": True}
+    except Exception:
+        _log.exception("не разобрал доставку GitLab %s (%s) — принимаю и ухожу в аудит",
+                       delivery_id or "без id", event)
+        await _audit_dropped_delivery(
+            payload, event, delivery_id,
+            gitlab_events.project_path(payload), ["(ошибка разбора)"])
+        return {"ok": True}
+
+    internal = gitlab_events.internal_event(event)
+    try:
+        return await _handle_delivery(normalized, internal, delivery_id)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("не обработал доставку GitLab %s (%s) — принимаю и ухожу в аудит",
+                       delivery_id or "без id", event)
+        await _audit_dropped_delivery(
+            normalized, internal, delivery_id,
+            (normalized.get("repository") or {}).get("full_name"),
+            ["(ошибка обработки)"])
         return {"ok": True}
 
 
