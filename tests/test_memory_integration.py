@@ -182,3 +182,98 @@ def test_clear_service_files_removes_all_and_reports(tmp_path):
 
 def test_clear_service_files_is_idempotent(tmp_path):
     assert develop.clear_service_files(tmp_path) == []
+
+
+# ────────── сигналы, измеренные контуром по ходу прогона ──────────
+
+def test_signals_file_lives_outside_the_clone(tmp_path):
+    """`git add -A` его не видит: корень задачи лежит вне рабочего дерева."""
+    a._write_signal(tmp_path, "tests_passed", True)
+    assert (tmp_path / a.SIGNALS_FILE).exists()
+    assert a._read_signals(tmp_path) == {"tests_passed": True}
+
+
+def test_signals_accumulate_not_overwrite(tmp_path):
+    a._write_signal(tmp_path, "tests_passed", False)
+    a._write_signal(tmp_path, "fix_rounds", 2)
+    assert a._read_signals(tmp_path) == {"tests_passed": False, "fix_rounds": 2}
+
+
+def test_missing_signals_file_is_not_an_error(tmp_path):
+    assert a._read_signals(tmp_path) == {}
+
+
+def test_broken_signals_file_is_not_an_error(tmp_path):
+    (tmp_path / a.SIGNALS_FILE).write_text("не json", encoding="utf-8")
+    assert a._read_signals(tmp_path) == {}
+    a._write_signal(tmp_path, "tests_passed", True)
+    assert a._read_signals(tmp_path) == {"tests_passed": True}
+
+
+def test_skipped_tests_are_unknown_not_passed(tmp_path, monkeypatch):
+    """Пропуск — не успех.
+
+    Иначе свёртка сигналов начнёт хвалить прогоны, в которых тесты не гонялись
+    вовсе: пустой `DEVELOP_TEST_COMMAND` засчитался бы как зелёный прогон.
+    """
+    monkeypatch.delenv("DEVELOP_TEST_COMMAND", raising=False)
+    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+
+    class _I:
+        repo, issue_number, title = "o/r", 1, "T"
+
+    a._dev_tests(_I())
+    assert a._read_signals(tmp_path) == {"tests_passed": None}
+
+
+def test_red_tests_record_the_outcome_before_raising(tmp_path, monkeypatch):
+    """Красный прогон — самый интересный для разбора. Терять о нём запись
+    значит собирать статистику только по удачам."""
+    import subprocess as sp
+
+    monkeypatch.setenv("DEVELOP_TEST_COMMAND", "какая-то команда")
+    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(a.subprocess, "run",
+                        lambda *x, **k: sp.CompletedProcess(x, 1, "провал", ""))
+
+    class _I:
+        repo, issue_number, title = "o/r", 1, "T"
+
+    with pytest.raises(RuntimeError, match="проверки не прошли"):
+        a._dev_tests(_I())
+    assert a._read_signals(tmp_path) == {"tests_passed": False}
+
+
+def test_green_tests_record_success(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    monkeypatch.setenv("DEVELOP_TEST_COMMAND", "какая-то команда")
+    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(a.subprocess, "run",
+                        lambda *x, **k: sp.CompletedProcess(x, 0, "всё зелено", ""))
+
+    class _I:
+        repo, issue_number, title = "o/r", 1, "T"
+
+    a._dev_tests(_I())
+    assert a._read_signals(tmp_path) == {"tests_passed": True}
+
+
+def test_signals_file_is_not_committed():
+    """Лежит в корне задачи, вне клона — но проверим и перечень служебных."""
+    assert a.SIGNALS_FILE.startswith(".")
+    assert a.INJECTED_RULES_FILE.startswith(".")
+
+
+def test_capture_runs_even_when_a_step_fails():
+    """Запись об итерации стоит в finally.
+
+    Красные тесты и сорвавшийся прогон агента уносили управление мимо неё, и
+    слой видел только удачные прогоны.
+    """
+    import pathlib
+    src = pathlib.Path("worker/workflows.py").read_text(encoding="utf-8")
+    block = src[src.index("class IssueDevelopment"):src.index('name="IssuePrFix"')]
+    assert "finally:" in block
+    assert block.index("finally:") < block.index("capture_episode")
+    assert "issue-lifecycle-capture-episode-always" in block

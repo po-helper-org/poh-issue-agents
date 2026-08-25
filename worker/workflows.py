@@ -2314,72 +2314,74 @@ class IssueDevelopment:
             )
             return None
 
-        # Порядок не косметический: сначала клон и постановка — они
-        # единственные могут не состояться до того, как что-либо сказано
-        # человеку.
-        await workflow.execute_activity(
-            activities.dev_prepare, args=[issue, plan.branch],
-            start_to_close_timeout=timedelta(seconds=600),
-            heartbeat_timeout=timedelta(seconds=300),
-            retry_policy=cheap,
-        )
-        await workflow.execute_activity(
-            activities.dev_announce, args=[issue, plan.branch],
-            start_to_close_timeout=timedelta(seconds=60),
-            retry_policy=cheap,
-        )
-        await workflow.execute_activity(
-            activities.dev_run_agent, issue,
-            start_to_close_timeout=timedelta(seconds=3600),
-            heartbeat_timeout=timedelta(seconds=300),
-            retry_policy=once,
-        )
-        # Находки — ДО тестов и публикации: файл находок обязан исчезнуть из
-        # рабочего дерева раньше коммита, иначе уедет в PR как мусор, а на
-        # следующем круге правок агент прочитает свои прошлые находки как новые.
-        await workflow.execute_activity(
-            activities.dev_followups, issue,
-            start_to_close_timeout=timedelta(seconds=300),
-            retry_policy=cheap,
-        )
-        await workflow.execute_activity(
-            activities.dev_tests, issue,
-            start_to_close_timeout=timedelta(seconds=1800),
-            heartbeat_timeout=timedelta(seconds=300),
-            retry_policy=once,
-        )
-        number = await workflow.execute_activity(
-            activities.dev_publish, args=[issue, plan.branch],
-            start_to_close_timeout=timedelta(seconds=600),
-            heartbeat_timeout=timedelta(seconds=300),
-            retry_policy=cheap,
-        )
-
-        # Запись об итерации — слою саморефлексии, если он подключён.
-        #
-        # ПОД МАРКЕРОМ, а не просто вызовом: новая команда в теле воркфлоу
-        # роняет недетерминизмом прогоны, начатые до выкладки, а прогон агента
-        # идёт до 45 минут и выкладку переживает. Прецедент в этом же файле:
-        # реплей без маркера падает `Timer machine does not handle
-        # ActivityTaskScheduled` — так легли подзадачи #20–#27 на стенде.
-        #
-        # ПОСЛЕ публикации и ДО проверки на `None`: запись нужна и о прогоне,
-        # который не дал ни одного изменённого файла. Это самый интересный для
-        # разбора исход, и терять его было бы ровно наоборот замыслу.
-        if workflow.patched("issue-lifecycle-capture-episode"):
-            try:
-                await workflow.execute_activity(
-                    activities.capture_episode, args=[issue, plan.branch, number],
-                    start_to_close_timeout=timedelta(seconds=60),
-                    # Активность детерминирована и дёшева: три попытки уместны.
-                    retry_policy=cheap,
-                )
-            except Exception as e:                       # noqa: BLE001 — см. ниже
-                # Слой саморефлексии ОПЦИОНАЛЕН, и его отказ не имеет права
-                # стоить прогона разработки. Работа сделана, пул-реквест открыт;
-                # потеря записи — досадно, потеря прогона — недопустимо.
-                workflow.logger.warning(
-                    "запись об итерации не отдана слою памяти: %s", _failure_reason(e))
+        number: int | None = None
+        try:
+            # Порядок не косметический: сначала клон и постановка — они
+            # единственные могут не состояться до того, как что-либо сказано
+            # человеку.
+            await workflow.execute_activity(
+                activities.dev_prepare, args=[issue, plan.branch],
+                start_to_close_timeout=timedelta(seconds=600),
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=cheap,
+            )
+            await workflow.execute_activity(
+                activities.dev_announce, args=[issue, plan.branch],
+                start_to_close_timeout=timedelta(seconds=60),
+                retry_policy=cheap,
+            )
+            await workflow.execute_activity(
+                activities.dev_run_agent, issue,
+                start_to_close_timeout=timedelta(seconds=3600),
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=once,
+            )
+            # Находки — ДО тестов и публикации: файл находок обязан исчезнуть из
+            # рабочего дерева раньше коммита, иначе уедет в PR как мусор, а на
+            # следующем круге правок агент прочитает свои прошлые находки как новые.
+            await workflow.execute_activity(
+                activities.dev_followups, issue,
+                start_to_close_timeout=timedelta(seconds=300),
+                retry_policy=cheap,
+            )
+            await workflow.execute_activity(
+                activities.dev_tests, issue,
+                start_to_close_timeout=timedelta(seconds=1800),
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=once,
+            )
+            number = await workflow.execute_activity(
+                activities.dev_publish, args=[issue, plan.branch],
+                start_to_close_timeout=timedelta(seconds=600),
+                heartbeat_timeout=timedelta(seconds=300),
+                retry_policy=cheap,
+            )
+        finally:
+            # Запись об итерации — В FINALLY, а не после успешных шагов.
+            #
+            # Красные тесты и сорвавшийся прогон агента — самые интересные для
+            # разбора исходы, и именно они пропускали запись: исключение из
+            # шага уносило управление мимо неё. Слой собирал статистику только
+            # по удачам и на ней же учился.
+            #
+            # ПОД МАРКЕРОМ: новая команда в теле воркфлоу роняет
+            # недетерминизмом прогоны, начатые до выкладки, а прогон агента
+            # идёт до 45 минут. Прецедент в этом же файле — реплей без маркера
+            # падает `Timer machine does not handle ActivityTaskScheduled`.
+            if workflow.patched("issue-lifecycle-capture-episode-always"):
+                try:
+                    await workflow.execute_activity(
+                        activities.capture_episode,
+                        args=[issue, plan.branch, number],
+                        start_to_close_timeout=timedelta(seconds=60),
+                        retry_policy=cheap,
+                    )
+                except Exception as e:                   # noqa: BLE001
+                    # Слой опционален и не имеет права стоить прогона — тем
+                    # более уже упавшего, где запись лишь пояснение к отказу.
+                    workflow.logger.warning(
+                        "запись об итерации не отдана слою памяти: %s",
+                        _failure_reason(e))
 
         if number is None:
             raise ApplicationError("агент не изменил ни одного файла — открывать нечего")

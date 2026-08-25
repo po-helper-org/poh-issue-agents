@@ -1905,6 +1905,43 @@ def _write_injected_rules(root: Path, ids: list[str]) -> None:
         logger.warning("перечень подсыпанных правил не сохранён: %s", e)
 
 
+SIGNALS_FILE = ".reflect-signals.json"
+"""Сигналы, которые контур измерил по ходу прогона.
+
+Лежит в КОРНЕ задачи, вне рабочего дерева git: `git add -A` его не видит.
+Через полезную нагрузку Temporal не везём — между шагами едут числа и пути.
+
+Существует потому, что измерение из первых рук точнее восстановленного
+постфактум: результат тестов контур знает в момент прогона, а по артефактам
+через неделю его не установить вовсе.
+"""
+
+
+def _write_signal(root: Path, name: str, value) -> None:
+    """Добавить измеренный сигнал. Отказ записи не срывает шаг."""
+    try:
+        path = root / SIGNALS_FILE
+        data = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) or {}
+            except ValueError:
+                data = {}
+        data[name] = value
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        logger.warning("сигнал %s не сохранён: %s", name, e)
+
+
+def _read_signals(root: Path) -> dict:
+    """Прочитать измеренные сигналы. Нет файла — пусто, это обычный ход дел."""
+    try:
+        data = json.loads((root / SIGNALS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _read_injected_rules(root: Path) -> list[str]:
     """Прочитать перечень. Нет файла — пустой список, это обычный ход событий."""
     try:
@@ -2123,13 +2160,24 @@ def _dev_tests(issue: IssueInput) -> str:
     агента CI может и не запуститься (события от токена Actions не порождают
     прогонов).
     """
+    root, clone_dir = _dev_paths(issue)
     command = os.environ.get("DEVELOP_TEST_COMMAND", "").strip()
     if not command:
+        # Пусто — шаг пропускается, и это НЕ «тесты прошли». Записываем
+        # неизвестность явно: иначе слой саморефлексии засчитает пропуск как
+        # успех, а свёртка сигналов начнёт хвалить прогоны, которых не было.
+        _write_signal(root, "tests_passed", None)
         return "(проверки не заданы — DEVELOP_TEST_COMMAND пуст)"
-    _, clone_dir = _dev_paths(issue)
+
     result = subprocess.run(command, shell=True, cwd=str(clone_dir),
                             capture_output=True, text=True, timeout=DEV_TESTS_TIMEOUT_SEC)
     out = ((result.stdout or "") + (result.stderr or ""))[-3000:]
+
+    # Исход пишется ДО возможного исключения. Красный прогон — самый интересный
+    # для разбора, и терять о нём запись значит собирать статистику только по
+    # удачам.
+    _write_signal(root, "tests_passed", result.returncode == 0)
+
     if result.returncode != 0:
         raise RuntimeError(f"проверки не прошли (код {result.returncode}):\n{out[-1500:]}")
     return out
@@ -2388,7 +2436,11 @@ async def capture_episode(issue: IssueInput, branch: str,
         "rules_injected": _read_injected_rules(root),
         # Число попыток активности: правило контура «Attempt > 1 у долгой
         # активности — уже беда» до сих пор нигде не читалось кодом.
-        "artifacts": {"activity_attempt": activity.info().attempt},
+        #
+        # Плюс всё, что контур измерил по ходу прогона: результат тестов и
+        # прочее. Измерение из первых рук точнее восстановленного постфактум.
+        "artifacts": {"activity_attempt": activity.info().attempt,
+                      **_read_signals(root)},
         **reflect,
     }
     ok = await asyncio.to_thread(memory.put_episode, episode)
