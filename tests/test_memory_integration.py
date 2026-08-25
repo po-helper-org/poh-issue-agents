@@ -277,3 +277,56 @@ def test_capture_runs_even_when_a_step_fails():
     assert "finally:" in block
     assert block.index("finally:") < block.index("capture_episode")
     assert "issue-lifecycle-capture-episode-always" in block
+# ────────── регрессия: файл намерений удалялся до чтения ──────────
+
+def test_reflect_note_is_preserved_not_destroyed(tmp_path):
+    """Живой прогон #94:
+
+        17:50:28  сняты служебные файлы: .task.md, .reflect.md
+        17:50:32  запись об итерации отдана слою памяти
+
+    Агент инструкцию выполнил и файл написал — а он был удалён за четыре
+    секунды до чтения. Намерение в записи оказалось пустым при исправном агенте.
+
+    «Снять из рабочего дерева» и «уничтожить» — разные вещи.
+    """
+    root = tmp_path
+    clone = tmp_path / "repo"
+    clone.mkdir()
+    (clone / ".reflect.md").write_text("## Намерение\nпочинил обработчик\n",
+                                       encoding="utf-8")
+    (clone / ".task.md").write_text("постановка", encoding="utf-8")
+
+    removed = develop.clear_service_files(clone, keep_dir=root)
+
+    assert sorted(removed) == [".reflect.md", ".task.md"]
+    assert not (clone / ".reflect.md").exists(), "из дерева обязан исчезнуть"
+    assert (root / ".reflect.md").exists(), "содержимое обязано пережить снятие"
+    assert a._read_reflect_note(root)["intent"] == "починил обработчик"
+
+
+def test_task_statement_is_destroyed_not_preserved(tmp_path):
+    """Постановку сохранять незачем — она и так публикуется дословно."""
+    clone = tmp_path / "repo"
+    clone.mkdir()
+    (clone / ".task.md").write_text("постановка", encoding="utf-8")
+    develop.clear_service_files(clone, keep_dir=tmp_path)
+    assert not (tmp_path / ".task.md").exists()
+
+
+def test_without_keep_dir_everything_is_destroyed(tmp_path):
+    """Круг правок PR сохранять намерение не просит — там своего корня нет."""
+    clone = tmp_path / "repo"
+    clone.mkdir()
+    (clone / ".reflect.md").write_text("х", encoding="utf-8")
+    develop.clear_service_files(clone)
+    assert not (clone / ".reflect.md").exists()
+
+
+def test_unwritable_keep_dir_still_clears_the_tree(tmp_path):
+    """Не сохранили — не повод оставить файл в дереве: в коммите он опаснее."""
+    clone = tmp_path / "repo"
+    clone.mkdir()
+    (clone / ".reflect.md").write_text("х", encoding="utf-8")
+    develop.clear_service_files(clone, keep_dir=tmp_path / "нет-такого")
+    assert not (clone / ".reflect.md").exists()
