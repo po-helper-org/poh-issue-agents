@@ -1857,8 +1857,16 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
     # Блок дописывается ПОСЛЕДНИМ и НЕ начинается с заголовка: разбор на
     # секции ниже сделал бы его именем секции без содержимого. При выключенном
     # слое текст пуст, и постановка не меняется ни на символ.
-    memory_rules = memory.rules(memory.DEVELOP, repo=issue.repo,
-                                query=f"{issue.title}\n{fresh_body or ''}")
+    # Контрольная выборка: каждая N-я задача идёт БЕЗ правил. Не порча
+    # прогона, а единственный способ ответить на вопрос «слой не мешает?» —
+    # сравнивать доли исходов не с чем, если правила подсыпаются всегда.
+    if memory.control_arm(issue.issue_number):
+        logger.info("Develop %s#%s: контрольная итерация — правила организации "
+                    "не подсыпаются", issue.repo, issue.issue_number)
+        memory_rules = memory.Rules(text="", ids=[])
+    else:
+        memory_rules = memory.rules(memory.DEVELOP, repo=issue.repo,
+                                    query=f"{issue.title}\n{fresh_body or ''}")
     if memory_rules.text:
         # Заголовок ставит КОНТУР, а не слой. Слой намеренно не выдаёт
         # заголовков вовсе — он не знает, во что его блок вставят. Зато контуру
@@ -2461,7 +2469,12 @@ async def capture_episode(issue: IssueInput, branch: str,
         #
         # Плюс всё, что контур измерил по ходу прогона: результат тестов и
         # прочее. Измерение из первых рук точнее восстановленного постфактум.
+        # `control` ставится ЯВНО, а не выводится из пустого перечня правил:
+        # пустым он бывает и когда слой был недоступен в момент подготовки.
+        # «Правил не дали нарочно» и «правил не досталось» — разные вещи, и
+        # смешивать их значит подмешивать в контрольную выборку брак.
         "artifacts": {"activity_attempt": activity.info().attempt,
+                      "control": memory.control_arm(issue.issue_number),
                       **_read_signals(root)},
         **reflect,
     }
