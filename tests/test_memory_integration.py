@@ -3,6 +3,7 @@
 Главное свойство, которое здесь закреплено: **слой опционален**. Выключенный он
 не меняет ни постановку, ни поведение шагов — побайтово.
 """
+import asyncio
 import json
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 import activities as a
 from shared import develop, memory
+from shared.workflow_types import IssueInput
 
 
 @pytest.fixture(autouse=True)
@@ -330,3 +332,55 @@ def test_unwritable_keep_dir_still_clears_the_tree(tmp_path):
     (clone / ".reflect.md").write_text("х", encoding="utf-8")
     develop.clear_service_files(clone, keep_dir=tmp_path / "нет-такого")
     assert not (clone / ".reflect.md").exists()
+
+
+# ───────── регрессия: судья не видел, что просили ─────────
+
+def _capture(monkeypatch, tmp_path, issue):
+    """Прогнать шаг записи, вернув отданную слою запись."""
+    sent = {}
+    monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
+    monkeypatch.setattr(a, "_dev_paths", lambda i: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(memory, "put_episode",
+                        lambda ep: sent.update(ep) or True)
+
+    class _Info:
+        workflow_id = "issue-o-r-77"
+        attempt = 1
+
+    monkeypatch.setattr(a.activity, "info", lambda: _Info())
+    assert asyncio.run(a.capture_episode(issue, "br", 123)) is True
+    return sent
+
+
+def test_episode_carries_the_task_text(monkeypatch, tmp_path):
+    """Живой прогон #94: правка в ДВЕ строки на задачу «описать поведение
+    функций» получила 0.93 и ни одного замечания.
+
+    Числа все хорошие — слито, тесты зелёные, круг правок один. Судья не мог
+    сказать ничего о СОРАЗМЕРНОСТИ, потому что постановки не видел вовсе.
+    """
+    issue = IssueInput(repo="o/r", issue_number=77, title="Описать JSDoc",
+                       body="Нужно описать поведение всех функций metrics.mjs",
+                       author_login="u", author_type="User")
+    sent = _capture(monkeypatch, tmp_path, issue)
+
+    assert sent["task_title"] == "Описать JSDoc"
+    assert "metrics.mjs" in sent["task_body"]
+
+
+def test_huge_statement_is_cut_before_it_goes_over_the_wire(monkeypatch, tmp_path):
+    """Постановка бывает на десятки килобайт. Память организации — не её копия."""
+    issue = IssueInput(repo="o/r", issue_number=77, title="t",
+                       body="я" * (a.TASK_BODY_LIMIT * 3),
+                       author_login="u", author_type="User")
+    sent = _capture(monkeypatch, tmp_path, issue)
+
+    assert len(sent["task_body"]) == a.TASK_BODY_LIMIT
+
+
+def test_empty_statement_travels_as_absent_not_as_blank(monkeypatch, tmp_path):
+    """Пустая строка сказала бы судье «просили ничего». Это не то же, что «неизвестно»."""
+    issue = IssueInput(repo="o/r", issue_number=77, title="t", body="",
+                       author_login="u", author_type="User")
+    assert _capture(monkeypatch, tmp_path, issue)["task_body"] is None
