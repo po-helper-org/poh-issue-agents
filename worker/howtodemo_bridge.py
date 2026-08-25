@@ -16,15 +16,11 @@ HowToDemo-Agent живёт в своём репозитории (`po-helper-org/
 
 import logging
 import os
-from pathlib import Path
 
 import github_client
 import llm
 
 _log = logging.getLogger(__name__)
-
-PROMPTS_DIR = Path(os.environ.get("PROMPTS_DIR", "/app/prompts"))
-PROMPT = "system_howtodemo_plan.md"
 
 
 def token_provider(repo: str) -> str:
@@ -42,7 +38,13 @@ class PlanTranslator:
     """
 
     def translate(self, scenario: list[str]) -> str:
-        system = (PROMPTS_DIR / PROMPT).read_text(encoding="utf-8")
+        # Промпт берётся ИЗ ПАКЕТА агента, а не из prompts/ этого репозитория:
+        # он часть договора агента с моделью наравне с форматом плана, их
+        # правят вместе. Копия у потребителя рано или поздно отстаёт — в
+        # контуре так уже отстала копия скилла bft-writer.
+        from poh_howtodemo import plan
+
+        system = plan.system_prompt()
         numbered = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(scenario))
         return llm.complete(system, numbered, model=llm.MODEL_CLASSIFY,
                             max_tokens=8000)
