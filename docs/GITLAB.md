@@ -15,20 +15,22 @@
 | Каталог меток и их заведение | **работает** — `shared/label_catalog.py`, `scripts/bootstrap_labels.py` |
 | Смена набора меток одной операцией | **работает** — `github_client.set_labels` |
 | Вебхук не отдаёт 5xx на неразобранной доставке | **работает** — `webhook/main.py` |
-| Эндпоинт `/gitlab/webhook` | **нет** |
-| Проверка подписи вебхука GitLab | **нет** |
-| Клиент GitLab API | **нет** |
-| Драйвер провайдера (`poh-forge`) | **нет** |
+| Эндпоинт `/gitlab/webhook` | **работает** — `webhook/main.py` |
+| Проверка подписи: HMAC (19.0+) и plain-токен | **работает** — `shared/gitlab_signature.py` |
+| Нормализация событий GitLab | **работает** — `shared/gitlab_events.py` |
+| Клиент GitLab API | **работает** — `worker/gitlab_client.py` |
+| Выбор провайдера в activities | **нет** — `worker/activities.py` зовёт `github_client` напрямую |
+| Пакет `poh-forge` | **нет** — вынос отложен, драйверы пока живут в репозитории |
 
 Проверить самому:
 
 ```bash
 git grep -n '@app.post' -- webhook/main.py
+python3 -m pytest tests/test_gitlab_events.py tests/test_gitlab_signature.py \
+  tests/test_gitlab_webhook_endpoint.py tests/test_gitlab_client.py -q
 ```
 
-Два эндпоинта — `/webhook` и `/agent-event`. Третьего нет.
-
-**Практическое следствие.** Контур пока не может вести проект GitLab. Подготовительные шаги 1–4 ниже выполняются уже сейчас и не пропадут; шаг 5 (вебхук) ставится последним, когда драйвер появится.
+**Практическое следствие.** События GitLab принимаются и нормализуются, клиент умеет всё, что умеет GitHub-клиент. Чего ещё нет — переключателя: `activities.py` импортирует `github_client` жёстко, поэтому задача из GitLab доедет до Temporal, но исходящие вызовы уйдут не туда. Шаги 1–4 ниже выполняются уже сейчас, шаг 5 (вебхук) — после того, как появится выбор провайдера.
 
 ---
 
