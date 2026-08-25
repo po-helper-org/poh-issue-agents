@@ -15,6 +15,7 @@ Delivery-Agent живёт в своём репозитории (`po-helper-org/p
 """
 
 import asyncio
+import datetime
 import logging
 import os
 import re
@@ -267,21 +268,69 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
 
 
 # --- круг ревью: вердикт как условие мержа ---
-
 def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
     """Ревью относится к текущему коммиту ветки, а не к прежнему.
 
-    Проверяется по отметке PR-Agent («Review updated until commit …»): ревью
-    вчерашнего кода — не разрешение влить сегодняшний.
+    Свежесть определяется по времени: ревью, созданное после последнего
+    коммита, считается свежим. Отметка PR-Agent («Review updated until
+    commit …») остаётся дополнительным признаком.
     """
     from poh_delivery import review as review_module
 
+    # 1. Получаем время последнего коммита
+    try:
+        commit_timestamp_str = github_client.get_commit_timestamp(repo, head_sha)
+        commit_timestamp = datetime.datetime.fromisoformat(
+            commit_timestamp_str.replace("Z", "+00:00")
+        )
+    except Exception:
+        # Если не удалось получить время коммита, fallback на старую логику
+        _log.warning(f"Не удалось получить время коммита {head_sha} в {repo}")
+        comments = github_client.list_comments(repo, pr_number, limit=100)
+        notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
+        seen = review_module.review_head(notes)
+        if not seen:
+            return False
+        return head_sha.startswith(seen) or seen.startswith(head_sha[:7])
+
+    # 2. Проверяем отметку PR-Agent как дополнительный признак
     comments = github_client.list_comments(repo, pr_number, limit=100)
     notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
     seen = review_module.review_head(notes)
-    if not seen:
-        return False
-    return head_sha.startswith(seen) or seen.startswith(head_sha[:7])
+    
+    if seen:
+        # Если отметка есть и указывает на другой коммит — ревю несвежее
+        if not (head_sha.startswith(seen) or seen.startswith(head_sha[:7])):
+            return False
+        # Отметка совпадает с текущим коммитом — свежее
+        return True
+
+    # 3. Проверяем ревю по времени
+    try:
+        reviews = github_client.list_reviews(repo, pr_number, limit=100)
+        for review in reviews:
+            # Игнорируем dismiss-ревю
+            if review.get("state") == "DISMISSED":
+                continue
+            
+            # Берём максимум из created_at и updated_at
+            review_time_str = review.get("updated_at") or review.get("created_at")
+            if not review_time_str:
+                continue
+                
+            review_timestamp = datetime.datetime.fromisoformat(
+                review_time_str.replace("Z", "+00:00")
+            )
+            
+            # Если ревю создано/обновлено после коммита — свежее
+            if review_timestamp >= commit_timestamp:
+                return True
+    except Exception as e:
+        _log.warning(f"Не удалось получить список ревью для {repo}#{pr_number}: {e}")
+
+    # 4. Нет ревю и нет отметки — просим ревю
+    return False
+
 
 
 @activity.defn(name="delivery_review_round")

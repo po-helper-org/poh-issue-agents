@@ -688,6 +688,31 @@ def get_pull(repo: str, number: int) -> dict:
     return resp.json()
 
 
+def get_commit_timestamp(repo: str, commit_sha: str) -> str:
+    """Время создания коммита в формате ISO 8601.
+
+    Используется для сравнения с временем ревю при определении свежести.
+    """
+    url = f"https://api.github.com/repos/{repo}/commits/{commit_sha}"
+    resp = requests.get(url, headers=_auth_headers(repo), timeout=30)
+    resp.raise_for_status()
+    return resp.json()["commit"]["committer"]["date"]
+
+
+def list_reviews(repo: str, pull_number: int, limit: int = 50) -> list[dict]:
+    """Список ревью PR с временными метками.
+
+    Возвращает список ревью с полями id, user, body, created_at, updated_at,
+    state, commit_id. Используется для определения свежести ревю по времени.
+    """
+    url = f"https://api.github.com/repos/{repo}/pulls/{pull_number}/reviews"
+    resp = requests.get(
+        url, headers=_auth_headers(repo), params={"per_page": min(limit, 100)}, timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()[:limit]
+
+
 def review_text(repo: str, number: int, limit: int = 12000) -> str:
     """Замечания ревью одним текстом: обзорные комментарии + построчные.
 
