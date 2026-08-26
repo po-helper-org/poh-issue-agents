@@ -1736,6 +1736,20 @@ def _write_runner_mcp_config(issue: IssueInput, root: Path) -> None:
     """
     if not repowise.enabled():
         return
+    if not repowise.available(timeout=repowise.PROBE_TIMEOUT_SEC):
+        # НАСТРОЕННЫЙ, но недоступный прокси — не то же самое, что выключенная
+        # интеграция, и раньше эти случаи не различались: конфиг писался по
+        # флагу, агент шёл поднимать по нему MCP и умирал на инициализации, не
+        # сделав ни одного хода. Контур при этом докладывал «агент не изменил
+        # ни одного файла» — то есть обвинял агента в отказе инфраструктуры.
+        # Живой случай: poh-demo-checkout#151, 2026-08-25.
+        #
+        # Работа без индекса — штатный режим, он же обещан документацией.
+        logger.warning(
+            "Develop %s#%s: Repowise настроен, но прокси не отвечает — "
+            "конфигурацию MCP не пишу, агент пойдёт без индекса",
+            issue.repo, issue.issue_number)
+        return
     config_dir = root / develop.MCP_CONFIG_DIR
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / develop.MCP_CONFIG_NAME).write_text(
@@ -2089,6 +2103,12 @@ def _reap_runner(slug: str) -> None:
 
 def _dev_run_agent(issue: IssueInput) -> str:
     """Прогон одноразового контейнера. Возвращает хвост вывода."""
+    shortage = develop.resource_shortage()
+    if shortage:
+        # Отказ ДО старта, а не сожжённый прогон: контейнер агента поднимается
+        # на общем хосте, и нехватка памяти бьёт не по нам, а по соседям через
+        # OOM-killer, который выбирает жертву сам.
+        raise RuntimeError(f"прогон агента не начат: {shortage}")
     slug = develop.task_slug(issue.repo, issue.issue_number)
     _reap_runner(slug)
     command = develop.runner_command(
@@ -2316,7 +2336,8 @@ async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None =
     number = await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
 
     if number is None:
-        raise RuntimeError("агент не изменил ни одного файла — открывать нечего")
+        task, _clone = _dev_paths(issue)
+        raise RuntimeError(develop.empty_run_reason(task))
     return number
 
 
@@ -2390,6 +2411,19 @@ async def dev_run_agent(issue: IssueInput) -> None:
     текста на прогон.
     """
     await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
+
+
+@activity.defn
+async def dev_empty_run_reason(issue: IssueInput) -> str:
+    """Почему прогон агента не дал изменений — по следам самого раннера.
+
+    Отдельной активностью, потому что воркфлоу файловой системы не видит, а
+    признак лежит именно там: каталог событий разговора OpenHands. Пуст —
+    агент не сделал ни одного хода, то есть отказало окружение, а не работа
+    агента. Это разные новости и зовут человека в разные места.
+    """
+    task, _clone = _dev_paths(issue)
+    return develop.empty_run_reason(task)
 
 
 @activity.defn
