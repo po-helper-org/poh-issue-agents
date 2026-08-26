@@ -11,10 +11,10 @@
     ssh poh-stand "T=compose-connect-redundant-system-mzso3q-temporal-1
     A=--address=compose-connect-redundant-system-mzso3q-temporal-1:7233
     rm -rf /tmp/hist && mkdir -p /tmp/hist
-    for w in \$(docker exec \$T temporal workflow list \$A --limit 300 2>/dev/null \
-                 | awk '\$3==\"IssueLifecycle\"{print \$2}'); do
-      docker exec \$T temporal workflow show \$A -w \"\$w\" -o json \
-        > /tmp/hist/\$(echo \"\$w\" | tr '/' '_').json 2>/dev/null
+    for w in \\$(docker exec \\$T temporal workflow list \\$A --limit 300 2>/dev/null \
+                 | awk '\\$3==\"IssueLifecycle\"{print \\$2}'); do
+      docker exec \\$T temporal workflow show \\$A -w \"\\$w\" -o json \
+        > /tmp/hist/\\$(echo \"\\$w\" | tr '/' '_').json 2>/dev/null
     done
     tar -czf /tmp/hist.tgz -C /tmp hist"
 
