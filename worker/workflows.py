@@ -1495,7 +1495,13 @@ class IssueLifecycle:
         # не парковаться: задача дошла до конца исследовательского пути, и
         # следующее решение (запуск разработки) принимается отдельно, в своей
         # фазе (_phase_await_build).
-        if deadlines.research_autostart:
+        # Маркер обязателен: ветка МЕНЯЕТ РЕШЕНИЕ. Прогоны, начатые до неё,
+        # записали в историю парковку (`set_phase` в `awaiting-build-decision`),
+        # и новый код на том же месте планировал запуск разработки —
+        # `[TMPRL1100] Nondeterminism error`. Так встали 28 прогонов из 124, и
+        # снаружи они выглядели живыми: сигналы приходили и умирали.
+        if (workflow.patched("issue-lifecycle-research-autostart-handoff")
+                and deadlines.research_autostart):
             if deadlines.develop_autostart and not self._plan_member:
                 # Полный автостарт: Research + Develop → замкнутый контур
                 return await self._start_development(issue)
