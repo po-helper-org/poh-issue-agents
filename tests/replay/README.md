@@ -14,11 +14,36 @@
       temporal workflow show --address=compose-connect-redundant-system-mzso3q-temporal-1:7233 \
       -w '<workflow-id>' -o json" > /tmp/hist.json
 
-    grep -cE "ghs_|ghp_|Bearer |PRIVATE KEY|api_key" /tmp/hist.json   # обязан быть 0
+Проверить на секреты — процедура из раздела ниже. Ненулевой ответ — историю в
+фикстуры не брать.
 
     gzip -c /tmp/hist.json > tests/replay/histories/<workflow-id с / → __>.json.gz
 
 Имя файла — идентификатор прогона, где `/` заменён на `__`.
+
+## Проверка на секреты
+
+Греп по сырому файлу недостаточен: аргументы и результаты активностей лежат в
+payload'ах base64, и токен внутри них греп не увидит. Проверять декодированное:
+
+    python - <<'PY' <файл истории>
+    import base64, json, re, sys
+    raw = open(sys.argv[1], encoding="utf-8").read()
+    text = [raw]
+    for chunk in re.findall(r'"data"\s*:\s*"([A-Za-z0-9+/=]{8,})"', raw):
+        try:
+            text.append(base64.b64decode(chunk).decode("utf-8", "replace"))
+        except Exception:
+            pass
+    joined = "\n".join(text)
+    bad = re.findall(r"ghs_\w+|ghp_\w+|gho_\w+|github_pat_\w+|sk-ant-\w+|sk-\w{20,}"
+                     r"|xox[baprs]-\w+|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY", joined)
+    print("подозрительных совпадений:", len(bad))
+    for item in sorted(set(bad))[:10]:
+        print(" ", item[:24])
+    PY
+
+Ненулевой ответ — историю в фикстуры не брать.
 
 ## Что держать здесь
 

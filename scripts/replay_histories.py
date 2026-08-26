@@ -18,14 +18,32 @@
     done
     tar -czf /tmp/hist.tgz -C /tmp hist"
 
+Имена в корпусе — с ОДНИМ подчёркиванием (`tr '/' '_'` в цикле выше). Фикстуры
+в tests/replay/histories/ — с ДВУМЯ (см. tests/replay/README.md). Перенос
+истории из снятого корпуса в фикстуры репозитория — это переименование, а не
+просто `cp` + `gzip`:
+
+    mv /tmp/hist/issue-po-helper-org_poh-example-1.json \
+       /tmp/hist/issue-po-helper-org__poh-example-1.json
+    gzip -c /tmp/hist/issue-po-helper-org__poh-example-1.json \
+      > tests/replay/histories/issue-po-helper-org__poh-example-1.json.gz
+
+Копия «как есть», без переименования, даст файл с одним подчёркиванием, и
+`workflow_id = path.name...replace("__", "/")` в тесте восстановит по нему
+неверный идентификатор прогона.
+
 Запуск:
 
-    python scripts/replay_histories.py <каталог с *.json>
+    python scripts/replay_histories.py <каталог с *.json или *.json.gz>
+
+Читает и распакованные истории корпуса (*.json), и сжатые фикстуры репозитория
+(*.json.gz) — один инструмент годится для обоих каталогов.
 
 Код возврата 1, если хоть одна история не проигралась.
 """
 import asyncio
 import glob
+import gzip
 import sys
 from collections import defaultdict
 
@@ -52,8 +70,15 @@ def workflow_classes() -> list[type]:
     return found
 
 
+def _read_history(path: str) -> str:
+    """*.json — как есть, *.json.gz — распаковать. Один каталог может смешивать оба вида."""
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8").read()
+    return open(path, encoding="utf-8").read()
+
+
 async def run(directory: str) -> int:
-    paths = sorted(glob.glob(f"{directory}/*.json"))
+    paths = sorted(glob.glob(f"{directory}/*.json") + glob.glob(f"{directory}/*.json.gz"))
     if not paths:
         print(f"в {directory} нет ни одной истории")
         return 1
@@ -62,7 +87,7 @@ async def run(directory: str) -> int:
     failures: dict[str, list[str]] = defaultdict(list)
     ok = 0
     for path in paths:
-        raw = open(path, encoding="utf-8").read()
+        raw = _read_history(path)
         name = path.rsplit("/", 1)[-1]
         try:
             await Replayer(workflows=classes).replay_workflow(
@@ -70,7 +95,7 @@ async def run(directory: str) -> int:
             ok += 1
         except Exception as exc:            # noqa: BLE001 — интересен любой отказ
             text = str(exc)
-            key = text.split(MARKER)[-1][:80] if MARKER in text else type(exc).__name__
+            key = text.split(MARKER)[-1][:160] if MARKER in text else type(exc).__name__
             failures[key].append(name)
 
     total = sum(len(v) for v in failures.values())

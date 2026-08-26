@@ -7,12 +7,14 @@
 приходят и умирают, а снаружи Issue выглядит живым.
 
 Найдено 2026-08-25: коммит `ac625e7` добавил ветку автостарта в
-`_phase_handoff` без маркера, и все прогоны, стоявшие в парковке
+`_phase_handoff` без маркера, и прогоны, стоявшие в парковке
 `awaiting-build-decision`, встали намертво с
 `[TMPRL1100] Nondeterminism error: Activity type of scheduled event 'set_phase'
-does not match activity type of activity command 'trigger_openhands_resolver'`.
-Полный прогон всех 149 реальных историй корпуса подтвердил: 29 мёртвых
-парковочных прогонов из 149, плюс 2 отказа по не связанной причине.
+does not match activity type of activity command '...'` — у 26 из 29 после
+`activity command` стоит `'mark_awaiting'`, у остальных 3 —
+`'trigger_openhands_resolver'`. Полный прогон всех 149 реальных историй корпуса
+подтвердил: 29 мёртвых парковочных прогонов из 149, плюс 2 отказа по не
+связанной причине.
 
 Фикстуры в tests/replay/histories/ — истории ЖИВЫХ прогонов, и утверждение
 теста в том, что текущий код их не ломает: они обязаны реплеиться. Историю
