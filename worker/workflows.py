@@ -2436,7 +2436,29 @@ class IssueDevelopment:
                         _failure_reason(e))
 
         if number is None:
-            raise ApplicationError("агент не изменил ни одного файла — открывать нечего")
+            reason = "агент не изменил ни одного файла — открывать нечего"
+            if workflow.patched("issue-lifecycle-empty-run-diagnosis"):
+                # Прежнее сообщение обвиняло агента в бездействии даже тогда,
+                # когда он не сделал ни одного хода — то есть когда отказало
+                # окружение. Человек шёл разбирать постановку вместо
+                # инфраструктуры. Признак лежит на диске, поэтому спрашиваем
+                # активность: воркфлоу файловой системы не видит.
+                #
+                # Уточнение НЕ ИМЕЕТ ПРАВА подменить собой исходный отказ:
+                # диагностика, способная сломать то, что диагностирует, хуже
+                # её отсутствия. Не вышло — докладываем прежним текстом.
+                try:
+                    reason = await workflow.execute_activity(
+                        activities.dev_empty_run_reason,
+                        args=[issue],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=cheap,
+                    )
+                except Exception as e:                   # noqa: BLE001
+                    workflow.logger.warning(
+                        "причину пустого прогона выяснить не удалось: %s",
+                        _failure_reason(e))
+            raise ApplicationError(reason)
         return number
 
 
