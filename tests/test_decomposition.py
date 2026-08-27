@@ -123,3 +123,46 @@ def test_decomposition_is_on_by_default(monkeypatch):
     monkeypatch.delenv("DECOMPOSE_ENABLED", raising=False)
 
     assert d.enabled() is True
+
+
+# --- Правило деления по объявленным зависимостям ---
+
+def test_no_dependencies_means_single_run():
+    """Граф без рёбер — не план, а список правок: делить нечего."""
+    items = [
+        {"title": "Импорт версии", "release": "mvp", "depends_on": [], "depends_reason": {}},
+        {"title": "Лог версии", "release": "mvp", "depends_on": [], "depends_reason": {}},
+    ]
+    assert d.needs_subissues(items) is False
+
+
+def test_one_real_dependency_means_split():
+    items = [
+        {"title": "Загрузить версию", "release": "mvp", "depends_on": [], "depends_reason": {}},
+        {"title": "Отдать версию", "release": "mvp", "depends_on": [0],
+         "depends_reason": {"0": "читает version из состояния"}},
+    ]
+    assert d.needs_subissues(items) is True
+
+
+def test_single_item_never_splits():
+    items = [{"title": "Одна правка", "release": "mvp", "depends_on": [], "depends_reason": {}}]
+    assert d.needs_subissues(items) is False
+
+
+def test_dependency_without_reason_is_reported():
+    """Ребро без предмета — выдумка ради вида плана, а не зависимость."""
+    items = [
+        {"title": "Первый", "release": "mvp", "depends_on": [], "depends_reason": {}},
+        {"title": "Второй", "release": "mvp", "depends_on": [0], "depends_reason": {}},
+    ]
+    assert d.dependency_reason_missing(items) == ["Второй"]
+
+
+def test_dependency_with_reason_is_not_reported():
+    items = [
+        {"title": "Первый", "release": "mvp", "depends_on": [], "depends_reason": {}},
+        {"title": "Второй", "release": "mvp", "depends_on": [0],
+         "depends_reason": {"0": "использует функцию parse()"}},
+    ]
+    assert d.dependency_reason_missing(items) == []

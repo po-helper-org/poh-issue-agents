@@ -193,3 +193,34 @@ def parent_summary(items: list[dict], numbers: dict[int, int], *, summary: str,
     parts.append("Задача готова к разработке: агент берёт подзадачи MVP в "
                  "порядке зависимостей.")
     return "\n".join(parts)
+
+
+def needs_subissues(items: list[dict]) -> bool:
+    """Разворачивать ли план в под-задачи.
+
+    Шаг существует, только если от него зависит другой шаг. Граф без рёбер —
+    это не план, а список правок, который исполнитель сделает за один прогон;
+    заводить под каждую строку задачу в трекере значит платить вниманием за
+    видимость, которой никто не пользуется.
+
+    Определение взято из инструмента, а не выдумано: задачи планов superpowers
+    несут блок Interfaces с Consumes/Produces, и непустой Consumes — это и есть
+    объявленное ребро.
+    """
+    return any(item.get("depends_on") for item in items)
+
+
+def dependency_reason_missing(items: list[dict]) -> list[str]:
+    """Заголовки шагов, где зависимость объявлена без предмета.
+
+    Ребро обязано называть, ЧТО даёт предшественник: «читает version из
+    состояния». Без предмета зависимость невозможно ни проверить, ни
+    опровергнуть, а модели дешевле выдумать её, чем признать, что плана нет.
+    """
+    bad = []
+    for item in items:
+        for index in item.get("depends_on") or []:
+            if not (item.get("depends_reason") or {}).get(str(index), "").strip():
+                bad.append(item["title"])
+                break
+    return bad
