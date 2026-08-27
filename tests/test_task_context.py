@@ -107,3 +107,41 @@ def test_truncation_marker_in_non_md_file(tmp_path):
     found = task_context.truncation_markers(tmp_path)
     # Должны найтись оба файла (не только .md)
     assert len(found) >= 2
+
+
+# ───────────────────── обязательный набор (задача 7) ─────────────────────
+#
+# missing() проверяет только то, что ей передали. Без канонического
+# обязательного набора сборщик контекста мог бы строить `entries` по факту
+# записанного — и молчаливый провал записи требований выглядел бы как
+# «всё доставлено», потому что отсутствующий файл просто не был бы назван.
+
+def test_requirements_are_mandatory_with_analysis_branch():
+    assert task_context.required(has_analysis=True) == {
+        task_context.REQUIREMENTS: "системные требования (ветка аналитики)"}
+
+
+def test_nothing_is_mandatory_without_an_analysis_branch():
+    """Аналитики нет — штатный путь «работай от тела Issue», а не провал."""
+    assert task_context.required(has_analysis=False) == {}
+
+
+def test_howtodemo_and_decisions_are_never_mandatory():
+    """Сценарий может лежать в письме БФТ; решений прошлых шагов может не
+    быть вовсе — оба случая штатные, а не отказ подготовки."""
+    required = task_context.required(has_analysis=True)
+    assert task_context.HOWTODEMO not in required
+    assert task_context.DECISIONS not in required
+
+
+def test_plan_is_never_mandatory_here():
+    """План кладёт стадия декомпозиции — не сборщик контекста разработки."""
+    assert task_context.PLAN not in task_context.required(has_analysis=True)
+
+
+def test_required_set_catches_absence_even_when_nothing_was_recorded(tmp_path):
+    """Регрессия сценария из докстринга `required()`: каталог пуст — будто
+    вся сборка контекста провалилась молча, — а обязательный набор всё равно
+    ловит отсутствие, а не сообщает «всё доставлено»."""
+    absent = task_context.missing(tmp_path, task_context.required(has_analysis=True))
+    assert absent == [task_context.REQUIREMENTS]

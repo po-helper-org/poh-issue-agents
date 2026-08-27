@@ -226,3 +226,132 @@ def test_a_retry_with_nothing_new_to_add_but_a_fresh_branch_is_still_no_changes(
     assert number is None
     assert not any(len(c) > 3 and c[3] == "push" for c in calls), (
         "пуша быть не должно — открывать нечего")
+
+
+# ────────── задача 7: `.harness/` коммитится всегда, пустой прогон не должен потеряться ──────────
+#
+# `.harness/` пишет `_dev_prepare` ДО прогона агента (контекст задачи, не
+# часть правки — см. `shared/develop.py`, SERVICE_FILES) и НЕ снимает перед
+# коммитом: он обязан дойти до PR. Значит каталог существует в рабочем дереве
+# независимо от того, тронул ли агент код, и голая проверка `git diff --cached
+# --quiet` перестала бы отличать «агент ничего не сделал» от «агент отработал».
+# `ignore_for_empty_check` — тот же трюк, что раньше решался снятием файла
+# (`.task.md` и соседи): каталог остаётся в коммите, но не в проверке пустоты.
+# Настоящий git, не подделка: находка — в точной семантике pathspec-исключения,
+# а мок рискует подтвердить не то, что происходит на самом деле (см. другие
+# тесты этого файла).
+
+def _seed_repo(tmp_path):
+    origin = tmp_path / "origin.git"
+    clone_dir = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(clone_dir)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(clone_dir), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "config", "user.name", "t"], check=True)
+    (clone_dir / "README.md").write_text("baseline")
+    subprocess.run(["git", "-C", str(clone_dir), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "commit", "-m", "seed"],
+                   check=True, capture_output=True)
+    return clone_dir
+
+
+def test_publish_ignores_the_harness_directory_when_deciding_if_anything_changed(
+        monkeypatch, tmp_path):
+    """`.harness/` коммитится всегда — его наличие само по себе не должно
+    читаться как «агент что-то сделал». Иначе ЛЮБОЙ прогон, даже тот, где
+    агент не тронул ни одного файла, открывал бы PR с одним каталогом
+    контекста внутри: то самое «шаг отработал, доложил успех, результата
+    нет», ради которого и существует эта проверка."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    # Только каталог контекста — как будто агент код не менял вовсе.
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    posts: list = []
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: posts.append((a, k)))
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-3",
+                                 title="t", body="b", message="m",
+                                 ignore_for_empty_check=(".harness/**",))
+
+    assert number is None, "только контекст без правок — это пустой прогон"
+    assert posts == [], "PR не должен открываться без настоящей правки"
+    log = subprocess.run(["git", "-C", str(clone_dir), "log", "--oneline"],
+                         check=True, capture_output=True, text=True).stdout
+    assert len(log.strip().splitlines()) == 1, "коммит одного контекста без кода делать не должны"
+
+
+def test_publish_still_commits_real_changes_alongside_the_harness_directory(
+        monkeypatch, tmp_path):
+    """Исключение из проверки пустоты не должно исключать каталог из самого
+    коммита: `.harness/` обязан доехать до PR вместе с настоящей правкой."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 55}
+
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-4",
+                                 title="t", body="b", message="m",
+                                 ignore_for_empty_check=(".harness/**",))
+
+    assert number == 55
+    show = subprocess.run(["git", "-C", str(clone_dir), "show", "--stat", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout
+    assert "a.txt" in show and ".harness/context.md" in show, (
+        "исключение из проверки пустоты не должно исключать файлы из самого коммита")
+
+
+def test_ignore_for_empty_check_defaults_to_excluding_nothing(monkeypatch, tmp_path):
+    """Без аргумента поведение прежнее: голый каталог контекста без кода
+    читается как пустой прогон везде, где вызывающий не попросил исключений."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / "untracked.txt").write_text("что угодно, без .harness")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 66}
+
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-5",
+                                 title="t", body="b", message="m")
+
+    assert number == 66, "без исключений обычный файл по-прежнему считается правкой"

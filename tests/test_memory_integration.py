@@ -134,14 +134,12 @@ def test_reflect_note_instruction_is_its_own_block():
 def test_reflect_note_block_is_its_own_contour_section():
     """Своей секцией, а не довеском к соседней.
 
-    Приклеенный блок делит судьбу соседа при усечении — так на прогоне #105
-    правила организации утащили за собой инструкции контура.
-    """
+    Приклеенный блок был бы неотличим при разборе от продолжения соседней
+    секции и терял бы собственный заголовок."""
     secs = a._split_sections([a._DEV_REFLECT_NOTE_RULE])
     assert len(secs) == 1
     assert secs[0][0] == "## След решения"
     assert a.REFLECT_NOTE_FILE in a._join_sections(secs)
-    assert a._section_rank("## След решения", 1, "T") == a._RANK_CONTOUR
 
 
 def test_reflect_note_instruction_survives_repo_own_rules():
@@ -455,7 +453,12 @@ def test_control_iteration_never_asks_the_layer_for_rules(monkeypatch, tmp_path)
     monkeypatch.setattr(a, "_clone_repo",
                         lambda repo, dest, branch=None: os.makedirs(dest, exist_ok=True))
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
-    monkeypatch.setattr(a.github_client, "get_file", lambda *args, **kw: "")
+    # Ветка аналитики передана ниже ("research/issue-94") — требования у неё
+    # обязательны (`task_context.required`), иначе подготовка откажет ещё до
+    # той точки, которую проверяет этот тест.
+    monkeypatch.setattr(a.github_client, "get_file",
+                        lambda repo, path, ref=None:
+                            "требования" if path.endswith("system_requirements.md") else "")
 
     issue = IssueInput(repo="o/r", issue_number=94, title="t", body="b",
                        author_login="u", author_type="User")

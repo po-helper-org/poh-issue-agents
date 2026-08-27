@@ -362,7 +362,8 @@ def test_task_statement_is_not_committed(tmp_path, monkeypatch):
     (clone / ".task.md").write_text("постановка", encoding="utf-8")
     captured = {}
 
-    def fake_publish(repo, clone_dir, branch, *, title, body, message):
+    def fake_publish(repo, clone_dir, branch, *, title, body, message,
+                     ignore_for_empty_check=()):
         captured["task_md_exists"] = (pathlib.Path(clone_dir) / ".task.md").exists()
         return 28
 

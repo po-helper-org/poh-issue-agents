@@ -1,8 +1,14 @@
-"""Тесты для ISSUE-113 — проверка сохранения контекста в разработке."""
-import pytest
+"""Тесты для ISSUE-113 — проверка сохранения контекста в разработке.
+
+Усечение постановки (`_apply_size_limit`) задача 7 сняла целиком вместе с
+общим потолком: контекст теперь лежит файлами `.harness/`, а не пересказом с
+жёстким лимитом. `_fetch_decomposition_plan`/`_fetch_subtasks`/
+`_fetch_dev_comments` из `_dev_prepare` больше не вызываются (см. комментарий
+над `_fetch_decomposition_plan` в `activities.py`), но сами функции рабочие и
+проверяются здесь по-прежнему — в ожидании нового механизма плана (задача 8).
+"""
 from activities import (
     _truncate,
-    _apply_size_limit,
     _fetch_decomposition_plan,
     _fetch_subtasks,
     _fetch_dev_comments,
@@ -24,40 +30,6 @@ def test_truncate_long_text():
     assert len(result) == 50 + len(" …[обрезано]")
     assert " …[обрезано]" in result
     assert result.startswith("A" * 50)
-
-
-def test_apply_size_limit_no_limit():
-    """Без лимита все секции сохраняются."""
-    secs = [("# Задача: реализовать Issue #1", "тело"), ("## Обсуждение", "разговор")]
-    kept, dropped = _apply_size_limit(secs, 1000, 1, "T")
-    assert kept == secs and dropped == []
-
-
-def test_apply_size_limit_with_limit():
-    """С лимитом секции вытесняются, и вытесненные НАЗЫВАЮТСЯ.
-
-    Прежняя редакция писала факт усечения в отладочный лог: постановка молча
-    укорачивалась, и по прогону этого было не видно.
-    """
-    secs = [("# Задача: реализовать Issue #1", "AAA"), ("## Обсуждение", "BBB"),
-            ("## Как работать", "CCC")]
-    kept, dropped = _apply_size_limit(secs, 40, 1, "T")
-    assert len(kept) >= 1
-    assert dropped, "вытеснение обязано быть названо, а не только случиться"
-
-
-def test_apply_size_limit_preserves_priority():
-    """Тело задачи вытесняется последним, правила — первыми."""
-    secs = [("# Задача: реализовать Issue #1", "AAA"), ("## Как работать", "CCC")]
-    kept, dropped = _apply_size_limit(secs, 40, 1, "T")
-    assert "# Задача: реализовать Issue #1" in [n for n, _ in kept]
-    assert dropped == ["## Как работать"]
-
-
-def test_apply_size_limit_empty_list():
-    """Пустой список не должен вызывать ошибку."""
-    kept, dropped = _apply_size_limit([], 100, 1, "T")
-    assert kept == [] and dropped == []
 
 
 def test_fetch_decomposition_plan_no_marker(monkeypatch):

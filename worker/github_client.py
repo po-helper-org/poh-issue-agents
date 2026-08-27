@@ -641,7 +641,8 @@ def _git_runner(clone_dir: str, env: dict):
 
 
 def publish_worktree(repo: str, clone_dir: str, branch: str, *,
-                     title: str, body: str, message: str) -> int | None:
+                     title: str, body: str, message: str,
+                     ignore_for_empty_check: tuple[str, ...] = ()) -> int | None:
     """Коммит рабочего дерева в ветку и PR. None — изменений нет.
 
     Делает это ВОРКЕР, а не агент разработки: агенту токен не давали намеренно,
@@ -651,6 +652,14 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     Токен идёт через credential.helper в env, а не в URL: argv команды целиком
     попадает в текст CalledProcessError, и вклеенный токен уехал бы в историю
     Temporal при первом же сбое пуша.
+
+    `ignore_for_empty_check` — пути (git pathspec, например `".harness/**"`),
+    которые не учитываются при решении «есть ли изменения». Они по-прежнему
+    попадают в сам коммит через `git add -A` ниже — исключаются только из
+    ПРОВЕРКИ пустоты. Нужно вызывающему, который пишет в рабочее дерево
+    каталог, обязанный дойти до PR независимо от того, менял ли агент код: без
+    исключения такой каталог сам по себе выглядел бы диффом, и «агент ничего
+    не изменил» перестало бы обнаруживаться.
     """
     if _dry_run():
         _log.info("[DRY_RUN] publish %s -> %s: %s", clone_dir, branch, title)
@@ -697,7 +706,13 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     # объявлять «нет диффа». Пустой коммит по-прежнему не делаем: PR без диффа
     # ревьюить нечего, а фаза задачи от него сдвинулась бы как от настоящей
     # работы — это по-прежнему верно для ПЕРВОЙ попытки на новой ветке.
-    if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+    #
+    # Проверка идёт БЕЗ путей из `ignore_for_empty_check` (git pathspec
+    # `:(exclude)...`) — сам коммит их всё равно заберёт, `git add -A` выше
+    # уже отработал по всему дереву.
+    diff_args = ["diff", "--cached", "--quiet", "--", "."]
+    diff_args += [f":(exclude){pattern}" for pattern in ignore_for_empty_check]
+    if git(*diff_args, check=False).returncode == 0:
         if not branch_existed:
             _log.warning("%s: агент не изменил ни одного файла", repo)
             return None

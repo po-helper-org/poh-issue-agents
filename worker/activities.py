@@ -42,6 +42,7 @@ from shared import (
     pr_closing,
     repowise,
     sentry_setup,
+    task_context,
 )
 from shared.awaiting import Awaiting
 from shared.commands import (
@@ -839,9 +840,13 @@ CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментар
 CONTEXT_PR_LIMIT = 20           # связанных PR
 CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
 
-# Потолок размера постановки для агента разработки (ISSUE-113)
-DEV_TASK_MAX_CHARS = 50000      # общий размер .task.md
-DEV_ARTIFACT_MAX_CHARS = 10000  # отдельный артефакт FNR
+# Задача 7 сняла общий потолок постановки (`DEV_TASK_MAX_CHARS`,
+# `DEV_ARTIFACT_MAX_CHARS`) вместе с усечением по приоритету: контекст теперь
+# доезжает файлами каталога `.harness/` (`shared/task_context.py`), и
+# исполнитель читает их из git по мере надобности, а не получает урезанный
+# пересказ. `DEV_COMMENT_CHARS` — другое: это потолок ОДНОГО комментария в
+# `_fetch_dev_comments`, не общей постановки, и переполнение постановки в
+# целом им не достигалось.
 DEV_COMMENT_CHARS = 1000        # обрезка одного комментария для разработки
 
 
@@ -1156,9 +1161,21 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit].rstrip() + " …[обрезано]"
 
 
+# `_fetch_decomposition_plan`, `_fetch_subtasks` и `_fetch_dev_comments` ниже
+# больше НЕ вызываются из `_dev_prepare` (задача 7): инлайнинг плана,
+# подзадач и обсуждения в постановку убран ради «постановка теперь короткая»
+# — `_fetch_subtasks` в частности ничем не ограничен по объёму и без общего
+# потолка постановки был бы новым каналом её неограниченного роста. Плановый
+# контекст получит основание в `.harness/plan.md`, когда задача 8 подключит
+# новый механизм плана (`task_context.PLAN`); текущий формат этих функций
+# (поиск по маркеру "🧩 Декомпозиция" / `root-issue: #N`, `shared/decomposition.py`)
+# рабочий и потому не удалён — только отключён от вызова. Функции остаются
+# протестированными в `tests/test_issue_113_context_loss.py`.
+
+
 def _fetch_decomposition_plan(issue: IssueInput) -> str:
     """Получает план декомпозиции из комментария родителя.
-    
+
     Если родитель содержит комментарий с декомпозицией (есть маркер "🧩 Декомпозиция"),
     возвращает этот текст. Иначе — пустую строку.
     """
@@ -1239,6 +1256,45 @@ def _refresh_issue_body(issue: IssueInput) -> str:
         return issue.body
 
 
+# Форма заголовка блока HowToDemo в теле Issue — те же четыре, что признаёт
+# HowToDemo-Agent при поиске сценария (`docs/HOWTODEMO.md`, «Как агент находит
+# сценарий»): `## HowToDemo`, `### How to demo`, `**How to demo:**`,
+# `How to demo:`. Один гибкий шаблон вместо четырёх литеральных: пробелы между
+# словами необязательны, поэтому он же покрывает слитное «HowToDemo».
+_HOWTODEMO_START = re.compile(
+    r"""(?imx)
+    ^[ \t]*
+    (?:
+        \#{2,3}[ \t]*how[ \t]*to[ \t]*demo\b[^\n]*      # ## HowToDemo / ### How to demo
+      | \*\*[ \t]*how[ \t]*to[ \t]*demo[ \t]*:[ \t]*\*\*  # **How to demo:**
+      | how[ \t]*to[ \t]*demo[ \t]*:                     # How to demo:
+    )
+    [ \t]*\n?
+    """
+)
+
+# Граница конца блока: следующий заголовок Markdown либо следующая
+# жирная метка-лейбл в духе письма БФТ (`**Открытые вопросы:**` и т.п.).
+_HOWTODEMO_END = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]|\*\*[^\n*]{1,80}:[ \t]*\*\*[ \t]*$)")
+
+
+def _howtodemo_block(body: str) -> str:
+    """Сценарий приёмки из тела Issue: раздел HowToDemo, если он там есть.
+
+    Блока нет — это НЕ отказ подготовки: сценарий мог остаться только в
+    первом письме БФТ треда, и приёмщик (HowToDemo-Agent) умеет забирать его
+    оттуда сам — тем же приоритетом, что описан в `docs/HOWTODEMO.md`. Здесь
+    проверяется только тело Issue, письмо БФТ этой функции не видно.
+    """
+    match = _HOWTODEMO_START.search(body or "")
+    if not match:
+        return ""
+    start = match.end()
+    end = _HOWTODEMO_END.search(body, start)
+    content = body[start:end.start() if end else len(body)]
+    return content.strip()
+
+
 def _split_sections(parts: list[str]) -> list[tuple[str, str]]:
     """Разложить куски постановки на секции `(заголовок, содержимое)`.
 
@@ -1268,93 +1324,19 @@ def _split_sections(parts: list[str]) -> list[tuple[str, str]]:
     return sections
 
 
-# Порядок вытеснения при переполнении. Меньше — важнее, вытесняется позже.
-#
-# ИНСТРУКЦИИ КОНТУРА СТОЯТ ВЫШЕ АРТЕФАКТОВ, и это выведено из живого отказа, а
-# не из соображений. На прогоне `poh-demo-checkout#105` блок правил организации
-# добавил три с половиной килобайта, постановка перевалила за потолок, и
-# усечение вытеснило секцию «Как работать» — ту, где написано «коммитить самому
-# не надо, коммит и PR делает контур». Агент закоммитил в свою ветку,
-# публикация не нашла изменений в рабочем дереве, прогон встал.
-#
-# Разница в цене несимметрична. Потеря требований даёт неполную правку — плохо,
-# но работа идёт. Потеря инструкций контура ломает прогон целиком, а стоят они
-# два килобайта против пятидесяти у артефактов.
-_RANK_TASK = 0
-_RANK_PLAN = 1
-_RANK_CONTOUR = 2       # как работать, индекс кода, след решения
-_RANK_ARTIFACTS = 3
-_RANK_DISCUSSION = 4
-_RANK_ORG_RULES = 5     # накопленный опыт организации — вытесняется первым
-
-
-CONTOUR_SECTIONS = ("## Как работать", "## Индекс кода", "## След решения")
-"""Секции с рабочими инструкциями контура.
-
-Без них агент не знает, кто коммитит, куда писать находки и как обращаться к
-индексу. Это не справочный материал, а условия прогона.
-"""
-
 ORG_RULES_HEADING = "## Накопленный опыт этой организации"
 """Заголовок блока правил от слоя саморефлексии.
 
-Отдельной секцией, а НЕ довеском к предыдущей: иначе правила организации
-делили бы судьбу инструкций контура и вытеснялись бы вместе с ними — либо, что
-и случилось, вытесняли бы их собой.
+Отдельной секцией, а НЕ довеском к предыдущей: приклеенный к соседней секции
+блок неотличим при парсинге от её продолжения, и заголовок соседней секции
+подписывался бы под чужой текст.
+
+До задачи 7 у отдельной секции была ВТОРАЯ причина: усечение по приоритету
+вытесняло секции целиком, и приклеенный блок делил бы судьбу соседа при
+вытеснении. Усечения больше нет (см. `_dev_prepare`), но первая причина —
+корректность самого разбора на секции — осталась, и заголовок остаётся
+своим.
 """
-
-
-def _section_rank(name: str, issue_number: int, title: str) -> int:
-    """Насколько секция важна. Больше — вытесняется раньше."""
-    if not name or name == f"# Задача: реализовать Issue #{issue_number}" \
-            or name == f"## {title}":
-        return _RANK_TASK
-    if name.startswith("## План декомпозиции") or name.startswith("### Подзадачи"):
-        return _RANK_PLAN
-    if name.startswith(ORG_RULES_HEADING):
-        return _RANK_ORG_RULES
-    if any(name.startswith(s) for s in CONTOUR_SECTIONS):
-        return _RANK_CONTOUR
-    if name.startswith("## Системные требования") or name.startswith("###"):
-        return _RANK_ARTIFACTS
-    if name.startswith("## Обсуждение"):
-        return _RANK_DISCUSSION
-    # Неизвестная секция — скорее всего правила репозитория со своим
-    # заголовком. Это инструкции прогона, и терять их нельзя.
-    return _RANK_CONTOUR
-
-
-def _apply_size_limit(sections: list[tuple[str, str]], limit: int,
-                      issue_number: int, title: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """Уложить постановку в потолок, вытесняя наименее важные секции.
-
-    Возвращает `(оставленные, имена вытесненных)`.
-
-    Раньше здесь был дефект, из-за которого приоритет не работал вовсе: список
-    индексов строился один раз и не пересчитывался после удаления, а цикл
-    брал первый подходящий индекс — всегда один и тот же. Усечение вырождалось
-    в отрезание от фиксированного места вперёд, и артефакты аналитики уходили
-    целиком независимо от объявленного порядка.
-
-    Переполнение достижимо штатно: сумма жёстких потолков артефактов равна
-    общему потолку постановки.
-    """
-    kept = list(sections)
-    dropped: list[str] = []
-
-    def total() -> int:
-        return len(_join_sections(kept))
-
-    while total() > limit and len(kept) > 1:
-        # Кандидат на вытеснение: самый неважный; среди равных — последний.
-        victim = max(range(len(kept)),
-                     key=lambda i: (_section_rank(kept[i][0], issue_number, title), i))
-        if _section_rank(kept[victim][0], issue_number, title) == _RANK_TASK:
-            break                      # тело задачи не вытесняем, лучше превысить
-        name, content = kept.pop(victim)
-        dropped.append(name or "(без заголовка)")
-
-    return kept, dropped
 
 
 def _join_sections(sections: list[tuple[str, str]]) -> str:
@@ -1772,8 +1754,23 @@ def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
     return root, root / "repo"
 
 
+def _previous_reflect_note_text(root: Path) -> str:
+    """Сырой текст `.reflect.md` предыдущей попытки этой же задачи, если есть.
+
+    `_dev_publish` перекладывает файл намерений из клона в КОРЕНЬ задачи перед
+    снятием служебных файлов (`develop.clear_service_files(..., keep_dir=root)`)
+    — именно затем, чтобы он пережил снятие. `_dev_prepare` сносит корень
+    заново при каждом вызове (см. ниже), поэтому читать файл нужно ДО сноса:
+    это единственное окно, где решения предыдущей попытки ещё на диске.
+    """
+    try:
+        return (root / REFLECT_NOTE_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
-    """Свежий клон + постановка файлом.
+    """Свежий клон + контекст каталогом `.harness/` + короткая постановка.
 
     Возвращает текст постановки и перечень идентификаторов правил, подсыпанных
     слоем саморефлексии. Перечень нужен записи об итерации: без него нельзя
@@ -1782,79 +1779,97 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
 
     Постановка собирается ЗДЕСЬ, а не в промпте агента: то, что уехало в
     работу, должно быть видно дословно. Иначе на разборе «почему агент сделал
-    не то» предъявить нечего.
-    
-    ISSUE-113: в постановку включается:
-    - свежее тело Issue (вместо устаревшего снимка);
-    - план декомпозиции и подзадачи (если есть);
-    - обсуждение Issue (комментарии);
-    - все артефакты FNR, включая repowise-dialog.md и validation.md;
-    - применён общий потолок размера с усечением по приоритету.
+    не то» предъявить нечего. Но сама постановка (`.task.md`, снимается перед
+    коммитом) больше НЕ несёт содержательный контекст — до задачи 7 она
+    паковала требования, артефакты аналитики, обсуждение и план декомпозиции
+    в один файл с потолком 50000 знаков на всё и 10000 на артефакт; докстринг
+    того кода признавал «переполнение достижимо штатно». Контекст теперь
+    лежит файлами каталога `.harness/` (`shared/task_context.py`) — он
+    коммитится вместе с кодом, виден в PR и читается через полгода, а
+    исполнитель открывает файлы из git по мере надобности, без потолка на
+    объём и без усечения.
+
+    Обязательный набор файлов контекста объявлен в `task_context.required()` и
+    проверяется здесь ЖЁСТКО: отсутствие обязательного файла — отказ стадии
+    (`RuntimeError`), а не предупреждение в лог. Молчаливая неполная сборка
+    хуже упавшей стадии — исполнитель работал бы вслепую, не зная, что
+    контекста не хватает.
     """
     root, clone_dir = _dev_paths(issue)
+    # ДО сноса корня: если задача уже проходила через /develop раньше, здесь
+    # может лежать файл намерений предыдущей попытки (см. докстринг функции).
+    previous_decisions = _previous_reflect_note_text(root)
+
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(issue.repo, str(clone_dir))
     _write_runner_mcp_config(issue, root)
 
-    # 1. Свежее тело Issue вместо устаревшего снимка (ISSUE-113 пункт 5)
+    # Свежее тело Issue вместо устаревшего снимка вебхука.
     fresh_body = _refresh_issue_body(issue)
-    
+
     parts = [f"# Задача: реализовать Issue #{issue.issue_number}",
              "", f"## {issue.title}", "", fresh_body or "(тело пустое)", ""]
 
-    # 2. План декомпозиции и подзадачи (ISSUE-113 пункт 1)
-    plan = _fetch_decomposition_plan(issue)
-    if plan:
-        parts.append("## План декомпозиции")
-        parts.append("")
-        parts.append(plan)
-        parts.append("")
-        
-        # Подзадачи плана с телами
-        subtasks = _fetch_subtasks(issue)
-        if subtasks:
-            parts.append("### Подзадачи плана")
-            parts.append("")
-            for sub in subtasks:
-                parts.append(f"#### #{sub['number']} — {sub['title']}")
-                parts.append("")
-                parts.append(sub['body'])
-                parts.append("")
+    # --- Контекст каталогом: исполнитель читает файлы из git, не пересказ ---
+    harness = clone_dir / task_context.DIR
+    harness.mkdir(parents=True, exist_ok=True)
+    entries: dict[str, str] = {}
 
-    # 3. Артефакты FNR — все пять, включая отброшенные (ISSUE-113 пункт 4)
+    requirements = ""
     if branch:
-        parts.append("## Системные требования (аналитика Issue-Agent)")
-        parts.append("")
-        
-        # Три основных артефакта (как было)
-        for name in ("system_requirements.md", "task.md", "concept.md"):
-            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
-            if text:
-                # Обрезаем каждый артефакт отдельно, если слишком большой
-                if len(text) > DEV_ARTIFACT_MAX_CHARS:
-                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
-                parts += [f"### {name}", "", text, ""]
-        
-        # Два дополнительных артефакта (ISSUE-113 пункт 3)
-        for name in ("repowise-dialog.md", "validation.md"):
-            text = github_client.get_file(issue.repo, f"{FNR_DIR}/{name}", branch)
-            if text:
-                if len(text) > DEV_ARTIFACT_MAX_CHARS:
-                    text = text[:DEV_ARTIFACT_MAX_CHARS].rstrip() + " …[обрезано]"
-                parts += [f"### {name}", "", text, ""]
-    else:
-        parts += ["## Аналитики по задаче нет — работай от тела Issue.", ""]
+        requirements = github_client.get_file(
+            issue.repo, f"{FNR_DIR}/system_requirements.md", branch) or ""
+        if requirements:
+            (harness / task_context.REQUIREMENTS).write_text(
+                requirements, encoding="utf-8")
+            entries[task_context.REQUIREMENTS] = "системные требования (ветка аналитики)"
 
-    # 4. Обсуждение Issue (ISSUE-113 пункт 2)
-    comments = _fetch_dev_comments(issue)
-    if comments:
-        parts.append("## Обсуждение Issue")
-        parts.append("")
-        parts.extend(comments)
-        parts.append("")
+    scenario = _howtodemo_block(fresh_body or "")
+    if scenario:
+        (harness / task_context.HOWTODEMO).write_text(scenario, encoding="utf-8")
+        entries[task_context.HOWTODEMO] = "сценарий приёмки: им проверяется результат"
 
-    # 5. Правила репозитория и Repowise (как было)
+    if previous_decisions:
+        (harness / task_context.DECISIONS).write_text(
+            previous_decisions, encoding="utf-8")
+        entries[task_context.DECISIONS] = \
+            "решения и намерения предыдущей попытки по этой же задаче"
+
+    (harness / task_context.CONTEXT_MAP).write_text(
+        task_context.render_map(entries), encoding="utf-8")
+
+    # Обязательный набор — ОТДЕЛЬНО от `entries`: перечень выше называет
+    # только то, что реально записалось, и на молчаливом провале записи
+    # (сеть недоступна, токен истёк) был бы просто короче — а `missing()` на
+    # НЁМ ЖЕ ответила бы «всё доставлено». Проверяем против объявленного вовне
+    # обязательного набора, который от факта записи не зависит.
+    absent = task_context.missing(harness, task_context.required(has_analysis=bool(branch)))
+    if absent:
+        raise RuntimeError(
+            f"Develop {issue.repo}#{issue.issue_number}: контекст не собран — "
+            f"в {task_context.DIR}/ нет обязательных файлов: {', '.join(absent)}. "
+            "Отказ стадии вместо слепого прогона исполнителя."
+        )
+    corrupted = task_context.truncation_markers(harness)
+    if corrupted:
+        raise RuntimeError(
+            f"Develop {issue.repo}#{issue.issue_number}: в {task_context.DIR}/ "
+            f"найден след усечения в файлах: {', '.join(corrupted)}."
+        )
+
+    parts.append(
+        f"## Контекст\n\n"
+        f"Требования и сценарий приёмки, если они собрались, — в `{task_context.DIR}/`"
+        f" рядом с кодом; что именно там лежит и в каком порядке читать — в "
+        f"`{task_context.DIR}/{task_context.CONTEXT_MAP}`. Это файлы git, а не "
+        "пересказ: открывай по мере надобности, потолка на объём нет.\n\n"
+        f"Результат проверяется сценарием приёмки, если он есть "
+        f"(`{task_context.DIR}/{task_context.HOWTODEMO}`), и тестами репозитория."
+        + ("" if branch else "\n\nАналитики по задаче нет — работай от тела Issue.")
+    )
+
+    # Правила репозитория и Repowise (как было)
     rules = (clone_dir / ".openhands" / "task-rules.md")
     parts.append(rules.read_text(encoding="utf-8") if rules.exists() else _DEV_FALLBACK_RULES)
     # Дописывается ПОСЛЕ правил репозитория, а не вместо: правила проекта
@@ -1874,7 +1889,7 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
     # всего — в репозиториях со своими правилами.
     parts.append(_FOCUS_RULE)
 
-    # 7. Правила и накопленный опыт организации — слой саморефлексии.
+    # Правила и накопленный опыт организации — слой саморефлексии.
     #
     # Отбор идёт ЗДЕСЬ, а не отдельной активностью перед этой. Отдельная
     # активность повезла бы текст правил через полезную нагрузку Temporal, а
@@ -1895,26 +1910,15 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
         memory_rules = memory.rules(memory.DEVELOP, repo=issue.repo,
                                     query=f"{issue.title}\n{fresh_body or ''}")
     if memory_rules.text:
-        # Заголовок ставит КОНТУР, а не слой. Слой намеренно не выдаёт
-        # заголовков вовсе — он не знает, во что его блок вставят. Зато контуру
-        # заголовок нужен: без него блок прилипает к предыдущей секции и делит
-        # её судьбу при усечении. Ровно так на прогоне #105 правила организации
-        # вытеснили инструкции контура и сломали прогон.
+        # Заголовок ставит КОНТУР, а не слой: слой не знает, во что его блок
+        # вставят, и заголовков не выдаёт. Отдельной секцией, а не довеском к
+        # предыдущей — см. докстринг ORG_RULES_HEADING.
         parts.append(f"{ORG_RULES_HEADING}\n{memory_rules.text.strip()}")
 
-    # 8. Потолок размера с усечением по приоритету (ISSUE-113 пункт 6)
-    # Приоритет: заголовок/тело > план > артефакты > обсуждение > правила
-    sections = _split_sections(parts)
-    sections, dropped = _apply_size_limit(
-        sections, DEV_TASK_MAX_CHARS, issue.issue_number, issue.title)
-
-    if dropped:
-        # Уровень warning, а не debug: молча укоротить постановку — значит
-        # изменить задачу агента и не сказать об этом никому.
-        logger.warning("Develop %s#%s: постановка не вместилась, вытеснены секции: %s",
-                       issue.repo, issue.issue_number, "; ".join(dropped))
-
-    task = _join_sections(sections)
+    # Постановка короткая по построению: тяжёлый контекст ушёл в `.harness/`
+    # выше, здесь остаются заголовок/тело задачи, указатель на контекст и
+    # рабочие инструкции контура — потолка на размер больше нет и не нужно.
+    task = _join_sections(_split_sections(parts))
     (clone_dir / ".task.md").write_text(task, encoding="utf-8")
 
     # Перечень подсыпанных правил — файлом в КОРНЕ задачи, а не в клоне.
@@ -2285,6 +2289,13 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
         title=f"feat(#{issue.issue_number}): {issue.title}",
         body=develop.pr_body(issue.issue_number, branch=branch),
         message=f"feat(#{issue.issue_number}): реализация по системным требованиям",
+        # `.harness/` — единственный служебный каталог, что НЕ снимается
+        # (задача 7: контекст обязан дойти до PR). Он пишется в `_dev_prepare`
+        # ДО прогона агента и потому существует независимо от того, тронул ли
+        # агент код, — «пустой прогон» больше не значит «дифф пуст», если
+        # эту проверку не поправить. Исключаем каталог из решения «есть ли
+        # диф», а не из самого коммита: `git add -A` продолжает забирать его.
+        ignore_for_empty_check=(f"{task_context.DIR}/**",),
     )
 
 
