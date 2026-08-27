@@ -240,3 +240,35 @@ def capture_estimate_failure(req, stage: str, exc_type: str,
             f"estimate failed at «{stage}»: {getattr(req, 'repo', '?')}"
             f"#{getattr(req, 'issue_number', '?')} ({exc_type})",
             level="error")
+
+
+def capture_followups_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`collect_dev_followups` (worker/activities.py) не записал находки
+    агента разработки в секцию GROW тела родителя.
+
+    Сама запись — best-effort и не роняет шаг разработки, но отказ до сих пор
+    был виден только строкой `logger.warning` в stdout контейнера: воркер их
+    не будит (см. докстринг модуля). warning в событие Sentry не превращается
+    (порог `event_level=ERROR` у `LoggingIntegration`), а бесследно потерянная
+    находка — это ровно тот класс отказа, который «шаг отработал, доложил
+    успех, а результата нет» (ревью, находка 4).
+
+    fingerprint по (followups_failure, exc_type): группируем по типу сбоя, а
+    не по issue — иначе один и тот же сетевой аутейдж GitHub заводит по
+    отдельной группе на каждую задачу, где он совпал с находкой агента.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "dev:followups")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["followups_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"dev followups failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")

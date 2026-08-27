@@ -170,6 +170,24 @@ def test_no_findings_means_no_github_calls_at_all(tmp_path, monkeypatch):
     assert result == []
 
 
+def test_prose_without_headings_leaves_nothing_to_retry(tmp_path, monkeypatch):
+    """Файл без заголовков не разбирается в находки — сохранять и повторять
+    нечего, и файл снимается сразу, не дожидаясь сетевой записи (которой в
+    этом случае и не будет)."""
+    clone = _workspace(tmp_path, monkeypatch, "нашёл кое-что, но оформить не смог\n")
+
+    def boom(*a, **k):
+        raise AssertionError("находок нет — сети тут делать нечего")
+
+    monkeypatch.setattr(activities_module.github_client, "get_issue_body", boom)
+    monkeypatch.setattr(activities_module.github_client, "update_issue_body", boom)
+
+    result = asyncio.run(activities_module.collect_dev_followups(_issue()))
+
+    assert result == []
+    assert not (clone / develop.FOLLOWUPS_FILE).exists()
+
+
 def test_second_run_keeps_earlier_grow_candidates(tmp_path, monkeypatch):
     """GROW копится за несколько прогонов разработки одной задачи, а не
     перезаписывается: до вердикта приёмки, который публикует секцию (Task 11),
@@ -199,6 +217,46 @@ def test_second_run_keeps_earlier_grow_candidates(tmp_path, monkeypatch):
     assert "Вторая находка" in section
 
 
+def test_second_run_keeps_a_multiline_finding_from_the_first_run(tmp_path, monkeypatch):
+    """Многострочная находка не должна обрезаться до заголовка на втором
+    прогоне (ревью, находка 1).
+
+    Воспроизводит живой сценарий целиком, двумя настоящими прогонами:
+    прогон 1 пишет находку с телом в три строки, прогон 2 приносит другую
+    находку. Раньше накопление разбирало прежнее содержимое блока построчно
+    и оставляло только строки, начинающиеся с `- [` — продолжения
+    многострочного тела под это правило не подходили и терялись молча.
+    """
+    clone = _workspace(
+        tmp_path, monkeypatch,
+        "## Отрицательная цена позиции проходит в расчёт\n\n"
+        "`subtotal` проверяет price < 0 уже после того, как qty умножен.\n"
+        "Всплывёт при импорте прайса из внешней системы.\n"
+        "Похоже на баг в src/pricing.mjs:26 — проверка стоит не в начале.\n")
+    bodies = {13: "Постановка."}
+    monkeypatch.setattr(activities_module.github_client, "get_issue_body",
+                        lambda repo, n: bodies[n])
+    monkeypatch.setattr(activities_module.github_client, "update_issue_body",
+                        lambda repo, n, new: bodies.__setitem__(n, new))
+
+    result_1 = asyncio.run(activities_module.collect_dev_followups(_issue()))
+    assert result_1 == ["Отрицательная цена позиции проходит в расчёт"]
+
+    (clone / develop.FOLLOWUPS_FILE).write_text(
+        "## Скидка не логируется\n\nНет способа объяснить клиенту итог.\n",
+        encoding="utf-8")
+    result_2 = asyncio.run(activities_module.collect_dev_followups(_issue()))
+    assert result_2 == ["Скидка не логируется"]
+
+    section = issue_blocks.read(bodies[13], issue_blocks.GROW)
+    assert "Отрицательная цена позиции проходит в расчёт" in section
+    assert "Всплывёт при импорте прайса из внешней системы" in section, (
+        "вторая строка тела первой находки потеряна после второго прогона")
+    assert "Похоже на баг в src/pricing.mjs:26" in section, (
+        "третья строка тела первой находки потеряна после второго прогона")
+    assert "Скидка не логируется" in section
+
+
 def test_a_failed_body_write_does_not_crash_the_step(tmp_path, monkeypatch, caplog):
     """Прогон уже состоялся: сбой записи находок в тело родителя (сеть,
     недоступный Issue) не должен ронять шаг разработки — только находки
@@ -217,6 +275,51 @@ def test_a_failed_body_write_does_not_crash_the_step(tmp_path, monkeypatch, capl
 
     assert result == [], "не записанные находки нельзя выдавать за записанные"
     assert "не записал находки" in caplog.text
+
+
+def test_a_failed_body_write_keeps_the_file_for_a_retry(tmp_path, monkeypatch):
+    """Отказ записи не должен снимать файл находок с диска: файл, снятый ДО
+    сетевой записи, лишает следующую попытку активности всего, что можно было
+    бы перечитать — она увидит пустое место и молча доложит «находок нет»
+    (ревью, находка 3)."""
+    clone = _workspace(tmp_path, monkeypatch, "## первая\n\nа\n\n## вторая\n\nб\n")
+    monkeypatch.setattr(activities_module.github_client, "get_issue_body",
+                        lambda repo, n: "Постановка.")
+
+    def boom_update(repo, n, new):
+        raise RuntimeError("GitHub 502")
+
+    monkeypatch.setattr(activities_module.github_client, "update_issue_body", boom_update)
+
+    result = asyncio.run(activities_module.collect_dev_followups(_issue()))
+
+    assert result == []
+    assert (clone / develop.FOLLOWUPS_FILE).exists(), (
+        "файл находок нельзя терять при неудавшейся записи — иначе ретрай бессмыслен")
+
+
+def test_a_failed_body_write_is_reported_to_sentry(tmp_path, monkeypatch):
+    """`logger.warning` живёт в stdout контейнера и никого не будит (см.
+    докстринг `shared/sentry_setup.py`) — отказ записи находок обязан
+    добираться и до Sentry, а не только до лога (ревью, находка 4)."""
+    _workspace(tmp_path, monkeypatch, "## первая\n\nа\n")
+    monkeypatch.setattr(activities_module.github_client, "get_issue_body",
+                        lambda repo, n: "Постановка.")
+
+    def boom_update(repo, n, new):
+        raise RuntimeError("GitHub 502")
+
+    monkeypatch.setattr(activities_module.github_client, "update_issue_body", boom_update)
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        activities_module.sentry_setup, "capture_followups_failure",
+        lambda issue, exc_type, message: captured.append(
+            (issue.issue_number, exc_type, message)) or "evt-1")
+
+    result = asyncio.run(activities_module.collect_dev_followups(_issue()))
+
+    assert result == []
+    assert captured == [(13, "RuntimeError", "GitHub 502")]
 
 
 def test_finding_that_quotes_a_block_marker_does_not_corrupt_the_body(tmp_path, monkeypatch, caplog):

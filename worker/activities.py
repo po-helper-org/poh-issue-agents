@@ -2613,9 +2613,24 @@ async def collect_dev_followups(issue: IssueInput) -> list[str]:
 
     Агент по-прежнему оставляет находки файлом: `gh` и GITHUB_TOKEN ему не
     дают намеренно, это весь смысл его изоляции — он исполняет чужой код. Файл
-    снимается всегда, независимо от исхода записи ниже — иначе он уедет в PR
-    как мусор, а на следующем круге правок агент прочитает свои прошлые
-    находки как новые.
+    снимается ПОСЛЕ того, как находки долетели до GROW (или сразу, если
+    парсить оказалось нечего) — а не заранее. Снятый до сетевой записи файл
+    убивал бы повтор активности так же, как сама неудавшаяся запись, только
+    тише: следующая попытка не находила бы файл и молча докладывала бы «находок
+    нет» вместо честного повтора (ревью, находка 3). Уехать в PR он всё равно
+    не может, даже если так и останется лежать до конца прогона: `_dev_publish`
+    снимает любой служебный файл через `develop.clear_service_files` перед
+    коммитом, независимо от исхода этой функции.
+
+    Накопление прежнего содержимого блока — присоединением целой строки
+    записи к целому прежнему содержимому, без построчного разбора. Раньше
+    накопление читало прежнее содержимое и оставляло только строки,
+    начинающиеся с `- [` — многострочная находка занимает несколько
+    физических строк, и её продолжение под это правило не подходило: со
+    второго прогона от неё оставался только заголовок (ревью, находка 1). По
+    той же причине терялся и любой текст, дописанный в блок человеком. Здесь
+    прежнее содержимое — уже готовый текст блока, и трогать в нём нечего:
+    новые записи дописываются к нему целиком, каким бы оно ни было.
 
     Запись в GROW — best-effort, как раньше было создание Issue: прогон
     разработки уже состоялся, и находка не должна ронять шаг целиком.
@@ -2623,10 +2638,11 @@ async def collect_dev_followups(issue: IssueInput) -> list[str]:
     похоже на маркер блока — а находка приходит от модели и может дословно
     процитировать разметку (например, разбирая баг в самом `issue_blocks.py`)
     — или если тело Issue уже повреждено. Такой отказ, как и любой сетевой
-    сбой чтения/записи тела, ловится здесь и уходит в лог: находка молча
-    теряется на ЭТОМ прогоне (файл уже снят и не переживёт его), но тело
-    Issue не портится половинчатой записью, и шаг разработки не падает из-за
-    находки.
+    сбой чтения/записи тела, ловится здесь: находка не засчитывается
+    записанной на ЭТОМ прогоне, файл остаётся на диске для следующей попытки,
+    а сам отказ уходит и в лог, и в Sentry (`capture_followups_failure`) —
+    иначе о молчаливой потере узнают только по stdout контейнера, который
+    никого не будит (ревью, находка 4).
     """
     _, clone_dir = _dev_paths(issue)
     path = clone_dir / develop.FOLLOWUPS_FILE
@@ -2639,8 +2655,8 @@ async def collect_dev_followups(issue: IssueInput) -> list[str]:
         logger.warning("не разобрал %s по %s#%s: %s",
                        develop.FOLLOWUPS_FILE, issue.repo, issue.issue_number, exc)
         items = []
-    path.unlink(missing_ok=True)
     if not items:
+        path.unlink(missing_ok=True)  # нечего сохранять, нечего и повторять
         return []
 
     lines = [f"- [ ] {item['title']} — {item.get('body', '').strip()}" for item in items]
@@ -2648,15 +2664,18 @@ async def collect_dev_followups(issue: IssueInput) -> list[str]:
         body = await asyncio.to_thread(github_client.get_issue_body,
                                        issue.repo, issue.issue_number)
         previous = issue_blocks.read(body, issue_blocks.GROW) or ""
-        content = "## GROW — после прохождения HowToDemo\n\n" + "\n".join(
-            [line for line in previous.splitlines() if line.startswith("- [")] + lines)
+        new_block = "\n".join(lines)
+        content = (f"{previous}\n{new_block}" if previous.strip()
+                  else f"## GROW — после прохождения HowToDemo\n\n{new_block}")
         await asyncio.to_thread(
             github_client.update_issue_body, issue.repo, issue.issue_number,
             issue_blocks.write(body, issue_blocks.GROW, content))
     except Exception as exc:  # noqa: BLE001 — запись находок не ломает разработку
         logger.warning("не записал находки по %s#%s в секцию %s: %s",
                        issue.repo, issue.issue_number, issue_blocks.GROW, exc)
+        sentry_setup.capture_followups_failure(issue, type(exc).__name__, str(exc))
         return []
+    path.unlink(missing_ok=True)  # находки доехали — теперь их можно снять
     return [item["title"] for item in items]
 
 
