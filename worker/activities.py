@@ -2821,6 +2821,22 @@ async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:
                            issue.repo, issue.issue_number, step, exc)
 
 
+# --- MVP: построение плана работ (навык writing-plans) ---
+
+@activity.defn
+async def build_mvp_plan(issue: IssueInput, branch: str) -> bool:
+    """План работ по требованиям — навыком writing-plans, файлом в `.harness/`.
+
+    Исход считается по АРТЕФАКТУ, а не по коду возврата и не по словам модели:
+    `claude -p` выходит нулём и без файла — так уже падали стадии FNR на
+    ограничении частоты у провайдера.
+    """
+    _, clone_dir = _dev_paths(issue)
+    plan_path = Path(clone_dir) / task_context.DIR / task_context.PLAN
+    await asyncio.to_thread(_run_claude, "/plan-mvp", str(clone_dir))
+    return plan_path.exists() and bool(plan_path.read_text(encoding="utf-8").strip())
+
+
 # --- Декомпозиция задачи на подзадачи и релизы ---
 
 class DecomposedItem(BaseModel):
