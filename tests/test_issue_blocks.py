@@ -102,3 +102,29 @@ def test_read_and_write_accept_none_body():
     assert issue_blocks.read(None, issue_blocks.GROW) is None
     result = issue_blocks.write(None, issue_blocks.GROW, "находки")
     assert issue_blocks.read(result, issue_blocks.GROW) == "находки"
+
+
+def test_write_refuses_content_containing_other_block_markers():
+    """Повторное ревью. Запись в один блок отравляла соседний.
+
+    write() проверяла содержимое только на маркеры ТОГО блока, в который
+    пишет. Если содержимое блока GROW содержало полную пару маркеров блока
+    MVP_PLAN, запись проходила молча. Дальше любое чтение или запись MVP_PLAN
+    падало с ValueError "тело повреждено", хотя сам этот блок никто не трогал.
+
+    Сценарий не надуманный: MVP_PLAN и GROW живут в одном теле, а GROW
+    наполняется находками агента (текстом, который цитирует код и разметку).
+
+    Фикс: проверка должна охватывать маркеры всех известных модулю блоков.
+    """
+    body = issue_blocks.write("Постановка.", issue_blocks.MVP_PLAN, "план шага 1")
+    # Пишу в GROW содержимое, которое включает маркеры MVP_PLAN.
+    # Должно отказать при write() в GROW, а не молча испортить тело.
+    with pytest.raises(ValueError):
+        issue_blocks.write(
+            body,
+            issue_blocks.GROW,
+            "нашли в коде вот это:\n"
+            "<!-- harness:mvp-plan:start -->\nне настоящий план\n"
+            "<!-- harness:mvp-plan:end -->\nконец находки",
+        )
