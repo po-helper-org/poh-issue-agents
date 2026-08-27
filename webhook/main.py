@@ -39,7 +39,7 @@ from starlette.requests import ClientDisconnect
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared import gitlab_events, gitlab_signature
+from shared import gitlab_events, gitlab_signature, labels
 
 from shared import sentry_setup
 from shared.commands import (
@@ -593,6 +593,19 @@ async def _handle_delivery(payload: dict, x_github_event: str,
         await _audit_dropped_delivery(payload, x_github_event, x_github_delivery,
                                       repo_full, specs)
         return {"ok": True}
+
+    # Под-задача шага (harness:step) не поднимает свой цикл: план родителя её
+    # уже разобрал, а живёт она только время шага (Task 13). Проверка стоит ДО
+    # get_temporal_client() — под-задача не должна поднимать вообще ничего, ни
+    # соединения с Temporal, ни тем более воркфлоу с триажом.
+    if x_github_event == "issues" and payload.get("action") == "opened":
+        issue = payload.get("issue") or {}
+        names = [label["name"] for label in issue.get("labels", [])]
+        if labels.has(names, labels.STEP):
+            repo = payload["repository"]["full_name"]
+            issue_number = issue["number"]
+            _log.info("под-задача шага %s#%s — цикл не поднимаем", repo, issue_number)
+            return {"ok": True}
 
     client = await get_temporal_client()
 
