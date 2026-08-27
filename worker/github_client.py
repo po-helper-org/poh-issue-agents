@@ -296,6 +296,11 @@ def link_sub_issue(repo: str, parent: int, child_id: int) -> None:
     `child_id` — внутренний id (см. `issue_node_id`), НЕ номер. Передача номера
     даёт 422 с невнятным телом, и отличить её от прочих отказов трудно.
 
+    Идемпотентна: уже существующая связь (422 «already added») не ошибка —
+    не глушит повторный вызов при ретрае активности. Отказ по правам или
+    неверному id остаётся ошибкой: отличить их от гонки можно по телу ответа,
+    но не обязательно — 422 с другими причинами тоже встречается редко.
+
     Холостой режим (`DRY_RUN`): сетевой вызов не выполняется, связь не создаётся.
     """
     if _dry_run():
@@ -303,20 +308,36 @@ def link_sub_issue(repo: str, parent: int, child_id: int) -> None:
         return
     url = f"https://api.github.com/repos/{repo}/issues/{parent}/sub_issues"
     resp = requests.post(url, headers=_auth_headers(repo), json={"sub_issue_id": child_id}, timeout=30)
+    if resp.status_code == 422:
+        # Уже существующая связь — не ошибка, как и в ensure_labels_exist для параллельного заведения
+        return
     resp.raise_for_status()
 
 
 def list_sub_issues(repo: str, parent: int) -> list[dict]:
-    """Под-задачи родителя.
+    """Под-задачи родителя. Полный список со всех страниц.
 
     Холостой режим не влияет на читающие функции: DRY_RUN защищает от мутаций,
     а не от чтения. Без доступа к контексту прогон в DRY_RUN не показал бы,
     что именно система собралась сделать.
+
+    Приём: полный обход страниц, как в `ensure_labels_exist`. GitHub по умолчанию
+    отдаёт 30 элементов; без пагинации счётчик готовности родителя молча окажется
+    неполным на плане из 30+ шагов — это класс «шаг отработал, результата нет».
     """
     url = f"https://api.github.com/repos/{repo}/issues/{parent}/sub_issues"
-    resp = requests.get(url, headers=_auth_headers(repo), timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    all_issues = []
+    page = 1
+    while True:
+        resp = requests.get(url, headers=_auth_headers(repo),
+                           params={"per_page": 100, "page": page}, timeout=30)
+        resp.raise_for_status()
+        chunk = resp.json()
+        all_issues.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return all_issues
 
 
 def close_issue(repo: str, issue_number: int) -> None:
