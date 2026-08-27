@@ -2659,24 +2659,43 @@ async def collect_dev_followups(issue: IssueInput) -> list[str]:
         path.unlink(missing_ok=True)  # нечего сохранять, нечего и повторять
         return []
 
-    lines = [f"- [ ] {item['title']} — {item.get('body', '').strip()}" for item in items]
     try:
         body = await asyncio.to_thread(github_client.get_issue_body,
                                        issue.repo, issue.issue_number)
         previous = issue_blocks.read(body, issue_blocks.GROW) or ""
-        new_block = "\n".join(lines)
-        content = (f"{previous}\n{new_block}" if previous.strip()
-                  else f"## GROW — после прохождения HowToDemo\n\n{new_block}")
-        await asyncio.to_thread(
-            github_client.update_issue_body, issue.repo, issue.issue_number,
-            issue_blocks.write(body, issue_blocks.GROW, content))
+
+        # Извлечём уже существующие заголовки из прежней секции GROW
+        existing_titles = set()
+        if previous.strip():
+            for line in previous.split('\n'):
+                # Формат: `- [ ] Заголовок — тело` или `- [ ] Заголовок`
+                if line.strip().startswith('- [ ] '):
+                    # Вытаскиваем заголовок до первого ` — ` (если есть) или до конца строки
+                    rest = line.strip()[6:]  # убираем '- [ ] '
+                    title = rest.split(' — ', 1)[0].strip()
+                    if title:
+                        existing_titles.add(title)
+
+        # Фильтруем items: оставляем только новые (не в existing_titles)
+        new_items = [item for item in items if item['title'] not in existing_titles]
+
+        # Формируем строки только для новых записей
+        lines = [f"- [ ] {item['title']} — {item.get('body', '').strip()}" for item in new_items]
+
+        if lines:  # Только если есть новые записи
+            new_block = "\n".join(lines)
+            content = (f"{previous}\n{new_block}" if previous.strip()
+                      else f"## GROW — после прохождения HowToDemo\n\n{new_block}")
+            await asyncio.to_thread(
+                github_client.update_issue_body, issue.repo, issue.issue_number,
+                issue_blocks.write(body, issue_blocks.GROW, content))
     except Exception as exc:  # noqa: BLE001 — запись находок не ломает разработку
         logger.warning("не записал находки по %s#%s в секцию %s: %s",
                        issue.repo, issue.issue_number, issue_blocks.GROW, exc)
         sentry_setup.capture_followups_failure(issue, type(exc).__name__, str(exc))
         return []
     path.unlink(missing_ok=True)  # находки доехали — теперь их можно снять
-    return [item["title"] for item in items]
+    return [item["title"] for item in new_items]
 
 
 async def _dev_announce(issue: IssueInput, branch: str, *, where: str) -> None:

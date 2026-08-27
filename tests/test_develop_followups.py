@@ -395,3 +395,43 @@ def test_agent_output_reaches_the_log(tmp_path, monkeypatch, caplog):
         activities_module._dev_run_agent(_issue(19))
 
     assert "AGENT-SAID-THIS" in caplog.text
+
+
+def test_duplicate_findings_are_not_accumulated(tmp_path, monkeypatch):
+    """Находка, которая уже в GROW, не должна дублироваться на следующем прогоне.
+
+    Контекст агента разработки не содержит текущего состояния секции GROW —
+    он видит только репозиторий. Непочиненный edge case он доложит снова на
+    следующем прогоне, и это правильно. Но найденная дважды одна и та же
+    находка должна остаться записью одной, а не двумя.
+
+    Сравнивается по заголовку: тело может отличаться формулировкой.
+    """
+    clone = _workspace(
+        tmp_path, monkeypatch,
+        "## Отрицательная цена позиции проходит в расчёт\n\n"
+        "`subtotal` проверяет price < 0 уже после того, как qty умножен.\n")
+
+    bodies = {13: (
+        "Постановка.\n\n"
+        "<!-- harness:grow:start -->\n"
+        "## GROW — после прохождения HowToDemo\n\n"
+        "- [ ] Отрицательная цена позиции проходит в расчёт — прежний вариант формулировки\n"
+        "<!-- harness:grow:end -->\n"
+    )}
+    monkeypatch.setattr(activities_module.github_client, "get_issue_body",
+                        lambda repo, n: bodies[n])
+    monkeypatch.setattr(activities_module.github_client, "update_issue_body",
+                        lambda repo, n, new: bodies.__setitem__(n, new))
+
+    # Первый прогон (находка уже в GROW, но с другой формулировкой)
+    result = asyncio.run(activities_module.collect_dev_followups(_issue()))
+
+    # Функция должна вернуть пустой список, потому что находка уже записана
+    # (по заголовку совпадает с тем, что в GROW)
+    assert result == [], f"найденная дважды находка должна быть отброшена, но вернулась: {result}"
+
+    section = issue_blocks.read(bodies[13], issue_blocks.GROW)
+    # Проверяем, что заголовок есть только один раз
+    count = section.count("Отрицательная цена позиции проходит в расчёт")
+    assert count == 1, f"заголовок должен встречаться один раз, но встречается {count} раз(а)"
