@@ -270,6 +270,11 @@ def test_decisions_are_retry_safe_since_they_now_come_from_git_not_local_disk(
 # карту.
 
 def test_optional_analysis_artifacts_reach_the_harness_directory(monkeypatch, tmp_path):
+    """N3 (повторное ревью): concept.md больше НЕ становится вторым файлом
+    каталога под своим именем — тот же текст уже лежит в decisions.md (M2).
+    Запись под именем concept.md отдельно проверяет
+    `test_concept_md_is_not_written_as_a_separate_file_from_decisions`
+    (регрессия на дублирование, ниже)."""
     _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(**{
         "system_requirements.md": "требования",
         "concept.md": "концепт",
@@ -284,16 +289,44 @@ def test_optional_analysis_artifacts_reach_the_harness_directory(monkeypatch, tm
 
     _root, clone = a._dev_paths(issue)
     harness = clone / task_context.DIR
-    assert (harness / task_context.CONCEPT).read_text(encoding="utf-8") == "концепт"
     assert (harness / task_context.TASK).read_text(encoding="utf-8") == "постановка FNR"
     assert (harness / task_context.REPOWISE_DIALOG).read_text(encoding="utf-8") == \
         "диалог с индексом"
     assert (harness / task_context.VALIDATION).read_text(encoding="utf-8") == "отчёт валидации"
 
     context_map = (harness / task_context.CONTEXT_MAP).read_text(encoding="utf-8")
-    for name in (task_context.CONCEPT, task_context.TASK,
-                task_context.REPOWISE_DIALOG, task_context.VALIDATION):
+    for name in (task_context.TASK, task_context.REPOWISE_DIALOG, task_context.VALIDATION):
         assert name in context_map
+
+
+def test_concept_md_is_not_written_as_a_separate_file_from_decisions(monkeypatch, tmp_path):
+    """N3 (повторное ревью): до этой правки concept.md писался ДВАЖДЫ — как
+    decisions.md (M2, роль «принятые решения и их причины») и как concept.md
+    отдельным артефактом (M4) — байт в байт тот же текст под двумя разными
+    подписями в карте контекста, как будто это разные срезы. Исполнитель
+    тратил бюджет чтения дважды на один и тот же текст. Теперь единственный
+    файл с этим содержимым — decisions.md; concept.md как имя файла в
+    каталоге не появляется вовсе, а его имя в карте контекста не значится."""
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(**{
+        "system_requirements.md": "требования",
+        "concept.md": "вердикт дебатов: делаем через адаптер",
+    }))
+
+    issue = a.IssueInput(repo="o/r", issue_number=20, title="t", body="b",
+                         author_login="u", author_type="User")
+    a._dev_prepare(issue, "research/issue-20")
+
+    _root, clone = a._dev_paths(issue)
+    harness = clone / task_context.DIR
+    assert (harness / task_context.DECISIONS).read_text(encoding="utf-8") == \
+        "вердикт дебатов: делаем через адаптер"
+    assert not (harness / task_context.CONCEPT).exists(), \
+        "concept.md не должен становиться вторым файлом с тем же текстом"
+
+    context_map = (harness / task_context.CONTEXT_MAP).read_text(encoding="utf-8")
+    assert task_context.DECISIONS in context_map
+    assert task_context.CONCEPT not in context_map, \
+        "имя concept.md не должно попадать в карту — файла с этим именем нет"
 
 
 def test_missing_optional_artifact_is_absent_from_the_map_not_an_error(monkeypatch, tmp_path):
@@ -555,6 +588,80 @@ def test_howtodemo_block_preserves_a_code_fence_that_is_legitimately_inside_it()
     assert "хвост" not in result
 
 
+# ────────── N1 (повторное ревью): маскировка не держит две формы забора ──────────
+#
+# `_CODE_FENCE` понимал только РОВНО три обратные кавычки на границе — забор
+# из четырёх и более (стандартный способ процитировать текст, где уже есть
+# тройные кавычки) не совпадал с закрывающей частью паттерна вовсе, и
+# `_mask_code_fences` оставлял такой блок непомаскированным. Тот же исход у
+# незакрытого забора: без закрывающей строки `.sub` не находит совпадения, и
+# маскировки не происходит. Хуже прежнего: граница конца блока (H2) теперь —
+# заголовок того же уровня или крупнее, поэтому ложное совпадение внутри
+# такого забора утаскивает всё до конца тела Issue, а не до ближайшего
+# постороннего заголовка.
+
+def test_howtodemo_block_quoted_inside_a_four_backtick_fence_is_not_a_real_scenario():
+    """Ревьюер воспроизвёл лично: шаблон с заголовком сценария внутри забора
+    из четырёх кавычек (нужен, когда цитируемый текст сам содержит тройные
+    кавычки) возвращал хвост шаблона, закрывающие кавычки и весь следующий
+    кусок тела — вместо пустого сценария."""
+    body = (
+        "Шаблон для заполнения:\n\n"
+        "````markdown\n"
+        "Пример: тройные кавычки ```внутри``` тоже возможны.\n"
+        "## HowToDemo\n"
+        "1. Шаг из шаблона\n"
+        "````\n\n"
+        "Остальной текст без настоящего сценария."
+    )
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_block_unclosed_fence_does_not_leak_a_scenario():
+    """Ревьюер воспроизвёл лично: незакрытый забор с маркером внутри
+    возвращал строку из середины забора как «сценарий». Незакрытый забор
+    обязан читаться как открытый до конца текста, а не как отсутствие
+    маскировки вовсе."""
+    body = (
+        "intro text\n\n"
+        "```\n"
+        "some code\n"
+        "## HowToDemo\n"
+        "leaked line as scenario\n"
+        "more code, fence never closes\n"
+    )
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_block_preserves_a_four_backtick_fence_legitimately_inside_it():
+    """Симметрично `..._preserves_a_code_fence_that_is_legitimately_inside_it`
+    (тот тест — для трёх кавычек, этот — для четырёх): маскировка нужна
+    только для ПОИСКА границ. Настоящий забор из четырёх кавычек, легитимно
+    лежащий внутри настоящего сценария (например, цитата markdown-примера с
+    собственным заголовком), обязан дойти до исполнителя дословно — а
+    вложенный заголовок внутри него не должен считаться границей конца
+    блока."""
+    body = (
+        "## HowToDemo\n\nОткрываю страницу и вижу шаблон:\n"
+        "````\n"
+        "```markdown\n"
+        "## Пример\n"
+        "```\n"
+        "````\n\n"
+        "## Другое\nхвост, сюда сценарий заходить не должен"
+    )
+    result = a._howtodemo_block(body)
+    assert result == (
+        "Открываю страницу и вижу шаблон:\n"
+        "````\n"
+        "```markdown\n"
+        "## Пример\n"
+        "```\n"
+        "````"
+    )
+    assert "хвост" not in result
+
+
 # ────────── требование 3: `.harness/` реально доезжает до PR ──────────
 
 def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp_path):
@@ -680,6 +787,88 @@ def test_dev_publish_treats_context_only_changes_as_an_empty_run(monkeypatch, tm
 
     assert number is None, "агент не тронул ни файла — пустой прогон, PR не открывается"
     assert posts == [], "запрос на создание PR не должен был уйти"
+
+
+# ────────── N2 (повторное ревью): force_include на МЕСТЕ ВЫЗОВА ──────────
+#
+# `force_include=(task_context.DIR,)` в `_dev_publish` (M3, ревью задачи 7) —
+# СОСЕДНИЙ аргумент того же вызова `publish_worktree`, что и
+# `ignore_for_empty_check` выше (M1). Тот аргумент прошлая правка закрыла
+# тестом на месте вызова; этот — нет, хотя дыра ровно того же рода:
+# `tests/test_github_client_pr.py` проверяет саму `publish_worktree` с
+# аргументом, переданным ВРУЧНУЮ тестом, но ни один тест не проверял, что
+# `_dev_publish` его действительно передаёт. Удаление строки в
+# `worker/activities.py` не роняло НИ ОДНОГО из 1333 тестов.
+
+def test_dev_publish_forces_the_harness_directory_past_the_target_repos_gitignore(
+        monkeypatch, tmp_path):
+    """Сквозная проверка настоящим git через `_dev_publish` (не через
+    `publish_worktree` напрямую, по тому же доводу, что и у соседнего теста
+    выше): `.gitignore` ЦЕЛЕВОГО репозитория игнорирует `.harness/`. Без
+    `force_include` на месте вызова голый `git add -A` внутри
+    `publish_worktree` молча пропустил бы каталог — PR ушёл бы с кодом
+    агента, но без контекста, и без единого предупреждения."""
+    import subprocess
+    import github_client as gc
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+
+    def fake_clone(repo, dest, branch=None):
+        subprocess.run(["git", "clone", str(origin), dest], check=True, capture_output=True)
+        subprocess.run(["git", "-C", dest, "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", dest, "config", "user.name", "t"], check=True)
+        (Path(dest) / "README.md").write_text("baseline")
+        # Ровно предпосылка M3: целевой репозиторий игнорирует каталог контекста.
+        (Path(dest) / ".gitignore").write_text(f"{task_context.DIR}/\n")
+        subprocess.run(["git", "-C", dest, "add", "README.md", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", dest, "commit", "-m", "seed"],
+                       check=True, capture_output=True)
+
+    monkeypatch.setattr(a, "_clone_repo", fake_clone)
+    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
+    monkeypatch.setattr(a.github_client, "get_file",
+                        lambda repo, path, ref=None:
+                            "требования" if path.endswith("system_requirements.md") else "")
+
+    issue = a.IssueInput(repo="o/r", issue_number=21, title="t", body="b",
+                         author_login="u", author_type="User")
+    a._dev_prepare(issue, "research/issue-21")
+
+    _root, clone = a._dev_paths(issue)
+    assert (clone / task_context.DIR / task_context.CONTEXT_MAP).exists(), \
+        "готовка не положила каталог контекста — дальше проверять нечего"
+    # «Агент» дописывает код уже ПОСЛЕ подготовки контекста, как в реальном прогоне.
+    (clone / "app.py").write_text("print('done')")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 89}
+
+    monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: _FakeResp())
+
+    number = a._dev_publish(issue, "research/issue-21")
+
+    assert number == 89
+    show = subprocess.run(["git", "-C", str(clone), "show", "--stat", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout
+    assert "app.py" in show, "код агента не доехал до коммита"
+    assert ".harness/context.md" in show, (
+        ".harness проигнорирован .gitignore целевого репозитория, несмотря на "
+        "force_include"
+    )
 
 
 # ────────── правило фокуса переживает свои правила репозитория ──────────
