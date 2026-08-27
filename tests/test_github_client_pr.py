@@ -527,6 +527,38 @@ class _FakeResp:
         return {"number": self.number}
 
 
+def test_publish_stops_before_push_when_missing_from_tree_reports_a_gap(monkeypatch, tmp_path):
+    """Покрывает саму ветку `RuntimeError`. `_missing_from_tree` — отдельно
+    протестированная чистая функция (`test_missing_from_tree_*` ниже);
+    настоящий git делает расхождение, которое она ловит, практически
+    невоспроизводимым (см. `test_publish_commits_a_forced_path_...` — код
+    сам себя чинит раньше, чем до этой проверки доходит). Здесь проверяется
+    интеграция: если она хоть что-то сообщит, `publish_worktree` обязана
+    остановиться ДО push и ДО запроса на PR."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+    # .harness/ ОБЯЗАН существовать на диске — иначе `git add -f -- .harness`
+    # сам упадёт раньше («pathspec did not match any files», тоже
+    # RuntimeError с «.harness» в тексте) и замаскирует то, что тест
+    # проверяет НА САМОМ ДЕЛЕ: ветку `_missing_from_tree` ниже по потоку.
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_missing_from_tree", lambda git, paths: [".harness"])
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("PR не должен запрашиваться после отказа")))
+
+    with pytest.raises(RuntimeError, match=r"\.harness"):
+        gc.publish_worktree("o/r", str(clone_dir), "agent/issue-11",
+                            title="t", body="b", message="m",
+                            force_include=(".harness",))
+
+
 # ────────── M3: подтверждение фактом, а не замыслом ──────────
 
 def test_missing_from_tree_reports_a_path_absent_from_head(tmp_path):
