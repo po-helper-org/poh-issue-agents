@@ -840,16 +840,6 @@ CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментар
 CONTEXT_PR_LIMIT = 20           # связанных PR
 CONTEXT_TOTAL_CHARS = 16000     # потолок брифа (title+body неприкосновенны)
 
-# Задача 7 сняла общий потолок постановки (`DEV_TASK_MAX_CHARS`,
-# `DEV_ARTIFACT_MAX_CHARS`) вместе с усечением по приоритету: контекст теперь
-# доезжает файлами каталога `.harness/` (`shared/task_context.py`), и
-# исполнитель читает их из git по мере надобности, а не получает урезанный
-# пересказ. `DEV_COMMENT_CHARS` — другое: это потолок ОДНОГО комментария в
-# `_fetch_dev_comments`, не общей постановки, и переполнение постановки в
-# целом им не достигалось.
-DEV_COMMENT_CHARS = 1000        # обрезка одного комментария для разработки
-
-
 def _fnr_stages(description: str) -> list[tuple[str, str, str | None]]:
     """Стадии цепочки FNR: (имя, промпт, ожидаемый артефакт).
 
@@ -1158,87 +1148,7 @@ def _truncate(text: str, limit: int) -> str:
     text = text.strip()
     if len(text) <= limit:
         return text
-    return text[:limit].rstrip() + " …[обрезано]"
-
-
-# `_fetch_decomposition_plan`, `_fetch_subtasks` и `_fetch_dev_comments` ниже
-# больше НЕ вызываются из `_dev_prepare` (задача 7): инлайнинг плана,
-# подзадач и обсуждения в постановку убран ради «постановка теперь короткая»
-# — `_fetch_subtasks` в частности ничем не ограничен по объёму и без общего
-# потолка постановки был бы новым каналом её неограниченного роста. Плановый
-# контекст получит основание в `.harness/plan.md`, когда задача 8 подключит
-# новый механизм плана (`task_context.PLAN`); текущий формат этих функций
-# (поиск по маркеру "🧩 Декомпозиция" / `root-issue: #N`, `shared/decomposition.py`)
-# рабочий и потому не удалён — только отключён от вызова. Функции остаются
-# протестированными в `tests/test_issue_113_context_loss.py`.
-
-
-def _fetch_decomposition_plan(issue: IssueInput) -> str:
-    """Получает план декомпозиции из комментария родителя.
-
-    Если родитель содержит комментарий с декомпозицией (есть маркер "🧩 Декомпозиция"),
-    возвращает этот текст. Иначе — пустую строку.
-    """
-    try:
-        comments = github_client.list_comments(issue.repo, issue.issue_number, limit=50)
-        for comment in reversed(comments):  # Сначала свежие
-            body = comment.get("body") or ""
-            if "🧩 Декомпозиция" in body:
-                return body
-    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
-        logger.warning("не удалось прочитать декомпозицию #%s: %s", issue.issue_number, exc)
-    return ""
-
-
-def _fetch_subtasks(issue: IssueInput) -> list[dict]:
-    """Получает подзадачи плана: номера, заголовки, тела и релизы.
-    
-    Читает все открытые Issue и фильтрует те, что содержат ссылку на родителя.
-    Это медленно, но работает без search API. Для оптимизации нужно индексирование.
-    """
-    try:
-        all_issues = github_client.list_open_issues(issue.repo, limit=500)
-        subtasks = []
-        for item in all_issues:
-            body = item.get("body") or ""
-            # Проверяем, что это подзадача этого родителя
-            if f"root-issue: #{issue.issue_number}" in body:
-                # Дополнительно проверяем наличие метки релиза (release:*)
-                labels = item.get("labels", [])
-                if any(str(l).startswith("release:") for l in labels):
-                    subtasks.append({
-                        "number": item.get("number"),
-                        "title": item.get("title"),
-                        "body": body,
-                        "state": item.get("state"),
-                    })
-        return subtasks
-    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
-        logger.warning("не удалось прочитать подзадачи #%s: %s", issue.issue_number, exc)
-        return []
-
-
-def _fetch_dev_comments(issue: IssueInput) -> list[str]:
-    """Свежие комментарии для постановки разработки (аналогично _fetch_comment_blocks).
-    
-    Отфильтровывает командный шум, обрезает по DEV_COMMENT_CHARS, возвращает от
-    старых к свежим.
-    """
-    try:
-        comments = github_client.list_comments(
-            issue.repo, issue.issue_number, limit=50
-        )
-        kept = [c for c in comments if parse_command(c.get("body") or "") is None]
-        blocks: list[str] = []
-        for c in kept[-10:]:  # До 10 свежих комментариев для разработки
-            user = (c.get("user") or {}).get("login", "?")
-            date = (c.get("created_at") or "")[:10]
-            body = _truncate(c.get("body") or "", DEV_COMMENT_CHARS)
-            blocks.append(f"**@{user} ({date}):**\n{body}")
-        return blocks
-    except Exception as exc:  # noqa: BLE001 — деградация важнее причины сбоя
-        logger.warning("list_comments failed for #%s: %s", issue.issue_number, exc)
-        return []
+    return text[:limit].rstrip() + " " + task_context.TRUNCATION_MARKER
 
 
 def _refresh_issue_body(issue: IssueInput) -> str:
@@ -1985,11 +1895,23 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
             "Отказ стадии вместо слепого прогона исполнителя."
         )
 
+    # L2 (ревью задачи 7): сообщение обязано подсказывать выход, а не только
+    # называть находку. В штатной работе этот путь недостижим — единственный
+    # код, что дописывал маркер (`_apply_size_limit`), задача 7 удалила
+    # целиком, — проверка защищает от УНАСЛЕДОВАННОГО маркера, если он всё же
+    # попал в исходный текст (например, дословно процитирован в требованиях).
+    # Без подсказки такой отказ повторялся бы на каждой разработке по этой
+    # задаче: файл на ветке аналитики не правит сам себя.
     corrupted = task_context.truncation_markers(harness)
     if corrupted:
+        source = f"ветке аналитики `{branch}`" if branch else "теле Issue"
         raise RuntimeError(
             f"Develop {issue.repo}#{issue.issue_number}: в {task_context.DIR}/ "
-            f"найден след усечения в файлах: {', '.join(corrupted)}."
+            f"найден след усечения (маркер «{task_context.TRUNCATION_MARKER}») "
+            f"в файлах: {', '.join(corrupted)}. Если это не сбойное усечение, а "
+            "часть настоящего текста (маркер процитирован дословно) — исправь "
+            f"исходный текст в {source} (перепиши или убери маркер) и повтори "
+            "`/develop`."
         )
 
     parts.append(

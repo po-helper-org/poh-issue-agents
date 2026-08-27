@@ -127,15 +127,24 @@ def test_truncation_marker_in_fetched_content_fails_the_stage(monkeypatch, tmp_p
 
     В норме этот путь недостижим: задача 7 убрала единственный код, что
     дописывал маркер (`_apply_size_limit`). Проверка защищает от УНАСЛЕДОВАННОГО
-    маркера — если он всё же попал в исходный текст требований."""
+    маркера — если он всё же попал в исходный текст требований.
+
+    L2 (ревью задачи 7): сообщение обязано подсказывать человеку выход, а не
+    только называть находку — попади маркер цитатой в требования, отказ без
+    подсказки повторялся бы на каждой разработке по этой задаче."""
+    marked = f"требования {task_context.TRUNCATION_MARKER}"
     _prepare_kwargs(monkeypatch, tmp_path, lambda repo, path, ref=None:
-                    "требования …[обрезано]" if path.endswith("system_requirements.md") else "")
+                    marked if path.endswith("system_requirements.md") else "")
 
     issue = a.IssueInput(repo="o/r", issue_number=14, title="t", body="b",
                          author_login="u", author_type="User")
 
-    with pytest.raises(RuntimeError, match="след усечения"):
+    with pytest.raises(RuntimeError, match="след усечения") as excinfo:
         a._dev_prepare(issue, "research/issue-14")
+    message = str(excinfo.value)
+    assert task_context.REQUIREMENTS in message, "сообщение не называет файл с находкой"
+    assert any(word in message for word in ("branch", "ветк", "исправ", "перепиш", "убер")), \
+        "сообщение не подсказывает человеку выход"
 
 
 def test_no_analysis_branch_does_not_require_a_requirements_file(monkeypatch, tmp_path):

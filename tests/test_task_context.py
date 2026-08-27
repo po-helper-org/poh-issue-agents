@@ -145,3 +145,25 @@ def test_required_set_catches_absence_even_when_nothing_was_recorded(tmp_path):
     ловит отсутствие, а не сообщает «всё доставлено»."""
     absent = task_context.missing(tmp_path, task_context.required(has_analysis=True))
     assert absent == [task_context.REQUIREMENTS]
+
+
+# ───────────────── L2 (ревью задачи 7): маркер усечения — одна константа ─────────────────
+#
+# Литерал маркера был продублирован в двух модулях (`task_context.py` и
+# `_truncate` в `worker/activities.py`): разойдись они — проверка на след
+# усечения тихо перестала бы находить то, что дописывает `_truncate`.
+
+def test_truncation_marker_literal_appears_in_exactly_one_place():
+    """Единственное разрешённое место буквального текста маркера — сама
+    константа здесь; всё остальное в `worker/` обязано на неё ссылаться, а
+    не заводить свою копию строки."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    offenders = []
+    for path in sorted((root / "worker").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if task_context.TRUNCATION_MARKER in line and "TRUNCATION_MARKER" not in line:
+                offenders.append(f"{path.relative_to(root)}:{lineno}")
+    assert offenders == [], f"литерал маркера продублирован вне константы: {offenders}"
