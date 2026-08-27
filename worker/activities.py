@@ -2829,12 +2829,21 @@ async def build_mvp_plan(issue: IssueInput, branch: str) -> bool:
 
     Исход считается по АРТЕФАКТУ, а не по коду возврата и не по словам модели:
     `claude -p` выходит нулём и без файла — так уже падали стадии FNR на
-    ограничении частоты у провайдера.
+    ограничении частоты у провайдера. Пустота и нечитаемость проверяются той
+    же `task_context.missing()`, что и у состава каталога — не своей, более
+    грубой проверкой.
+
+    Вызов обёрнут `_run_with_heartbeat`, как и остальные стадии этого файла
+    сравнимой длительности (FNR, подготовка каталога задачи): без
+    периодического сигнала изнутри стадии сервер Temporal счёл бы activity
+    мёртвой по `heartbeat_timeout` воркфлоу раньше, чем успевает завершиться
+    вызов модели (см. докстринг `_run_with_heartbeat`).
     """
     _, clone_dir = _dev_paths(issue)
-    plan_path = Path(clone_dir) / task_context.DIR / task_context.PLAN
-    await asyncio.to_thread(_run_claude, "/plan-mvp", str(clone_dir))
-    return plan_path.exists() and bool(plan_path.read_text(encoding="utf-8").strip())
+    harness = Path(clone_dir) / task_context.DIR
+    await _run_with_heartbeat(_run_claude, "/plan-mvp", str(clone_dir), label="plan-mvp")
+    absent = task_context.missing(harness, {task_context.PLAN: "план работ"})
+    return not absent
 
 
 # --- Декомпозиция задачи на подзадачи и релизы ---
