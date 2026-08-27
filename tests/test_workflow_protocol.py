@@ -145,6 +145,43 @@ async def test_agents_off_is_visible_as_a_stage():
 
 
 @pytest.mark.timeout(60)
+async def test_step_subissue_spends_nothing():
+    """R5, правка по ревью Task 13: та же форма, что у agents_off — прогон по
+    под-задаче шага (`harness:step`) не делает НИ ОДНОГО вызова LLM.
+    Второй, независимый барьер для входа мимо `created` — в
+    tests/test_agent_event_workflow.py."""
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, gate, classify, duplicate, score,
+                                      post_priority, escalate,
+                                      _state_stub(ProtocolState(step_subissue=True)), deadlines_stub, phase_stub]):
+            await env.client.execute_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+    assert "intake_gate" not in _calls
+    assert "classify" not in _calls
+    assert "duplicate" not in _calls
+    assert "priority" not in _calls
+
+
+@pytest.mark.timeout(60)
+async def test_step_subissue_is_visible_as_a_stage():
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq, workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=[awaiting_stub, prefilter_ok, gate, classify, duplicate, score,
+                                      post_priority, escalate,
+                                      _state_stub(ProtocolState(step_subissue=True)), deadlines_stub, phase_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.result()
+            assert await handle.query(IssueLifecycle.stage) == "step-subissue"
+
+
+@pytest.mark.timeout(60)
 async def test_agent_issue_skips_gate_and_advisor_answer():
     """R6: Issue от агента уже классифицирован. Intake gate и advisor-ответ —
     разговор сервиса с самим собой; дедуп и приоритет по-прежнему нужны."""

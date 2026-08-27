@@ -1042,6 +1042,37 @@ class IssueLifecycle:
         # иначе переключённый посреди прогона уронил бы реплей недетерминизмом.
         self._decompose = deadlines.decompose_enabled
         self._followup_max_rounds = deadlines.followup_max_rounds
+
+        # Барьер под-задачи шага (R5) для входов МИМО created. `_phase_triage`
+        # уже проверяет `state.step_subissue`, но событие внешнего агента (#38)
+        # поднимает цикл СРАЗУ в фазе, о которой тот доложил (см.
+        # `_lifecycle_args_for` в вебхуке) — created и, вместе с ним, triage
+        # остаются в стороне. Без барьера здесь `_phase_park` мог бы запустить
+        # дорогое действие — например, приёмку HowToDemo на первом же входе в
+        # `pr-open` — раньше любого сигнала и безо всякой метки в событии: у
+        # AgentEvent их попросту нет.
+        #
+        # `self._phase != lifecycle.CREATED`: этот случай ведёт `_phase_triage`
+        # своим чтением — второе здесь было бы лишним вызовом GitHub на каждый
+        # обычный Issue. `not lifecycle.is_terminal`: из released/cancelled
+        # переход в cancelled не определён, а войти сюда в терминальной фазе
+        # можно только с уже мёртвого прогона. `workflow.patched` обязателен:
+        # прогоны, уже стоящие в боковой фазе, не знают этой активности в своей
+        # истории, и реплей без маркера упал бы недетерминизмом.
+        if (self._phase != lifecycle.CREATED
+                and not lifecycle.is_terminal(self._phase)
+                and workflow.patched("issue-lifecycle-step-subissue-barrier")):
+            state = await workflow.execute_activity(
+                activities.read_protocol_state,
+                args=[issue.repo, issue.issue_number],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if state.step_subissue:
+                await self._enter(lifecycle.CANCELLED, "step-subissue", write_label=False)
+                await self._stop_awaiting()
+                return
+
         while True:
             if self._closed_by is not None and not lifecycle.is_terminal(self._phase):
                 # Issue закрыт на GitHub: любая парковка потеряла смысл. Одна
@@ -1146,6 +1177,12 @@ class IssueLifecycle:
                 # Метку не пишем: человек забрал Issue себе, и наши пометки на
                 # нём — ровно то, от чего он отгородился рубильником.
                 return (lifecycle.CANCELLED, "agents-off", False)
+            if state.step_subissue:
+                # Та же логика, что у agents_off: план родителя уже разобрал
+                # эту задачу, отметка на ней самой не нужна (Task 13, R5).
+                # Второй барьер, вне triage, стоит в начале _run_phase_loop —
+                # он ловит вход, который в created вообще не заходит.
+                return (lifecycle.CANCELLED, "step-subissue", False)
             if state.depth_exceeded:
                 await workflow.execute_activity(
                     activities.escalate_to_human,

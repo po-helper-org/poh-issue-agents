@@ -423,12 +423,16 @@ def post_agents_off_notice(repo: str, issue_number: int, what: str) -> None:
 def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
     """Состояние Issue по протоколу — одно чтение на старте (правило R2).
 
-    Три вопроса сразу, потому что каждый меняет маршрут целиком:
+    Четыре вопроса сразу, потому что каждый меняет маршрут целиком:
 
     - `agents:off` — человек забрал Issue себе. Проверяется здесь, ДО первого
       обращения к LLM: смысл рубильника в том, чтобы не тратить бюджет (R4).
     - `origin:agent` — Issue создал агент, значит он уже классифицирован, и
       advisor-ответ был бы разговором сервиса с самим собой (R6).
+    - `harness:step` — под-задача шага плана MvpDelivery. План родителя её уже
+      разобрал, а триаж был бы разговором контура с самим собой; барьер здесь
+      закрывает и вход, у которого в событии нет ни одной метки — например,
+      факт внешнего агента (R5).
     - глубина цепочки — follow-up, порождённый follow-up-ом. Родителя ищем по
       строке `root-issue: #N` в теле; если у родителя тоже `origin:agent`,
       цепочка пошла на второй круг и дальше её ведёт человек (R7). Иначе контур
@@ -459,6 +463,7 @@ def read_protocol_state(repo: str, issue_number: int) -> ProtocolState:
         origin_agent=origin_agent,
         depth_exceeded=depth_exceeded,
         root_issue=root_issue,
+        step_subissue=labels.has(names, labels.STEP),
     )
 
 

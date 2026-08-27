@@ -598,13 +598,21 @@ async def _handle_delivery(payload: dict, x_github_event: str,
     # уже разобрал, а живёт она только время шага (Task 13). Проверка стоит ДО
     # get_temporal_client() — под-задача не должна поднимать вообще ничего, ни
     # соединения с Temporal, ни тем более воркфлоу с триажом.
-    if x_github_event == "issues" and payload.get("action") == "opened":
+    #
+    # Одна проверка на входе вместо одной на каждую ветку, которая умеет
+    # поднять цикл: `issues` — любым action, а не только `opened` (лейбл
+    # решения и `run:*` поднимают цикл через signal-with-start не хуже
+    # открытия), `issue_comment` — командой в треде. Action здесь ни при чём:
+    # метка решает раньше, чем мы вообще смотрим, какое это событие, поэтому
+    # шестая ветка, способная поднять цикл, унаследует проверку бесплатно.
+    if x_github_event in ("issues", "issue_comment"):
         issue = payload.get("issue") or {}
         names = [label["name"] for label in issue.get("labels", [])]
         if labels.has(names, labels.STEP):
             repo = payload["repository"]["full_name"]
             issue_number = issue["number"]
-            _log.info("под-задача шага %s#%s — цикл не поднимаем", repo, issue_number)
+            _log.info("под-задача шага %s#%s (%s) — цикл не поднимаем",
+                      repo, issue_number, x_github_event)
             return {"ok": True}
 
     client = await get_temporal_client()
