@@ -204,10 +204,16 @@ def needs_subissues(items: list[dict]) -> bool:
     видимость, которой никто не пользуется.
 
     Определение взято из инструмента, а не выдумано: задачи планов superpowers
-    несут блок Interfaces с Consumes/Produces, и непустой Consumes — это и есть
+    несят блок Interfaces с Consumes/Produces, и непустой Consumes — это и есть
     объявленное ребро.
     """
-    return any(item.get("depends_on") for item in items)
+    for index, item in enumerate(items):
+        depends = item.get("depends_on") or []
+        for dep in depends:
+            # Ребром считается только зависимость на другой, существующий шаг
+            if isinstance(dep, int) and 0 <= dep < len(items) and dep != index:
+                return True
+    return False
 
 
 def dependency_reason_missing(items: list[dict]) -> list[str]:
@@ -218,9 +224,11 @@ def dependency_reason_missing(items: list[dict]) -> list[str]:
     опровергнуть, а модели дешевле выдумать её, чем признать, что плана нет.
     """
     bad = []
-    for item in items:
+    for item_index, item in enumerate(items):
         for index in item.get("depends_on") or []:
             if not (item.get("depends_reason") or {}).get(str(index), "").strip():
-                bad.append(item["title"])
+                # Используем заголовок, если есть; иначе используем порядковый номер
+                title = item.get("title") or f"шаг #{item_index}"
+                bad.append(title)
                 break
     return bad

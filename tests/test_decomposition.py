@@ -166,3 +166,45 @@ def test_dependency_with_reason_is_not_reported():
          "depends_reason": {"0": "использует функцию parse()"}},
     ]
     assert d.dependency_reason_missing(items) == []
+
+
+# --- Правка по ревью: Находка 1 и 2 ---
+
+def test_self_dependency_is_not_considered_an_edge():
+    """Шаг, ссылающийся сам на себя, существует, но от него никто не зависит —
+    не ребро. needs_subissues должен вернуть False, так как есть только один шаг
+    и у него нет реальных зависимостей от других шагов."""
+    items = [
+        {"title": "Одна правка", "release": "mvp", "depends_on": [0], "depends_reason": {}},
+    ]
+    assert d.needs_subissues(items) is False
+
+
+def test_dependency_on_nonexistent_index_is_not_considered_an_edge():
+    """Ссылка на несуществующий индекс не должна считаться ребром для needs_subissues.
+    Валидация отклонит этот план (это ошибка), но needs_subissues должна игнорировать
+    такие ссылки и считать ребром только зависимости на существующие и различные индексы."""
+    # Примечание: это не пройдёт валидацию, но функция needs_subissues
+    # должна быть устойчива к этому случаю
+    items = [
+        {"title": "Первый", "release": "mvp", "depends_on": [], "depends_reason": {}},
+        {"title": "Второй", "release": "mvp", "depends_on": [5], "depends_reason": {}},
+    ]
+    # Второй шаг ссылается на несуществующий индекс 5 — это не валидная
+    # зависимость, поэтому не считается ребром
+    assert d.needs_subissues(items) is False
+
+
+def test_missing_title_does_not_crash_dependency_reason_missing():
+    """Отсутствующий title не должен вызывать KeyError.
+    Функция должна обработать это gracefully, используя порядковый номер
+    шага вместо отсутствующего заголовка."""
+    items = [
+        {"release": "mvp", "depends_on": [0], "depends_reason": {}},  # no title, has depends_on
+    ]
+    # Элемент без title пытается быть добавлен в bad, что вызывает KeyError
+    # при обращении к item["title"]. Функция должна обработать это gracefully.
+    result = d.dependency_reason_missing(items)
+    # Результат должен быть списком, содержащим идентификатор элемента без reason
+    # (может быть индекс или другой идентификатор, но не KeyError)
+    assert isinstance(result, list)
