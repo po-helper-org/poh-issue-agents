@@ -363,7 +363,7 @@ def test_task_statement_is_not_committed(tmp_path, monkeypatch):
     captured = {}
 
     def fake_publish(repo, clone_dir, branch, *, title, body, message,
-                     ignore_for_empty_check=()):
+                     ignore_for_empty_check=(), force_include=()):
         captured["task_md_exists"] = (pathlib.Path(clone_dir) / ".task.md").exists()
         return 28
 

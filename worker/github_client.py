@@ -640,9 +640,31 @@ def _git_runner(clone_dir: str, env: dict):
     return git
 
 
+def _missing_from_tree(git, paths: tuple[str, ...]) -> list[str]:
+    """Каких путей из `paths` нет в дереве HEAD — проверка ФАКТОМ (M3), а не
+    предположением, что `git add -f` где-то выше сработал. `git add -A`
+    молча пропускает пути, которые `.gitignore` целевого репозитория
+    игнорирует — единственный способ узнать, доехал ли путь до коммита,
+    который вот-вот уйдёт в push, это посмотреть в сам коммит.
+
+    Пустой `paths` — нулевая стоимость: ни одного вызова git не делается.
+    """
+    if not paths:
+        return []
+    tree = git("ls-tree", "-r", "--name-only", "HEAD", check=False).stdout
+    names = tree.splitlines()
+    missing = []
+    for path in paths:
+        if any(name == path or name.startswith(f"{path}/") for name in names):
+            continue
+        missing.append(path)
+    return missing
+
+
 def publish_worktree(repo: str, clone_dir: str, branch: str, *,
                      title: str, body: str, message: str,
-                     ignore_for_empty_check: tuple[str, ...] = ()) -> int | None:
+                     ignore_for_empty_check: tuple[str, ...] = (),
+                     force_include: tuple[str, ...] = ()) -> int | None:
     """Коммит рабочего дерева в ветку и PR. None — изменений нет.
 
     Делает это ВОРКЕР, а не агент разработки: агенту токен не давали намеренно,
@@ -660,6 +682,19 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     каталог, обязанный дойти до PR независимо от того, менял ли агент код: без
     исключения такой каталог сам по себе выглядел бы диффом, и «агент ничего
     не изменил» перестало бы обнаруживаться.
+
+    `force_include` — пути (без pathspec-магии, например `".harness"`),
+    которые обязаны попасть в коммит НЕЗАВИСИМО от `.gitignore` целевого
+    репозитория (M3, ревью задачи 7). Голый `git add -A` молча пропускает
+    путь, который репозиторий игнорирует: проверка пустоты (уже не
+    учитывающая этот путь через `ignore_for_empty_check`) видит только код
+    агента, коммит и PR проходят — а каталог контекста теряется без единого
+    предупреждения. `git add -f` ниже обходит `.gitignore`; после решения о
+    коммите факт присутствия в дереве HEAD подтверждается ЗАНОВО
+    (`_missing_from_tree`) — замыслом («мы же вызвали add -f») здесь не
+    обойтись, потому что путь может остаться только в индексе, если решение
+    «коммитить или нет» приняло его не в расчёт (см. ветку `forced_pending`
+    ниже).
     """
     if _dry_run():
         _log.info("[DRY_RUN] publish %s -> %s: %s", clone_dir, branch, title)
@@ -700,6 +735,10 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
 
     git("checkout", "-B", branch)
     git("add", "-A")
+    for path in force_include:
+        # -f обходит .gitignore целевого репозитория: без него `add -A` выше
+        # молча пропускает путь, который репозиторий игнорирует (M3).
+        git("add", "-f", "--", path)
     # Пустой ИНДЕКС — не то же самое, что «агент ничего не менял»: если ветка
     # уже существовала до этого вызова, значит, коммит уехал в прошлой попытке,
     # а сорвался только пуш (или создание PR) — публикацию нужно довести, а не
@@ -712,13 +751,46 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     # уже отработал по всему дереву.
     diff_args = ["diff", "--cached", "--quiet", "--", "."]
     diff_args += [f":(exclude){pattern}" for pattern in ignore_for_empty_check]
-    if git(*diff_args, check=False).returncode == 0:
-        if not branch_existed:
-            _log.warning("%s: агент не изменил ни одного файла", repo)
-            return None
-    else:
+    visible_diff = git(*diff_args, check=False).returncode != 0
+
+    # M3: `force_include` может внести изменение, которого «видимый» дифф не
+    # видит (он же его специально исключает через `ignore_for_empty_check`) —
+    # например, .harness/ не попал в САМЫЙ ПЕРВЫЙ коммит на этой ветке (был
+    # проигнорирован .gitignore до этой правки или иным путём), а рабочее
+    # дерево на ретрае больше не менялось. Не заметить такое pending-изменение
+    # значило бы никогда его не закоммитить: индекс не хранится между
+    # вызовами дольше жизни рабочего дерева.
+    #
+    # Гейт на `branch_existed` обязателен: на СОВЕРШЕННО НОВОЙ ветке
+    # force_include-путь «новый» ВСЕГДА (только что собран `_dev_prepare`,
+    # разница с базовым коммитом гарантирована) — без гейта пустой прогон
+    # (агент не менял код, есть только `.harness/`) считался бы правкой при
+    # КАЖДОМ вызове, и это ровно тот регресс M1/H1, ради которого
+    # `ignore_for_empty_check` вообще существует. На РЕТРАЕ существующей
+    # ветки предыдущий коммит — это факт, а не свежая сборка, и его нехватку
+    # (гитигнор, старая версия кода) нужно чинить именно здесь.
+    forced_pending = branch_existed and bool(force_include) and git(
+        "diff", "--cached", "--quiet", "--", *force_include, check=False
+    ).returncode != 0
+
+    if visible_diff or forced_pending:
         git("commit", "-m", message, "-m",
             "Автор изменений — OpenHands, запущен активностью Develop.")
+    elif not branch_existed:
+        _log.warning("%s: агент не изменил ни одного файла", repo)
+        return None
+
+    # Подтверждаем ФАКТОМ, а не замыслом вызова `add -f` выше (M3): проверяем
+    # дерево HEAD — то, что вот-вот уйдёт в push, — а не полагаемся на то, что
+    # `git add -f` где-то раньше отработал как задумано.
+    missing = _missing_from_tree(git, force_include)
+    if missing:
+        raise RuntimeError(
+            f"{repo}: {', '.join(missing)} не попал(и) в коммит ветки {branch}, "
+            "хотя force_include этого требует — вероятно, .gitignore целевого "
+            "репозитория. Публикация остановлена до пуша."
+        )
+
     git("push", "--force-with-lease", "-u", "origin", branch)
 
     resp = requests.post(
