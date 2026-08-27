@@ -3,6 +3,8 @@
 Оба дефекта, которые здесь закрыты, были молчаливыми: постановка собиралась,
 файл писался, прогон шёл — и часть содержимого просто отсутствовала.
 """
+from pathlib import Path
+
 import activities as a
 
 
@@ -172,3 +174,42 @@ def test_everything_fits_when_artifacts_are_modest():
     kept, dropped = _cut(a._split_sections(_contour_parts(artifacts_size=5000)),
                          a.DEV_TASK_MAX_CHARS)
     assert dropped == []
+
+
+# ────────── правило фокуса переживает свои правила репозитория ──────────
+
+def test_focus_rule_survives_repository_own_rules(monkeypatch, tmp_path):
+    """Правило фокуса обязано доехать и в репозиторий со своими правилами.
+
+    Свой `.openhands/task-rules.md` целевого репозитория вытесняет запасные
+    правила контура ЦЕЛИКОМ. Это уже стоило потери блока правил и инструкции
+    про файл находок: они жили внутри запасных правил и исчезали в самых
+    обычных репозиториях — тех, у кого свои правила есть.
+    """
+    import activities as a
+
+    monkeypatch.setattr(a.github_client, "get_file",
+                        lambda repo, path, ref=None: "## Свои правила репозитория"
+                        if path.endswith("task-rules.md") else "")
+
+    def _fake_clone(repo, dest, branch=None):
+        # `_dev_prepare` читает `.openhands/task-rules.md` локальным файлом
+        # клона (`rules.exists()` / `rules.read_text()`), а не через
+        # `github_client.get_file` — двойник обязан положить файл НА ДИСК,
+        # иначе `rules.exists()` всегда False и репозиторий со своими
+        # правилами неотличим в тесте от репозитория без них.
+        rules_dir = Path(dest) / ".openhands"
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        (rules_dir / "task-rules.md").write_text(
+            "## Свои правила репозитория", encoding="utf-8")
+
+    monkeypatch.setattr(a, "_clone_repo", _fake_clone)
+    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
+
+    issue = a.IssueInput(repo="o/r", issue_number=1, title="t", body="b",
+                         author_login="u", author_type="User")
+    task, _ = a._dev_prepare(issue, "research/issue-1")
+
+    assert "Свои правила репозитория" in task, "правила репозитория потерялись"
+    assert "пройдёт ли сценарий без этого" in task, "правило фокуса не доехало"
