@@ -70,6 +70,16 @@ def test_non_dry_run_reaction_posts_to_the_comment(monkeypatch):
     assert calls["json"] == {"content": "eyes"}
 
 
+def test_dry_run_link_sub_issue_makes_no_http_call(monkeypatch):
+    gc = _fresh(monkeypatch, dry=True)
+
+    def boom(*a, **k):
+        raise AssertionError("HTTP called under DRY_RUN")
+
+    monkeypatch.setattr(gc.requests, "post", boom)
+    gc.link_sub_issue("o/r", 151, 987654)
+
+
 def test_reads_are_not_blocked_by_dry_run(monkeypatch):
     """DRY_RUN защищает от мутаций, а не от чтения: без чтения контекста
     прогон в DRY_RUN не показал бы, что именно система собралась сделать."""
