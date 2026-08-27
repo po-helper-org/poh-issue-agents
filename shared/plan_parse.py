@@ -7,6 +7,7 @@ Interfaces, и непустой Consumes — объявленная зависи
 
 import re
 
+from shared import markdown_fences
 from shared.markdown_fences import mask_code_fences
 
 _TASK = re.compile(r"^###\s+Task\s+(\d+)\s*:\s*(.+?)\s*$", re.M)
@@ -25,14 +26,25 @@ _NOTHING = ("ничего", "nothing", "—", "-")
 def parse(text: str) -> list[dict]:
     """Шаги плана с объявленными зависимостями.
 
-    Блоки кода (тройные и более обратные кавычки) в разборе не участвуют
-    (ревью, находка F2): план часто цитирует сам себя как пример внутри
-    описания задачи (см. `docs/superpowers/plans/*`, задача про этот же
+    Блоки кода (тройные и более обратные кавычки/тильды) в разборе не
+    участвуют (ревью, находка F2): план часто цитирует сам себя как пример
+    внутри описания задачи (см. `docs/superpowers/plans/*`, задача про этот же
     модуль), и такая цитата не должна читаться как настоящий шаг или
     настоящая зависимость. Маскировка общая с `worker.activities` — см.
     `shared.markdown_fences`.
+
+    Незакрытый забор кода — громкий отказ (ревью, находка 1): молчаливая
+    потеря всех задач после него опаснее, чем явный отказ разбора.
     """
-    haystack = mask_code_fences(text or "")
+    text = text or ""
+    # Проверка на незакрытый забор перед маскировкой, чтобы явно отказать
+    if markdown_fences.has_unclosed_fence(text):
+        raise ValueError(
+            "Plan contains unclosed code fence (``` or ~~~). "
+            "All tasks after unclosed fence are hidden in mask. "
+            "Close all code fences before parsing plan."
+        )
+    haystack = mask_code_fences(text)
     bounds = [(m.start(), int(m.group(1)), m.group(2))
               for m in _TASK.finditer(haystack)]
 

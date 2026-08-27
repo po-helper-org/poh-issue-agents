@@ -230,3 +230,71 @@ def test_real_repo_plan_step_count_matches_real_task_headers():
     text = path.read_text(encoding="utf-8")
     steps = plan_parse.parse(text)
     assert len(steps) == 13
+
+
+# ────────── находка 1: незакрытый забор скрывает последующие задачи ──────────
+
+PLAN_UNCLOSED_FENCE = """# План
+
+### Task 1: Первая задача
+
+Описание с незакрытым забором:
+
+```python
+def hello():
+    print("hello")
+
+### Task 2: Вторая задача (скрыта незакрытым забором)
+
+**Interfaces:**
+- Consumes: ничего.
+
+### Task 3: Третья задача
+
+**Interfaces:**
+- Consumes: ничего.
+"""
+
+
+def test_unclosed_fence_in_task_body_causes_parse_error():
+    """Незакрытый забор в теле задачи скрывает все последующие задачи в
+    маске. Это опасно: результат структурно валиден, но половина плана
+    исчезла молча. Должен быть явный отказ разбора."""
+    import pytest
+    with pytest.raises(ValueError, match="unclosed.*fence|незакрытый.*забор"):
+        plan_parse.parse(PLAN_UNCLOSED_FENCE)
+
+
+# ────────── находка 2: заборы из тильд не распознаются ──────────
+
+PLAN_WITH_TILDES = """# План
+
+### Task 1: Первая задача
+
+Пример:
+
+~~~python
+def hello():
+    print("hello")
+~~~
+
+### Task 2: Вторая задача
+
+**Interfaces:**
+- Consumes: Task 1 — использует первую.
+"""
+
+
+def test_tildes_fence_is_recognized():
+    """Заборы из трёх или более тильд — валидный Markdown, и примеры внутри
+    них не должны читаться как настоящие задачи или зависимости. Старый
+    код не распознавал тильды, и заголовок внутри забора из тильд становился
+    выдуманной задачей."""
+    steps = plan_parse.parse(PLAN_WITH_TILDES)
+    # Должны быть ровно две задачи, не три (не было Task внутри примера)
+    assert len(steps) == 2
+    assert [s["title"] for s in steps] == [
+        "Первая задача", "Вторая задача"
+    ]
+    # Task 2 должна найти Task 1 в своих зависимостях
+    assert steps[1]["depends_on"] == [0]
