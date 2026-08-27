@@ -6,6 +6,16 @@
 постановку.
 
 Модуль намеренно чистый: ни сети, ни GitHub — как `lifecycle.py`.
+
+Известное ограничение (ревью, находка 2). Текст человека, дословно совпадающий
+с форматом маркера (ровно одна пара start/end), от настоящего блока
+неотличим — read()/write() работают по разметке, а не по намерению автора
+строки, и полностью снять эту двусмысленность нельзя. Смягчают риск, но не
+убирают его, два правила ниже: write() отказывает, если ЗАПИСЫВАЕМОЕ
+содержимое само похоже на маркер (контуру такая запись никогда не нужна, а
+значит источником двусмысленности остаётся только текст человека, не сам
+контур), и любое число маркеров, кроме ровно нуля или ровно одной пары,
+считается повреждённым телом и тоже даёт отказ — вместо тихой порчи.
 """
 
 import re
@@ -18,20 +28,66 @@ def _markers(name: str) -> tuple[str, str]:
     return f"<!-- harness:{name}:start -->", f"<!-- harness:{name}:end -->"
 
 
-def read(body: str, name: str) -> str | None:
-    """Содержимое блока либо None, если блока нет."""
-    start, end = _markers(name)
-    pattern = re.compile(re.escape(start) + r"\n(.*?)\n" + re.escape(end), re.S)
-    found = pattern.search(body or "")
-    return found.group(1) if found else None
+def _matched_block(body: str, name: str, start: str, end: str) -> re.Match | None:
+    """Проверяет структуру блока `name` в `body` по числу маркеров, а не угадывает.
+
+    Ровно один старт и один конец — блок на месте, возвращается Match на него.
+    Ноль обоих — блока нет: для write() это сигнал добавить блок в конец, для
+    read() — вернуть None.
+    Любая другая комбинация (дубли, старт без конца, конец без старта) — тело
+    повреждено. Восстановление добавлением плодит дубли и осиротевшие
+    маркеры, а не чинит структуру (ревью, находка 3), поэтому вместо угадывания
+    — громкий отказ.
+    """
+    starts, ends = body.count(start), body.count(end)
+    if starts == 0 and ends == 0:
+        return None
+    if starts == 1 and ends == 1:
+        pattern = re.compile(re.escape(start) + r"\n(.*?)\n" + re.escape(end), re.S)
+        match = pattern.search(body)
+        if match:
+            return match
+    raise ValueError(
+        f"Тело повреждено: блок {name!r} должен встречаться маркерами начала "
+        f"и конца ровно по одному разу, а найдено start={starts}, end={ends}. "
+        "Чтобы не гадать и не плодить дубли, автоматическая правка отказана."
+    )
 
 
-def write(body: str, name: str, content: str) -> str:
-    """Тело с заменённым (или добавленным) блоком."""
+def read(body: str | None, name: str) -> str | None:
+    """Содержимое блока либо None, если блока нет.
+
+    Поднимает ValueError, если структура маркеров блока повреждена (см.
+    докстринг модуля и `_matched_block`): склеенный из обрывков результат
+    вреднее честного отказа.
+    """
     start, end = _markers(name)
+    match = _matched_block(body or "", name, start, end)
+    return match.group(1) if match else None
+
+
+def write(body: str | None, name: str, content: str) -> str:
+    """Тело с заменённым (или добавленным) блоком.
+
+    Поднимает ValueError в двух случаях:
+    - `content` сам содержит маркер блока `name` (ревью, находка 1: нежадный
+      поиск следующей записи остановится на первом же таком вхождении и
+      обрежет хвост тела без возврата — контуру такая запись никогда не
+      нужна);
+    - структура существующего блока в `body` повреждена (ревью, находка 3, см.
+      `_matched_block`).
+    """
+    start, end = _markers(name)
+    if start in content or end in content:
+        raise ValueError(
+            f"Содержимое блока {name!r} не должно содержать его собственные "
+            f"маркеры ({start!r} / {end!r}) — контуру такая запись никогда не "
+            "нужна, а тихая порча тела недопустима."
+        )
+    body = body or ""
     block = f"{start}\n{content}\n{end}"
-    pattern = re.compile(re.escape(start) + r"\n.*?\n" + re.escape(end), re.S)
-    if pattern.search(body or ""):
-        return pattern.sub(lambda _: block, body, count=1)
-    tail = "" if (body or "").endswith("\n") else "\n"
-    return f"{body or ''}{tail}\n{block}\n"
+    match = _matched_block(body, name, start, end)
+    if match:
+        return f"{body[:match.start()]}{block}{body[match.end():]}"
+    tail = "" if body.endswith("\n") else "\n"
+    return f"{body}{tail}\n{block}\n"
