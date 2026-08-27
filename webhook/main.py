@@ -599,13 +599,30 @@ async def _handle_delivery(payload: dict, x_github_event: str,
     # get_temporal_client() — под-задача не должна поднимать вообще ничего, ни
     # соединения с Temporal, ни тем более воркфлоу с триажом.
     #
-    # Одна проверка на входе вместо одной на каждую ветку, которая умеет
-    # поднять цикл: `issues` — любым action, а не только `opened` (лейбл
-    # решения и `run:*` поднимают цикл через signal-with-start не хуже
-    # открытия), `issue_comment` — командой в треде. Action здесь ни при чём:
-    # метка решает раньше, чем мы вообще смотрим, какое это событие, поэтому
-    # шестая ветка, способная поднять цикл, унаследует проверку бесплатно.
-    if x_github_event in ("issues", "issue_comment"):
+    # Гейт гасит только пути, способные ПОДНЯТЬ новый цикл (с signal-with-start):
+    # - issues.opened, issues.labeled: всегда поднимают
+    # - issue_comment с КОМАНДОЙ: поднимают через signal-with-start
+    #
+    # Пути, которые гейт НЕ гасит (работают с существующим циклом):
+    # - issues.closed: signal в живой цикл об окончании Issue
+    # - issue_comment обычный: signal в цикл уточнений (receiver = IssueLifecycle)
+    #
+    # Любой новый путь, способный поднять цикл, унаследует проверку автоматически.
+    should_gate = False
+
+    if x_github_event == "issues":
+        action = payload.get("action", "")
+        # issues.opened и issues.labeled (и все иные actions, если появятся,
+        # которые поднимают цикл) проходят гейт
+        should_gate = action in ("opened", "labeled")
+
+    elif x_github_event == "issue_comment":
+        # issue_comment с командой проходит гейт; обычный комментарий — нет
+        if payload.get("action") == "created":
+            comment_body = payload.get("comment", {}).get("body") or ""
+            should_gate = parse_command(comment_body) is not None
+
+    if should_gate:
         issue = payload.get("issue") or {}
         names = [label["name"] for label in issue.get("labels", [])]
         if labels.has(names, labels.STEP):
