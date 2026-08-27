@@ -471,6 +471,63 @@ def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp
     assert ".harness/context.md" in show, ".harness не доехал до коммита"
 
 
+# ────────── M1 (ревью задачи 7): гвард пустого прогона на МЕСТЕ ВЫЗОВА ──────────
+#
+# `ignore_for_empty_check=(f"{task_context.DIR}/**",)` в `_dev_publish` —
+# единственная строка, исключающая `.harness/` из проверки «есть ли
+# изменения». `tests/test_github_client_pr.py` проверяет саму функцию
+# `publish_worktree` с аргументом, переданным ВРУЧНУЮ тестом, — но ни один
+# тест не проверял, что `_dev_publish` этот аргумент ДЕЙСТВИТЕЛЬНО передаёт.
+# Удаление строки в `worker/activities.py` не роняло ни одного из 1317
+# тестов до этой правки.
+
+def test_dev_publish_treats_context_only_changes_as_an_empty_run(monkeypatch, tmp_path):
+    """Сквозная проверка настоящим git через `_dev_publish` (не через
+    `publish_worktree` напрямую): агент не тронул ни одного файла, в рабочем
+    дереве только `.harness/`, положенный `_dev_prepare`. Без исключения
+    аргумента на месте вызова это читалось бы как «агент кое-что сделал» —
+    PR открылся бы с одним каталогом контекста внутри."""
+    import subprocess
+    import github_client as gc
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+
+    def fake_clone(repo, dest, branch=None):
+        subprocess.run(["git", "clone", str(origin), dest], check=True, capture_output=True)
+        subprocess.run(["git", "-C", dest, "config", "user.email", "t@t"], check=True)
+        subprocess.run(["git", "-C", dest, "config", "user.name", "t"], check=True)
+        (Path(dest) / "README.md").write_text("baseline")
+        subprocess.run(["git", "-C", dest, "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", dest, "commit", "-m", "seed"],
+                       check=True, capture_output=True)
+
+    monkeypatch.setattr(a, "_clone_repo", fake_clone)
+    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
+    monkeypatch.setattr(a.github_client, "get_file",
+                        lambda repo, path, ref=None:
+                            "требования" if path.endswith("system_requirements.md") else "")
+
+    issue = a.IssueInput(repo="o/r", issue_number=16, title="t", body="b",
+                         author_login="u", author_type="User")
+    a._dev_prepare(issue, "research/issue-16")
+    # «Агент» не трогает рабочее дерево вовсе — единственная правка внутри
+    # него это `.harness/`, положенный подготовкой ДО прогона агента.
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+    posts: list = []
+    monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: posts.append((args, kw)))
+
+    number = a._dev_publish(issue, "research/issue-16")
+
+    assert number is None, "агент не тронул ни файла — пустой прогон, PR не открывается"
+    assert posts == [], "запрос на создание PR не должен был уйти"
+
+
 # ────────── правило фокуса переживает свои правила репозитория ──────────
 
 def test_focus_rule_survives_repository_own_rules(monkeypatch, tmp_path):
