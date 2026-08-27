@@ -285,6 +285,30 @@ def create_issue(repo: str, title: str, body: str, labels: list[str] | None = No
     return resp.json()["number"]
 
 
+def issue_node_id(repo: str, issue_number: int) -> int:
+    """Внутренний id задачи. Привязка под-задач идёт по нему, а не по номеру."""
+    return int(get_issue(repo, issue_number)["id"])
+
+
+def link_sub_issue(repo: str, parent: int, child_id: int) -> None:
+    """Привязать задачу к родителю нативной связью GitHub.
+
+    `child_id` — внутренний id (см. `issue_node_id`), НЕ номер. Передача номера
+    даёт 422 с невнятным телом, и отличить её от прочих отказов трудно.
+    """
+    url = f"https://api.github.com/repos/{repo}/issues/{parent}/sub_issues"
+    resp = requests.post(url, headers=_auth_headers(repo), json={"sub_issue_id": child_id}, timeout=30)
+    resp.raise_for_status()
+
+
+def list_sub_issues(repo: str, parent: int) -> list[dict]:
+    """Под-задачи родителя."""
+    url = f"https://api.github.com/repos/{repo}/issues/{parent}/sub_issues"
+    resp = requests.get(url, headers=_auth_headers(repo), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def close_issue(repo: str, issue_number: int) -> None:
     if _dry_run():
         _log.info("[DRY_RUN] close %s#%s", repo, issue_number)
