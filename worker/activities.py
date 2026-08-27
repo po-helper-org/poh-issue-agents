@@ -1807,18 +1807,32 @@ def _dev_paths(issue: IssueInput) -> tuple[Path, Path]:
     return root, root / "repo"
 
 
-def _previous_reflect_note_text(root: Path) -> str:
-    """Сырой текст `.reflect.md` предыдущей попытки этой же задачи, если есть.
+# M4 (ревью задачи 7): артефакты цепочки FNR сверх требований. Прежняя
+# сборка (до задачи 7) тянула все пять в постановку; задача 7 оставила
+# только требования — concept.md, task.md, repowise-dialog.md и
+# validation.md выпали без упоминания. Возвращаются файлами в каталог: он
+# для того и заведён, чтобы объём перестал быть поводом выбрасывать
+# контекст. НЕ обязательны — `task_context.required()` их не требует.
+_OPTIONAL_ANALYSIS_ARTIFACTS = (
+    (task_context.TASK, "постановка, с которой начинался анализ FNR"),
+    (task_context.REPOWISE_DIALOG, "диалог с индексом кода на старте анализа"),
+    (task_context.VALIDATION, "проверка требований на этапе анализа"),
+)
 
-    `_dev_publish` перекладывает файл намерений из клона в КОРЕНЬ задачи перед
-    снятием служебных файлов (`develop.clear_service_files(..., keep_dir=root)`)
-    — именно затем, чтобы он пережил снятие. `_dev_prepare` сносит корень
-    заново при каждом вызове (см. ниже), поэтому читать файл нужно ДО сноса:
-    это единственное окно, где решения предыдущей попытки ещё на диске.
+
+def _fetch_optional_artifact(repo: str, name: str, branch: str) -> str:
+    """Один необязательный артефакт цепочки FNR с ветки аналитики (M4).
+
+    Деградация, а не отказ, при ЛЮБОМ сбое (не только 404 — `get_file`
+    бросает исключение на прочих кодах ответа): эти артефакты никогда не
+    входят в `task_context.required()`, и сетевой сбой на одном из них не
+    должен ронять всю подготовку контекста, которая уже прошла обязательные
+    требования.
     """
     try:
-        return (root / REFLECT_NOTE_FILE).read_text(encoding="utf-8").strip()
-    except OSError:
+        return github_client.get_file(repo, f"{FNR_DIR}/{name}", branch) or ""
+    except Exception as exc:  # noqa: BLE001 — деградация, а не отказ
+        logger.warning("не удалось прочитать %s с ветки %s: %s", name, branch, exc)
         return ""
 
 
@@ -1849,10 +1863,6 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
     контекста не хватает.
     """
     root, clone_dir = _dev_paths(issue)
-    # ДО сноса корня: если задача уже проходила через /develop раньше, здесь
-    # может лежать файл намерений предыдущей попытки (см. докстринг функции).
-    previous_decisions = _previous_reflect_note_text(root)
-
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     _clone_repo(issue.repo, str(clone_dir))
@@ -1879,6 +1889,7 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
     entries: dict[str, str] = {}
 
     requirements = ""
+    concept = ""
     if branch:
         requirements = github_client.get_file(
             issue.repo, f"{FNR_DIR}/system_requirements.md", branch) or ""
@@ -1886,17 +1897,42 @@ def _dev_prepare(issue: IssueInput, branch: str) -> tuple[str, list[str]]:
             (harness / task_context.REQUIREMENTS).write_text(
                 requirements, encoding="utf-8")
             entries[task_context.REQUIREMENTS] = "системные требования (ветка аналитики)"
+        # concept.md читается один раз и используется дважды: как источник
+        # DECISIONS (M2, ниже) и как один из необязательных артефактов (M4).
+        concept = _fetch_optional_artifact(issue.repo, task_context.CONCEPT, branch)
 
     scenario = _howtodemo_block(fresh_body or "")
     if scenario:
         (harness / task_context.HOWTODEMO).write_text(scenario, encoding="utf-8")
         entries[task_context.HOWTODEMO] = "сценарий приёмки: им проверяется результат"
 
-    if previous_decisions:
-        (harness / task_context.DECISIONS).write_text(
-            previous_decisions, encoding="utf-8")
+    # M2 (ревью задачи 7): DECISIONS больше НЕ копия `.reflect.md`. Постановка
+    # обещает агенту дословно «файл в коммит не попадёт, его снимает контур»
+    # — под это обещание агент пишет намерение, допущения и СОМНЕНИЯ, а копия
+    # в decisions.md коммитилась и уезжала в PR: обещание нарушалось кодом
+    # же, который его давал. Источник — concept.md ветки аналитики: там
+    # вердикт дебатов, то есть принятые решения и их причины, а не намерения
+    # агента. Заодно (L1) это делает DECISIONS ретрай-устойчивым: файл
+    # приходит через git на каждом вызове независимо от локального состояния
+    # каталога задачи, а не из файла, который снесла же предыдущая попытка.
+    if concept:
+        (harness / task_context.DECISIONS).write_text(concept, encoding="utf-8")
         entries[task_context.DECISIONS] = \
-            "решения и намерения предыдущей попытки по этой же задаче"
+            "вердикт дебатов аналитики: принятые решения и их причины"
+
+    # M4: остальные артефакты цепочки FNR — опциональные, читаются, только
+    # если ветка аналитики есть (иначе им взяться неоткуда). concept.md уже
+    # прочитан выше (для DECISIONS) — здесь он лишь дописывается СВОИМ именем,
+    # без повторного запроса к GitHub.
+    if branch:
+        if concept:
+            (harness / task_context.CONCEPT).write_text(concept, encoding="utf-8")
+            entries[task_context.CONCEPT] = "концепт: разбор проблемы и рассмотренные варианты"
+        for name, description in _OPTIONAL_ANALYSIS_ARTIFACTS:
+            content = _fetch_optional_artifact(issue.repo, name, branch)
+            if content:
+                (harness / name).write_text(content, encoding="utf-8")
+                entries[name] = description
 
     (harness / task_context.CONTEXT_MAP).write_text(
         task_context.render_map(entries), encoding="utf-8")

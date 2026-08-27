@@ -149,40 +149,185 @@ def test_no_analysis_branch_does_not_require_a_requirements_file(monkeypatch, tm
     assert "Аналитики по задаче нет" in task
 
 
-# ───────────────── решения прошлой попытки (задача 7) ─────────────────
+# ───────────────── M2 (ревью задачи 7): DECISIONS из concept.md, не из .reflect.md ─────────────────
+#
+# Постановка обещает агенту дословно: «Файл в коммит не попадёт, его снимает
+# контур» (`.reflect.md` — намерения, допущения, СОМНЕНИЯ) — а старая версия
+# копировала этот файл в decisions.md, который коммитится и уезжает в PR:
+# обещание нарушалось кодом же, который его давал. Источник поменян на
+# `concept.md` с ветки аналитики — там вердикт дебатов, то есть принятые
+# решения и их причины; это не намерения агента, а факт из git, который
+# коммититься уже не боится ничего нарушить.
 
-def test_decisions_carry_over_from_a_previous_attempts_reflect_note(monkeypatch, tmp_path):
-    """`.reflect.md` предыдущей попытки этой же задачи не пропадает при
-    повторном /develop — он лежит в корне задачи ДО того, как `_dev_prepare`
-    снесёт корень заново, и это единственное окно, где решения можно
-    перенести дальше следующему прогону."""
-    _prepare_kwargs(monkeypatch, tmp_path, lambda repo, path, ref=None: "")
+def _get_file_double(**by_suffix):
+    """github_client.get_file, отвечающий по суффиксу пути. Отсутствующий в
+    словаре суффикс — пустая строка (файла на ветке нет)."""
+    def get_file(repo, path, ref=None):
+        for suffix, content in by_suffix.items():
+            if path.endswith(suffix):
+                return content
+        return ""
+    return get_file
+
+
+def test_decisions_come_from_the_analysis_branch_concept_md(monkeypatch, tmp_path):
+    """Источник поменян: decisions.md — это concept.md ветки аналитики, а не
+    файл намерений локального диска."""
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(
+        **{"system_requirements.md": "требования",
+           "concept.md": "## Решение\nделаем через адаптер, не патчим ядро"}))
 
     issue = a.IssueInput(repo="o/r", issue_number=11, title="t", body="b",
+                         author_login="u", author_type="User")
+    a._dev_prepare(issue, "research/issue-11")
+
+    _root, clone = a._dev_paths(issue)
+    harness = clone / task_context.DIR
+    assert (harness / task_context.DECISIONS).read_text(encoding="utf-8") == \
+        "## Решение\nделаем через адаптер, не патчим ядро"
+
+
+def test_no_concept_on_the_analysis_branch_is_not_an_error(monkeypatch, tmp_path):
+    """concept.md на ветке нет (или он пуст) — DECISIONS не пишется, отказа
+    нет: `task_context.required()` его никогда не требует."""
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(
+        **{"system_requirements.md": "требования"}))
+
+    issue = a.IssueInput(repo="o/r", issue_number=12, title="t", body="b",
+                         author_login="u", author_type="User")
+    a._dev_prepare(issue, "research/issue-12")
+
+    _root, clone = a._dev_paths(issue)
+    assert not (clone / task_context.DIR / task_context.DECISIONS).exists()
+
+
+def test_reflect_note_no_longer_reaches_decisions(monkeypatch, tmp_path):
+    """Регрессия на само нарушение обещания: даже если `.reflect.md`
+    предыдущей попытки лежит в корне задачи (унаследован от старого кода или
+    оставлен другим механизмом), его текст не должен попасть в decisions.md —
+    контур обязан сдержать обещание «файл в коммит не попадёт»."""
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(
+        **{"system_requirements.md": "требования",
+           "concept.md": "## Решение\nвердикт дебатов"}))
+
+    issue = a.IssueInput(repo="o/r", issue_number=13, title="t", body="b",
                          author_login="u", author_type="User")
     root, _clone = a._dev_paths(issue)
     root.mkdir(parents=True, exist_ok=True)
     (root / a.REFLECT_NOTE_FILE).write_text(
-        "## Намерение\nсделал минимально необходимое для сценария\n", encoding="utf-8")
+        "## Намерение\nэто НЕ должно попасть в PR\n", encoding="utf-8")
 
-    a._dev_prepare(issue, "")  # без ветки аналитики — решения проверяем изолированно
+    a._dev_prepare(issue, "research/issue-13")
+
+    _root, clone = a._dev_paths(issue)
+    decisions = (clone / task_context.DIR / task_context.DECISIONS).read_text(encoding="utf-8")
+    assert "НЕ должно попасть" not in decisions
+    assert decisions == "## Решение\nвердикт дебатов"
+
+
+def test_decisions_are_retry_safe_since_they_now_come_from_git_not_local_disk(
+        monkeypatch, tmp_path):
+    """L1: раньше решения приходили из `.reflect.md`, прочитанного из
+    каталога задачи ДО его сноса — упавшая первая попытка, дошедшая до
+    чтения файла, оставляла вторую и третью попытку без него (каталог уже
+    снесён предыдущим вызовом `_dev_prepare`, а новый файл взяться неоткуда
+    без свежего прогона агента). concept.md приходит через git на КАЖДОМ
+    вызове независимо от локального состояния каталога — повторный вызов
+    (как повторная попытка Temporal) получает те же решения, что и первый."""
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(
+        **{"system_requirements.md": "требования",
+           "concept.md": "## Решение\nделаем через адаптер"}))
+
+    issue = a.IssueInput(repo="o/r", issue_number=14, title="t", body="b",
+                         author_login="u", author_type="User")
+
+    a._dev_prepare(issue, "research/issue-14")  # «первая попытка»
+    _root, clone = a._dev_paths(issue)
+    first = (clone / task_context.DIR / task_context.DECISIONS).read_text(encoding="utf-8")
+
+    a._dev_prepare(issue, "research/issue-14")  # «повторная попытка» — тот же каталог
+    _root, clone = a._dev_paths(issue)
+    second = (clone / task_context.DIR / task_context.DECISIONS).read_text(encoding="utf-8")
+
+    assert first == second == "## Решение\nделаем через адаптер"
+
+
+# ───────────────── M4 (ревью задачи 7): остальные артефакты цепочки FNR ─────────────────
+#
+# Прежняя сборка тянула пять артефактов FNR в постановку; задача 7 оставила
+# только требования. concept.md, task.md, repowise-dialog.md и validation.md
+# выпали без упоминания — возвращаются файлами в каталог. Не обязательны:
+# обязательны только требования, отсутствующий артефакт просто не попадает в
+# карту.
+
+def test_optional_analysis_artifacts_reach_the_harness_directory(monkeypatch, tmp_path):
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(**{
+        "system_requirements.md": "требования",
+        "concept.md": "концепт",
+        "task.md": "постановка FNR",
+        "repowise-dialog.md": "диалог с индексом",
+        "validation.md": "отчёт валидации",
+    }))
+
+    issue = a.IssueInput(repo="o/r", issue_number=17, title="t", body="b",
+                         author_login="u", author_type="User")
+    a._dev_prepare(issue, "research/issue-17")
 
     _root, clone = a._dev_paths(issue)
     harness = clone / task_context.DIR
-    assert "сделал минимально необходимое" in \
-        (harness / task_context.DECISIONS).read_text(encoding="utf-8")
+    assert (harness / task_context.CONCEPT).read_text(encoding="utf-8") == "концепт"
+    assert (harness / task_context.TASK).read_text(encoding="utf-8") == "постановка FNR"
+    assert (harness / task_context.REPOWISE_DIALOG).read_text(encoding="utf-8") == \
+        "диалог с индексом"
+    assert (harness / task_context.VALIDATION).read_text(encoding="utf-8") == "отчёт валидации"
+
+    context_map = (harness / task_context.CONTEXT_MAP).read_text(encoding="utf-8")
+    for name in (task_context.CONCEPT, task_context.TASK,
+                task_context.REPOWISE_DIALOG, task_context.VALIDATION):
+        assert name in context_map
 
 
-def test_no_previous_reflect_note_is_not_an_error(monkeypatch, tmp_path):
-    """Первый прогон по задаче — файла намерений нет, и это не отказ."""
-    _prepare_kwargs(monkeypatch, tmp_path, lambda repo, path, ref=None: "")
+def test_missing_optional_artifact_is_absent_from_the_map_not_an_error(monkeypatch, tmp_path):
+    """task.md и validation.md отсутствуют на ветке (сорванный анализ мог не
+    дойти до этих стадий) — не отказ, просто не попадают в карту."""
+    _prepare_kwargs(monkeypatch, tmp_path, _get_file_double(**{
+        "system_requirements.md": "требования",
+        "concept.md": "концепт",
+        "repowise-dialog.md": "диалог с индексом",
+    }))
 
-    issue = a.IssueInput(repo="o/r", issue_number=12, title="t", body="b",
+    issue = a.IssueInput(repo="o/r", issue_number=18, title="t", body="b",
                          author_login="u", author_type="User")
-    task, _ = a._dev_prepare(issue, "")
+    a._dev_prepare(issue, "research/issue-18")
 
     _root, clone = a._dev_paths(issue)
-    assert not (clone / task_context.DIR / task_context.DECISIONS).exists()
+    harness = clone / task_context.DIR
+    assert not (harness / task_context.TASK).exists()
+    assert not (harness / task_context.VALIDATION).exists()
+    context_map = (harness / task_context.CONTEXT_MAP).read_text(encoding="utf-8")
+    assert task_context.TASK not in context_map
+    assert task_context.VALIDATION not in context_map
+
+
+def test_optional_artifact_fetch_failure_degrades_instead_of_failing_the_stage(
+        monkeypatch, tmp_path):
+    """Сетевой сбой на ОДНОМ необязательном артефакте не должен ронять всю
+    подготовку — деградация, как и у остальных источников контура, а не
+    отказ стадии (эти файлы не входят в `task_context.required()`)."""
+    def get_file(repo, path, ref=None):
+        if path.endswith("system_requirements.md"):
+            return "требования"
+        if path.endswith("validation.md"):
+            raise RuntimeError("имитация сетевого сбоя")
+        return ""
+    _prepare_kwargs(monkeypatch, tmp_path, get_file)
+
+    issue = a.IssueInput(repo="o/r", issue_number=19, title="t", body="b",
+                         author_login="u", author_type="User")
+    task, _ = a._dev_prepare(issue, "research/issue-19")  # не должно бросить исключение
+
+    _root, clone = a._dev_paths(issue)
+    assert not (clone / task_context.DIR / task_context.VALIDATION).exists()
 
 
 # ───────────── H1: каталог не наследует чужую задачу (ревью) ─────────────

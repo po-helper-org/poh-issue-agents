@@ -23,6 +23,16 @@ HOWTODEMO = "howtodemo.md"
 DECISIONS = "decisions.md"
 CONTEXT_MAP = "context.md"
 
+# M4 (ревью задачи 7): остальные артефакты цепочки FNR — те же имена, что и
+# на ветке аналитики (`FNR_DIR/{name}` в `worker/activities.py`), чтобы файл
+# без переименования узнавался и там, и здесь. Опциональные — не входят в
+# `required()`: обязательны только требования, отсутствие любого из этих
+# файлов не отказ, он просто не попадает в карту контекста.
+CONCEPT = "concept.md"
+TASK = "task.md"
+REPOWISE_DIALOG = "repowise-dialog.md"
+VALIDATION = "validation.md"
+
 TRUNCATION_MARKER = "…[обрезано]"
 
 
