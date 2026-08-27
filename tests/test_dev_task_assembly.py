@@ -185,6 +185,93 @@ def test_no_previous_reflect_note_is_not_an_error(monkeypatch, tmp_path):
     assert not (clone / task_context.DIR / task_context.DECISIONS).exists()
 
 
+# ───────────── H1: каталог не наследует чужую задачу (ревью) ─────────────
+#
+# `.harness/` коммитится в main, поэтому следующий клон того же репозитория
+# приезжает с каталогом ПРЕДЫДУЩЕЙ задачи. `harness.mkdir(exist_ok=True)` без
+# очистки оставлял чужие файлы на месте: если сбор ЭТОЙ задачи молча вернул
+# пусто (истёк токен, переименован артефакт, sysreq не дописан), проверка
+# обязательного набора видела унаследованный файл прошлой задачи и засчитывала
+# его — отказа не было, а исполнитель работал по требованиям и сценарию чужого
+# Issue, которые затем уезжали в PR как контекст этой задачи.
+
+def _clone_with_stale_harness(stale_files: dict[str, str]):
+    """Двойник `_clone_repo`, кладущий в клон файлы `.harness/` — как будто
+    их принёс настоящий `git clone` репозитория, где `.harness/` от
+    ПРЕДЫДУЩЕЙ задачи уже вмержен в основную ветку. `root` (родитель
+    `clone_dir`) `_dev_prepare` сносит и создаёт заново на КАЖДОМ вызове
+    независимо от H1 — если положить чужие файлы в клон ДО вызова
+    `_dev_prepare`, этот снос уберёт их сам, и тест ничего не проверит. Файлы
+    обязаны появиться так же, как в реальности: ВНУТРИ самого клонирования."""
+    def clone(repo, dest, branch=None):
+        harness = Path(dest) / task_context.DIR
+        harness.mkdir(parents=True, exist_ok=True)
+        for name, content in stale_files.items():
+            (harness / name).write_text(content, encoding="utf-8")
+    return clone
+
+
+def test_stale_harness_from_a_previous_issue_does_not_survive_a_fresh_run(monkeypatch, tmp_path):
+    """Сценарий H1 дословно: требования этой задачи не собрались (токен истёк
+    / артефакт переименован / sysreq не дописан), а клон приносит требования и
+    сценарий ЧУЖОЙ задачи — унаследованные из main, куда `.harness/`
+    предыдущей задачи вмержили вместе с кодом. Ожидается отказ стадии, а не
+    тихий провоз чужого контекста."""
+    monkeypatch.setattr(a.github_client, "get_file", lambda repo, path, ref=None: "")
+    monkeypatch.setattr(a, "_clone_repo", _clone_with_stale_harness({
+        task_context.REQUIREMENTS: "требования ЧУЖОЙ задачи из предыдущего прогона",
+        task_context.HOWTODEMO: "сценарий ЧУЖОЙ задачи",
+    }))
+    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
+
+    issue = a.IssueInput(repo="o/r", issue_number=20, title="t", body="b",
+                         author_login="u", author_type="User")
+
+    with pytest.raises(RuntimeError, match="requirements.md"):
+        a._dev_prepare(issue, "research/issue-20")
+
+
+def test_harness_directory_is_rebuilt_from_scratch_every_run(monkeypatch, tmp_path):
+    """Унаследованный файл, вообще не входящий в объявленный набор, обязан
+    пропасть при пересборке — каталог собирается с нуля, а не дополняется
+    поверх того, что принёс клон."""
+    monkeypatch.setattr(a.github_client, "get_file", lambda repo, path, ref=None: "")
+    monkeypatch.setattr(a, "_clone_repo", _clone_with_stale_harness({
+        "leftover-from-another-issue.md": "чужой файл",
+    }))
+    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
+
+    issue = a.IssueInput(repo="o/r", issue_number=21, title="t", body="b",
+                         author_login="u", author_type="User")
+
+    a._dev_prepare(issue, "")  # без ветки — не наткнёмся на обязательный набор
+
+    _root, clone = a._dev_paths(issue)
+    assert not (clone / task_context.DIR / "leftover-from-another-issue.md").exists(), \
+        "унаследованный файл пережил пересборку каталога"
+
+
+def test_empty_context_fails_even_if_required_set_is_patched_to_demand_nothing(
+        monkeypatch, tmp_path):
+    """H1, вторая половина чинки: пустая карта контекста при живой ветке
+    аналитики — самостоятельный повод для отказа, а не только следствие
+    `task_context.required()`. Сегодня `required()` уже ловит этот случай
+    (REQUIREMENTS обязателен при has_analysis), но полагаться ТОЛЬКО на него
+    значит терять защиту, если его определение изменится независимо от этой
+    проверки — поэтому патчим `required()`, чтобы он перестал требовать
+    что-либо, и убеждаемся, что отказ всё равно происходит."""
+    _prepare_kwargs(monkeypatch, tmp_path, lambda repo, path, ref=None: "")
+    monkeypatch.setattr(task_context, "required", lambda *, has_analysis: {})
+
+    issue = a.IssueInput(repo="o/r", issue_number=22, title="t", body="b",
+                         author_login="u", author_type="User")
+
+    with pytest.raises(RuntimeError, match="контекст не собран"):
+        a._dev_prepare(issue, "research/issue-22")
+
+
 # ───────────────── вырезка блока HowToDemo из тела Issue (задача 7) ─────────────────
 #
 # Формы заголовка — те же четыре, что признаёт HowToDemo-Agent при поиске
@@ -234,6 +321,84 @@ def test_howtodemo_scenario_reaches_the_harness_file(monkeypatch, tmp_path):
     assert (harness / task_context.HOWTODEMO).read_text(encoding="utf-8") == \
         "Открываю страницу и вижу цену"
     assert task_context.HOWTODEMO in (harness / task_context.CONTEXT_MAP).read_text(encoding="utf-8")
+
+
+# ───────────── H2: вырезка сценария приёмки теряет и портит его (ревью) ─────────────
+#
+# Все четыре случая воспроизведены ревьюером на живом коде: старая граница
+# конца блока — ЛЮБОЙ заголовок 1-6 уровня либо ЛЮБАЯ жирная метка — путала
+# структуру внутри сценария с концом сценария и ложно срабатывала на заголовки,
+# где «HowToDemo» лишь часть другого слова.
+
+def test_howtodemo_heading_then_blank_line_then_bold_label_keeps_the_label_as_content():
+    """Случай 1, самый дорогой: после заголовка пустая строка, затем жирная
+    метка. Старая граница конца блока считала ЛЮБУЮ жирную метку концом
+    сценария — обрезка происходила на первой же строке содержимого, сценарий
+    оказывался пустым, и файл `.harness/howtodemo.md` не писался вовсе (не
+    обязателен — в лог тоже ничего не уходило)."""
+    body = "## HowToDemo\n\n**Шаги:**\n1. Открываю корзину\n2. Вижу итог\n\n## Другое\nхвост"
+    assert a._howtodemo_block(body) == "**Шаги:**\n1. Открываю корзину\n2. Вижу итог"
+
+
+def test_howtodemo_block_survives_a_nested_h3_subheading():
+    """Случай 2: подзаголовок третьего уровня ВНУТРИ блока, начатого `##`
+    (второй уровень), — часть сценария, а не соседняя секция. Старая граница
+    обрезала блок на первом же вложенном подзаголовке."""
+    body = ("## HowToDemo\n\n"
+            "### Шаг 1: открыть страницу\nтекст шага 1\n\n"
+            "### Шаг 2: оформить заказ\nтекст шага 2\n\n"
+            "## Другое\nхвост")
+    result = a._howtodemo_block(body)
+    assert "### Шаг 1" in result and "### Шаг 2" in result and "текст шага 2" in result
+    assert "хвост" not in result
+
+
+def test_howtodemo_h3_start_still_ends_at_a_sibling_h3():
+    """Зеркальный случай: блок, начатый `###` (третий уровень), обязан
+    заканчиваться на СЛЕДУЮЩЕМ заголовке того же уровня или крупнее — а не
+    поглощать всё до конца тела."""
+    body = "### How to demo\nШаг1\n\n### Другой раздел\nхвост"
+    assert a._howtodemo_block(body) == "Шаг1"
+
+
+def test_howtodemo_heading_where_the_word_is_part_of_another_word_does_not_trigger():
+    """Случай 3: заголовок вида `## HowToDemo-Agent: как он работает» — это
+    заголовок ПРО агента с таким именем, а не раздел сценария. Старый регэксп
+    матчил по `\\b` после «demo», а «-» — граница слова, поэтому ложно
+    срабатывал и утаскивал в сценарий чужой текст."""
+    body = "## HowToDemo-Agent: как он работает\n\nОписание агента, не сценарий приёмки."
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_block_quoted_inside_a_code_fence_is_not_a_real_scenario():
+    """Случай 4: раздел процитирован внутри тройных обратных кавычек —
+    например, как пример/шаблон для заполнения. Это НЕ настоящий сценарий этой
+    задачи; старый разбор находил его внутри блока кода и утаскивал в
+    сценарий шаблон вместе с хвостом кавычек."""
+    body = (
+        "Шаблон для заполнения:\n\n"
+        "```markdown\n"
+        "## HowToDemo\n"
+        "1. Шаг из шаблона\n"
+        "```\n\n"
+        "Остальной текст без настоящего сценария."
+    )
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_block_preserves_a_code_fence_that_is_legitimately_inside_it():
+    """Маскировка нужна только для ПОИСКА границ — не должна портить
+    содержимое настоящего сценария: пример (например, curl-команда в шаге
+    демонстрации), легитимно лежащий ВНУТРИ блока, обязан дойти до
+    исполнителя дословно, вместе с обратными кавычками."""
+    body = (
+        "## HowToDemo\n\nОткрываю страницу и вижу цену:\n"
+        "```\ncurl https://example.com\n```\n\n"
+        "## Другое\nхвост, сюда сценарий заходить не должен"
+    )
+    result = a._howtodemo_block(body)
+    assert result == "Открываю страницу и вижу цену:\n```\ncurl https://example.com\n```"
+    assert "хвост" not in result
 
 
 # ────────── требование 3: `.harness/` реально доезжает до PR ──────────
