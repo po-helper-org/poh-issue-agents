@@ -1837,7 +1837,17 @@ class IssueLifecycle:
                     args=[issue, self._root_issue, branch],
                     # Прогон агента идёт десятками минут, поэтому потолок общий
                     # на весь шаг, а живость сообщается heartbeat'ом.
-                    start_to_close_timeout=timedelta(seconds=3600),
+                    #
+                    # 5400с = построение плана (до 900с) + прогон агента (до
+                    # 2700с) + проверки проекта (до 900с) + запас на клон,
+                    # объявление, находки и публикацию, которые своего
+                    # потолка не объявляют. Активность одна на весь шаг
+                    # (см. ниже), поэтому вмещать обязана сумму, а не
+                    # самую долгую часть: план подключён Task 9 (remainder
+                    # после revert 80b3291) внутрь этой же активности, и
+                    # прежних 3600с (ровно agent+tests, без всякого запаса)
+                    # больше не хватает.
+                    start_to_close_timeout=timedelta(seconds=5400),
                     heartbeat_timeout=timedelta(seconds=300),
                     # Ретрай повторяет активность ЦЕЛИКОМ, включая прогон
                     # агента: на прогоне #39 контур трижды объявил о передаче
@@ -2348,7 +2358,11 @@ class IssueLifecycle:
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
                 issue,
-                start_to_close_timeout=timedelta(seconds=90),
+                # Тот же потолок и по той же арифметике, что у второго вызова
+                # этой же активности в `_start_development` — план и прогон
+                # агента идут внутри одной активности целиком (см. комментарий
+                # там).
+                start_to_close_timeout=timedelta(seconds=5400),
                 # Одна попытка — по той же причине, что и на основном пути
                 # (`_start_development`): ретрай прогоняет агента заново.
                 retry_policy=RetryPolicy(maximum_attempts=1),
