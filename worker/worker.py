@@ -186,6 +186,7 @@ async def main() -> None:
             activities.dev_announce,
             activities.dev_run_agent,
             activities.dev_followups,
+            activities.dev_empty_run_reason,
             activities.dev_tests,
             activities.dev_publish,
             activities.capture_episode,
