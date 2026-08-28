@@ -144,6 +144,9 @@ def test_all_dev_steps_are_registered_activities():
     names = worker_module.DEVELOP_ACTIVITIES
     expected = [activities_module.dev_begin, activities_module.dev_dispatch,
                 activities_module.dev_prepare, activities_module.dev_announce,
+                # План работ (Task 10) — под маркером патча, между готовым
+                # рабочим местом и стартом агента; отказ не роняет прогон.
+                activities_module.build_mvp_plan,
                 activities_module.dev_run_agent, activities_module.dev_followups,
                 activities_module.dev_tests, activities_module.dev_publish,
                 # Запись об итерации слою саморефлексии. Шаг опционален по

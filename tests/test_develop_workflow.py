@@ -5,6 +5,7 @@
 публикацию, а не двадцатиминутный прогон агента.
 """
 
+import inspect
 import uuid
 
 import pytest
@@ -43,6 +44,20 @@ async def prepare_ok(issue: IssueInput, branch: str) -> int:
 @activity.defn(name="dev_announce")
 async def announce_ok(issue: IssueInput, branch: str) -> None:
     _calls.append("announce")
+
+
+@activity.defn(name="build_mvp_plan")
+async def plan_ok(issue: IssueInput, branch: str) -> bool:
+    _calls.append("plan")
+    return True
+
+
+@activity.defn(name="build_mvp_plan")
+async def plan_fails(issue: IssueInput, branch: str) -> bool:
+    """`claude -p` для /plan-mvp упал (лимит частоты, как уже бывало у FNR) —
+    построение плана обязано быть прозрачным для остального прогона."""
+    _calls.append("plan")
+    raise RuntimeError("claude -p exit 1: rate limited")
 
 
 @activity.defn(name="dev_run_agent")
@@ -127,6 +142,58 @@ async def test_steps_run_in_the_order_that_protects_the_pr():
     assert number == 101
     assert _calls == ["begin", "prepare", "announce", "agent",
                       "followups", "tests", "publish"]
+
+
+@pytest.mark.timeout(60)
+async def test_plan_is_built_after_prepare_and_before_the_agent_runs():
+    """Task 10: план — вход агента, не отчёт по его работе.
+
+    Не раньше подготовки: `.harness/`, который читает и куда пишет
+    `/plan-mvp`, наполняет только `dev_prepare` — до него каталога не
+    существует (K2, ревью Task 9, revert 80b3291: холодный старт, стадия
+    планирования падала в каталоге, которого никто ещё не создал).
+
+    Не позже старта агента: план — вход, который агент читает, а не отчёт по
+    итогам его работы.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        number = await _run(env, tq, [begin_local, dispatch_stub, prepare_ok,
+                                      announce_ok, plan_ok, agent_ok, followups_ok,
+                                      checks_ok, publish_ok])
+
+    assert number == 101
+    assert _calls.index("prepare") < _calls.index("plan") < _calls.index("agent"), (
+        f"план обязан строиться после подготовки и до агента: {_calls}")
+
+
+@pytest.mark.timeout(60)
+async def test_a_failed_plan_build_does_not_stop_the_agent():
+    """Отказ построения плана — не отказ разработки: план необязателен, агент
+    штатно работает без него уже сегодня. Топить дорогой прогон разработки
+    из-за необязательного шага значило бы разменивать штатный путь на
+    необязательное ускорение."""
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        number = await _run(env, tq, [begin_local, dispatch_stub, prepare_ok,
+                                      announce_ok, plan_fails, agent_ok, followups_ok,
+                                      checks_ok, publish_ok])
+
+    assert number == 101
+    assert _calls == ["begin", "prepare", "announce", "plan", "agent",
+                      "followups", "tests", "publish"], (
+        "агент не запустился после отказа построения плана")
+
+
+def test_plan_stage_patch_marker_is_frozen():
+    """Идентификатор патча — часть истории уже идущих прогонов разработки:
+    переименование увело бы их на реплее в новую ветку (недетерминизм, самый
+    дорогой класс отказов в Temporal). Строка меняется только вместе с
+    осознанным `workflow.deprecate_patch`."""
+    src = inspect.getsource(IssueDevelopment.run)
+    assert 'workflow.patched("issue-lifecycle-develop-plan-stage")' in src
 
 
 @pytest.mark.timeout(60)

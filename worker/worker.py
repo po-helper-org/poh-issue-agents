@@ -45,6 +45,9 @@ DEVELOP_ACTIVITIES = [
     activities.dev_dispatch,
     activities.dev_prepare,
     activities.dev_announce,
+    # Не `dev_*`: план работ навыком writing-plans, а не шаг, рождённый
+    # разрезанием монолитной активности (см. `activities.build_mvp_plan`).
+    activities.build_mvp_plan,
     activities.dev_run_agent,
     activities.dev_followups,
     activities.dev_tests,
@@ -183,6 +186,7 @@ async def main() -> None:
             activities.dev_dispatch,
             activities.dev_prepare,
             activities.dev_announce,
+            activities.build_mvp_plan,
             activities.dev_run_agent,
             activities.dev_followups,
             activities.dev_empty_run_reason,

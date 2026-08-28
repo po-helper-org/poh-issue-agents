@@ -2419,6 +2419,41 @@ class IssueDevelopment:
                 start_to_close_timeout=timedelta(seconds=60),
                 retry_policy=cheap,
             )
+            # MVP: план работ — СТРОГО здесь, между готовым рабочим местом
+            # (`dev_prepare` выше уже наполнил `.harness/`) и стартом агента.
+            #
+            # Не раньше: каталог, который читает и куда пишет `/plan-mvp`,
+            # создаёт только `dev_prepare`. Прежняя попытка (Task 9, откачена
+            # ревью, revert 80b3291) звала планирование до подготовки —
+            # находка K2, «холодный старт»: стадия падала в каталоге,
+            # которого никто ещё не создал.
+            #
+            # Не позже: план — вход агента, а не отчёт по итогам его работы.
+            #
+            # ПОД МАРКЕРОМ: новая активность — новая команда в истории, и
+            # прогоны, начатые до выкладки, обязаны реплеиться прежней
+            # последовательностью, без неё.
+            #
+            # Отказ НЕ роняет прогон: план — необязательный вход агента, а не
+            # результат стадии (`PLAN` не входит в `task_context.required()`
+            # намеренно) — агент штатно работает без него уже сегодня. Топить
+            # дорогой прогон разработки из-за упавшего необязательного шага
+            # значило бы разменивать штатный путь на необязательное ускорение.
+            if workflow.patched("issue-lifecycle-develop-plan-stage"):
+                try:
+                    has_plan = await workflow.execute_activity(
+                        activities.build_mvp_plan, args=[issue, plan.branch],
+                        start_to_close_timeout=timedelta(seconds=1200),  # claude до 900 + буфер
+                        heartbeat_timeout=timedelta(seconds=300),
+                        retry_policy=once,
+                    )
+                except Exception as e:                    # noqa: BLE001
+                    workflow.logger.warning(
+                        "план работ не построен: %s", _failure_reason(e))
+                else:
+                    if not has_plan:
+                        workflow.logger.warning(
+                            "план работ пуст или не создан — агент продолжит без него")
             await workflow.execute_activity(
                 activities.dev_run_agent, issue,
                 start_to_close_timeout=timedelta(seconds=3600),
