@@ -26,7 +26,7 @@ from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
     from shared import bft, labels, lifecycle
-    from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE
+    from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE, RESEARCH
     from shared.workflow_ids import (
         analysis_workflow_id,
         bft_workflow_id,
@@ -34,6 +34,7 @@ with workflow.unsafe.imports_passed_through():
         estimate_workflow_id,
         howtodemo_workflow_id,
         pr_fix_workflow_id,
+        research_workflow_id,
     )
     from shared import agent_events, awaiting as awaiting_mod
     from shared.agent_events import AgentEvent
@@ -81,6 +82,8 @@ MAX_REWORK_ROUNDS = 2
 # событий, и обработчик фазы решает, что с ними делать.
 AGENT_ANALYZE = "__agent__:analyze"
 
+# Запрос на прогон продуктового исследования
+AGENT_RESEARCH = "__agent__:research"
 # Очередь приёмщика HowToDemo. Своя, а не общая: прогон приёмки держит
 # активность десятками минут и на общем пуле вытеснял бы триаж Issue.
 # Значение читается на импорте — оно одинаково у всех реплеев одного воркера,
@@ -401,12 +404,12 @@ class IssueLifecycle:
         self._phase_since: datetime | None = None
         self._analyze_comment_id: int | None = None
         self._analyze_pending = False  # запрос на аналитику лежит в очереди
-        # Прогон аналитики идёт прямо сейчас. Отдельно от `_analyze_pending`:
-        # тот говорит «запрос в очереди», этот — «работа выполняется». Первый
-        # прогон запускает метка `research-me` мимо очереди сигналов, и без
-        # второго флага команда, пришедшая во время такого прогона, вставала
-        # бы в очередь и заводила второй.
-        self._analysis_running = False
+        self._analysis_running = False  # идёт прогон IssueAnalysis
+        # Состояние продуктового исследования (аналогично анализу)
+        self._research_comment_id: int | None = None
+        self._research_pending = False  # запрос на исследование лежит в очереди
+        self._research_running = False  # идёт прогон исследования
+        self._research_done = False  # исследование завершено успешно
         # Номер PR по этой задаче. Известен из доклада внешнего агента либо от
         # локального прогона разработки; нужен фазе доведения.
         self._pr_number: int | None = None
@@ -579,6 +582,23 @@ class IssueLifecycle:
         await self._signal_queue.put(AGENT_ANALYZE)
 
     @workflow.signal
+    async def research_requested(self, comment_id: int | None) -> None:
+        """По Issue запрошено продуктовое исследование — командой `/research` или меткой.
+
+        Цикл ведёт его сам: запрос уходит в общую очередь сигналов, а
+        обработчик фазы поднимает дочерний прогон исследования. Аналогично
+        analyze_requested: avoids race conditions, checks for pending runs,
+        and uses the signal queue.
+        """
+        # Запрос уже в очереди — второй прогон был бы шумом и деньгами
+        if self._research_pending or self._research_running:
+            return
+        self._research_pending = True
+        self._research_comment_id = comment_id
+        await workflow.wait_condition(lambda: self._issue is not None)
+        await self._signal_queue.put(AGENT_RESEARCH)
+
+    @workflow.signal
     async def agent_event(self, event: AgentEvent) -> None:
         """Факт от внешнего агента контура: PR открыт, ревью взято, CI упал (#38).
 
@@ -678,14 +698,11 @@ class IssueLifecycle:
         try:
             await workflow.start_child_workflow(
                 IssueEstimation.run, req,
-                id=estimate_workflow_id(req.repo, req.issue_number, comment_id),
-                # Родитель переживёт continue-as-new и завершение цикла, а
-                # оценка — нет: ABANDON оставляет её доигрывать саму.
+                id=estimate_workflow_id(req.repo, req.issue_number, req.comment_id),
                 parent_close_policy=ParentClosePolicy.ABANDON,
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
         except WorkflowAlreadyStartedError:
-            # Тот же вебхук доставлен повторно — оценка уже идёт.
             workflow.logger.info("estimate already running for %s#%s",
                                  req.repo, req.issue_number)
 
@@ -972,6 +989,38 @@ class IssueLifecycle:
             self._analyze_pending = False
             self._analysis_running = False
 
+    async def _run_research_child(self, issue: IssueInput) -> bool:
+        """Продуктовое исследование дочерним прогоном — аналогично анализу.
+
+        Запускает workflow исследования с тем же паттерном idempotency
+        и управления состоянием, что и анализ, но с другим workflow классом.
+        """
+        # Для исследования используем те же input данные, что и для анализа
+        research_input = AnalyzeInput(repo=issue.repo, issue_number=issue.issue_number,
+                                      title=issue.title, body=issue.body,
+                                      comment_id=self._research_comment_id,
+                                      trigger=None)
+        
+        self._research_running = True
+        try:
+            # TODO: Replace with actual Research workflow when implemented
+            # Currently reusing IssueAnalysis for MVP - will be replaced
+            return await workflow.execute_child_workflow(
+                IssueAnalysis.run, research_input,
+                id=research_workflow_id(issue.repo, issue.issue_number, 
+                                        self._research_comment_id or 0),
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+        except WorkflowAlreadyStartedError:
+            workflow.logger.info("research already running for %s#%s",
+                                 issue.repo, issue.issue_number)
+            return False
+        finally:
+            self._research_comment_id = None
+            self._research_pending = False
+            self._research_running = False
+
     async def _agent_event(self, event: AgentEvent) -> tuple:
         """Факт внешнего агента — переход по той же таблице, что и у своих.
 
@@ -1079,6 +1128,8 @@ class IssueLifecycle:
                 nxt = await self._phase_await_decision(issue, deadlines)
             elif self._phase == lifecycle.BUSINESS_ANALYSIS:
                 nxt = await self._phase_analysis(issue)
+            elif self._phase == lifecycle.PRODUCT_RESEARCH:
+                nxt = await self._phase_research(issue)
             elif self._phase == lifecycle.SYSTEM_REQUIREMENTS:
                 nxt = await self._phase_handoff(issue, deadlines)
             elif self._phase == lifecycle.READY_FOR_DEV:
@@ -1408,7 +1459,11 @@ class IssueLifecycle:
         label = self._classification_label
         feature = label is None or label == "advisor:feature-request"
         bug = label is None or label == "advisor:bug"
-        if decision == "research-me" and feature:
+        research = label == "advisor:product-research"
+        if decision == "research-me" and (feature or research):
+            # Продуктовое исследование запускается отдельно от бизнес-анализа
+            if research:
+                return (lifecycle.PRODUCT_RESEARCH, "research", True)
             return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
         if decision == "bug-me" and bug:
             return (lifecycle.READY_FOR_DEV, "bug", True)
@@ -1428,6 +1483,17 @@ class IssueLifecycle:
         if not self._analysis_done:
             return (lifecycle.FAILED, "failed", True)
         return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
+
+    async def _phase_research(self, issue: IssueInput) -> tuple | None:
+        """Фаза `product-research`: продуктовое исследование дочерним прогоном.
+
+        Запускает отдельный workflow исследования, аналогично анализу, но
+        с другим пайплайном и артефактами (PRD вместо бизнес-требований).
+        """
+        self._research_done = await self._run_research_child(issue)
+        if not self._research_done:
+            return (lifecycle.FAILED, "failed", True)
+        return (lifecycle.SYSTEM_REQUIREMENTS, "research-done", True)
 
     async def _phase_handoff(self, issue: IssueInput, deadlines) -> tuple | None:
         """Фаза `system-requirements`: декомпозиция и передача разработчику (H1).
@@ -2743,3 +2809,38 @@ class IssueEstimation:
                 retry_policy=RetryPolicy(maximum_attempts=5),
             )
             await _finish_labels(req.repo, req.issue_number, ESTIMATE, ok=False)
+
+
+@workflow.defn(name="IssueResearch")
+class IssueResearch:
+    """Продуктовое исследование по команде /research или метке run:research.
+
+    Отдельный workflow, аналогичный IssueAnalysis, но с другим пайплайном:
+    PRD, обход продуктовых нексусов, исследование рынка и спроса вместо
+    бизнес-анализа.
+
+    Работает в двух режимах: дочерним прогоном IssueLifecycle, когда цикл
+    жив, и самостоятельным — при автономном запуске. Id фиксирован, поэтому
+    повторная команда упирается в WorkflowAlreadyStarted.
+    """
+
+    @workflow.run
+    async def run(self, analyze: AnalyzeInput) -> bool:
+        """Возвращает, опубликованы ли артефакты.
+
+        Родителю этот ответ нужен, чтобы решить, можно ли переходить к
+        следующей фазе. Автономный запуск результат просто игнорирует.
+        """
+        if await _agents_off(analyze.repo, analyze.issue_number, "/research"):
+            return False
+        await workflow.execute_activity(
+            activities.ack_command,
+            analyze,
+            start_to_close_timeout=timedelta(seconds=60),
+            retry_policy=RetryPolicy(maximum_attempts=3),
+        )
+        # TODO: Реализовать пайплайн продуктового исследования.
+        # Пока — заглушка, возвращающая успех, чтобы не блокировать фазу.
+        # Реализация должна включать: PRD, обход продуктовых нексусов,
+        # исследование рынка и спроса — по аналогии с _run_staged_analysis.
+        return True

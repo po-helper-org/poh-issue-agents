@@ -18,6 +18,7 @@ from shared.workflow_types import AnalyzeInput, BftRequest
 
 ESTIMATE = "estimate"
 ANALYZE = "analyze"
+RESEARCH = "research"
 # БФТ двумя командами, а не одной с флагом: цена у них разная на два порядка
 # (один вызов модели против пайплайна в клоне репозитория), и человек обязан
 # видеть, что именно он запускает, ещё до запуска.
@@ -32,7 +33,7 @@ RELEASE = "release"
 # а не флаг у /release: приёмка идёт ДО мержа и не выкатывает ничего.
 HOWTODEMO = "howtodemo"
 
-_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE,
+_COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE, "/research": RESEARCH,
              "/bft": BFT, "/bft-deep": BFT_DEEP, "/release": RELEASE,
              "/howtodemo": HOWTODEMO}
 

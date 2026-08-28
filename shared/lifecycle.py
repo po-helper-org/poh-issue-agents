@@ -22,6 +22,7 @@ from dataclasses import dataclass
 CREATED = "created"
 CLASSIFIED = "classified"
 BUSINESS_ANALYSIS = "business-analysis"
+PRODUCT_RESEARCH = "product-research"
 SYSTEM_REQUIREMENTS = "system-requirements"
 GROOMED = "groomed"
 READY_FOR_DEV = "ready-for-dev"
@@ -83,6 +84,7 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     ),
     CLASSIFIED: (
         Transition(BUSINESS_ANALYSIS, HUMAN, "run:analyze / research-me"),
+        Transition(PRODUCT_RESEARCH, HUMAN, "run:research / product-research + research-me"),
         # Путь бага: аналитика не нужна, задача готова к разработке сразу.
         Transition(READY_FOR_DEV, HUMAN, "bug-me"),
         # Путь подзадачи плана: требования уже есть — в ветке анализа родителя,
@@ -100,6 +102,12 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     BUSINESS_ANALYSIS: (
         Transition(SYSTEM_REQUIREMENTS, AGENT, "цепочка FNR дошла до sysreq"),
         Transition(FAILED, AGENT, "прогон анализа сорвался"),
+        Transition(ESCALATED, HUMAN, "разбор вручную"),
+        Transition(CANCELLED, HUMAN, "agents:off"),
+    ),
+    PRODUCT_RESEARCH: (
+        Transition(SYSTEM_REQUIREMENTS, AGENT, "продуктовое исследование завершено"),
+        Transition(FAILED, AGENT, "прогон исследования сорвался"),
         Transition(ESCALATED, HUMAN, "разбор вручную"),
         Transition(CANCELLED, HUMAN, "agents:off"),
     ),
