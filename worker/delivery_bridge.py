@@ -15,6 +15,7 @@ Delivery-Agent живёт в своём репозитории (`po-helper-org/p
 """
 
 import asyncio
+import datetime
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ from pathlib import Path
 from temporalio import activity
 
 import github_client
-from shared import develop, pr_closing
+from shared import agent_comment, develop, pr_closing
 
 _log = logging.getLogger(__name__)
 
@@ -268,20 +269,84 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
 
 # --- круг ревью: вердикт как условие мержа ---
 
+def _parse_time(stamp: str | None):
+    """Метка времени GitHub в `datetime`; `None`, если её нет или она нечитаема."""
+    if not stamp:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _review_is_fresh(repo: str, pr_number: int, head_sha: str) -> bool:
     """Ревью относится к текущему коммиту ветки, а не к прежнему.
 
-    Проверяется по отметке PR-Agent («Review updated until commit …»): ревью
-    вчерашнего кода — не разрешение влить сегодняшний.
+    Свежесть ищется в четырёх источниках, и хватает любого: формальное ревью
+    (`commit_id`, иначе `submitted_at`), построчное замечание на текущем
+    коммите, обзорный комментарий бота-ревьюера позже коммита и отметка
+    PR-Agent («Review updated until commit …»). Раньше засчитывалась только
+    отметка — то есть один конкретный бот; там, где его нет, круг правок не
+    открывался никогда, сколько бы ревью на PR ни лежало.
+
+    Свои комментарии за ревью не считаются: служебные несут подпись контура,
+    а команда вроде `/review` — это просьба о ревью, а не ревью.
     """
     from poh_delivery import review as review_module
 
-    comments = github_client.list_comments(repo, pr_number, limit=100)
+    commit_time = None
+    try:
+        commit_time = _parse_time(github_client.get_commit_timestamp(repo, head_sha))
+    except Exception as e:
+        # Без времени коммита остаются проверки по commit_id и по отметке.
+        _log.warning("Не удалось получить время коммита для %s#%s: %s", repo, pr_number, e)
+
+    # 1. Формальные ревью: точнее всего commit_id, иначе время отправки.
+    try:
+        for review in github_client.list_reviews(repo, pr_number, limit=100):
+            if review.get("state") in ("PENDING", "DISMISSED"):
+                continue
+            if review.get("commit_id") == head_sha:
+                return True
+            submitted = _parse_time(review.get("submitted_at"))
+            if commit_time and submitted and submitted >= commit_time:
+                return True
+    except Exception as e:
+        _log.warning("Не удалось получить список ревью для %s#%s: %s", repo, pr_number, e)
+
+    # 2. Построчные замечания, оставленные на текущем коммите.
+    try:
+        for comment in github_client.list_pull_request_comments(repo, pr_number, limit=100):
+            if comment.get("commit_id") == head_sha:
+                return True
+    except Exception as e:
+        _log.warning("Не удалось получить построчные комментарии для %s#%s: %s",
+                     repo, pr_number, e)
+
+    try:
+        comments = github_client.list_comments(repo, pr_number, limit=100)
+    except Exception as e:
+        _log.warning("Не удалось получить комментарии для %s#%s: %s", repo, pr_number, e)
+        return False
+
+    # 3. Обзорный комментарий бота-ревьюера позже последнего коммита.
+    for comment in comments:
+        body = comment.get("body") or ""
+        if agent_comment.is_agent_comment(body) or body.lstrip().startswith("/"):
+            continue
+        if (comment.get("user") or {}).get("type") != "Bot":
+            continue
+        created = _parse_time(comment.get("created_at"))
+        if commit_time and created and created >= commit_time:
+            return True
+
+    # 4. Отметка PR-Agent — прежний единственный признак, теперь один из.
     notes = [{"body": (item.get("body") or "")[:2000]} for item in comments]
     seen = review_module.review_head(notes)
-    if not seen:
-        return False
-    return head_sha.startswith(seen) or seen.startswith(head_sha[:7])
+    if seen and (head_sha.startswith(seen) or seen.startswith(head_sha[:7])):
+        return True
+
+    return False
 
 
 @activity.defn(name="delivery_review_round")

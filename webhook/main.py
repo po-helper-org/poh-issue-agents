@@ -821,22 +821,15 @@ async def _handle_delivery(payload: dict, x_github_event: str,
             # Issue репозитория, включая тысячи старых. Цена ошибки здесь —
             # веер LLM-прогонов, а польза — доставка реплики в цикл, которого
             # нет; поэтому комментарий по-прежнему best-effort.
+            # Реакции на такой комментарий не будет: вебхук в GitHub не ходит
+            # вовсе — у него нет ни клиента, ни зависимости для сети (см.
+            # `webhook/requirements.txt`), весь ввод-вывод делают активности
+            # воркера. Здесь стоял `from worker import github_client`, который
+            # не мог сработать ни в контейнере (образ вебхука каталога
+            # `worker/` не содержит), ни в тестах (там имя `worker`
+            # перехватывает модуль `worker/worker.py`), — и `except Exception`
+            # это молча съедал.
             _log.info("no live lifecycle for %s#%s — комментарий не доставлен",
                       repo, issue_number)
-            
-            # Минимальная реакция на комментарий в мёртвый прогон:
-            # ставим реакцию 👀, чтобы человек увидел, что его комментарий принят,
-            # но цикл по этому Issue завершён.
-            try:
-                from worker import github_client
-                await asyncio.to_thread(
-                    github_client.add_reaction,
-                    repo,
-                    payload["comment"]["id"],
-                    "eyes"
-                )
-            except Exception as reaction_exc:
-                # Реакция — только удобство, её неудача не должна ломать вебхук
-                _log.warning("не смог поставить реакцию на комментарий: %s", reaction_exc)
 
     return {"ok": True}

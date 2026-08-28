@@ -32,6 +32,7 @@ with workflow.unsafe.imports_passed_through():
         bft_workflow_id,
         development_workflow_id,
         estimate_workflow_id,
+        howtodemo_workflow_id,
         pr_fix_workflow_id,
     )
     from shared import agent_events, awaiting as awaiting_mod
@@ -79,6 +80,12 @@ MAX_REWORK_ROUNDS = 2
 # схема, что у реплики человека (`UserComment`): одна очередь, разные виды
 # событий, и обработчик фазы решает, что с ними делать.
 AGENT_ANALYZE = "__agent__:analyze"
+
+# Очередь приёмщика HowToDemo. Своя, а не общая: прогон приёмки держит
+# активность десятками минут и на общем пуле вытеснял бы триаж Issue.
+# Значение читается на импорте — оно одинаково у всех реплеев одного воркера,
+# а в историю уезжает уже решение о запуске, не сама строка.
+HOWTODEMO_TASK_QUEUE = "howtodemo"
 
 # Issue закрыт на GitHub. Тот же приём: сигнал будит парковку, а решение
 # принимает цикл — иначе обработчику каждой фазы пришлось бы знать про закрытие.
@@ -403,6 +410,10 @@ class IssueLifecycle:
         # Номер PR по этой задаче. Известен из доклада внешнего агента либо от
         # локального прогона разработки; нужен фазе доведения.
         self._pr_number: int | None = None
+        # Приёмка по HowToDemo запускается один раз на прогон: цикл фаз может
+        # вернуться в pr-open (закрытый и переоткрытый PR), а второй прогон
+        # приёмки упёрся бы в WorkflowAlreadyStarted и насорил в логах.
+        self._howtodemo_started = False
         # Разбивать ли задачу на подзадачи перед передачей в разработку.
         # Значение приезжает активностью вместе со сроками — по той же причине,
         # что и остальные тумблеры: оно обязано лежать в истории.
@@ -1915,6 +1926,33 @@ class IssueLifecycle:
         )
         return (lifecycle.ESCALATED, "escalated", True)
 
+    async def _start_howtodemo(self, issue: IssueInput) -> None:
+        """Приёмка по HowToDemo — отдельным прогоном, без ожидания результата.
+
+        Не ждём намеренно. Приёмка поднимает стенд, ходит по шагам и зовёт
+        модель — это десятки минут, а цикл фаз в это время обязан оставаться
+        отзывчивым: доклад PR-Agent'а не должен стоять в очереди за приёмкой.
+        Докладывает приёмка сама — комментарием и метками `demo:*`.
+
+        `ABANDON` по той же причине: закрытие Issue не должно убивать уже
+        идущий прогон приёмки на середине.
+        """
+        try:
+            await workflow.start_child_workflow(
+                "HowToDemoVerify",
+                {"repo": issue.repo, "issue": issue.issue_number,
+                 "pr_number": self._pr_number or 0},
+                id=howtodemo_workflow_id(issue.repo, issue.issue_number),
+                task_queue=HOWTODEMO_TASK_QUEUE,
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                execution_timeout=timedelta(hours=1),
+            )
+        except WorkflowAlreadyStartedError:
+            # Приёмку уже запустил человек командой `/howtodemo` — это не сбой,
+            # а ровно тот прогон, который мы и хотели.
+            workflow.logger.info("приёмка %s#%s уже идёт", issue.repo,
+                                 issue.issue_number)
+
     async def _phase_park(self, issue: IssueInput, deadlines) -> tuple | None:
         """Боковые фазы и фазы внешних агентов.
 
@@ -1922,6 +1960,20 @@ class IssueLifecycle:
         «вечная сессия». Сигнал `reopen` возвращает Issue в работу по таблице
         переходов — первым допустимым переходом обратно в основной путь.
         """
+        # Открылся PR — запускаем приёмку по сценарию из Issue. Фазу не двигаем:
+        # `testing` объявлена в модели, но в код не входит ни одним переходом, и
+        # оживлять её здесь значило бы править диспетчер фаз ради метки. Приёмка
+        # докладывает комментарием и метками `demo:*`, фаза остаётся честной.
+        #
+        # `workflow.patched` обязателен: прогоны, уже стоящие в pr-open, на
+        # реплее выбрали ветку без приёмки, и новый код без развода поколений
+        # уронил бы их недетерминизмом.
+        if (self._phase == lifecycle.PR_OPEN and deadlines.howtodemo_autostart
+                and not self._howtodemo_started
+                and workflow.patched("issue-lifecycle-howtodemo-on-pr-open")):
+            self._howtodemo_started = True
+            await self._start_howtodemo(issue)
+
         kind = awaiting_mod.kind_for_phase(self._phase)
         signal = await self._wait_for_signal(await self._park(
             kind,
@@ -2384,7 +2436,29 @@ class IssueDevelopment:
                         _failure_reason(e))
 
         if number is None:
-            raise ApplicationError("агент не изменил ни одного файла — открывать нечего")
+            reason = "агент не изменил ни одного файла — открывать нечего"
+            if workflow.patched("issue-lifecycle-empty-run-diagnosis"):
+                # Прежнее сообщение обвиняло агента в бездействии даже тогда,
+                # когда он не сделал ни одного хода — то есть когда отказало
+                # окружение. Человек шёл разбирать постановку вместо
+                # инфраструктуры. Признак лежит на диске, поэтому спрашиваем
+                # активность: воркфлоу файловой системы не видит.
+                #
+                # Уточнение НЕ ИМЕЕТ ПРАВА подменить собой исходный отказ:
+                # диагностика, способная сломать то, что диагностирует, хуже
+                # её отсутствия. Не вышло — докладываем прежним текстом.
+                try:
+                    reason = await workflow.execute_activity(
+                        activities.dev_empty_run_reason,
+                        args=[issue],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=cheap,
+                    )
+                except Exception as e:                   # noqa: BLE001
+                    workflow.logger.warning(
+                        "причину пустого прогона выяснить не удалось: %s",
+                        _failure_reason(e))
+            raise ApplicationError(reason)
         return number
 
 

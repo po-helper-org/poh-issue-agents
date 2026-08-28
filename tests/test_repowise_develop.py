@@ -192,6 +192,10 @@ def test_rules_do_not_ask_agent_to_retell_the_dialog():
 
 def test_home_directory_is_handed_over_to_runner(tmp_path, monkeypatch):
     handed = []
+    # Конфигурация MCP пишется только живому прокси: настроенный, но мёртвый
+    # убивал раннер на инициализации (poh-demo-checkout#151). Тест про передачу
+    # HOME, поэтому живость просто подделываем.
+    monkeypatch.setattr(activities.repowise, "available", lambda timeout=0: True)
     monkeypatch.setattr(activities, "_handover_to_runner", handed.append)
     monkeypatch.setattr(activities, "_clone_repo",
                         lambda repo, dest, branch=None: __import__("os").makedirs(dest, exist_ok=True))
