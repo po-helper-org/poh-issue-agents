@@ -138,6 +138,7 @@ def deadline_hours(kind: str, override: int | None = None) -> int:
 
 KIND_BY_PHASE: dict[str, str] = {
     lifecycle.CLASSIFIED: HUMAN_DECISION,
+    lifecycle.PRODUCT_RESEARCH: EXTERNAL_AGENT,
     lifecycle.READY_FOR_DEV: APPROVAL,
     lifecycle.GROOMED: HUMAN_DECISION,
     lifecycle.IN_DEVELOPMENT: EXTERNAL_AGENT,
@@ -167,6 +168,7 @@ KIND_BY_PHASE: dict[str, str] = {
 # здесь метка тут же вернулась бы парковкой.
 WORKED_BY_AGENT: frozenset[str] = frozenset({
     lifecycle.CREATED, lifecycle.BUSINESS_ANALYSIS, lifecycle.SYSTEM_REQUIREMENTS,
+    lifecycle.PRODUCT_RESEARCH,
 })
 
 WHO_BY_KIND: dict[str, str] = {
@@ -179,6 +181,7 @@ WHO_BY_KIND: dict[str, str] = {
 
 REASON_BY_PHASE: dict[str, str] = {
     lifecycle.CLASSIFIED: "решение о тяжёлой стадии: `research-me` либо `bug-me`",
+    lifecycle.PRODUCT_RESEARCH: "продуктовое исследование гипотезы",
     lifecycle.READY_FOR_DEV: "возьмут ли задачу в разработку (`build-me`)",
     lifecycle.GROOMED: "передача задачи в разработку",
     lifecycle.IN_DEVELOPMENT: "открытие PR по задаче",
