@@ -226,3 +226,368 @@ def test_a_retry_with_nothing_new_to_add_but_a_fresh_branch_is_still_no_changes(
     assert number is None
     assert not any(len(c) > 3 and c[3] == "push" for c in calls), (
         "пуша быть не должно — открывать нечего")
+
+
+# ────────── задача 7: `.harness/` коммитится всегда, пустой прогон не должен потеряться ──────────
+#
+# `.harness/` пишет `_dev_prepare` ДО прогона агента (контекст задачи, не
+# часть правки — см. `shared/develop.py`, SERVICE_FILES) и НЕ снимает перед
+# коммитом: он обязан дойти до PR. Значит каталог существует в рабочем дереве
+# независимо от того, тронул ли агент код, и голая проверка `git diff --cached
+# --quiet` перестала бы отличать «агент ничего не сделал» от «агент отработал».
+# `ignore_for_empty_check` — тот же трюк, что раньше решался снятием файла
+# (`.task.md` и соседи): каталог остаётся в коммите, но не в проверке пустоты.
+# Настоящий git, не подделка: находка — в точной семантике pathspec-исключения,
+# а мок рискует подтвердить не то, что происходит на самом деле (см. другие
+# тесты этого файла).
+
+def _seed_repo(tmp_path):
+    origin = tmp_path / "origin.git"
+    clone_dir = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(clone_dir)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(clone_dir), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "config", "user.name", "t"], check=True)
+    (clone_dir / "README.md").write_text("baseline")
+    subprocess.run(["git", "-C", str(clone_dir), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "commit", "-m", "seed"],
+                   check=True, capture_output=True)
+    return clone_dir
+
+
+def test_publish_ignores_the_harness_directory_when_deciding_if_anything_changed(
+        monkeypatch, tmp_path):
+    """`.harness/` коммитится всегда — его наличие само по себе не должно
+    читаться как «агент что-то сделал». Иначе ЛЮБОЙ прогон, даже тот, где
+    агент не тронул ни одного файла, открывал бы PR с одним каталогом
+    контекста внутри: то самое «шаг отработал, доложил успех, результата
+    нет», ради которого и существует эта проверка."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    # Только каталог контекста — как будто агент код не менял вовсе.
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    posts: list = []
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: posts.append((a, k)))
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-3",
+                                 title="t", body="b", message="m",
+                                 ignore_for_empty_check=(".harness/**",))
+
+    assert number is None, "только контекст без правок — это пустой прогон"
+    assert posts == [], "PR не должен открываться без настоящей правки"
+    log = subprocess.run(["git", "-C", str(clone_dir), "log", "--oneline"],
+                         check=True, capture_output=True, text=True).stdout
+    assert len(log.strip().splitlines()) == 1, "коммит одного контекста без кода делать не должны"
+
+
+def test_publish_still_commits_real_changes_alongside_the_harness_directory(
+        monkeypatch, tmp_path):
+    """Исключение из проверки пустоты не должно исключать каталог из самого
+    коммита: `.harness/` обязан доехать до PR вместе с настоящей правкой."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 55}
+
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-4",
+                                 title="t", body="b", message="m",
+                                 ignore_for_empty_check=(".harness/**",))
+
+    assert number == 55
+    show = subprocess.run(["git", "-C", str(clone_dir), "show", "--stat", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout
+    assert "a.txt" in show and ".harness/context.md" in show, (
+        "исключение из проверки пустоты не должно исключать файлы из самого коммита")
+
+
+def test_ignore_for_empty_check_defaults_to_excluding_nothing(monkeypatch, tmp_path):
+    """Без аргумента поведение прежнее: голый каталог контекста без кода
+    по-прежнему считается изменением — исключение из проверки пустоты
+    работает, только когда вызывающий явно об этом попросил.
+
+    L3 (ревью задачи 7): раньше тест создавал посторонний файл
+    (`untracked.txt`), никак не связанный с `.harness/`, и проходил бы при
+    ЛЮБОМ значении по умолчанию — обычный файл считается правкой независимо
+    от того, исключается ли `.harness/`. Докстринг обещал проверку «голый
+    каталог контекста читается как пустой прогон», а тест её не делал. Теперь
+    сценарий — тот же голый каталог контекста, что и в
+    `test_publish_ignores_the_harness_directory_when_deciding_if_anything_changed`,
+    но БЕЗ `ignore_for_empty_check`: по умолчанию каталог не исключается и
+    обязан читаться как настоящее изменение — PR открывается."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 66}
+
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-5",
+                                 title="t", body="b", message="m")
+
+    assert number == 66, "без исключений даже .harness/ по-прежнему считается правкой"
+
+
+# ────────── M3 (ревью задачи 7): .gitignore целевого репозитория не съедает каталог ──────────
+#
+# `git add -A` молча пропускает пути, которые `.gitignore` целевого
+# репозитория игнорирует. Если в нём есть `.harness/`, `.harness/` не
+# попадает в индекс — проверка пустоты (уже исключающая `.harness/**` из
+# рассмотрения) видит только код агента, коммит и PR проходят, а каталог
+# контекста молча теряется без единого предупреждения.
+
+def test_force_include_on_a_brand_new_branch_does_not_undo_the_empty_run_guard(
+        monkeypatch, tmp_path):
+    """Регрессия на связку M1+M3: `force_include` сам по себе не должен
+    заставлять коммитить пустой прогон. На СОВЕРШЕННО НОВОЙ ветке
+    `.harness/` «новый» ВСЕГДА (его только что собрал `_dev_prepare`) — если
+    бы это само по себе считалось изменением, ЛЮБОЙ прогон, где агент не
+    тронул ни файла, открывал бы PR с одним каталогом контекста внутри,
+    ровно тот регресс, ради которого существует `ignore_for_empty_check`."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+    # Агент НИЧЕГО не менял — единственное отличие от seed-коммита это .harness/.
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    posts: list = []
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: posts.append((a, k)))
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-10",
+                                 title="t", body="b", message="m",
+                                 ignore_for_empty_check=(".harness/**",),
+                                 force_include=(".harness",))
+
+    assert number is None, "пустой прогон с force_include всё равно обязан читаться пустым"
+    assert posts == [], "PR не должен открываться без настоящей правки"
+    log = subprocess.run(["git", "-C", str(clone_dir), "log", "--oneline"],
+                         check=True, capture_output=True, text=True).stdout
+    assert len(log.strip().splitlines()) == 1, "коммит одного контекста без кода делать не должны"
+
+
+def test_publish_force_includes_the_harness_directory_despite_gitignore(monkeypatch, tmp_path):
+    """Основной случай: `.gitignore` целевого репозитория игнорирует
+    `.harness/`, но `force_include` заставляет его попасть в коммит вместе с
+    настоящей правкой кода."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / ".gitignore").write_text(".harness/\n")
+    subprocess.run(["git", "-C", str(clone_dir), "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "commit", "-m", "add gitignore"],
+                   check=True, capture_output=True)
+
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 88}
+
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-6",
+                                 title="t", body="b", message="m",
+                                 ignore_for_empty_check=(".harness/**",),
+                                 force_include=(".harness",))
+
+    assert number == 88
+    show = subprocess.run(["git", "-C", str(clone_dir), "show", "--stat", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout
+    assert ".harness/context.md" in show, \
+        ".harness проигнорирован .gitignore, несмотря на force_include"
+
+
+def test_publish_commits_a_forced_path_even_when_the_visible_diff_is_otherwise_empty(
+        monkeypatch, tmp_path):
+    """Ретрай без нового кода: первый коммит на ветке сделан БЕЗ
+    force_include (например, старой версией кода) и не содержит `.harness/`
+    из-за `.gitignore`. Второй вызов — с force_include, но без каких-либо
+    других изменений в рабочем дереве: «видимый» дифф (без
+    `ignore_for_empty_check`) пуст, но `.harness/` обязан всё равно доехать
+    до коммита — иначе force_include ничего не гарантирует именно там, где
+    он нужнее всего."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / ".gitignore").write_text(".harness/\n")
+    subprocess.run(["git", "-C", str(clone_dir), "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "commit", "-m", "add gitignore"],
+                   check=True, capture_output=True)
+
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+
+    # Первый вызов — БЕЗ force_include, как «старая версия»: коммит уходит,
+    # но .harness/ в него не попадает (gitignore).
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp(77))
+    number1 = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-9",
+                                  title="t", body="b", message="m",
+                                  ignore_for_empty_check=(".harness/**",))
+    assert number1 == 77
+    show1 = subprocess.run(["git", "-C", str(clone_dir), "show", "--stat", "HEAD"],
+                           check=True, capture_output=True, text=True).stdout
+    assert ".harness" not in show1, "тест не воспроизвёл предпосылку — .harness уже в коммите"
+
+    # Второй вызов — с force_include, рабочее дерево НЕ менялось: видимый
+    # дифф (a.txt) пуст, потому что a.txt уже в первом коммите.
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _FakeResp(77))
+    number2 = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-9",
+                                  title="t", body="b", message="m",
+                                  ignore_for_empty_check=(".harness/**",),
+                                  force_include=(".harness",))
+
+    assert number2 == 77, "PR должен подтвердиться, а не пропасть на ретрае"
+    show2 = subprocess.run(["git", "-C", str(clone_dir), "show", "--stat", "HEAD"],
+                           check=True, capture_output=True, text=True).stdout
+    assert ".harness/context.md" in show2, \
+        "force_include не довёл каталог до коммита, когда видимый дифф пуст"
+    log = subprocess.run(["git", "-C", str(clone_dir), "log", "--oneline", "agent/issue-9"],
+                         check=True, capture_output=True, text=True).stdout
+    assert len(log.strip().splitlines()) == 4, (
+        "ожидался НОВЫЙ коммит поверх первого (seed + gitignore + первый + второй):\n" + log)
+
+
+class _FakeResp:
+    def __init__(self, number, status_code=201):
+        self.number = number
+        self.status_code = status_code
+        self.text = ""
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"number": self.number}
+
+
+def test_publish_stops_before_push_when_missing_from_tree_reports_a_gap(monkeypatch, tmp_path):
+    """Покрывает саму ветку `RuntimeError`. `_missing_from_tree` — отдельно
+    протестированная чистая функция (`test_missing_from_tree_*` ниже);
+    настоящий git делает расхождение, которое она ловит, практически
+    невоспроизводимым (см. `test_publish_commits_a_forced_path_...` — код
+    сам себя чинит раньше, чем до этой проверки доходит). Здесь проверяется
+    интеграция: если она хоть что-то сообщит, `publish_worktree` обязана
+    остановиться ДО push и ДО запроса на PR."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+    # .harness/ ОБЯЗАН существовать на диске — иначе `git add -f -- .harness`
+    # сам упадёт раньше («pathspec did not match any files», тоже
+    # RuntimeError с «.harness» в тексте) и замаскирует то, что тест
+    # проверяет НА САМОМ ДЕЛЕ: ветку `_missing_from_tree` ниже по потоку.
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("# Контекст задачи\n")
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_missing_from_tree", lambda git, paths: [".harness"])
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("PR не должен запрашиваться после отказа")))
+
+    with pytest.raises(RuntimeError, match=r"\.harness"):
+        gc.publish_worktree("o/r", str(clone_dir), "agent/issue-11",
+                            title="t", body="b", message="m",
+                            force_include=(".harness",))
+
+
+# ────────── M3: подтверждение фактом, а не замыслом ──────────
+
+def test_missing_from_tree_reports_a_path_absent_from_head(tmp_path):
+    """Юнит на саму проверку «фактом»: путь либо есть в дереве HEAD, либо
+    нет — независимо от того, что о нём думал `git add -f`."""
+    import os
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    git = gc._git_runner(str(clone_dir), {**os.environ})
+
+    assert gc._missing_from_tree(git, (".harness",)) == [".harness"]
+
+    harness = clone_dir / ".harness"
+    harness.mkdir()
+    (harness / "context.md").write_text("x")
+    subprocess.run(["git", "-C", str(clone_dir), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(clone_dir), "commit", "-m", "add harness"],
+                   check=True, capture_output=True)
+
+    assert gc._missing_from_tree(git, (".harness",)) == []
+
+
+def test_missing_from_tree_is_a_noop_without_force_include(tmp_path):
+    """Без аргументов проверка не должна стоить лишнего вызова git — путь
+    вызывающего кода без `force_include` её не платит вовсе."""
+    import os
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    git = gc._git_runner(str(clone_dir), {**os.environ})
+    assert gc._missing_from_tree(git, ()) == []

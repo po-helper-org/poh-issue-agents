@@ -30,12 +30,21 @@ def test_clean_issue_has_nothing_set(monkeypatch):
     assert state.agents_off is False
     assert state.origin_agent is False
     assert state.depth_exceeded is False
+    assert state.step_subissue is False
 
 
 def test_agents_off_is_detected(monkeypatch):
     _wire(monkeypatch, {7: _issue(["agents:off", "priority:P1"])})
 
     assert activities.read_protocol_state("o/r", 7).agents_off is True
+
+
+def test_step_subissue_is_detected(monkeypatch):
+    """R5: тот же барьер, что и у agents_off, но для метки под-задачи шага —
+    читается тут же, без лишнего вызова GitHub (`names` уже собраны)."""
+    _wire(monkeypatch, {7: _issue(["harness:step", "priority:P1"])})
+
+    assert activities.read_protocol_state("o/r", 7).step_subissue is True
 
 
 def test_origin_agent_is_detected(monkeypatch):

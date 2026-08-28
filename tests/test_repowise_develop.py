@@ -200,8 +200,12 @@ def test_home_directory_is_handed_over_to_runner(tmp_path, monkeypatch):
     monkeypatch.setattr(activities, "_clone_repo",
                         lambda repo, dest, branch=None: __import__("os").makedirs(dest, exist_ok=True))
     monkeypatch.setattr(activities.develop, "workspace_mount", lambda: str(tmp_path))
+    # Ветка аналитики передана ниже — требования у неё обязательны
+    # (`task_context.required`), иначе подготовка откажет раньше, чем этот
+    # тест успеет проверить передачу HOME.
     monkeypatch.setattr(activities.github_client, "get_file",
-                        lambda *a, **k: "")
+                        lambda repo, path, ref=None:
+                            "требования" if path.endswith("system_requirements.md") else "")
 
     issue = _issue(56)
     activities._dev_prepare(issue, "research/issue-56")

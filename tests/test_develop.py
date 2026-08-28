@@ -67,7 +67,7 @@ def test_comment_says_where_the_run_happens():
     assert "research/issue-12" in body
     assert "на своём сервере" in body    # где именно идёт работа
     assert "Closes #12" in body          # чем прогон должен закончиться
-    assert "SubIssue" in body            # и что он делает с edge-кейсами
+    assert "GROW" in body                # и что он делает с edge-кейсами
 
 
 def test_comment_without_analysis_says_so_instead_of_naming_a_branch():

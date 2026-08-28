@@ -44,6 +44,14 @@ async def protocol_default(repo: str, issue_number: int) -> ProtocolState:
     return ProtocolState()
 
 
+@activity.defn(name="read_protocol_state")
+async def protocol_step_subissue(repo: str, issue_number: int) -> ProtocolState:
+    """Под-задача шага (R5): барьер в `_run_phase_loop` читает это же
+    состояние, только не через `_phase_triage` — тот здесь не выполняется."""
+    _calls.append("read_state")
+    return ProtocolState(step_subissue=True)
+
+
 @activity.defn(name="read_deadlines")
 async def deadlines_stub() -> Deadlines:
     # Круг правок здесь выключен намеренно: тест про цепочку событий, а не про
@@ -287,3 +295,45 @@ async def test_cycle_raised_by_an_event_skips_triage():
             assert await _await_phase(env, handle, lifecycle.PR_OPEN) == lifecycle.PR_OPEN
 
     assert not any(c.startswith("phase:classified") for c in _calls), "триаж всё же пошёл"
+
+
+@pytest.mark.timeout(30)
+async def test_step_subissue_barrier_catches_a_cycle_raised_by_an_event():
+    """Правка по ревью (Task 13, R5): под-задача шага закрывается своим PR —
+    `Closes #N` в его теле корректно указывает на неё, — поэтому PR-Agent
+    доложит о ней агентским событием так же, как о любой другой задаче. Такое
+    событие поднимает цикл СРАЗУ в доложенной фазе (см. предыдущий тест) —
+    мимо `created`, а с ним и мимо `_phase_triage`, где стоит основная
+    проверка `state.step_subissue`. У самого AgentEvent меток не бывает
+    вовсе — гейт вебхука по `harness:step` тут физически нечем поднять.
+
+    Без отдельного барьера в начале `_run_phase_loop` цикл дошёл бы до
+    `_phase_park` и встал там ждать сигнала — а включи кто-нибудь
+    HOWTODEMO_AUTOSTART, поднял бы дорогой child-воркфлоу приёмки на первом же
+    входе в `pr-open`, до какого-либо сигнала и без единой метки в событии.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        activities = [a for a in ACTIVITIES if a is not protocol_default]
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation,
+                                     IssueDevelopment],
+                          activities=[*activities, protocol_step_subissue, awaiting_stub]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run,
+                args=[IssueInput(repo="o/r", issue_number=7, title="", body="",
+                                 author_login="", author_type="User", interactive=False),
+                      LifecycleState(phase=lifecycle.PR_OPEN, stage=lifecycle.PR_OPEN)],
+                id=f"wf-{uuid.uuid4()}", task_queue=tq,
+                start_signal="agent_event",
+                start_signal_args=[_event(lifecycle.PR_OPEN)],
+            )
+            await handle.result()
+
+            assert await handle.query(IssueLifecycle.stage) == "step-subissue"
+
+    assert "read_state" in _calls, "барьер не прочитал состояние протокола"
+    # Метку не пишем — тот же приём, что и у agents_off: план родителя уже
+    # разобрал эту задачу, отметка на подзадаче никому не нужна.
+    assert not any(c.startswith("phase:") for c in _calls), "метка фазы не должна ставиться"

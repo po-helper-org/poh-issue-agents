@@ -193,3 +193,42 @@ def parent_summary(items: list[dict], numbers: dict[int, int], *, summary: str,
     parts.append("Задача готова к разработке: агент берёт подзадачи MVP в "
                  "порядке зависимостей.")
     return "\n".join(parts)
+
+
+def needs_subissues(items: list[dict]) -> bool:
+    """Разворачивать ли план в под-задачи.
+
+    Шаг существует, только если от него зависит другой шаг. Граф без рёбер —
+    это не план, а список правок, который исполнитель сделает за один прогон;
+    заводить под каждую строку задачу в трекере значит платить вниманием за
+    видимость, которой никто не пользуется.
+
+    Определение взято из инструмента, а не выдумано: задачи планов superpowers
+    несят блок Interfaces с Consumes/Produces, и непустой Consumes — это и есть
+    объявленное ребро.
+    """
+    for index, item in enumerate(items):
+        depends = item.get("depends_on") or []
+        for dep in depends:
+            # Ребром считается только зависимость на другой, существующий шаг
+            if isinstance(dep, int) and 0 <= dep < len(items) and dep != index:
+                return True
+    return False
+
+
+def dependency_reason_missing(items: list[dict]) -> list[str]:
+    """Заголовки шагов, где зависимость объявлена без предмета.
+
+    Ребро обязано называть, ЧТО даёт предшественник: «читает version из
+    состояния». Без предмета зависимость невозможно ни проверить, ни
+    опровергнуть, а модели дешевле выдумать её, чем признать, что плана нет.
+    """
+    bad = []
+    for item_index, item in enumerate(items):
+        for index in item.get("depends_on") or []:
+            if not (item.get("depends_reason") or {}).get(str(index), "").strip():
+                # Используем заголовок, если есть; иначе используем порядковый номер
+                title = item.get("title") or f"шаг #{item_index}"
+                bad.append(title)
+                break
+    return bad

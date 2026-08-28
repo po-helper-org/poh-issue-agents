@@ -39,7 +39,7 @@ from starlette.requests import ClientDisconnect
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared import gitlab_events, gitlab_signature
+from shared import gitlab_events, gitlab_signature, labels
 
 from shared import sentry_setup
 from shared.commands import (
@@ -594,6 +594,44 @@ async def _handle_delivery(payload: dict, x_github_event: str,
         await _audit_dropped_delivery(payload, x_github_event, x_github_delivery,
                                       repo_full, specs)
         return {"ok": True}
+
+    # Под-задача шага (harness:step) не поднимает свой цикл: план родителя её
+    # уже разобрал, а живёт она только время шага (Task 13). Проверка стоит ДО
+    # get_temporal_client() — под-задача не должна поднимать вообще ничего, ни
+    # соединения с Temporal, ни тем более воркфлоу с триажом.
+    #
+    # Гейт гасит только пути, способные ПОДНЯТЬ новый цикл (с signal-with-start):
+    # - issues.opened, issues.labeled: всегда поднимают
+    # - issue_comment с КОМАНДОЙ: поднимают через signal-with-start
+    #
+    # Пути, которые гейт НЕ гасит (работают с существующим циклом):
+    # - issues.closed: signal в живой цикл об окончании Issue
+    # - issue_comment обычный: signal в цикл уточнений (receiver = IssueLifecycle)
+    #
+    # Любой новый путь, способный поднять цикл, унаследует проверку автоматически.
+    should_gate = False
+
+    if x_github_event == "issues":
+        action = payload.get("action", "")
+        # issues.opened и issues.labeled (и все иные actions, если появятся,
+        # которые поднимают цикл) проходят гейт
+        should_gate = action in ("opened", "labeled")
+
+    elif x_github_event == "issue_comment":
+        # issue_comment с командой проходит гейт; обычный комментарий — нет
+        if payload.get("action") == "created":
+            comment_body = payload.get("comment", {}).get("body") or ""
+            should_gate = parse_command(comment_body) is not None
+
+    if should_gate:
+        issue = payload.get("issue") or {}
+        names = [label["name"] for label in issue.get("labels", [])]
+        if labels.has(names, labels.STEP):
+            repo = payload["repository"]["full_name"]
+            issue_number = issue["number"]
+            _log.info("под-задача шага %s#%s (%s) — цикл не поднимаем",
+                      repo, issue_number, x_github_event)
+            return {"ok": True}
 
     client = await get_temporal_client()
 
