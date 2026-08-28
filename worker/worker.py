@@ -18,7 +18,6 @@ import consolidation_activities as ca
 import delivery_bridge
 import howtodemo_bridge
 from consolidation_workflow import ConsolidationWorkflow
-from mvp_delivery import MvpDelivery
 from shared import sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import (
@@ -126,8 +125,8 @@ async def main() -> None:
         client,
         task_queue="issue-lifecycle",
         workflows=[IssueLifecycle, IssueAnalysis, IssueBft, IssueDevelopment,
-                   IssueEstimation, IssuePrFix, MvpDelivery, ConsolidationWorkflow,
-                   WebhookAudit, OrphanAgentEvent, CommentAck],
+                   IssueEstimation, IssuePrFix, ConsolidationWorkflow, WebhookAudit,
+                   OrphanAgentEvent, CommentAck],
         activities=[
             activities.prefilter_bot_and_security,
             activities.read_protocol_state,
@@ -176,13 +175,6 @@ async def main() -> None:
             activities.publish_analysis_error,
             activities.run_bug_pipeline,
             activities.trigger_openhands_resolver,
-            # MvpDelivery (worker/mvp_delivery.py) зовёт эти четыре по строковому
-            # имени, а не ссылкой `activities.*` — AST-проверка test_worker_wiring.py
-            # такой вызов не видит, регистрация здесь ничем не подстрахована.
-            activities.mvp_read_plan,
-            activities.mvp_open_substep,
-            activities.mvp_develop_step,
-            activities.mvp_close_substep,
             # DEVELOP_ACTIVITIES не разворачиваем звёздочкой: test_worker_wiring.py
             # ищет использованные воркфлоу активности разбором AST и видит только
             # `activities.<имя>` прямо в списке — `*DEVELOP_ACTIVITIES` для него
