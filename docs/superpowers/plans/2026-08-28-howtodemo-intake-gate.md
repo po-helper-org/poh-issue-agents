@@ -563,7 +563,7 @@ git commit -m "feat(acceptance): модель вариантов критери�
 
 **Interfaces:**
 - Consumes: `shared.acceptance_proposal` из Task 5, `issue_blocks.HOWTODEMO` из Task 2
-- Produces: активность `ask_acceptance_criteria(issue: IssueInput) -> bool` — `True`, если вопрос задан или уже висел; `False`, если задать не удалось. Имя для `execute_activity` — `activities.ask_acceptance_criteria`.
+- Produces: активность `ask_acceptance_criteria(issue: IssueInput) -> None` — задаёт вопрос и вешает метку ожидания. Возвращаемого значения нет: пропустить задачу в разработку без критерия эта активность права не имеет ни при каких исходах, и `bool`, всегда равный `True`, лишь изображал бы выбор. Имя для `execute_activity` — `activities.ask_acceptance_criteria`.
 
 - [ ] **Step 1: Метка ожидания**
 
@@ -606,7 +606,7 @@ def test_question_names_the_command_verbatim(monkeypatch, issue):
     monkeypatch.setattr(a, "_propose_acceptance_options",
                         lambda issue: ["было A; стало B", "было C; стало D"])
 
-    assert a.ask_acceptance_criteria(issue) is True
+    a.ask_acceptance_criteria(issue)
     body = posted[0]
     assert "/harness-answer" in body
     assert "обычный комментарий" in body.lower()
@@ -640,7 +640,7 @@ def test_question_is_asked_once(monkeypatch, issue):
     monkeypatch.setattr(a, "_propose_acceptance_options",
                         lambda issue: ["было A; стало B"])
 
-    assert a.ask_acceptance_criteria(issue) is True
+    a.ask_acceptance_criteria(issue)
     assert posted == []
 
 
@@ -662,7 +662,7 @@ def test_model_failure_asks_plainly_and_does_not_pass(monkeypatch, issue):
 
     monkeypatch.setattr(a, "_propose_acceptance_options", boom)
 
-    assert a.ask_acceptance_criteria(issue) is True
+    a.ask_acceptance_criteria(issue)
     assert "/harness-answer" in posted[0]
     assert "не смог" in posted[0].lower()
 
@@ -677,7 +677,7 @@ def test_existing_block_means_no_question(monkeypatch, issue):
     monkeypatch.setattr(a.github_client, "add_label", lambda *args: None)
     monkeypatch.setattr(a.github_client, "list_comments", lambda *args, **kw: [])
 
-    assert a.ask_acceptance_criteria(issue) is True
+    a.ask_acceptance_criteria(issue)
     assert posted == []
 ```
 
@@ -710,14 +710,14 @@ def _propose_acceptance_options(issue) -> list[str]:
 
 
 @activity.defn
-def ask_acceptance_criteria(issue) -> bool:
+def ask_acceptance_criteria(issue) -> None:
     """Спросить у человека критерий приёмки и повесить метку ожидания.
 
-    Возвращает True всегда, когда задача осталась ждать, — и когда вопрос
-    задан, и когда он уже висел, и когда модель отказала. False не возвращается
-    вовсе: пропустить задачу в разработку без критерия эта активность права не
-    имеет. Тип оставлен bool на случай, если такое право появится, — менять
-    сигнатуру у живых прогонов дороже.
+    Ничего не возвращает. Все исходы — вопрос задан, вопрос уже висел, модель
+    отказала — оставляют задачу ждать, и различать их вызывающему незачем:
+    пропустить задачу в разработку без критерия эта активность права не имеет
+    ни при каких обстоятельствах. Признак, который всегда одинаков, изображал
+    бы выбор, которого нет.
 
     Отказ, ради которого написано: poh-demo-checkout#163 отработал целиком и
     закрылся, а приёмка отвечала «проверять нечем».
@@ -726,12 +726,12 @@ def ask_acceptance_criteria(issue) -> bool:
 
     # Критерий уже утверждён — спрашивать нечего.
     if issue_blocks.read(body, issue_blocks.HOWTODEMO):
-        return True
+        return
 
     # Вопрос уже задан — второй раз не задаём.
     for comment in github_client.list_comments(issue.repo, issue.issue_number):
         if ACCEPTANCE_QUESTION_MARKER in (comment.get("body") or ""):
-            return True
+            return
 
     try:
         options = _propose_acceptance_options(issue)
@@ -771,7 +771,6 @@ def ask_acceptance_criteria(issue) -> bool:
     github_client.post_comment(issue.repo, issue.issue_number, "\n".join(lines))
     github_client.add_label(issue.repo, issue.issue_number,
                             labels.NEEDS_HUMAN_HOWTODEMO)
-    return True
 ```
 
 Если константа маркера комментария контура называется иначе — взять существующее имя из модуля (то, что подставляется в прочие комментарии активностей) вместо `AGENT_COMMENT_MARKER`.
@@ -810,6 +809,7 @@ git commit -m "feat(acceptance): вопрос о критерии приёмки
 
 **Interfaces:**
 - Consumes: `ACCEPTANCE_QUESTION_MARKER` из Task 6, `commands.HARNESS_ANSWER` из Task 4
+- Заводит здесь же: `ACCEPTANCE_ECHO_MARKER`, `ACCEPTANCE_ECHO_END` — пара маркеров вокруг показанного толкования
 - Produces: активность `accept_acceptance_answer(issue, text: str) -> str` — возвращает `"accepted"` (критерий записан в тело, можно ехать), `"confirm"` (показано толкование, ждём второго ответа), `"noop"` (вопроса не было)
 
 - [ ] **Step 1: Написать падающие тесты**
@@ -881,8 +881,9 @@ def test_free_text_shows_what_it_recorded_and_waits(monkeypatch, issue):
 def test_second_answer_confirms_and_accepts(monkeypatch, issue):
     """Второй ответ — подтверждение, критерий записан."""
     written = {}
-    shown = ("Записал так: 405 на любой метод кроме POST\n"
-             f"{a.ACCEPTANCE_ECHO_MARKER}")
+    shown = ("Записал критерий так:\n\n"
+             f"{a.ACCEPTANCE_ECHO_MARKER}\n405 на любой метод кроме POST\n"
+             f"{a.ACCEPTANCE_ECHO_END}")
     monkeypatch.setattr(a.github_client, "list_comments",
                         lambda *args, **kw: [_question(), {"body": shown}])
     monkeypatch.setattr(a.github_client, "get_issue_body", lambda *args: "описание")
@@ -894,6 +895,29 @@ def test_second_answer_confirms_and_accepts(monkeypatch, issue):
     assert a.accept_acceptance_answer(issue, "да") == "accepted"
     assert "405 на любой метод кроме POST" in \
         issue_blocks.read(written["body"], issue_blocks.HOWTODEMO)
+
+
+def test_echo_recovery_survives_wording_changes(monkeypatch, issue):
+    """Критерий восстанавливается по паре маркеров, а не по форме прозы.
+
+    Без пары маркеров правка окружающего текста ломала бы подтверждение
+    молча — критерий уехал бы в тело обрезанным или пустым.
+    """
+    written = {}
+    shown = ("Совершенно другая формулировка вокруг.\n\n"
+             f"{a.ACCEPTANCE_ECHO_MARKER}\n405 на любой метод кроме POST\n"
+             f"{a.ACCEPTANCE_ECHO_END}\n\nи ещё текст после.")
+    monkeypatch.setattr(a.github_client, "list_comments",
+                        lambda *args, **kw: [_question(), {"body": shown}])
+    monkeypatch.setattr(a.github_client, "get_issue_body", lambda *args: "описание")
+    monkeypatch.setattr(a.github_client, "update_issue_body",
+                        lambda repo, number, body: written.setdefault("body", body))
+    monkeypatch.setattr(a.github_client, "remove_label", lambda *args: None)
+    monkeypatch.setattr(a.github_client, "post_comment", lambda *args: None)
+
+    assert a.accept_acceptance_answer(issue, "да") == "accepted"
+    assert issue_blocks.read(written["body"], issue_blocks.HOWTODEMO) == \
+        "405 на любой метод кроме POST"
 
 
 def test_answer_without_question_says_so(monkeypatch, issue):
@@ -932,9 +956,16 @@ Expected: FAIL с `AttributeError: module 'activities' has no attribute 'accept_
 В `worker/activities.py`:
 
 ```python
-# Маркер комментария «вот что я записал». По нему активность отличает второй
-# ответ (подтверждение) от первого.
+# Комментарий «вот что я записал». Толкование в нём обёрнуто ПАРОЙ маркеров, а
+# не отделено от прозы разрезанием строк: подтверждение восстанавливает критерий
+# из этого же комментария, и правка формулировки вокруг не должна ломать
+# восстановление молча.
 ACCEPTANCE_ECHO_MARKER = "<!-- harness:acceptance-echo -->"
+ACCEPTANCE_ECHO_END = "<!-- harness:acceptance-echo:end -->"
+
+_ACCEPTANCE_ECHO = re.compile(
+    re.escape(ACCEPTANCE_ECHO_MARKER) + r"(?P<text>.*?)" + re.escape(ACCEPTANCE_ECHO_END),
+    re.DOTALL)
 
 # Вариант в комментарии вопроса: `**1.** было …; стало …`
 _ACCEPTANCE_OPTION = re.compile(r"^\*\*(?P<number>\d+)\.\*\*[ \t]*(?P<text>.+)$",
@@ -953,8 +984,9 @@ def _acceptance_question(repo: str, issue_number: int) -> tuple[list[str], str]:
         if ACCEPTANCE_QUESTION_MARKER in body:
             options = [match.group("text").strip()
                        for match in _ACCEPTANCE_OPTION.finditer(body)]
-        if ACCEPTANCE_ECHO_MARKER in body:
-            echo = body.split(ACCEPTANCE_ECHO_MARKER)[0].strip()
+        match = _ACCEPTANCE_ECHO.search(body)
+        if match:
+            echo = match.group("text").strip()
     return options, echo
 
 
@@ -994,7 +1026,7 @@ def accept_acceptance_answer(issue, text: str) -> str:
 
     # Второй ответ при показанном толковании — подтверждение.
     if echo:
-        _write_acceptance_block(issue, echo.split("\n", 1)[-1].strip() or echo)
+        _write_acceptance_block(issue, echo)
         return "accepted"
 
     if answer.isdigit() and 1 <= int(answer) <= len(options):
@@ -1004,11 +1036,12 @@ def accept_acceptance_answer(issue, text: str) -> str:
     # Всё остальное — свободный текст, включая номер вне списка.
     github_client.post_comment(
         issue.repo, issue.issue_number,
-        f"Записал критерий так:\n\n{answer}\n\n"
+        "Записал критерий так:\n\n"
+        f"{ACCEPTANCE_ECHO_MARKER}\n{answer}\n{ACCEPTANCE_ECHO_END}\n\n"
         "Если верно — подтвердите:\n\n"
         "```\n/harness-answer да\n```\n\n"
         "Если нет — пришлите поправленный текст той же командой.\n\n"
-        f"{ACCEPTANCE_ECHO_MARKER}\n{AGENT_COMMENT_MARKER}")
+        f"{AGENT_COMMENT_MARKER}")
     return "confirm"
 ```
 
@@ -1451,7 +1484,7 @@ def test_question_then_answer_then_criterion_reaches_the_runner(monkeypatch, iss
     assert a.read_acceptance_criterion(issue) == ""
 
     # 2. Вопрос задан и называет команду.
-    assert a.ask_acceptance_criteria(issue) is True
+    a.ask_acceptance_criteria(issue)
     question = state["comments"][0]["body"]
     assert "/harness-answer" in question
     assert labels.NEEDS_HUMAN_HOWTODEMO in state["labels"]
