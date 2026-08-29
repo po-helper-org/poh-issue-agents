@@ -910,3 +910,46 @@ def test_focus_rule_survives_repository_own_rules(monkeypatch, tmp_path):
 
     assert "Свои правила репозитория" in task, "правила репозитория потерялись"
     assert "пройдёт ли сценарий без этого" in task, "правило фокуса не доехало"
+
+
+def test_howtodemo_block_russian_headings():
+    """Раздел приёмки, написанный по-русски, распознаётся наравне с английским.
+
+    Отказ, ради которого это написано: poh-demo-checkout#163 приехал с
+    разделом `## Как принимаем` и блоками curl «было/должно работать»,
+    прошёл разработку, PR и мерж — а приёмка всё это время отвечала
+    «проверять нечем».
+    """
+    for heading in ("## Как принимаем", "## Как проверяем",
+                    "## Приёмка", "## Приемка", "## Как демонстрируем",
+                    "### Как принимаем"):
+        body = f"вступление\n\n{heading}\n\nБыло 404, стало 405\n\n## Другое\nхвост"
+        assert a._howtodemo_block(body) == "Было 404, стало 405", heading
+
+
+def test_howtodemo_russian_heading_as_part_of_another_word_does_not_trigger():
+    """`## Приёмка-агент: как он устроен` — это описание, а не сценарий."""
+    body = "## Приёмка-агент: как он устроен\n\nОписание агента, не сценарий."
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_russian_heading_with_empty_body_is_no_scenario():
+    """Заголовок есть, под ним пусто — сценария нет (R7).
+
+    Пустой критерий хуже отсутствующего: он создаёт видимость приёмки.
+    """
+    body = "## Как принимаем\n\n\n## Другое\nхвост"
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_russian_heading_inside_code_fence_is_not_a_scenario():
+    """Заголовок, процитированный примером, сценарием не считается (R8)."""
+    body = (
+        "Шаблон задачи:\n\n"
+        "```markdown\n"
+        "## Как принимаем\n"
+        "тут пишем сценарий\n"
+        "```\n\n"
+        "Настоящего раздела нет."
+    )
+    assert a._howtodemo_block(body) == ""
