@@ -1269,6 +1269,24 @@ def _howtodemo_block(body: str) -> str:
     следующая жирная метка.
     """
     body = body or ""
+
+    # Утверждённый блок старше раздела: человек подтвердил именно этот текст
+    # командой, а раздел мог остаться от прежней редакции задачи. Пустой блок
+    # не считается утверждением и не затирает написанное человеком.
+    approved = issue_blocks.read(body, issue_blocks.HOWTODEMO)
+    if approved and approved.strip():
+        return approved.strip()
+    if approved is not None:
+        # Блок есть, но пуст — не утверждение. Его маркеры-комментарии всё
+        # равно остаются в теле, а для поиска ниже они не заголовок и не
+        # метка, значит не граница: без вырезания пустой блок прилипал бы
+        # хвостом к разделу/метке человека вместо того, чтобы просто не
+        # участвовать в приёмке.
+        start_marker = f"<!-- harness:{issue_blocks.HOWTODEMO}:start -->"
+        end_marker = f"<!-- harness:{issue_blocks.HOWTODEMO}:end -->"
+        block = re.compile(re.escape(start_marker) + r"\n.*?\n" + re.escape(end_marker), re.S)
+        body = block.sub("", body)
+
     haystack = _mask_code_fences(body)
     match = _HOWTODEMO_START.search(haystack)
     if not match:

@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 import activities as a
-from shared import task_context
+from shared import issue_blocks, task_context
 
 
 TITLE = "Починить кнопку"
@@ -660,6 +660,20 @@ def test_howtodemo_block_preserves_a_four_backtick_fence_legitimately_inside_it(
         "````"
     )
     assert "хвост" not in result
+
+
+def test_howtodemo_approved_block_wins_over_heading():
+    """Утверждённый блок старше раздела: человек подтвердил именно его."""
+    body = issue_blocks.write("## Как принимаем\n\nстарый текст",
+                              issue_blocks.HOWTODEMO, "утверждённый критерий")
+    assert a._howtodemo_block(body) == "утверждённый критерий"
+
+
+def test_howtodemo_empty_approved_block_falls_back_to_heading():
+    """Пустой блок не должен затирать написанный человеком раздел."""
+    body = issue_blocks.write("## Как принимаем\n\nтекст раздела",
+                              issue_blocks.HOWTODEMO, "   ")
+    assert a._howtodemo_block(body) == "текст раздела"
 
 
 # ────────── требование 3: `.harness/` реально доезжает до PR ──────────
