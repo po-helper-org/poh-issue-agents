@@ -159,3 +159,35 @@ def test_howtodemo_block_survives_grow_block():
     body = issue_blocks.write(body, issue_blocks.HOWTODEMO, "сценарий")
     assert issue_blocks.read(body, issue_blocks.GROW) == "- [ ] находка"
     assert issue_blocks.read(body, issue_blocks.HOWTODEMO) == "сценарий"
+
+
+def test_strip_removes_block_with_both_markers():
+    """Ревью, находка 1 (Important). `strip()` — единственное место, знающее
+    формат маркеров при вырезании блока целиком, наряду с read()/write().
+    `worker/activities.py` раньше дублировал этот формат буквальными строками
+    вместо вызова сюда — правка проверяет, что вырезание убирает и маркеры, и
+    содержимое, а текст человека вокруг блока остаётся нетронутым.
+    """
+    body = issue_blocks.write("До.\n\nПосле.", issue_blocks.HOWTODEMO, "  ")
+    result = issue_blocks.strip(body, issue_blocks.HOWTODEMO)
+    assert "harness:howtodemo" not in result
+    assert "До." in result
+    assert "После." in result
+
+
+def test_strip_absent_block_returns_body_untouched():
+    body = "просто текст без блоков"
+    assert issue_blocks.strip(body, issue_blocks.HOWTODEMO) == body
+
+
+def test_strip_none_body_returns_empty_string():
+    assert issue_blocks.strip(None, issue_blocks.HOWTODEMO) == ""
+
+
+def test_strip_raises_on_corrupted_markers():
+    """Как read()/write() — непарный маркер считается порчей тела, а не
+    сигналом «блока нет», и strip() не должен молча съедать обрывок.
+    """
+    body = "текст\n<!-- harness:howtodemo:start -->\nобрезано"
+    with pytest.raises(ValueError):
+        issue_blocks.strip(body, issue_blocks.HOWTODEMO)

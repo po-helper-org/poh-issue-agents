@@ -1273,7 +1273,22 @@ def _howtodemo_block(body: str) -> str:
     # Утверждённый блок старше раздела: человек подтвердил именно этот текст
     # командой, а раздел мог остаться от прежней редакции задачи. Пустой блок
     # не считается утверждением и не затирает написанное человеком.
-    approved = issue_blocks.read(body, issue_blocks.HOWTODEMO)
+    #
+    # Ревью, находка 2 (Important). `issue_blocks.read` кидает ValueError, если
+    # маркеры блока в теле не парные (один старт без конца и т. п.). До этой
+    # задачи такой обрывок — например, скопированный человеком литерал маркера
+    # из примера в документации — был инертным текстом: ничего не парсило тело
+    # по разметке. Теперь парсит, и непойманный ValueError ронял бы всю стадию
+    # подготовки `_dev_prepare`. Молчаливый отказ хуже: ловим исключение, пишем
+    # предупреждение в лог с причиной и продолжаем поиском по заголовку — как
+    # если бы утверждённого блока не было вовсе (тот же принцип деградации, что
+    # у записи находок GROW чуть ниже по файлу).
+    try:
+        approved = issue_blocks.read(body, issue_blocks.HOWTODEMO)
+    except ValueError as exc:
+        logger.warning("тело повреждено для блока %s — ищу сценарий по заголовку: %s",
+                       issue_blocks.HOWTODEMO, exc)
+        approved = None
     if approved and approved.strip():
         return approved.strip()
     if approved is not None:
@@ -1282,10 +1297,13 @@ def _howtodemo_block(body: str) -> str:
         # метка, значит не граница: без вырезания пустой блок прилипал бы
         # хвостом к разделу/метке человека вместо того, чтобы просто не
         # участвовать в приёмке.
-        start_marker = f"<!-- harness:{issue_blocks.HOWTODEMO}:start -->"
-        end_marker = f"<!-- harness:{issue_blocks.HOWTODEMO}:end -->"
-        block = re.compile(re.escape(start_marker) + r"\n.*?\n" + re.escape(end_marker), re.S)
-        body = block.sub("", body)
+        #
+        # Ревью, находка 1 (Important). Формат маркеров вырезался здесь
+        # самодельной регэксп-строкой с буквальными `harness:{name}:start` /
+        # `:end -->` — единственное место в репозитории вне
+        # `shared/issue_blocks.py`, где он был захардкожен. `issue_blocks.strip`
+        # переиспользует тот же `_matched_block`, что и read()/write().
+        body = issue_blocks.strip(body, issue_blocks.HOWTODEMO)
 
     haystack = _mask_code_fences(body)
     match = _HOWTODEMO_START.search(haystack)

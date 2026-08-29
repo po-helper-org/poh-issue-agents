@@ -676,6 +676,46 @@ def test_howtodemo_empty_approved_block_falls_back_to_heading():
     assert a._howtodemo_block(body) == "текст раздела"
 
 
+def test_howtodemo_empty_block_removal_follows_issue_blocks_marker_format(monkeypatch):
+    """Ревью, находка 1 (Important). Вырезание пустого утверждённого блока
+    должно идти через `issue_blocks.strip`, который берёт формат маркеров из
+    `_markers()`, а не через самодельную регэксп-строку с захардкоженными
+    `<!-- harness:{name}:start -->` / `:end -->` прямо в `worker/activities.py`.
+
+    Тест меняет формат маркеров подменой `issue_blocks._markers` — ровно то,
+    что случится при следующей правке формата в одном настоящем месте. Если
+    `worker/activities.py` вырезает блок СВОЕЙ копией формата, а не вызовом
+    `issue_blocks.strip`, вырезание после подмены молча перестаёт совпадать:
+    маркеры нового формата остаются в теле и текстом попадают в сценарий
+    приёмки. С вызовом `issue_blocks.strip` вырезание следует за одним
+    источником формата и продолжает работать.
+    """
+    def custom_markers(name: str) -> tuple[str, str]:
+        return f"<!-- custom:{name}:begin -->", f"<!-- custom:{name}:finish -->"
+
+    monkeypatch.setattr(issue_blocks, "_markers", custom_markers)
+    body = issue_blocks.write("## Как принимаем\n\nтекст раздела",
+                              issue_blocks.HOWTODEMO, "   ")
+    assert a._howtodemo_block(body) == "текст раздела"
+
+
+def test_howtodemo_corrupted_approved_block_does_not_crash_the_stage(caplog):
+    """Ревью, находка 2 (Important). Непарный маркер в теле Issue — например,
+    буквально скопированный человеком из примера в документации, — раньше был
+    инертным текстом. С приоритетом утверждённого блока над разделом
+    `issue_blocks.read` кидает ValueError на такой структуре, и непойманное
+    исключение уронило бы стадию `_dev_prepare` целиком. Проверяем: тело с
+    одиночным непарным маркером не роняет разбор, критерий приёмки берётся из
+    заголовка, а в лог уходит предупреждение о повреждённом теле — молчаливый
+    отказ здесь хуже открытого.
+    """
+    body = "<!-- harness:howtodemo:start -->\n## Как принимаем\n\nтекст раздела"
+    with caplog.at_level("WARNING", logger="activities"):
+        result = a._howtodemo_block(body)
+    assert result == "текст раздела"
+    assert "тело повреждено" in caplog.text
+
+
 # ────────── требование 3: `.harness/` реально доезжает до PR ──────────
 
 def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp_path):
