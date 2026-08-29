@@ -128,3 +128,34 @@ def test_write_refuses_content_containing_other_block_markers():
             "<!-- harness:mvp-plan:start -->\nне настоящий план\n"
             "<!-- harness:mvp-plan:end -->\nконец находки",
         )
+
+
+def test_howtodemo_block_roundtrip():
+    """Критерий приёмки кладётся в тело и читается обратно."""
+    body = "описание задачи"
+    written = issue_blocks.write(body, issue_blocks.HOWTODEMO,
+                                 "Было 404, стало 405 с Allow: POST")
+    assert issue_blocks.read(written, issue_blocks.HOWTODEMO) == \
+        "Было 404, стало 405 с Allow: POST"
+    assert "описание задачи" in written
+
+
+def test_howtodemo_block_is_known_and_guarded():
+    """Блок входит в _ALL_BLOCKS: вложенные маркеры дают громкую ошибку.
+
+    Без этого содержимое с чужими маркерами тихо перезаписало бы соседний
+    блок — ровно тот молчаливый отказ, который мы вычищаем.
+    """
+    assert issue_blocks.HOWTODEMO in issue_blocks._ALL_BLOCKS
+    body = issue_blocks.write("текст", issue_blocks.GROW, "- [ ] находка")
+    with pytest.raises(ValueError):
+        issue_blocks.write(body, issue_blocks.HOWTODEMO,
+                           "<!-- harness:grow:start -->подделка<!-- harness:grow:end -->")
+
+
+def test_howtodemo_block_survives_grow_block():
+    """Два блока в одном теле не мешают друг другу."""
+    body = issue_blocks.write("текст", issue_blocks.GROW, "- [ ] находка")
+    body = issue_blocks.write(body, issue_blocks.HOWTODEMO, "сценарий")
+    assert issue_blocks.read(body, issue_blocks.GROW) == "- [ ] находка"
+    assert issue_blocks.read(body, issue_blocks.HOWTODEMO) == "сценарий"

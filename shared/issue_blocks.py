@@ -23,10 +23,13 @@ import re
 
 MVP_PLAN = "mvp-plan"
 GROW = "grow"
+# Критерий приёмки, утверждённый человеком. В теле, а не комментарием:
+# комментарий теряется в ленте, а критерий должен быть виден в задаче всегда.
+HOWTODEMO = "howtodemo"
 
 # Все известные модулю имена блоков. Добавление третьего блока должно пополнить
 # этот кортеж — no silent drift.
-_ALL_BLOCKS = (MVP_PLAN, GROW)
+_ALL_BLOCKS = (MVP_PLAN, GROW, HOWTODEMO)
 
 
 def _markers(name: str) -> tuple[str, str]:
