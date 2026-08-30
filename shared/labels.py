@@ -23,6 +23,9 @@ import re
 NEEDS_HUMAN_PREFIX = "needs-human:"
 NEEDS_HUMAN_TRIAGE = f"{NEEDS_HUMAN_PREFIX}triage"
 
+# Ждём ответа человека на заданный контуром вопрос.
+NEEDS_HUMAN_ANSWER = f"{NEEDS_HUMAN_PREFIX}answer"
+
 # Историческое имя. Оставлено ради поиска по старым Issue: сервис его больше не
 # ставит, но выборка по бэклогу до перехода всё ещё им пользуется.
 LEGACY_NEEDS_HUMAN_TRIAGE = "needs-human-triage"

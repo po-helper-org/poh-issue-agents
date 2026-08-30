@@ -145,6 +145,7 @@ async def main() -> None:
             activities.post_clarifying_question,
             activities.close_as_spam,
             activities.escalate_to_human,
+            activities.ask_question,
             activities.post_error_label,
             activities.ack_comment_seen,
             activities.mark_analyzing,

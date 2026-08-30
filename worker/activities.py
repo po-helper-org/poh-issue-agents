@@ -32,6 +32,7 @@ import forge
 github_client = forge
 import llm
 from shared import (
+    agent_comment,
     bft,
     decomposition,
     develop,
@@ -41,6 +42,7 @@ from shared import (
     markdown_fences,
     memory,
     pr_closing,
+    questions,
     repowise,
     sentry_setup,
     task_context,
@@ -211,6 +213,50 @@ def escalate_to_human(issue: IssueInput, reason: str = "") -> None:
                   "Передаю на ручной разбор.",
     )
     github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_HUMAN_TRIAGE)
+
+
+@activity.defn
+def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) -> str:
+    """Задать человеку вопрос и повесить метку ожидания.
+
+    Возвращает идентификатор ОТКРЫТОГО вопроса — только что заданного либо уже
+    висевшего. Повторный вызов второго комментария не даёт: вопрос уже в ленте,
+    и второй его экземпляр человека только запутает. Это же делает активность
+    безопасной после перезапуска прогона, когда задача жива, а прогон нет.
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+
+    already = questions.read_open(body)
+    if already is not None:
+        return already.id
+
+    question = questions.Question(
+        id=questions.next_question_id(questions.read_journal(body), kind),
+        kind=kind, text=text, options=tuple(options))
+
+    github_client.update_issue_body(issue.repo, issue.issue_number,
+                                    questions.write_open(body, question))
+
+    lines = [question.text, ""]
+    if question.options:
+        for number, option in enumerate(question.options, start=1):
+            lines.append(f"**{number}.** {option}")
+        lines.append("")
+        lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
+        lines.append("")
+        lines.append(f"```\n/harness-answer 1\n```")
+        lines.append("")
+        lines.append("или своим текстом:")
+    else:
+        lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
+    lines.append("")
+    lines.append("```\n/harness-answer здесь ваш ответ\n```")
+
+    github_client.post_comment(issue.repo, issue.issue_number,
+                               agent_comment.sign("\n".join(lines)))
+    github_client.add_label(issue.repo, issue.issue_number,
+                            labels.NEEDS_HUMAN_ANSWER)
+    return question.id
 
 
 @activity.defn
