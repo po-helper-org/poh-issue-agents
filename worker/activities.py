@@ -263,7 +263,14 @@ def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) ->
                                         questions.write_open(body, question))
 
     marker = questions.comment_marker(question.id)
-    existing_comments = github_client.list_comments(issue.repo, issue.issue_number)
+    # Повторное ревью, находка (Important). `list_comments` без пагинации
+    # читает страницу 1 — то есть самые СТАРЫЕ комментарии ленты; на задаче,
+    # где до вопроса накопилось больше её лимита, свежий комментарий с
+    # маркером туда никогда не попадает, и проверка ниже решает, что его нет.
+    # Комментарий с вопросом по построению свежий (публикуется последним),
+    # поэтому ищем среди последних — `list_recent_comments` прыгает сразу на
+    # последнюю страницу ленты вместо полного обхода.
+    existing_comments = github_client.list_recent_comments(issue.repo, issue.issue_number)
     already_commented = any(marker in (comment.get("body") or "")
                             for comment in existing_comments)
     if not already_commented:

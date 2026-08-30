@@ -22,9 +22,19 @@ def github(monkeypatch, issue):
     пропажи явной подписи в самой активности, и тест на подпись комментария
     проверял бы то, чего в проде не происходит.
 
-    `list_comments`/`get_issue` читают ту же память: активность сверяется по
-    ним, чтобы не задвоить комментарий и метку при повторном вызове (ревью,
-    находки 1 и 2).
+    `list_recent_comments`/`get_issue` читают ту же память: активность
+    сверяется по ним, чтобы не задвоить комментарий и метку при повторном
+    вызове (ревью, находки 1 и 2).
+
+    Повторное ревью, находка (Important). Раньше здесь стоял мок
+    `list_comments`, игнорировавший `limit` и всегда возвращавший ВСЮ
+    историю — то есть расходившийся с настоящей функцией именно в том
+    поведении (усечение по странице), от которого зависит корректность
+    проверки «комментарий уже есть». Такой мок не мог поймать находку про
+    длинную ленту: он был честнее прода. Активность теперь зовёт
+    `list_recent_comments`, и подмена усекает список так же, как настоящая
+    функция читает последнюю страницу ленты — отдаёт ПОСЛЕДНИЕ `limit`
+    комментариев, а не весь список.
     """
     state = {"body": issue.body, "comments": [], "labels": set()}
     monkeypatch.setattr(a.github_client, "get_issue_body",
@@ -33,8 +43,8 @@ def github(monkeypatch, issue):
                         lambda repo, number, body: state.update(body=body))
     monkeypatch.setattr(a.github_client, "post_comment",
                         lambda repo, number, body: state["comments"].append(agent_comment.sign(body)))
-    monkeypatch.setattr(a.github_client, "list_comments",
-                        lambda repo, number, limit=50: [{"body": c} for c in state["comments"]])
+    monkeypatch.setattr(a.github_client, "list_recent_comments",
+                        lambda repo, number, limit=100: [{"body": c} for c in state["comments"]][-limit:])
     monkeypatch.setattr(a.github_client, "get_issue",
                         lambda repo, number: {"labels": [{"name": l} for l in state["labels"]]})
     monkeypatch.setattr(a.github_client, "add_label",
@@ -152,3 +162,28 @@ def test_resumes_label_after_crash_between_comment_and_label(monkeypatch, github
     assert question_id == "howtodemo-1"
     assert len(github["comments"]) == 1  # не задвоил комментарий
     assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
+
+
+def test_open_question_not_reasked_on_issue_with_long_comment_history(github, issue):
+    """Повторное ревью, находка (Important). `github_client.list_comments` без
+    пагинации читает страницу 1 — то есть самые СТАРЫЕ комментарии ленты.
+    На задаче, где до вопроса накопилось больше её лимита чужих комментариев,
+    свежий комментарий с вопросом в эту выборку никогда не попадёт — и
+    повторный вызов `ask_question`, не найдя его, опубликует вопрос ВТОРОЙ
+    раз. Это подрывает ровно то свойство, которое чинила прошлая правка
+    (находки 1 и 2): идемпотентность по следствию «комментарий».
+
+    Число чужих комментариев (120) нарочно больше и лимита `list_comments`
+    (50), и лимита `list_recent_comments` (100) — тест не завязан на
+    конкретное число, а проверяет само свойство «независимо от длины ленты»."""
+    github["comments"].extend(f"чужой комментарий №{n}" for n in range(120))
+
+    first = a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
+    assert len(github["comments"]) == 121  # 120 чужих + наш с вопросом
+
+    second = a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
+
+    assert second == first == "howtodemo-1"
+    assert len(github["comments"]) == 121  # второй вызов не задвоил комментарий
+    marker = questions.comment_marker("howtodemo-1")
+    assert sum(marker in c for c in github["comments"]) == 1
