@@ -32,7 +32,6 @@ import forge
 github_client = forge
 import llm
 from shared import (
-    agent_comment,
     bft,
     decomposition,
     develop,
@@ -221,41 +220,76 @@ def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) ->
 
     Возвращает идентификатор ОТКРЫТОГО вопроса — только что заданного либо уже
     висевшего. Повторный вызов второго комментария не даёт: вопрос уже в ленте,
-    и второй его экземпляр человека только запутает. Это же делает активность
-    безопасной после перезапуска прогона, когда задача жива, а прогон нет.
+    и второй его экземпляр человека только запутает.
+
+    Ревью, находка 1 (Critical) и находка 2 (Important). У активности ТРИ
+    следствия — блок в теле, комментарий, метка, — а раньше она считала себя
+    выполненной по ПЕРВОМУ из них: ранний возврат срабатывал по признаку
+    «блок вопроса уже в теле», а тело писалось раньше остальных двух шагов.
+    Обрыв между записью тела и публикацией комментария прятал вопрос от
+    человека НАВСЕГДА — сырой JSON в теле ему не адресован, метки нет, задача
+    выпала из очереди, а следующий вызов, увидев блок, молча возвращал успех,
+    так и не опубликовав комментарий. Та же дыра была у метки: комментарий
+    уходил, `add_label` падал — и задача выпадала из выборки
+    `label:needs-human:*` без единого следа.
+
+    Починка — идемпотентность по каждому следствию ОТДЕЛЬНО: и блок, и
+    комментарий, и метка сверяются с уже сделанным и дописываются только те,
+    которых не хватает. Так активность действительно безопасна после
+    перезапуска прогона (докстринг это обещал и раньше, но обещание не
+    выполнялось).
+
+    Чтобы отличить «в ленте уже есть комментарий именно С ЭТИМ вопросом» от
+    «в ленте вообще есть наш комментарий», в текст добавлен невидимый маркер
+    `questions.comment_marker(question.id)`, привязанный к идентификатору
+    вопроса, а не к общей подписи `agent_comment.MARKER` — у задачи вопросов
+    бывает несколько, и второй не должен считать себя уже опубликованным
+    из-за комментария первого.
+
+    Явной подписи `agent_comment.sign(...)` здесь больше нет (ревью, находка
+    3, Minor): `github_client.post_comment` подписывает каждый исходящий
+    комментарий сам, в единственной точке отправки — второй вызов подписи
+    здесь был безвреден (идемпотентен), но противоречил этому месту
+    единственной ответственности и годился в антипример.
     """
     body = github_client.get_issue_body(issue.repo, issue.issue_number)
 
-    already = questions.read_open(body)
-    if already is not None:
-        return already.id
+    question = questions.read_open(body)
+    if question is None:
+        question = questions.Question(
+            id=questions.next_question_id(questions.read_journal(body), kind),
+            kind=kind, text=text, options=tuple(options))
+        github_client.update_issue_body(issue.repo, issue.issue_number,
+                                        questions.write_open(body, question))
 
-    question = questions.Question(
-        id=questions.next_question_id(questions.read_journal(body), kind),
-        kind=kind, text=text, options=tuple(options))
-
-    github_client.update_issue_body(issue.repo, issue.issue_number,
-                                    questions.write_open(body, question))
-
-    lines = [question.text, ""]
-    if question.options:
-        for number, option in enumerate(question.options, start=1):
-            lines.append(f"**{number}.** {option}")
+    marker = questions.comment_marker(question.id)
+    existing_comments = github_client.list_comments(issue.repo, issue.issue_number)
+    already_commented = any(marker in (comment.get("body") or "")
+                            for comment in existing_comments)
+    if not already_commented:
+        lines = [question.text, ""]
+        if question.options:
+            for number, option in enumerate(question.options, start=1):
+                lines.append(f"**{number}.** {option}")
+            lines.append("")
+            lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
+            lines.append("")
+            lines.append(f"```\n/harness-answer 1\n```")
+            lines.append("")
+            lines.append("или своим текстом:")
+        else:
+            lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
         lines.append("")
-        lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
+        lines.append("```\n/harness-answer здесь ваш ответ\n```")
         lines.append("")
-        lines.append(f"```\n/harness-answer 1\n```")
-        lines.append("")
-        lines.append("или своим текстом:")
-    else:
-        lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
-    lines.append("")
-    lines.append("```\n/harness-answer здесь ваш ответ\n```")
+        lines.append(marker)
+        github_client.post_comment(issue.repo, issue.issue_number, "\n".join(lines))
 
-    github_client.post_comment(issue.repo, issue.issue_number,
-                               agent_comment.sign("\n".join(lines)))
-    github_client.add_label(issue.repo, issue.issue_number,
-                            labels.NEEDS_HUMAN_ANSWER)
+    current_labels = [label["name"] for label in
+                      github_client.get_issue(issue.repo, issue.issue_number).get("labels", [])]
+    if not labels.has(current_labels, labels.NEEDS_HUMAN_ANSWER):
+        github_client.add_label(issue.repo, issue.issue_number,
+                                labels.NEEDS_HUMAN_ANSWER)
     return question.id
 
 
