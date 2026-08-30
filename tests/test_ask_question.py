@@ -17,24 +17,20 @@ def github(monkeypatch, issue):
     """Подменённый GitHub с телом, комментариями и метками в памяти.
 
     `post_comment` сам подписывает тело (`agent_comment.sign`) — так же, как
-    настоящий `github_client.post_comment` (единственная точка подписи,
-    ревью, находка 3). Подмена целиком, без этого шага, не заметила бы
-    пропажи явной подписи в самой активности, и тест на подпись комментария
-    проверял бы то, чего в проде не происходит.
+    настоящий `github_client.post_comment` (единственная точка подписи).
 
-    `list_recent_comments`/`get_issue` читают ту же память: активность
-    сверяется по ним, чтобы не задвоить комментарий и метку при повторном
-    вызове (ревью, находки 1 и 2).
-
-    Повторное ревью, находка (Important). Раньше здесь стоял мок
-    `list_comments`, игнорировавший `limit` и всегда возвращавший ВСЮ
-    историю — то есть расходившийся с настоящей функцией именно в том
-    поведении (усечение по странице), от которого зависит корректность
-    проверки «комментарий уже есть». Такой мок не мог поймать находку про
-    длинную ленту: он был честнее прода. Активность теперь зовёт
-    `list_recent_comments`, и подмена усекает список так же, как настоящая
-    функция читает последнюю страницу ленты — отдаёт ПОСЛЕДНИЕ `limit`
-    комментариев, а не весь список.
+    Третий круг ревью убрал у `ask_question` последнюю зависимость от ленты
+    комментариев: признак «комментарий уже опубликован» с этого круга живёт
+    в самом теле (`questions.Question.announced`), а не проверяется
+    перебором ленты. Поэтому фикстура НЕ подменяет никакой функции чтения
+    комментариев (ни `list_comments`, ни `list_recent_comments` — второй из
+    них в клиентах вообще больше нет, см. `worker/github_client.py` и
+    `worker/gitlab_client.py`). Если бы код `ask_question` всё же попытался
+    прочитать ленту, вызов ушёл бы в диспетчер `forge` и упал бы —
+    `list_recent_comments` у настоящего `github_client` удалена, а ничего
+    другого он для неподменённого имени не подставит. Тест-фикстура сама
+    служит проверкой того, что зависимость от ленты действительно убрана
+    целиком, а не спрятана в другом методе с тем же эффектом.
     """
     state = {"body": issue.body, "comments": [], "labels": set()}
     monkeypatch.setattr(a.github_client, "get_issue_body",
@@ -43,8 +39,6 @@ def github(monkeypatch, issue):
                         lambda repo, number, body: state.update(body=body))
     monkeypatch.setattr(a.github_client, "post_comment",
                         lambda repo, number, body: state["comments"].append(agent_comment.sign(body)))
-    monkeypatch.setattr(a.github_client, "list_recent_comments",
-                        lambda repo, number, limit=100: [{"body": c} for c in state["comments"]][-limit:])
     monkeypatch.setattr(a.github_client, "get_issue",
                         lambda repo, number: {"labels": [{"name": l} for l in state["labels"]]})
     monkeypatch.setattr(a.github_client, "add_label",
@@ -63,6 +57,7 @@ def test_question_lands_in_body_comment_and_label(github, issue):
     assert stored.id == "howtodemo-1"
     assert stored.kind == "howtodemo"
     assert stored.options == ("было 404; стало 405", "то же плюс OPTIONS")
+    assert stored.announced is True
     assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
     assert len(github["comments"]) == 1
 
@@ -80,6 +75,7 @@ def test_comment_names_the_command_verbatim(github, issue):
     assert "обычный комментарий" in comment.lower()
     assert "вариант один" in comment
     assert "<!-- issue-agent -->" in comment
+    assert questions.comment_marker("howtodemo-1") in comment
 
 
 def test_open_question_is_not_asked_twice(github, issue):
@@ -110,14 +106,15 @@ def test_question_without_options_asks_for_free_text(github, issue):
     assert questions.read_open(github["body"]).options == ()
 
 
-# --- ревью: обрыв между следствиями не должен прятать вопрос навсегда ---
+# --- третий круг ревью: признак «объявлено» в теле, а не в ленте ---
 
 def test_resumes_comment_after_crash_between_body_write_and_comment(monkeypatch, github, issue):
-    """Находка 1 (Critical). Обрыв сразу после записи тела — до правки второй
-    вызов находил блок вопроса в теле, считал вопрос уже заданным и молча
-    возвращал успех, ни разу не опубликовав комментарий. Человек не видел
-    вообще ничего: тело с сырым JSON ему не адресовано, метки нет, задача
-    выпала из очереди — и не находилась в ней уже никогда."""
+    """Обрыв сразу после записи блока вопроса (шаг 1 из докстринга активности)
+    — до самого первого круга правок второй вызов находил блок в теле,
+    считал вопрос уже заданным и молча возвращал успех, ни разу не
+    опубликовав комментарий. Признак `announced` остаётся `False`, пока
+    комментарий не ушёл по-настоящему, — второй вызов обязан доделать
+    именно недостающий комментарий, не создавая вопрос заново."""
     monkeypatch.setattr(a.github_client, "post_comment",
                         lambda repo, number, body: (_ for _ in ()).throw(RuntimeError("сеть моргнула")))
 
@@ -125,7 +122,9 @@ def test_resumes_comment_after_crash_between_body_write_and_comment(monkeypatch,
         a.ask_question(issue, "howtodemo", "Чем принимать эту задачу?", ["а"])
 
     # Тело уже записано — то самое состояние, в котором вопрос раньше терялся.
-    assert questions.read_open(github["body"]) is not None
+    stored = questions.read_open(github["body"])
+    assert stored is not None
+    assert stored.announced is False
     assert github["comments"] == []
     assert labels.NEEDS_HUMAN_ANSWER not in github["labels"]
 
@@ -136,15 +135,52 @@ def test_resumes_comment_after_crash_between_body_write_and_comment(monkeypatch,
 
     assert question_id == "howtodemo-1"
     assert len(github["comments"]) == 1  # доделал недостающее, не задвоил тело
+    assert questions.read_open(github["body"]).announced is True
     assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
 
 
-def test_resumes_label_after_crash_between_comment_and_label(monkeypatch, github, issue):
-    """Находка 2 (Important). Комментарий ушёл, `add_label` упал — до правки
-    метка не появлялась никогда: второй вызов находил блок вопроса в теле и
-    возвращался, не пытаясь ни поставить метку, ни (по счастью здесь) выслать
-    второй комментарий. Задача выпадает из выборки `label:needs-human:*`,
-    которая обязана быть полной очередью к людям."""
+def test_duplicate_comment_if_crash_between_comment_and_flag(monkeypatch, github, issue):
+    """Узкое окно, названное в докстринге `ask_question` (пункт 3): комментарий
+    успешно ушёл, а запись признака `announced=True` в тело — следующий
+    вызов `update_issue_body` — упала. Признак в сохранённом теле так и
+    остался `False`, и повторный вызов, не отличая этот случай от «комментарий
+    вообще не публиковался», честно публикует его ВТОРОЙ раз.
+
+    Это ожидаемое, сознательно допущенное поведение, а не задача на починку:
+    единственная альтернатива — проставлять признак ДО комментария — переносит
+    риск обрыва на шаг раньше и снова прячет вопрос от человека НАВСЕГДА (тот
+    самый дефект первого круга). Лишний комментарий в ленте несравнимо дешевле
+    потерянного вопроса.
+    """
+    calls = {"n": 0}
+    real_update = a.github_client.update_issue_body
+
+    def flaky_update(repo, number, body):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1-й вызов пишет блок вопроса, 2-й — признак announced
+            raise RuntimeError("сеть моргнула перед записью признака")
+        real_update(repo, number, body)
+
+    monkeypatch.setattr(a.github_client, "update_issue_body", flaky_update)
+
+    with pytest.raises(RuntimeError):
+        a.ask_question(issue, "howtodemo", "Чем принимать эту задачу?", ["а"])
+
+    assert len(github["comments"]) == 1
+    assert questions.read_open(github["body"]).announced is False
+
+    question_id = a.ask_question(issue, "howtodemo", "Чем принимать эту задачу?", ["а"])
+
+    assert question_id == "howtodemo-1"
+    assert len(github["comments"]) == 2  # окно сработало — второй экземпляр в ленте, это ожидаемо
+    assert questions.read_open(github["body"]).announced is True
+    assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
+
+
+def test_resumes_label_after_crash_between_flag_and_label(monkeypatch, github, issue):
+    """Комментарий ушёл, признак `announced=True` успешно записан, но
+    `add_label` упал следом. Оба первых следствия уже настоящие — повторный
+    вызов обязан доделать ТОЛЬКО метку, не трогая ни тело, ни комментарий."""
     monkeypatch.setattr(a.github_client, "add_label",
                         lambda repo, number, label: (_ for _ in ()).throw(RuntimeError("API упал")))
 
@@ -152,6 +188,7 @@ def test_resumes_label_after_crash_between_comment_and_label(monkeypatch, github
         a.ask_question(issue, "howtodemo", "Чем принимать эту задачу?", ["а"])
 
     assert len(github["comments"]) == 1
+    assert questions.read_open(github["body"]).announced is True
     assert labels.NEEDS_HUMAN_ANSWER not in github["labels"]
 
     monkeypatch.setattr(a.github_client, "add_label",
@@ -160,30 +197,57 @@ def test_resumes_label_after_crash_between_comment_and_label(monkeypatch, github
     question_id = a.ask_question(issue, "howtodemo", "Чем принимать эту задачу?", ["а"])
 
     assert question_id == "howtodemo-1"
-    assert len(github["comments"]) == 1  # не задвоил комментарий
+    assert len(github["comments"]) == 1  # announced уже True — не задвоил комментарий
     assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
 
 
-def test_open_question_not_reasked_on_issue_with_long_comment_history(github, issue):
-    """Повторное ревью, находка (Important). `github_client.list_comments` без
-    пагинации читает страницу 1 — то есть самые СТАРЫЕ комментарии ленты.
-    На задаче, где до вопроса накопилось больше её лимита чужих комментариев,
-    свежий комментарий с вопросом в эту выборку никогда не попадёт — и
-    повторный вызов `ask_question`, не найдя его, опубликует вопрос ВТОРОЙ
-    раз. Это подрывает ровно то свойство, которое чинила прошлая правка
-    (находки 1 и 2): идемпотентность по следствию «комментарий».
+def test_fully_completed_question_is_untouched_on_repeat_call(monkeypatch, github, issue):
+    """Вопрос уже полностью выполнен — блок с `announced=True`, комментарий,
+    метка. Новый вызов активности не должен трогать НИ ОДНО из трёх
+    следствий: ни писать тело заново, ни публиковать второй комментарий, ни
+    переставлять метку. Проверяется счётчиками вызовов, а не только длиной
+    итоговых списков — так подмена не может случайно замаскировать лишний
+    вызов, который ничего не изменил по счастливой случайности."""
+    a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
+    assert len(github["comments"]) == 1
+    assert questions.read_open(github["body"]).announced is True
 
-    Число чужих комментариев (120) нарочно больше и лимита `list_comments`
-    (50), и лимита `list_recent_comments` (100) — тест не завязан на
-    конкретное число, а проверяет само свойство «независимо от длины ленты»."""
-    github["comments"].extend(f"чужой комментарий №{n}" for n in range(120))
+    calls = {"body_writes": 0, "comments": 0, "labels": 0}
+    monkeypatch.setattr(a.github_client, "update_issue_body",
+                        lambda repo, number, body: calls.__setitem__("body_writes", calls["body_writes"] + 1))
+    monkeypatch.setattr(a.github_client, "post_comment",
+                        lambda repo, number, body: calls.__setitem__("comments", calls["comments"] + 1))
+    monkeypatch.setattr(a.github_client, "add_label",
+                        lambda repo, number, label: calls.__setitem__("labels", calls["labels"] + 1))
+
+    question_id = a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
+
+    assert question_id == "howtodemo-1"
+    assert calls == {"body_writes": 0, "comments": 0, "labels": 0}
+
+
+def test_ask_question_ignores_comment_feed_entirely(github, issue):
+    """Третий круг ревью чинил один и тот же дефект дважды именно потому, что
+    признак «уже опубликовано» жил в ленте комментариев, а не в теле:
+    сначала перебор брал первую (самую старую) страницу, потом прыжок на
+    последнюю страницу терял маркер на ленте, где число комментариев на
+    единицу больше кратного странице. С этого круга лента не читается
+    вовсе — поведение обязано не зависеть от её длины НИКАК, а не просто
+    «работать на распространённых длинах».
+
+    500 — специально больше лимитов старой (удалённой) `list_recent_comments`
+    (100 у GitHub, где раньше и терялась находка) и любого правдоподобного
+    порога пагинации: тест не завязан на конкретное число, а проверяет само
+    свойство «независимо от длины ленты».
+    """
+    github["comments"].extend(f"чужой комментарий №{n}" for n in range(500))
 
     first = a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
-    assert len(github["comments"]) == 121  # 120 чужих + наш с вопросом
+    assert len(github["comments"]) == 501  # 500 чужих + наш с вопросом
 
     second = a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
 
     assert second == first == "howtodemo-1"
-    assert len(github["comments"]) == 121  # второй вызов не задвоил комментарий
+    assert len(github["comments"]) == 501  # второй вызов не задвоил комментарий
     marker = questions.comment_marker("howtodemo-1")
     assert sum(marker in c for c in github["comments"]) == 1

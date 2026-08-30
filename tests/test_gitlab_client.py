@@ -141,22 +141,6 @@ def test_бот_определяется_логином(gl, calls, monkeypatch):
     assert [c["user"]["type"] for c in out] == ["Bot", "User"]
 
 
-def test_list_recent_comments_просит_свежие_первыми(gl, calls):
-    """Повторное ревью (Important) у `github_client.list_comments`: диспетчер
-    `forge` заводит `ask_question` на этот клиент для GitLab-репозиториев,
-    и без парного метода вызов падал бы с NotImplementedError там, где для
-    GitHub работал бы. У GitLab, в отличие от GitHub, для этого достаточно
-    `sort=desc` — страничный трюк не нужен."""
-    seen, fake = calls
-    fake.response = Resp(payload=[
-        {"id": 2, "body": "свежий", "author": {"username": "human"}},
-        {"id": 1, "body": "старый", "author": {"username": "human"}},
-    ])
-    out = gl.list_recent_comments("g/p", 7)
-    assert seen[0][2]["params"]["sort"] == "desc"
-    assert [c["body"] for c in out] == ["свежий", "старый"]
-
-
 # --- ревью ---
 
 def test_ревью_отбирает_по_маркеру_а_не_по_боту(gl, calls):

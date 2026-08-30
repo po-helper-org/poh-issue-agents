@@ -136,41 +136,6 @@ def list_comments(repo: str, issue_number: int, limit: int = 50) -> list[dict]:
     return out
 
 
-def list_recent_comments(repo: str, issue_number: int, limit: int = 100) -> list[dict]:
-    """Самые свежие комментарии — не первые `limit`, которые отдаёт `list_comments`.
-
-    Диспетчер `worker/forge.py` подставляет клиента по репозиторию под одним
-    и тем же именем: `ask_question` в `worker/activities.py` зовёт
-    `github_client.list_recent_comments(...)`, что для GitLab-репозитория
-    придёт именно сюда. Без этой функции задача на GitLab падала бы с
-    `NotImplementedError` там, где GitHub работал бы — расхождение поверхности
-    двух клиентов, которого этот модуль по своему собственному докстрингу
-    (`activities не должны знать, с каким провайдером работают`) не должен
-    допускать.
-
-    В отличие от GitHub, где на этот случай нужен трюк со страницей (см.
-    `github_client.list_recent_comments`: там у эндпоинта нет `sort`), у
-    GitLab Notes API он есть — `sort=desc` отдаёт хвост ленты одним запросом.
-    """
-    resp = _ok(_request("GET", _url(repo, f"/issues/{issue_number}/notes"),
-                        params={"per_page": min(limit, 100),
-                                "sort": "desc", "activity_filter": "only_comments"}))
-    out = []
-    for note in resp.json()[:limit]:
-        author = note.get("author") or {}
-        login = author.get("username") or ""
-        out.append({
-            "id": note.get("id"),
-            "body": note.get("body") or "",
-            "user": {
-                "login": login,
-                "type": "Bot" if bot_login() and login == bot_login() else "User",
-            },
-            "created_at": note.get("created_at"),
-        })
-    return out
-
-
 def add_reaction(repo: str, comment_id: int, content: str = "eyes",
                  issue_number: int | None = None) -> None:
     """Реакция на комментарий.

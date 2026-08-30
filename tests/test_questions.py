@@ -13,6 +13,37 @@ def test_question_roundtrip():
     assert restored == original
 
 
+def test_question_roundtrip_carries_announced_flag():
+    """Третий круг ревью: `announced` — обычное поле `Question`, участвует в
+    сериализации наравне с остальными, а не хранится где-то отдельно."""
+    original = questions.Question(id="howtodemo-1", kind="howtodemo",
+                                  text="Чем принимать?", options=("а",),
+                                  announced=True)
+    restored = questions.parse_question(questions.render_question(original))
+    assert restored == original
+    assert restored.announced is True
+
+
+def test_parse_question_defaults_announced_false_for_legacy_block():
+    """Блок, записанный версией кода ДО поля `announced` (JSON без такого
+    ключа вовсе — не порча, а более старая запись), должен читаться как
+    `announced=False`, а не падать и не подставлять `True`.
+
+    Умолчание `False`, а не `True`, — умышленный выбор (см. докстринг
+    `Question.announced`): вопрос, застрявший в дефекте первого круга (тело
+    записано, комментарий так и не ушёл), под старым кодом не имел бы
+    никакого признака вовсе, и `False` заставит комментарий наконец уйти.
+    `True` по умолчанию сделало бы это молча невозможным — снова спрятало бы
+    вопрос от человека, теперь уже насовсем.
+    """
+    legacy_payload = ("## Открытый вопрос контура\n\n```json\n"
+                      '{"id": "howtodemo-1", "kind": "howtodemo", '
+                      '"text": "Чем принимать?", "options": []}\n```')
+    restored = questions.parse_question(legacy_payload)
+    assert restored is not None
+    assert restored.announced is False
+
+
 def test_question_with_multiline_text_survives():
     """Текст вопроса бывает многострочным — форма не должна его портить."""
     original = questions.Question(id="mvp-bounds-1", kind="mvp-bounds",
@@ -213,6 +244,24 @@ def test_open_question_write_read_clear():
     cleared = questions.clear_open(body)
     assert questions.read_open(cleared) is None
     assert "описание задачи" in cleared
+
+
+def test_mark_announced_sets_flag_and_keeps_other_fields():
+    """`mark_announced` меняет только `announced`, остальные поля вопроса —
+    id, kind, text, options — переживают запись без изменений."""
+    question = questions.Question(id="howtodemo-1", kind="howtodemo",
+                                  text="Чем принимать?", options=("а", "б"))
+    body = questions.write_open("описание задачи", question)
+    assert questions.read_open(body).announced is False
+
+    body = questions.mark_announced(body, question)
+    stored = questions.read_open(body)
+    assert stored.announced is True
+    assert stored.id == question.id
+    assert stored.kind == question.kind
+    assert stored.text == question.text
+    assert stored.options == question.options
+    assert "описание задачи" in body
 
 
 def test_read_open_of_body_without_block_is_none():

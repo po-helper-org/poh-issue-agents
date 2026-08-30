@@ -80,21 +80,3 @@ def test_dispatch_workflow_бросает_ошибку_самого_клиент
     g = importlib.reload(f)
     with pytest.raises(NotImplementedError, match="локальным раннером"):
         g.dispatch_workflow("gl/project", "wf.yml")
-
-
-def test_list_recent_comments_реализован_у_обоих_провайдеров(forge, monkeypatch):
-    """Повторное ревью, находка (Important) у `github_client.list_comments`.
-    `ask_question` в `worker/activities.py` зовёт `github_client.list_recent_comments`
-    через этот же диспетчер (`github_client = forge` там). Без метода у ОБОИХ
-    клиентов GitLab-репозиторий падал бы с `NotImplementedError` ровно там,
-    где для GitHub всё работало бы — расхождение поверхности, которого этот
-    диспетчер (и `activities.py`, не знающий о провайдере) не должен видеть."""
-    monkeypatch.setenv("GITLAB_REPOS", "gl/*")
-    import forge as f
-    g = importlib.reload(f)
-    monkeypatch.setattr(g.github_client, "list_recent_comments",
-                        lambda repo, n, limit=100: ["github"])
-    monkeypatch.setattr(g.gitlab_client, "list_recent_comments",
-                        lambda repo, n, limit=100: ["gitlab"])
-    assert g.list_recent_comments("gh/project", 1) == ["github"]
-    assert g.list_recent_comments("gl/project", 1) == ["gitlab"]

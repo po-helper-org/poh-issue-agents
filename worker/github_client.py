@@ -469,47 +469,6 @@ def list_comments(repo: str, issue_number: int, limit: int = 50) -> list[dict]:
     return resp.json()[:limit]
 
 
-def list_recent_comments(repo: str, issue_number: int, limit: int = 100) -> list[dict]:
-    """Самые СВЕЖИЕ комментарии — а не первые `limit`, которые отдаёт `list_comments`.
-
-    У этого эндпоинта GitHub нет `sort`/`direction` (в отличие от варианта
-    «список комментариев по репозиторию целиком»): он всегда отдаёт страницы
-    по возрастанию времени. `list_comments` без указания номера страницы
-    поэтому всегда читает страницу 1 — то есть САМЫЕ СТАРЫЕ `limit`
-    комментариев. На короткой ленте разницы не видно (там всего одна
-    страница), но на задаче с историей длиннее `limit` свежий комментарий в
-    эту выборку не попадёт никогда — и с ростом ленты будет только дальше
-    от неё.
-
-    Здесь нужны именно свежие: используется для проверки «этот комментарий
-    уже опубликован», а публикуется он всегда последним. Полный обход всех
-    страниц, как в `ensure_labels_exist` (там нужен ПОЛНЫЙ список меток —
-    без этого нельзя), для одной проверки избыточен: у задачи бывают сотни
-    комментариев, и обход ради каждого вызова идемпотентной активности —
-    лишняя нагрузка на GitHub. Вместо этого прыгаем сразу на последнюю
-    страницу: её номер GitHub кладёт в заголовок `Link` (`rel="last"`) уже
-    в ответе на первый запрос, `requests` разбирает его сам (`resp.links`).
-    Итого один запрос, если лента укладывается в одну страницу, и два —
-    если нет, независимо от того, сколько всего комментариев в ленте.
-    """
-    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
-    per_page = min(limit, 100)
-    resp = requests.get(
-        url, headers=_auth_headers(repo), params={"per_page": per_page, "page": 1}, timeout=30
-    )
-    resp.raise_for_status()
-    last = resp.links.get("last")
-    if last is None:
-        return resp.json()  # одна страница — она же последняя, дальше ходить некуда
-    last_page = int(urllib.parse.parse_qs(urllib.parse.urlparse(last["url"]).query)["page"][0])
-    resp = requests.get(
-        url, headers=_auth_headers(repo),
-        params={"per_page": per_page, "page": last_page}, timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
 def list_linked_prs(repo: str, issue_number: int, limit: int = 20) -> list[dict]:
     """PR, кросс-ссылающиеся на issue (Timeline API).
 
