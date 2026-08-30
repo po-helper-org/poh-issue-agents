@@ -90,3 +90,114 @@ def test_effective_handles_chain_of_supersessions():
                            supersedes="a-2"),
     ]
     assert [d.answer for d in questions.effective(decisions)] == ["третье"]
+
+
+def test_next_question_id_uses_max_number_not_count():
+    """Ревью, находка 1 (Critical): номер — максимум среди записей вида, а не их количество.
+
+    Тело Issue правят руками. Если запись `howtodemo-2` из середины журнала
+    пропала, счётчик «по количеству» увидит одну запись вида `howtodemo` и
+    выдаст `howtodemo-2` — идентификатор, который уже занят записью `-3`.
+    Правильный ответ — `howtodemo-4`, следующий за максимальным номером.
+    """
+    decisions = [
+        questions.Decision(question_id="howtodemo-1", kind="howtodemo",
+                           question="q", answer="a"),
+        questions.Decision(question_id="howtodemo-3", kind="howtodemo",
+                           question="q", answer="a"),
+    ]
+    assert questions.next_question_id(decisions, "howtodemo") == "howtodemo-4"
+
+
+def test_next_question_id_ignores_ids_without_trailing_number():
+    """Запись с id без числового хвоста не участвует в подсчёте номера, но и не роняет функцию.
+
+    Такое бывает после ручной правки тела Issue. Максимум среди пригодных для
+    счёта записей — 2, значит следующий номер — 3, а не «мусорный» id ломает
+    вычисление.
+    """
+    decisions = [
+        questions.Decision(question_id="howtodemo-руками-испорчено", kind="howtodemo",
+                           question="q", answer="a"),
+        questions.Decision(question_id="howtodemo-2", kind="howtodemo",
+                           question="q", answer="a"),
+    ]
+    assert questions.next_question_id(decisions, "howtodemo") == "howtodemo-3"
+
+
+def test_effective_breaks_cycle_of_supersedes_instead_of_dropping_everything():
+    """Ревью, находка 2 (Important): цикл ссылок не должен стирать журнал целиком.
+
+    До правки `{a-1 supersedes a-2, a-2 supersedes a-1}` считал отменёнными
+    ОБЕ записи — действующего решения не оставалось вовсе, а это молчаливый
+    отказ, худший класс дефектов в этом контуре. Журнал только пополняется,
+    значит отмена всегда приходит позже отменяемого: `a-1` не может отменить
+    `a-2`, если `a-2` записан следом за ней. Значит в силе остаётся именно
+    `a-2` (её отменяющая ссылка на `a-1` не в счёт как «вперёд по времени»,
+    а вот ссылка `a-2 -> a-1` действует, потому что `a-1` идёт раньше).
+    """
+    decisions = [
+        questions.Decision(question_id="a-1", kind="a", question="q",
+                           answer="первое", supersedes="a-2"),
+        questions.Decision(question_id="a-2", kind="a", question="q",
+                           answer="второе", supersedes="a-1"),
+    ]
+    live = questions.effective(decisions)
+    assert [d.answer for d in live] == ["второе"]
+    assert len(decisions) == 2, "журнал не должен терять записи"
+
+
+def test_effective_ignores_reference_to_nonexistent_record():
+    """Ссылка на несуществующую запись и раньше не ломала действующие — не сломать при правке цикла."""
+    decisions = [
+        questions.Decision(question_id="a-1", kind="a", question="q",
+                           answer="единственное", supersedes="a-несуществует"),
+    ]
+    assert [d.answer for d in questions.effective(decisions)] == ["единственное"]
+
+
+def test_parse_question_of_two_fences_in_one_chunk_is_none():
+    """Ревью, находка 3: в переданном куске больше одного забора кода — это порча, а не выбор первого попавшегося.
+
+    Контракт `parse_question`/`parse_journal` — на вход идёт содержимое ОДНОГО
+    размеченного блока (то, что вернул `issue_blocks.read(body, <имя>)`), а не
+    тело Issue целиком. Тело, где рядом лежат и блок вопроса, и блок журнала
+    (ровно сценарий ревьюера), в эту функцию попадать не должно — но если
+    такое всё же случилось, брать первый забор молча означало бы тихо
+    подставить чужие данные вместо честного отказа: до правки этот вызов
+    возвращал бы настоящий `Question`, собранный из ПЕРВОГО забора (блока
+    вопроса), хотя кусок целиком уже испорчен второй записью рядом.
+    """
+    q = questions.Question(id="a-1", kind="a", text="t")
+    chunk = questions.render_question(q) + "\n\n" + questions.render_journal([])
+    assert questions.parse_question(chunk) is None
+
+
+def test_parse_journal_of_two_fences_in_one_chunk_is_empty():
+    """Тот же случай, что и test_parse_question_of_two_fences_in_one_chunk_is_none, со стороны журнала.
+
+    До правки первый забор (блок журнала с одной записью) разбирался бы
+    успешно, и функция вернула бы непустой список вместо `[]`.
+    """
+    d = questions.Decision(question_id="a-1", kind="a", question="q", answer="a")
+    chunk = questions.render_journal([d]) + "\n\n" + questions.render_question(
+        questions.Question(id="b-1", kind="b", text="t"))
+    assert questions.parse_journal(chunk) == []
+
+
+def test_parse_question_of_truncated_json_inside_fence_is_none():
+    """Ревью, находка 4: сценарий из докстринга `_unwrap` — обрывок JSON ВНУТРИ валидного забора — не был проверен ни разу.
+
+    `test_parse_question_of_garbage_is_none` гоняет вход без забора кода
+    вовсе (`"не json вовсе"`) — там срабатывает ветка «забора нет», и до
+    `except (ValueError, TypeError)` в `_unwrap` выполнение не доходит.
+    Этот тест доходит: забор есть, `json.loads` внутри него падает.
+    """
+    payload = "## Открытый вопрос контура\n\n```json\n{\"id\": \"a-1\", \"kind\":\n```"
+    assert questions.parse_question(payload) is None
+
+
+def test_parse_journal_of_truncated_json_inside_fence_is_empty():
+    """Тот же обрыв JSON внутри забора, что и у вопроса, со стороны журнала."""
+    payload = "## Решения по задаче\n\n```json\n[{\"question_id\": \"a-1\",\n```"
+    assert questions.parse_journal(payload) == []

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 _FENCE = "```"
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*\n(?P<payload>.*?)\n```", re.DOTALL)
@@ -59,14 +59,26 @@ def _wrap(payload: object, header: str) -> str:
 
 
 def _unwrap(payload: str | None):
-    """JSON из забора кода. Ничего не разобралось — None."""
+    """JSON из ЕДИНСТВЕННОГО забора кода.
+
+    На вход — содержимое ОДНОГО размеченного блока (то, что возвращает
+    `issue_blocks.read(body, <имя блока>)`), а не тело Issue целиком: у
+    журнала и у вопроса свои отдельные блоки, и смешивать их не
+    предполагается.
+
+    Ничего не разобралось — None. Заборов кода в переданном куске БОЛЬШЕ
+    ОДНОГО — тоже None (ревью, находка 3, Critical): это признак испорченного
+    входа (например, вызвали не на содержимом блока, а на теле целиком, где
+    рядом лежит ещё один блок), и выбор первого попавшегося забора молча
+    подставил бы чужую запись вместо честного отказа.
+    """
     if not payload:
         return None
-    match = _JSON_BLOCK.search(payload)
-    if not match:
+    matches = list(_JSON_BLOCK.finditer(payload))
+    if len(matches) != 1:
         return None
     try:
-        return json.loads(match.group("payload"))
+        return json.loads(matches[0].group("payload"))
     except (ValueError, TypeError):
         # Тело Issue правят руками, и обрывок JSON там появится рано или поздно.
         # Это отсутствие записи, а не отказ: вызывающий решит, что делать.
@@ -80,6 +92,15 @@ def render_question(question: Question) -> str:
 
 
 def parse_question(payload: str | None) -> Question | None:
+    """Вопрос из содержимого ОДНОГО размеченного блока, не из тела Issue целиком.
+
+    `payload` — то, что вернул `issue_blocks.read(body, issue_blocks.QUESTION)`,
+    то есть уже вырезанный блок. Тело Issue целиком не годится в аргумент: в
+    нём рядом может лежать ещё и блок журнала решений, а тогда заборов кода
+    в куске окажется больше одного и `_unwrap` вернёт None как для любой
+    другой порчи (ревью, находка 3) — вместо того чтобы гадать, какой забор
+    имелся в виду.
+    """
     data = _unwrap(payload)
     if not isinstance(data, dict):
         return None
@@ -99,6 +120,13 @@ def render_journal(decisions: Sequence[Decision]) -> str:
 
 
 def parse_journal(payload: str | None) -> list[Decision]:
+    """Журнал из содержимого ОДНОГО размеченного блока, не из тела Issue целиком.
+
+    `payload` — то, что вернул `issue_blocks.read(body, issue_blocks.ANSWERS)`.
+    Тот же контракт, что у `parse_question` (см. её докстринг и `_unwrap`):
+    кусок с более чем одним забором кода — испорченный вход, результат — []
+    (ревью, находка 3), а не журнал, собранный из первого попавшегося забора.
+    """
     data = _unwrap(payload)
     if not isinstance(data, list):
         return []
@@ -119,18 +147,57 @@ def parse_journal(payload: str | None) -> list[Decision]:
     return result
 
 
+_TRAILING_NUMBER = re.compile(r"-(\d+)$")
+
+
 def next_question_id(decisions: Sequence[Decision], kind: str) -> str:
     """Следующий идентификатор вопроса этого вида.
 
     Номер берётся из журнала, а не из счётчика в прогоне: прогон теряется,
     журнал остаётся. Идентификатор читаем человеком — он попадает в
     комментарий и в историю задачи.
+
+    Ревью, находка 1 (Critical). Номер — МАКСИМАЛЬНЫЙ среди записей этого
+    вида плюс единица, а не количество таких записей: тело Issue правят
+    руками, и если запись из середины журнала пропала, счёт «по количеству»
+    выдал бы уже занятый идентификатор (два `howtodemo-3` в журнале ломают
+    уникальность `question_id`, на которой держатся `effective()`, сам
+    журнал и указатель текущего вопроса в прогоне). Записи, чей id не
+    оканчивается на `-<число>` (испорчены вручную или принадлежат другому
+    формату), в подсчёте номера не участвуют, но из журнала не выбрасываются
+    — это забота `parse_journal`, не этой функции.
     """
-    used = sum(1 for decision in decisions if decision.kind == kind)
-    return f"{kind}-{used + 1}"
+    max_used = 0
+    for decision in decisions:
+        if decision.kind != kind:
+            continue
+        match = _TRAILING_NUMBER.search(decision.question_id)
+        if match:
+            max_used = max(max_used, int(match.group(1)))
+    return f"{kind}-{max_used + 1}"
 
 
 def effective(decisions: Sequence[Decision]) -> list[Decision]:
-    """Действующие решения: без тех, что кем-то отменены."""
-    superseded = {d.supersedes for d in decisions if d.supersedes}
-    return [d for d in decisions if d.question_id not in superseded]
+    """Действующие решения: без тех, что кем-то отменены.
+
+    Ревью, находка 2 (Important). Журнал только пополняется, значит отмена
+    ВСЕГДА приходит позже отменяемого во времени. Поэтому запись считается
+    отменённой, только если ссылающаяся на неё запись `supersedes` стоит
+    ПОЗЖЕ неё в журнале (по индексу), а не просто существует где-то рядом.
+    До правки простое множество идентификаторов-целей не смотрело на
+    порядок: цикл ссылок (`a-1 supersedes a-2`, `a-2 supersedes a-1`) отменял
+    ОБЕ записи разом, и действующего решения не оставалось вовсе — молчаливый
+    отказ, худший класс дефектов в этом контуре. С учётом порядка цикл рвётся
+    сам собой: ссылка «вперёд по времени» просто не в счёт, отдельная защита
+    от циклов не нужна. Ссылка на несуществующую запись по-прежнему ни на что
+    не влияет — такого id нет среди индексов, и вычёркивать нечего.
+    """
+    index_by_id = {d.question_id: i for i, d in enumerate(decisions)}
+    superseded_indices: set[int] = set()
+    for i, d in enumerate(decisions):
+        if not d.supersedes:
+            continue
+        target_index = index_by_id.get(d.supersedes)
+        if target_index is not None and target_index < i:
+            superseded_indices.add(target_index)
+    return [d for i, d in enumerate(decisions) if i not in superseded_indices]
