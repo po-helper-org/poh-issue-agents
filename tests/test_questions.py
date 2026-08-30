@@ -1,6 +1,6 @@
 import pytest
 
-from shared import questions
+from shared import issue_blocks, questions
 
 
 def test_question_roundtrip():
@@ -201,3 +201,48 @@ def test_parse_journal_of_truncated_json_inside_fence_is_empty():
     """Тот же обрыв JSON внутри забора, что и у вопроса, со стороны журнала."""
     payload = "## Решения по задаче\n\n```json\n[{\"question_id\": \"a-1\",\n```"
     assert questions.parse_journal(payload) == []
+
+
+def test_open_question_write_read_clear():
+    question = questions.Question(id="howtodemo-1", kind="howtodemo",
+                                  text="Чем принимать?", options=("а", "б"))
+    body = questions.write_open("описание задачи", question)
+    assert questions.read_open(body) == question
+    assert "описание задачи" in body
+
+    cleared = questions.clear_open(body)
+    assert questions.read_open(cleared) is None
+    assert "описание задачи" in cleared
+
+
+def test_read_open_of_body_without_block_is_none():
+    assert questions.read_open("просто описание") is None
+    assert questions.read_open(None) is None
+
+
+def test_append_decision_accumulates_and_keeps_order():
+    """Журнал пополняется, порядок записей сохраняется."""
+    body = questions.append_decision("описание", questions.Decision(
+        question_id="howtodemo-1", kind="howtodemo", question="q1", answer="a1"))
+    body = questions.append_decision(body, questions.Decision(
+        question_id="howtodemo-2", kind="howtodemo", question="q2", answer="a2",
+        supersedes="howtodemo-1"))
+    journal = questions.read_journal(body)
+    assert [d.question_id for d in journal] == ["howtodemo-1", "howtodemo-2"]
+    assert [d.answer for d in questions.effective(journal)] == ["a2"]
+    assert "описание" in body
+
+
+def test_question_block_and_journal_coexist_with_other_blocks():
+    """Четыре блока в одном теле не мешают друг другу."""
+    body = issue_blocks.write("описание", issue_blocks.GROW, "- [ ] находка")
+    body = issue_blocks.write(body, issue_blocks.HOWTODEMO, "критерий")
+    body = questions.write_open(body, questions.Question(
+        id="mvp-bounds-1", kind="mvp-bounds", text="Что в MVP?"))
+    body = questions.append_decision(body, questions.Decision(
+        question_id="howtodemo-1", kind="howtodemo", question="q", answer="a"))
+
+    assert issue_blocks.read(body, issue_blocks.GROW) == "- [ ] находка"
+    assert issue_blocks.read(body, issue_blocks.HOWTODEMO) == "критерий"
+    assert questions.read_open(body).id == "mvp-bounds-1"
+    assert [d.question_id for d in questions.read_journal(body)] == ["howtodemo-1"]

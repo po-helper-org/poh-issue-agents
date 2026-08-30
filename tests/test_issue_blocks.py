@@ -191,3 +191,9 @@ def test_strip_raises_on_corrupted_markers():
     body = "текст\n<!-- harness:howtodemo:start -->\nобрезано"
     with pytest.raises(ValueError):
         issue_blocks.strip(body, issue_blocks.HOWTODEMO)
+
+
+def test_question_and_answers_blocks_are_known():
+    """Оба блока в реестре: порча тела даёт громкую ошибку, а не перезапись."""
+    assert issue_blocks.QUESTION in issue_blocks._ALL_BLOCKS
+    assert issue_blocks.ANSWERS in issue_blocks._ALL_BLOCKS

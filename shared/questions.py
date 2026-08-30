@@ -201,3 +201,38 @@ def effective(decisions: Sequence[Decision]) -> list[Decision]:
         if target_index is not None and target_index < i:
             superseded_indices.add(target_index)
     return [d for i, d in enumerate(decisions) if i not in superseded_indices]
+
+
+from shared import issue_blocks  # noqa: E402  (внизу — модуль выше не зависит от блоков)
+
+
+def read_open(body: str | None) -> Question | None:
+    """Открытый вопрос из тела Issue. Нет блока или он испорчен — None."""
+    try:
+        return parse_question(issue_blocks.read(body, issue_blocks.QUESTION))
+    except ValueError:
+        # Тело повреждено непарным маркером. Для вызывающего это «вопроса
+        # нет»: решать, что делать с повреждённым телом, — не наша забота.
+        return None
+
+
+def write_open(body: str | None, question: Question) -> str:
+    return issue_blocks.write(body, issue_blocks.QUESTION, render_question(question))
+
+
+def clear_open(body: str | None) -> str:
+    return issue_blocks.strip(body, issue_blocks.QUESTION)
+
+
+def read_journal(body: str | None) -> list[Decision]:
+    try:
+        return parse_journal(issue_blocks.read(body, issue_blocks.ANSWERS))
+    except ValueError:
+        return []
+
+
+def append_decision(body: str | None, decision: Decision) -> str:
+    """Дописать решение в журнал. Журнал только пополняется."""
+    journal = read_journal(body)
+    journal.append(decision)
+    return issue_blocks.write(body, issue_blocks.ANSWERS, render_journal(journal))
