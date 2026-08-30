@@ -316,6 +316,121 @@ def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) ->
     return question.id
 
 
+# Реакции на пустую команду: «?!» и «Отказ» в наборе GitHub. Реакции, а не
+# комментарий: пустая команда — оговорка, и отвечать на неё абзацем значит
+# засорять ленту задачи.
+_EMPTY_ANSWER_REACTIONS = ("confused", "-1")
+
+
+def _record_decision(issue: IssueInput, body: str, question: questions.Question,
+                     answer: str, supersedes: str = "") -> None:
+    """Записать решение в журнал, закрыть вопрос, снять метку ожидания."""
+    body = questions.append_decision(body, questions.Decision(
+        question_id=question.id, kind=question.kind, question=question.text,
+        answer=answer, supersedes=supersedes))
+    github_client.update_issue_body(issue.repo, issue.issue_number,
+                                    questions.clear_open(body))
+    github_client.remove_label(issue.repo, issue.issue_number,
+                               labels.NEEDS_HUMAN_ANSWER)
+
+
+@activity.defn
+def answer_question(issue: IssueInput, question_id: str, text: str,
+                    comment_id: int | None) -> str:
+    """Принять ответ человека на открытый вопрос.
+
+    `accepted`    — решение записано, ожидание снято.
+    `confirm`     — толкование показано, ждём второго ответа.
+    `empty`       — команда без содержания, вопрос остался открытым.
+    `no-question` — вопроса не задавали.
+    `reasked`     — блок вопроса пропал из тела, вопрос задан заново.
+
+    Номер и свободный текст разведены намеренно: выбирая номер, человек
+    утверждает текст, который прочитал дословно, — толковать нечего. Свободный
+    текст контур истолкует заново в следующей задаче (`_interpret_answer`),
+    здесь же толкование заменено прямой записью текста — `_confirm_free_text`
+    просто показывает человеку, что записал, дословно.
+
+    Комментарии здесь передаются в `github_client.post_comment` НЕ обёрнутыми
+    в `agent_comment.sign(...)`: подпись ставится один раз, внутри самого
+    `post_comment` (см. её докстринг и `worker/activities.py:ask_question`) —
+    повторная подпись здесь задвоила бы маркер агента в исходящем тексте.
+    """
+    answer = (text or "").strip()
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    question = questions.read_open(body)
+
+    if question is None:
+        if not question_id:
+            # Вопроса не задавали вовсе. Молчание здесь неотличимо от
+            # проглоченной команды.
+            github_client.post_comment(
+                issue.repo, issue.issue_number,
+                "Сейчас я не задавал вопроса — отвечать не на что.")
+            return "no-question"
+
+        # Прогон ждёт ответа, а блока в теле нет: его стёрли или переписали
+        # тело руками. Варианты НЕ перегенерируем: старый комментарий с
+        # нумерацией остался в ленте, и новая нумерация сделала бы ответ «2»
+        # двусмысленным.
+        journal = questions.read_journal(body)
+        kind = question_id.rsplit("-", 1)[0] or "answer"
+
+        # Пропавший `question_id` в журнал никогда не попадал: блок исчез ДО
+        # того, как на него ответили, значит записи о нём в ANSWERS нет и
+        # `next_question_id` по журналу его не видит. Без подсказки счётчик
+        # честно решит, что вопросов вида `kind` ещё не было, и выдаст ТОТ ЖЕ
+        # номер, что стоял в пропавшем блоке (для "howtodemo-1" без записей в
+        # журнале — снова "howtodemo-1") — новый вопрос обманчиво совпал бы
+        # со старым, уже недействительным идентификатором. Подставляем
+        # пропавший id фиктивной записью ТОЛЬКО для расчёта следующего
+        # номера — в реальный журнал (и в тело Issue) она не попадает.
+        seeded = [*journal, questions.Decision(
+            question_id=question_id, kind=kind, question="", answer="")]
+        revived = questions.Question(
+            id=questions.next_question_id(seeded, kind), kind=kind,
+            text="Вопрос пропал из тела задачи — прежние варианты недействительны.",
+            options=())
+        body = questions.write_open(body, revived)
+        github_client.update_issue_body(issue.repo, issue.issue_number, body)
+        github_client.post_comment(issue.repo, issue.issue_number,
+            "Вопрос пропал из тела задачи, прежние варианты **недействительны**.\n\n"
+            "Ответьте своим текстом:\n\n```\n/harness-answer здесь ваш ответ\n```")
+
+        # Признак — ПОСЛЕ успешной публикации, тем же приёмом, что и в
+        # `ask_question` (см. её докстринг, пункты 1-3): иначе будущий вызов
+        # `ask_question` для того же вида вопроса увидит `announced=False` и
+        # опубликует комментарий ещё раз, хотя он уже ушёл прямо здесь.
+        body = questions.mark_announced(body, revived)
+        github_client.update_issue_body(issue.repo, issue.issue_number, body)
+
+        github_client.add_label(issue.repo, issue.issue_number,
+                                labels.NEEDS_HUMAN_ANSWER)
+        return "reasked"
+
+    if not answer:
+        if comment_id is not None:
+            for reaction in _EMPTY_ANSWER_REACTIONS:
+                github_client.add_reaction(issue.repo, comment_id, reaction)
+        return "empty"
+
+    if answer.isdigit() and 1 <= int(answer) <= len(question.options):
+        _record_decision(issue, body, question, question.options[int(answer) - 1])
+        return "accepted"
+
+    return _confirm_free_text(issue, body, question, answer)
+
+
+def _confirm_free_text(issue: IssueInput, body: str, question: questions.Question,
+                       answer: str) -> str:
+    """Показать, что понял, и ждать подтверждения. Толкование — в Task 6."""
+    github_client.post_comment(issue.repo, issue.issue_number,
+        f"Записал так:\n\n{answer}\n\n"
+        "Если верно — подтвердите:\n\n```\n/harness-answer да\n```\n\n"
+        "Если нет — пришлите поправленный текст той же командой.")
+    return "confirm"
+
+
 @activity.defn
 def set_phase(repo: str, issue_number: int, phase: str) -> None:
     """Метка фазы с соблюдением инварианта «одна фаза — одна метка».
