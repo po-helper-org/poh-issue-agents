@@ -155,9 +155,15 @@ def test_command_labels_match_commands_constant():
 
 
 def test_catalog_includes_all_command_labels():
-    """Новая команда в commands._COMMANDS должна быть и в каталоге."""
+    """Новая команда в commands._COMMANDS должна быть и в каталоге.
+
+    Команды из NO_RUN_LABEL_COMMANDS не запускают дорогую стадию, поэтому
+    для них проверка пропускается — см. test_harness_answer_does_not_produce_run_labels.
+    """
     catalog = label_catalog.all_labels()
     for cmd in commands._COMMANDS.values():
+        if cmd in commands.NO_RUN_LABEL_COMMANDS:
+            continue
         assert commands.run_label(cmd) in catalog, f"run:{cmd} отсутствует в каталоге"
         assert commands.done_label(cmd) in catalog, f"done:{cmd} отсутствует в каталоге"
         assert commands.failed_label(cmd) in catalog, f"failed:{cmd} отсутствует в каталоге"
@@ -175,12 +181,28 @@ def _build_expected_command_labels():
     """Вспомогательная функция: собрать все командные метки из констант."""
     result = set()
     for cmd in commands._COMMANDS.values():
+        # Команды из NO_RUN_LABEL_COMMANDS не запускают дорогую стадию —
+        # меток прогона у них нет, см. test_harness_answer_does_not_produce_run_labels.
+        if cmd in commands.NO_RUN_LABEL_COMMANDS:
+            continue
         result.add(commands.run_label(cmd))
         result.add(commands.done_label(cmd))
         result.add(commands.failed_label(cmd))
     # Legacy labels
     result.update(commands._LEGACY_RUNNING_LABELS.get(commands.ANALYZE, ()))
     return frozenset(result)
+
+
+def test_harness_answer_does_not_produce_run_labels():
+    """Ответ человека — не дорогая стадия, меток прогона у него нет.
+
+    Каталог выводит run:/done:/failed: из перечня команд автоматически;
+    без исключения на задачах появилось бы `run:harness-answer`.
+    """
+    known = label_catalog.all_labels()
+    for label in ("run:harness-answer", "done:harness-answer",
+                  "failed:harness-answer"):
+        assert label not in known, label
 
 
 # --- протокольные метки ---
@@ -276,11 +298,15 @@ def test_catalog_grows_with_lifecycle():
 
 def test_catalog_grows_with_commands():
     """Регрессия: новая команда, не попавшая в каталог, роняет набор.
-    
-    Аналогично test_catalog_grows_with_lifecycle, но для команд.
+
+    Аналогично test_catalog_grows_with_lifecycle, но для команд. Команды из
+    NO_RUN_LABEL_COMMANDS в проверку не входят — у них меток прогона нет по
+    замыслу, см. test_harness_answer_does_not_produce_run_labels.
     """
     catalog = label_catalog.all_labels()
     for cmd in commands._COMMANDS.values():
+        if cmd in commands.NO_RUN_LABEL_COMMANDS:
+            continue
         assert commands.run_label(cmd) in catalog, (
             f"команда {cmd} из commands._COMMANDS отсутствует в каталоге. "
             f"Добавь её в commands._COMMANDS или обнови каталог."
@@ -336,11 +362,25 @@ def test_every_phase_is_present():
 
 
 def test_command_labels_cover_all_three_outcomes():
+    """Команды из NO_RUN_LABEL_COMMANDS без дорогой стадии в проверку не
+    входят — у них меток прогона в каталоге нет по замыслу."""
     names = catalog()
     for command in commands._COMMANDS.values():
+        if command in commands.NO_RUN_LABEL_COMMANDS:
+            continue
         assert f"{commands.RUN_PREFIX}{command}" in names
         assert f"{commands.DONE_PREFIX}{command}" in names
         assert f"{commands.FAILED_PREFIX}{command}" in names
+
+
+def test_harness_answer_is_absent_from_rich_catalog_run_labels():
+    """catalog() отдельно от all_labels() — её берёт bootstrap_labels.py и
+    реально заводит метки в GitHub. Исключения из all_labels() без исключения
+    здесь всё равно завело бы run:harness-answer в репозитории."""
+    names = catalog()
+    for label in ("run:harness-answer", "done:harness-answer",
+                  "failed:harness-answer"):
+        assert label not in names, label
 
 
 def test_control_labels_are_present():
