@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 import activities as a
-from shared import task_context
+from shared import issue_blocks, task_context
 
 
 TITLE = "Починить кнопку"
@@ -662,6 +662,60 @@ def test_howtodemo_block_preserves_a_four_backtick_fence_legitimately_inside_it(
     assert "хвост" not in result
 
 
+def test_howtodemo_approved_block_wins_over_heading():
+    """Утверждённый блок старше раздела: человек подтвердил именно его."""
+    body = issue_blocks.write("## Как принимаем\n\nстарый текст",
+                              issue_blocks.HOWTODEMO, "утверждённый критерий")
+    assert a._howtodemo_block(body) == "утверждённый критерий"
+
+
+def test_howtodemo_empty_approved_block_falls_back_to_heading():
+    """Пустой блок не должен затирать написанный человеком раздел."""
+    body = issue_blocks.write("## Как принимаем\n\nтекст раздела",
+                              issue_blocks.HOWTODEMO, "   ")
+    assert a._howtodemo_block(body) == "текст раздела"
+
+
+def test_howtodemo_empty_block_removal_follows_issue_blocks_marker_format(monkeypatch):
+    """Ревью, находка 1 (Important). Вырезание пустого утверждённого блока
+    должно идти через `issue_blocks.strip`, который берёт формат маркеров из
+    `_markers()`, а не через самодельную регэксп-строку с захардкоженными
+    `<!-- harness:{name}:start -->` / `:end -->` прямо в `worker/activities.py`.
+
+    Тест меняет формат маркеров подменой `issue_blocks._markers` — ровно то,
+    что случится при следующей правке формата в одном настоящем месте. Если
+    `worker/activities.py` вырезает блок СВОЕЙ копией формата, а не вызовом
+    `issue_blocks.strip`, вырезание после подмены молча перестаёт совпадать:
+    маркеры нового формата остаются в теле и текстом попадают в сценарий
+    приёмки. С вызовом `issue_blocks.strip` вырезание следует за одним
+    источником формата и продолжает работать.
+    """
+    def custom_markers(name: str) -> tuple[str, str]:
+        return f"<!-- custom:{name}:begin -->", f"<!-- custom:{name}:finish -->"
+
+    monkeypatch.setattr(issue_blocks, "_markers", custom_markers)
+    body = issue_blocks.write("## Как принимаем\n\nтекст раздела",
+                              issue_blocks.HOWTODEMO, "   ")
+    assert a._howtodemo_block(body) == "текст раздела"
+
+
+def test_howtodemo_corrupted_approved_block_does_not_crash_the_stage(caplog):
+    """Ревью, находка 2 (Important). Непарный маркер в теле Issue — например,
+    буквально скопированный человеком из примера в документации, — раньше был
+    инертным текстом. С приоритетом утверждённого блока над разделом
+    `issue_blocks.read` кидает ValueError на такой структуре, и непойманное
+    исключение уронило бы стадию `_dev_prepare` целиком. Проверяем: тело с
+    одиночным непарным маркером не роняет разбор, критерий приёмки берётся из
+    заголовка, а в лог уходит предупреждение о повреждённом теле — молчаливый
+    отказ здесь хуже открытого.
+    """
+    body = "<!-- harness:howtodemo:start -->\n## Как принимаем\n\nтекст раздела"
+    with caplog.at_level("WARNING", logger="activities"):
+        result = a._howtodemo_block(body)
+    assert result == "текст раздела"
+    assert "тело повреждено" in caplog.text
+
+
 # ────────── требование 3: `.harness/` реально доезжает до PR ──────────
 
 def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp_path):
@@ -910,3 +964,46 @@ def test_focus_rule_survives_repository_own_rules(monkeypatch, tmp_path):
 
     assert "Свои правила репозитория" in task, "правила репозитория потерялись"
     assert "пройдёт ли сценарий без этого" in task, "правило фокуса не доехало"
+
+
+def test_howtodemo_block_russian_headings():
+    """Раздел приёмки, написанный по-русски, распознаётся наравне с английским.
+
+    Отказ, ради которого это написано: poh-demo-checkout#163 приехал с
+    разделом `## Как принимаем` и блоками curl «было/должно работать»,
+    прошёл разработку, PR и мерж — а приёмка всё это время отвечала
+    «проверять нечем».
+    """
+    for heading in ("## Как принимаем", "## Как проверяем",
+                    "## Приёмка", "## Приемка", "## Как демонстрируем",
+                    "### Как принимаем"):
+        body = f"вступление\n\n{heading}\n\nБыло 404, стало 405\n\n## Другое\nхвост"
+        assert a._howtodemo_block(body) == "Было 404, стало 405", heading
+
+
+def test_howtodemo_russian_heading_as_part_of_another_word_does_not_trigger():
+    """`## Приёмка-агент: как он устроен` — это описание, а не сценарий."""
+    body = "## Приёмка-агент: как он устроен\n\nОписание агента, не сценарий."
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_russian_heading_with_empty_body_is_no_scenario():
+    """Заголовок есть, под ним пусто — сценария нет (R7).
+
+    Пустой критерий хуже отсутствующего: он создаёт видимость приёмки.
+    """
+    body = "## Как принимаем\n\n\n## Другое\nхвост"
+    assert a._howtodemo_block(body) == ""
+
+
+def test_howtodemo_russian_heading_inside_code_fence_is_not_a_scenario():
+    """Заголовок, процитированный примером, сценарием не считается (R8)."""
+    body = (
+        "Шаблон задачи:\n\n"
+        "```markdown\n"
+        "## Как принимаем\n"
+        "тут пишем сценарий\n"
+        "```\n\n"
+        "Настоящего раздела нет."
+    )
+    assert a._howtodemo_block(body) == ""

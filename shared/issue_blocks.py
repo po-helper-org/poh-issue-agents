@@ -23,10 +23,13 @@ import re
 
 MVP_PLAN = "mvp-plan"
 GROW = "grow"
+# Критерий приёмки, утверждённый человеком. В теле, а не комментарием:
+# комментарий теряется в ленте, а критерий должен быть виден в задаче всегда.
+HOWTODEMO = "howtodemo"
 
 # Все известные модулю имена блоков. Добавление третьего блока должно пополнить
 # этот кортеж — no silent drift.
-_ALL_BLOCKS = (MVP_PLAN, GROW)
+_ALL_BLOCKS = (MVP_PLAN, GROW, HOWTODEMO)
 
 
 def _markers(name: str) -> tuple[str, str]:
@@ -102,3 +105,31 @@ def write(body: str | None, name: str, content: str) -> str:
         return f"{body[:match.start()]}{block}{body[match.end():]}"
     tail = "" if body.endswith("\n") else "\n"
     return f"{body}{tail}\n{block}\n"
+
+
+def strip(body: str | None, name: str) -> str:
+    """Тело без блока `name` целиком, вместе с обоими маркерами.
+
+    Блока нет — тело возвращается как было (ничего не вырезаем).
+
+    Ревью, находка 1 (Important). До этой функции `worker/activities.py` вырезал
+    пустой утверждённый блок HowToDemo самодельной регэксп-строкой с буквальными
+    `<!-- harness:{name}:start -->` / `:end -->` — единственное место во всём
+    репозитории, где формат маркеров был захардкожен ВНЕ этого модуля. Смени
+    формат в `_markers()` — и тот дубликат молча перестал бы совпадать: вырезание
+    стало бы пустой операцией, а пустой блок снова прилипал бы хвостом к разделу
+    человека, то есть вернулся бы ровно тот дефект, ради которого писалась
+    приоритетность блока над разделом. `strip()` переиспользует `_matched_block`
+    — тот же код, что уже используют read()/write() и что покрыт тестами на
+    структуру маркеров, — а не заводит вторую регэксп-вырезку.
+
+    Поднимает ValueError, если структура маркеров блока повреждена (см.
+    докстринг модуля и `_matched_block`) — молчаливо резать повреждённое тело
+    так же плохо, как молчаливо резать по неверному формату.
+    """
+    start, end = _markers(name)
+    body = body or ""
+    match = _matched_block(body, name, start, end)
+    if not match:
+        return body
+    return body[:match.start()] + body[match.end():]
