@@ -15,9 +15,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+
+# Логгер по правилам shared/ (см. shared/task_context.py): модуль остаётся
+# чистым — логирование не сеть и не GitHub, а без него порча тела тонет без
+# следа (ревью, находка 2).
+logger = logging.getLogger(__name__)
 
 _FENCE = "```"
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*\n(?P<payload>.*?)\n```", re.DOTALL)
@@ -206,13 +212,39 @@ def effective(decisions: Sequence[Decision]) -> list[Decision]:
 from shared import issue_blocks  # noqa: E402  (внизу — модуль выше не зависит от блоков)
 
 
+class CorruptedJournal(RuntimeError):
+    """Блок журнала решений (`ANSWERS`) в теле Issue есть, но JSON внутри не разбирается.
+
+    Ревью, находка 1 (Critical). Не тот же случай, что ValueError из
+    `issue_blocks.read`: там порчены МАРКЕРЫ (парная разметка сломана), а
+    здесь маркеры целы — испорчено содержимое между ними (тело правили
+    руками, JSON внутри оборван). `append_decision`, увидев такое, обязана
+    отказать, а не молча переписать блок единственной новой записью — иначе
+    вся прежняя история решений исчезает без следа, без исключения и без
+    строки в логе.
+
+    RuntimeError, а не ValueError или голый `Exception`: в `worker/workflows.py`
+    (комментарий «Граница по типу») именно RuntimeError размечает сбои стадии
+    как невосстановимые ретраем — повторный вызов активности не починит
+    испорченный JSON в теле Issue, чинить может только человек, а значит
+    ошибка обязана дойти до него, а не тонуть в автоматическом повторе.
+    """
+
+
 def read_open(body: str | None) -> Question | None:
-    """Открытый вопрос из тела Issue. Нет блока или он испорчен — None."""
+    """Открытый вопрос из тела Issue. Нет блока или он испорчен — None.
+
+    Ревью, находка 2 (Important). Порча МАРКЕРОВ раньше проглатывалась молча:
+    `ValueError` гасился без единого следа в логе, неотличимо от «блока
+    никогда не было». Логируем причину тем же приёмом, что и
+    `worker/activities.py` для блока HOWTODEMO (`_howtodemo_block`), и только
+    потом деградируем до None.
+    """
     try:
         return parse_question(issue_blocks.read(body, issue_blocks.QUESTION))
-    except ValueError:
-        # Тело повреждено непарным маркером. Для вызывающего это «вопроса
-        # нет»: решать, что делать с повреждённым телом, — не наша забота.
+    except ValueError as exc:
+        logger.warning("тело повреждено для блока %s — вопроса нет: %s",
+                       issue_blocks.QUESTION, exc)
         return None
 
 
@@ -225,14 +257,48 @@ def clear_open(body: str | None) -> str:
 
 
 def read_journal(body: str | None) -> list[Decision]:
+    """Журнал решений из тела Issue. Нет блока или он испорчен — [].
+
+    Ревью, находка 2 (Important), тот же случай, что у `read_open`: порча
+    маркеров раньше проглатывалась молча, теперь — с предупреждением в лог.
+    """
     try:
         return parse_journal(issue_blocks.read(body, issue_blocks.ANSWERS))
-    except ValueError:
+    except ValueError as exc:
+        logger.warning("тело повреждено для блока %s — журнал пуст: %s",
+                       issue_blocks.ANSWERS, exc)
         return []
 
 
 def append_decision(body: str | None, decision: Decision) -> str:
-    """Дописать решение в журнал. Журнал только пополняется."""
-    journal = read_journal(body)
+    """Дописать решение в журнал. Журнал только пополняется.
+
+    Ревью, находка 1 (Critical). Раньше запись шла через `read_journal`,
+    которая ЛЮБУЮ порчу блока — включая «маркеры целы, JSON внутри оборван»
+    — превращала в пустой список, неотличимый от «журнала никогда не было».
+    `append_decision` в этом случае считала журнал пустым и переписывала блок
+    одной новой записью: прежние решения исчезали бесследно.
+
+    Чтобы отличить два случая, читаем блок сами (`issue_blocks.read`, не
+    `read_journal`) и проверяем: содержимое непустое, а `_unwrap` не вернул
+    список — значит разобрать его не удалось, это порча, и двигаться дальше
+    нельзя. Легитимный пустой журнал (блок с `[]`) от порчи так отличается:
+    там `_unwrap` успешно возвращает пустой список, а не None и не что-то
+    другое. Тело при отказе не меняется — `issue_blocks.write` до него не
+    доходит.
+    """
+    raw = issue_blocks.read(body, issue_blocks.ANSWERS)
+    if raw is not None and raw.strip() and not isinstance(_unwrap(raw), list):
+        raise CorruptedJournal(
+            f"журнал решений повреждён: блок {issue_blocks.ANSWERS!r} в теле Issue "
+            "есть, но JSON внутри не разбирается (похоже на ручную правку тела, "
+            "оборвавшую запись). Отказываю дописывать решение "
+            f"{decision.question_id!r} ({decision.kind!r}), чтобы не переписать блок "
+            "единственной новой записью и не стереть прежнюю историю решений. "
+            "Почини JSON в блоке ANSWERS в теле Issue вручную (или восстанови его "
+            "из истории правок Issue) и повтори команду. Начало испорченного "
+            f"содержимого блока: {raw.strip()[:200]!r}"
+        )
+    journal = parse_journal(raw)
     journal.append(decision)
     return issue_blocks.write(body, issue_blocks.ANSWERS, render_journal(journal))
