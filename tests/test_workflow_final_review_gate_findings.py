@@ -22,6 +22,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
+from activities import ConflictingOpenQuestion
 from shared import lifecycle
 from shared.workflow_types import (
     ClassificationResult,
@@ -602,6 +603,136 @@ async def test_criterion_question_resets_the_park_deadline():
     assert new_remaining_hours > 24, (
         "срок ответа на вопрос обязан отсчитываться заново (72 часа), "
         f"а не от остатка исходной парковки (осталось {new_remaining_hours:.1f} ч)")
+
+
+# ---------------------------------------------------------------------------
+# F2 (Important, второй круг финального ревью) — регресс правки I2 выше.
+# Повторный вход в гейт ПРИ УЖЕ ОТКРЫТОМ вопросе не обязан продлевать срок.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reopening_the_gate_with_an_open_question_does_not_reset_the_deadline():
+    """Без правки: `self._phase_since = workflow.now()` в ветке «вопрос
+    гейта» (`_start_development`) стоит БЕЗУСЛОВНО, а не только при ПЕРВОЙ
+    постановке. Повторный `build-me` при уже открытом вопросе (вебхук
+    доставляет каждое событие ДВАЖДЫ — см. докстринг `_answer_open_
+    question`; дежурный или человек вполне мог прислать решение снова, пока
+    критерий не найден) заново заходит в `_start_development`, `ask_
+    question` идемпотентно возвращает id ТОГО ЖЕ вопроса (не публикуя
+    второй комментарий) — а срок парковки без правки отсчитывается заново
+    НА КАЖДЫЙ такой заход. Дедлайн превращается в «N часов с последнего
+    шороха» — ровно то, против чего в этом файле заведён абсолютный предел
+    парковки (`_park_timeout`, правило R3).
+
+    Без правки второй `awaiting()` покажет `deadline_epoch`, сдвинутый на
+    интервал между двумя `build-me` (здесь — вперёд на два часа
+    относительно первого), — тест падает на `assert second == first`.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      i2_criterion_absent, options_stub, ask_stub,
+                                      dev_forbidden],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "ask" in _calls)
+            await _await_quiescence(env, handle)
+            first = await handle.query(IssueLifecycle.awaiting)
+            assert first is not None
+
+            # Пауза между двумя «в разработку» — достаточно большая, чтобы
+            # регресс (сброс срока НА КАЖДЫЙ заход) был виден отчётливо, а
+            # не потерялся в паре секунд обработки сигналов.
+            await env.sleep(2 * 3600)
+
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: _calls.count("ask") >= 2)
+            await _await_quiescence(env, handle)
+            second = await handle.query(IssueLifecycle.awaiting)
+            assert second is not None
+
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert second.deadline_epoch == first.deadline_epoch, (
+        "повторный вход в гейт ПРИ УЖЕ ОТКРЫТОМ вопросе не должен продлевать "
+        f"срок парковки (было {first.deadline_epoch}, стало {second.deadline_epoch})")
+    assert "development" not in _calls
+
+
+# ---------------------------------------------------------------------------
+# F4 (Important, второй круг финального ревью): конфликт вопросов
+# (`ConflictingOpenQuestion`, находка I5) не должен ронять весь цикл.
+# ---------------------------------------------------------------------------
+
+_f4_ask_calls = {"n": 0}
+
+
+@activity.defn(name="read_acceptance_criterion")
+async def f4_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@activity.defn(name="ask_question")
+async def f4_ask_conflicts(issue: IssueInput, kind: str, text: str,
+                           options: list[str]) -> str:
+    # Детерминированный конфликт: в теле уже открыт вопрос ДРУГОГО вида
+    # (находка I5) — повторный вызов с теми же аргументами получит ТОТ ЖЕ
+    # отказ, ретрай его не лечит.
+    _f4_ask_calls["n"] += 1
+    _calls.append("ask")
+    raise ConflictingOpenQuestion(
+        f"вопрос вида 'mvp-bounds' (id='mvp-bounds-1') уже открыт — нельзя "
+        f"задать поверх него вопрос вида {kind!r}")
+
+
+@activity.defn(name="report_criterion_gate_stall")
+async def f4_notify(issue: IssueInput, reason: str) -> None:
+    _calls.append("notified")
+
+
+@pytest.mark.asyncio
+async def test_ask_question_conflict_does_not_kill_the_lifecycle():
+    """Без правки: вызов `ask_question` в `_start_development` не обёрнут ни
+    в try/except, ни в список нерепетируемых типов исключений. Стандартная
+    `RetryPolicy(maximum_attempts=3)` трижды дёргает заглушку тем же
+    заведомо провальным запросом, а когда попытки исчерпаны — падение уходит
+    наружу и роняет ВЕСЬ `IssueLifecycle` (тот же класс отказа, что чинит
+    защита `answer_question`, находка I1, и `read_acceptance_criterion`).
+
+    Без правки `handle.result()` ниже бросает `WorkflowFailureError`
+    (сценарий даже не доходит до `issue_closed`), а `_f4_ask_calls["n"]`
+    доходит до 3 — тест падает и на количестве попыток, и на самом отказе.
+    """
+    _calls.clear()
+    _f4_ask_calls["n"] = 0
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      f4_criterion_absent, options_stub,
+                                      f4_ask_conflicts, f4_notify, dev_forbidden],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "notified" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()  # без правки — WorkflowFailureError здесь
+
+    assert _f4_ask_calls["n"] == 1, (
+        "детерминированный конфликт не должен повторяться ретраями — "
+        f"заглушка вызвана {_f4_ask_calls['n']} раз(а)")
+    assert "notified" in _calls, "отказ обязан стать заметным (Sentry/комментарий)"
+    assert "development" not in _calls
 
 
 # ---------------------------------------------------------------------------

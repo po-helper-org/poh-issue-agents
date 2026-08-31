@@ -2380,15 +2380,77 @@ class IssueLifecycle:
                     start_to_close_timeout=timedelta(minutes=5),
                     retry_policy=RetryPolicy(maximum_attempts=1),
                 )
-                self._open_question = await workflow.execute_activity(
-                    activities.ask_question,
-                    args=[issue, "howtodemo",
-                          "**Не вижу, чем принимать эту задачу.** "
-                          "Разработку не начинаю, пока не будет критерия готовности.",
-                          options],
-                    start_to_close_timeout=timedelta(minutes=3),
-                    retry_policy=RetryPolicy(maximum_attempts=3),
-                )
+                # Находка F2 (Important, второй круг финального ревью).
+                # Запоминаем ДО вызова `ask_question`, был ли вопрос уже
+                # открыт, — см. комментарий у сброса `_phase_since` ниже:
+                # решает именно это, а не сам факт вызова.
+                question_already_open = bool(self._open_question)
+                try:
+                    self._open_question = await workflow.execute_activity(
+                        activities.ask_question,
+                        args=[issue, "howtodemo",
+                              "**Не вижу, чем принимать эту задачу.** "
+                              "Разработку не начинаю, пока не будет критерия готовности.",
+                              options],
+                        start_to_close_timeout=timedelta(minutes=3),
+                        # Находка F4 (Important, второй круг финального
+                        # ревью). `ConflictingOpenQuestion` (находка I5) —
+                        # ДЕТЕРМИНИРОВАННЫЙ конфликт: в теле уже открыт
+                        # вопрос ДРУГОГО вида. Без списка нерепетируемых
+                        # типов три попытки трижды дёргали бы GitHub тем же
+                        # заведомо провальным запросом, прежде чем активность
+                        # упадёт. Сверка идёт по имени класса исключения, а
+                        # не по иерархии, — тем же приёмом, что и
+                        # `non_retryable_error_types=["RuntimeError"]` у
+                        # стадий FNR выше по файлу.
+                        retry_policy=RetryPolicy(
+                            maximum_attempts=3,
+                            non_retryable_error_types=["ConflictingOpenQuestion"],
+                        ),
+                    )
+                except Exception as e:
+                    # Находка F4 (Important, второй круг финального ревью).
+                    # Вызов раньше не был обёрнут вовсе: единственный отказ
+                    # (детерминированный конфликт выше или устойчивая
+                    # недоступность GitHub) улетал наружу и ронял ВЕСЬ
+                    # `IssueLifecycle` — Issue теряла владельца состояния
+                    # целиком. Гейт обязан пережить и то, и другое — тем же
+                    # приёмом, что и защита `read_acceptance_criterion` чуть
+                    # выше: остаёмся на парковке той же фазы, вопрос не
+                    # задан, а следующий сигнал (человек, автостарт, дежурный)
+                    # снова вызовет гейт.
+                    #
+                    # Уведомление — БЕЗ дедупликации по `self._criterion_
+                    # gate_notified`: этот флаг сбрасывается в `False` строкой
+                    # выше на КАЖДОЙ повторной попытке (сразу после успешного
+                    # чтения критерия), так что «одно на серию» здесь всё
+                    # равно не получилось бы — сериями владеет отказ ЧТЕНИЯ,
+                    # а не отказ ПОСТАНОВКИ вопроса. Отдельный флаг под это
+                    # решили не заводить: `ConflictingOpenQuestion` — редкий
+                    # детерминированный край, а не длящийся аутейдж, и
+                    # предпочли простоту `report_answer_question_failure`
+                    # (находка I1) — уведомляем на каждый отказ, а не
+                    # исхитряемся с ещё одним состоянием, которое пришлось бы
+                    # нести через continue-as-new.
+                    workflow.logger.warning(
+                        "не смог задать вопрос критерия приёмки: %s",
+                        _failure_reason(e))
+                    if workflow.patched("issue-lifecycle-ask-question-failure-safe"):
+                        try:
+                            await workflow.execute_activity(
+                                activities.report_criterion_gate_stall,
+                                args=[issue, _failure_reason(e)],
+                                start_to_close_timeout=timedelta(seconds=30),
+                                retry_policy=RetryPolicy(maximum_attempts=5),
+                            )
+                        except Exception as notify_exc:
+                            # Уведомление не имеет права ронять то, что оно
+                            # уведомляет (тот же приём, что у `report_
+                            # criterion_gate_stall` двумя экранами выше).
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе постановки "
+                                "вопроса гейта: %s", _failure_reason(notify_exc))
+                    return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
                 # Находка I2 (Important, финальное ревью). Вопрос задаётся
                 # ВОЗВРАТОМ В ТУ ЖЕ ФАЗУ — `_enter` при совпадении фазы не
                 # трогает `_phase_since` (см. её докстринг), а срок парковки
@@ -2398,6 +2460,22 @@ class IssueLifecycle:
                 # считаные минуты — спека A26 обещает 72 часа. Вопрос — новое,
                 # отдельное ожидание со своим сроком, а не хвост уже идущей
                 # парковки; отсчёт обязан начаться заново.
+                #
+                # НО только В ПЕРВЫЙ РАЗ, когда указателя ещё не было
+                # (находка F2, Important, второй круг финального ревью —
+                # регресс правки выше). Безусловный сброс означал: повторный
+                # `build-me`/автостарт ПРИ УЖЕ ОТКРЫТОМ вопросе (вебхук
+                # доставляет каждое событие ДВАЖДЫ — см. докстринг
+                # `_answer_open_question`, а человек или дежурный вполне
+                # может прислать решение снова, пока критерий не найден)
+                # заново заходил сюда, `ask_question` идемпотентно возвращал
+                # id ТОГО ЖЕ вопроса (не публикуя второй комментарий — см. её
+                # докстринг), а срок ответа отсчитывался с нуля НА КАЖДЫЙ
+                # такой заход. Дедлайн превращался в «N часов с последнего
+                # шороха» — ровно то, против чего в этом файле заведён
+                # абсолютный предел парковки (`_park_timeout`, правило R3):
+                # вопрос — не НОВОЕ ожидание, если он уже был открыт до этого
+                # вызова.
                 #
                 # `workflow.patched` здесь не нужен: проверено напрямую —
                 # длительность таймера/парковки не входит в проверку
@@ -2422,7 +2500,8 @@ class IssueLifecycle:
                 # прямо, а не молчу: смешивать её с правкой самого срока
                 # означало бы либо раздувать этот коммит, либо чинить
                 # доставку сигналов наспех.
-                self._phase_since = workflow.now()
+                if not question_already_open:
+                    self._phase_since = workflow.now()
                 # Ждём в READY_FOR_DEV: та же фаза, что и до вопроса, поэтому
                 # write_label=False — метка `ready-for-dev` уже стоит, вопрос
                 # не меняет то, что видно как состояние Issue снаружи.
