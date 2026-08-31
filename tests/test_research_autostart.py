@@ -165,6 +165,15 @@ async def child_develop_dispatch(issue: IssueInput, branch: str) -> None:
     _calls.append("develop")
 
 
+# Гейт критерия приёмки (задача 8): `_start_development` перед передачей в
+# разработку читает критерий из тела Issue. Этот файл проверяет автостарт
+# исследования, а не гейт — критерий уже есть, чтобы разработка (там, где до
+# неё вообще доходит — `develop_autostart=True`) стартовала молча, без вопроса.
+@activity.defn(name="read_acceptance_criterion")
+async def criterion_present(issue: IssueInput) -> str:
+    return "было 404; стало 405"
+
+
 def _deadlines(research: bool, develop: bool = False):
     @activity.defn(name="read_deadlines")
     async def stub() -> Deadlines:
@@ -185,9 +194,9 @@ async def _run_until_phase(research_autostart: bool, develop_autostart: bool = F
                                       gate, classify, duplicate,
                                       score, post_priority, mark_running, finish, ack,
                                       prepare, stage_ok, publish, cleanup, publish_error,
-                                      ready, develop, decompose, publish_plan, 
+                                      ready, develop, decompose, publish_plan,
                                       phase_stub, no_questions, child_develop_begin,
-                                      child_develop_dispatch]):
+                                      child_develop_dispatch, criterion_present]):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
 

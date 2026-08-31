@@ -185,6 +185,15 @@ DEV_STEPS = [dev_begin_local, dev_dispatch_stub, dev_prepare_ok, dev_announce_ok
              dev_agent_ok, dev_followups_ok, dev_checks_ok, dev_publish_ok]
 
 
+# Гейт критерия приёмки (задача 8): `_start_development` перед передачей в
+# разработку читает критерий из тела Issue. Этот файл проверяет уточнение
+# после аналитики, а не гейт — критерий уже есть, чтобы разработка стартовала
+# молча, без вопроса.
+@activity.defn(name="read_acceptance_criterion")
+async def criterion_present(issue: IssueInput) -> str:
+    return "было 404; стало 405"
+
+
 @activity.defn(name="decompose_issue")
 async def decompose(issue: IssueInput, branch: str) -> dict:
     _calls.append("decompose")
@@ -217,7 +226,7 @@ def _questions_then_none():
 BASE = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub, phase_stub,
         gate_ok, classify_feature, duplicate_none, score_p1, post_priority, escalate,
         mark_running, finish, ack, prepare, stage_ok, publish, cleanup, publish_error,
-        ready, develop, decompose, publish_plan, ask, *DEV_STEPS]
+        ready, develop, decompose, publish_plan, ask, criterion_present, *DEV_STEPS]
 
 
 async def _await_phase(env, handle, expected: str, tries: int = 300) -> str:

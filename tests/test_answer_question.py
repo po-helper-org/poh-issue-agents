@@ -351,6 +351,12 @@ def test_confirmation_records_answer_and_amendments(github, issue, monkeypatch):
     assert "старое решение" in " ".join(d.answer for d in journal), \
         "отменённая запись видна в журнале"
 
+    # Правка меняет решение по ПРОШЛОМУ вопросу вида `howtodemo` — назначение
+    # по виду (задача 8, A28) обязано отразить это в блоке HOWTODEMO так же,
+    # как отразило бы прямое решение по нему, иначе блок остался бы со старым
+    # («старое решение»), хотя журнал уже отменил его правкой.
+    assert issue_blocks.read(github["body"], issue_blocks.HOWTODEMO) == "наоборот"
+
 
 def test_model_failure_keeps_the_question_open(github, issue, monkeypatch):
     """Модель отказала — вопрос стоит, человек получает честный текст."""
@@ -738,3 +744,51 @@ def test_discard_draft_has_no_block_name_parameter():
     поведенческий тест), но и по самой сигнатуре функции, опечаткой в вызове.
     """
     assert list(inspect.signature(issue_blocks.discard_draft).parameters) == ["body"]
+
+
+# --- задача 8: решение по критерию приёмки уходит в блок HOWTODEMO (A28) ---
+
+def test_acceptance_decision_lands_in_the_howtodemo_block(github, issue):
+    """Решение по критерию приёмки читает подготовка задачи — из блока (A28).
+
+    Журнал ANSWERS общий для всех видов вопросов; приёмка HowToDemo смотрит
+    не в него, а в блок HOWTODEMO — без этого назначения решение легло бы
+    только в журнал, и `read_acceptance_criterion` продолжал бы видеть пустой
+    блок даже после того, как человек ответил.
+    """
+    _open(github)
+    assert a.answer_question(issue, "howtodemo-1", "1", 101) == "accepted"
+
+    assert issue_blocks.read(github["body"], issue_blocks.HOWTODEMO) == \
+        "было 404; стало 405"
+
+
+def test_read_acceptance_criterion_reads_the_howtodemo_block(github, issue):
+    """`read_acceptance_criterion` — тонкая обёртка над тем же блоком (A28).
+
+    Не гоняет модель (`propose_acceptance_options` — отдельная активность):
+    читает ровно то, что `_howtodemo_block` уже умеет находить в теле Issue —
+    утверждённый блок HOWTODEMO либо раздел по заголовку.
+    """
+    assert a.read_acceptance_criterion(issue) == ""
+
+    github["body"] = issue_blocks.write(
+        github["body"], issue_blocks.HOWTODEMO, "было 404; стало 405")
+
+    assert a.read_acceptance_criterion(issue) == "было 404; стало 405"
+
+
+def test_non_howtodemo_decision_does_not_touch_the_howtodemo_block(github, issue):
+    """Назначение — только для видов, у которых оно объявлено (`howtodemo`).
+
+    Вопрос другого вида не должен молча протекать в чужой блок — иначе блок
+    HOWTODEMO стал бы свалкой решений по любому поводу.
+    """
+    github["body"] = questions.write_open(github["body"], questions.Question(
+        id="scope-1", kind="scope", text="Что входит в MVP?",
+        options=("только API", "API и UI")))
+    github["labels"].add(labels.NEEDS_HUMAN_ANSWER)
+
+    assert a.answer_question(issue, "scope-1", "1", 101) == "accepted"
+
+    assert issue_blocks.read(github["body"], issue_blocks.HOWTODEMO) is None

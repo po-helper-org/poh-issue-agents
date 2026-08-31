@@ -32,6 +32,7 @@ import forge
 github_client = forge
 import llm
 from shared import (
+    acceptance_proposal,
     answer_interpretation,
     bft,
     decomposition,
@@ -330,6 +331,26 @@ _EMPTY_ANSWER_REACTIONS = ("confused", "-1")
 # исключением постфактум.
 _MAX_OPTION_NUMBER_DIGITS = 4
 
+# Помимо журнала, решение уходит туда, где его ждёт механизм, задавший вопрос
+# (A28: приёмка HowToDemo читает критерий из блока HOWTODEMO, а не из журнала
+# решений — журнал общий для всех видов вопросов, и заставлять приёмщика
+# разбирать его целиком означало бы держать знание о формате журнала в двух
+# независимых местах). Журнал общий; назначение объявляет вид вопроса. Без
+# этого правила журнал стал бы вторым источником правды о критерии — решение
+# лежало бы в ANSWERS, а `read_acceptance_criterion` (и приёмка) продолжали бы
+# видеть пустой блок HOWTODEMO.
+_DECISION_DESTINATION = {"howtodemo": issue_blocks.HOWTODEMO}
+
+
+def _place_decision(body: str, kind: str, answer: str) -> str:
+    """Тело с ответом, положенным в блок, который читает вид вопроса `kind`.
+
+    Вид без известного назначения (любой, кроме `howtodemo` сегодня) тело не
+    трогает — решению по нему довольно журнала.
+    """
+    block = _DECISION_DESTINATION.get(kind)
+    return issue_blocks.write(body, block, answer) if block else body
+
 
 def _record_decision(issue: IssueInput, body: str, question: questions.Question,
                      answer: str, supersedes: str = "") -> None:
@@ -355,6 +376,7 @@ def _record_decision(issue: IssueInput, body: str, question: questions.Question,
     body = questions.append_decision(body, questions.Decision(
         question_id=question.id, kind=question.kind, question=question.text,
         answer=answer, supersedes=supersedes))
+    body = _place_decision(body, question.kind, answer)
     body = questions.clear_open(body)
     body = questions.clear_draft(body, issue_ref=f"{issue.repo}#{issue.issue_number}")
     github_client.update_issue_body(issue.repo, issue.issue_number, body)
@@ -495,6 +517,44 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
         return "accepted"
 
     return _confirm_free_text(issue, body, question, answer)
+
+
+@activity.defn
+def propose_acceptance_options(issue: IssueInput) -> list[str]:
+    """Варианты критерия приёмки от модели. Отказала — пустой список.
+
+    Пустой список НЕ пропускает задачу дальше: вопрос всё равно задаётся,
+    просто без вариантов, свободным текстом (`ask_question` уже умеет это —
+    см. её докстринг и `Question.options`).
+    """
+    try:
+        options = llm.extract(
+            acceptance_proposal.SYSTEM_PROMPT,
+            f"# {issue.title}\n\n{issue.body or ''}",
+            acceptance_proposal.AcceptanceOptions,
+            model=llm.MODEL_GATE,
+        )
+    except Exception as err:
+        activity.logger.warning("варианты критерия не построились: %s", err)
+        return []
+    return [acceptance_proposal.render_option(option) for option in options.options]
+
+
+@activity.defn
+def read_acceptance_criterion(issue: IssueInput) -> str:
+    """Критерий приёмки: утверждённый блок HOWTODEMO либо раздел в теле Issue.
+
+    Отдельная активность, а не чтение в воркфлоу: тело Issue живёт снаружи, и
+    ходить за ним из воркфлоу нельзя — реплей обязан быть детерминированным.
+
+    Переиспользует `_howtodemo_block` — ту же функцию, которой уже пользуется
+    `_dev_prepare` для сборки контекста задачи (см. её докстринг): критерий
+    приёмки и сценарий HowToDemo — одно и то же поле тела Issue, и заводить
+    вторую логику чтения означало бы держать два источника правды о том, что
+    считается утверждённым блоком, а что — разделом по заголовку.
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    return _howtodemo_block(body)
 
 
 def _interpret_answer(question: questions.Question,
@@ -681,6 +741,7 @@ def _apply_interpretation(issue: IssueInput, body: str, question: questions.Ques
     body = questions.append_decision(body, questions.Decision(
         question_id=question.id, kind=question.kind, question=question.text,
         answer=interpretation.answer))
+    body = _place_decision(body, question.kind, interpretation.answer)
     for amendment in interpretation.amendments:
         journal = questions.read_journal(body)
         previous = next((d for d in journal
@@ -697,6 +758,12 @@ def _apply_interpretation(issue: IssueInput, body: str, question: questions.Ques
                                                    previous.kind),
             kind=previous.kind, question=previous.question,
             answer=amendment.answer, supersedes=amendment.question_id))
+        # Правка меняет решение по ПРОШЛОМУ вопросу того же вида — например,
+        # человек пересматривает ранее принятый критерий приёмки в том же
+        # ответе, где отвечает на текущий. Назначение по виду не знает о
+        # порядке во времени, только о виде: последняя запись в блоке обязана
+        # быть последней ПО ЖУРНАЛУ, и `append_decision` выше уже это дал.
+        body = _place_decision(body, previous.kind, amendment.answer)
     github_client.update_issue_body(issue.repo, issue.issue_number,
                                     questions.clear_open(body))
     github_client.remove_label(issue.repo, issue.issue_number,

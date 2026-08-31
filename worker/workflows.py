@@ -25,7 +25,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared import bft, labels, lifecycle
+    from shared import bft, commands, labels, lifecycle
     from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE, RESEARCH
     from shared.workflow_ids import (
         analysis_workflow_id,
@@ -392,6 +392,11 @@ class IssueLifecycle:
         # ответа. Потолок — из `Deadlines`, вместе с остальными тумблерами.
         self._followup_rounds = 0
         self._answered_comment_ids: list[int] = []
+        # Идентификатор открытого вопроса к человеку. Пусто — вопроса нет.
+        # Прогон хранит ТОЛЬКО указатель: содержание вопроса живёт в теле
+        # Issue (`shared.questions`) — копия здесь разошлась бы с телом при
+        # первой правке руками.
+        self._open_question = ""
         self._followup_max_rounds = Deadlines().followup_max_rounds
         # Сколько раз человек вернул этап на пересборку (rework intent).
         # Потолок нужен, чтобы пара «переделай» ↔ «переделал» не стояла по
@@ -765,6 +770,7 @@ class IssueLifecycle:
             self._followup_rounds = carried.followup_rounds
             self._answered_comment_ids = list(carried.answered_comment_ids)
             self._rework_rounds = carried.rework_rounds
+            self._open_question = carried.open_question
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -797,6 +803,7 @@ class IssueLifecycle:
             followup_rounds=self._followup_rounds,
             answered_comment_ids=list(self._answered_comment_ids),
             rework_rounds=self._rework_rounds,
+            open_question=self._open_question,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -1860,6 +1867,23 @@ class IssueLifecycle:
             return await self._agent_event(decision)
         if decision == AGENT_ANALYZE:
             return await self._analysis_requested(issue)
+        if (isinstance(decision, UserComment) and self._open_question
+                and workflow.patched("issue-lifecycle-question-answer")):
+            # Гейт критерия приёмки задал вопрос — маркер обязателен: у
+            # прогонов, припаркованных здесь ДО этой задачи, указателя
+            # `self._open_question` в истории нет и быть не может, а значит
+            # эта ветка для них попросту недостижима на реплее; без маркера
+            # реплей всё равно упал бы, не найдя действие, которое исполнил
+            # старый код на этом же месте.
+            nxt = await self._answer_open_question(issue, decision)
+            if nxt is not None:
+                return nxt
+            # Не команда `/harness-answer` — вопрос всё ещё открыт, а
+            # обычная реплика ответом не считается (A5). Диалог по
+            # припаркованной задаче (`_answer_followup`) сюда намеренно не
+            # ведём: два разных протокола ответа на один и тот же комментарий
+            # запутали бы человека больше, чем короткое молчание.
+            return (self._phase, self._stage, False)
         if isinstance(decision, UserComment) and workflow.patched(
                 "issue-lifecycle-followup-answer"):
             # Маркер обязателен: у припаркованных прогонов отброшенные реплики
@@ -1870,19 +1894,112 @@ class IssueLifecycle:
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
         return await self._start_development(issue)
 
-    async def _start_development(self, issue: IssueInput) -> tuple:
-        """Активность Develop: передать задачу агенту разработки.
+    async def _answer_open_question(self, issue: IssueInput,
+                                    comment: UserComment) -> tuple | None:
+        """Обработать `/harness-answer` на открытый вопрос гейта критерия.
 
-        Одна точка на оба входа — решение человека `build-me` и автостарт. Две
-        копии этого вызова разъехались бы на первой же правке ретраев, и один из
-        входов молча остался бы со старым поведением.
-        
+        `None` — комментарий не был обработан здесь (это не команда
+        `/harness-answer`, либо это её точный повтор, снятый защитой ниже);
+        вызывающий решает, что делать дальше.
+
+        Ревью, отказ ради которого это написано: вебхук доставляет каждое
+        событие ДВАЖДЫ (в истории `poh-demo-checkout#42` сигналов ровно
+        вдвое), и без защиты по `comment_id` один ответ человека принимался
+        бы дважды — второй раз уже при закрытом вопросе, то есть отвечал бы
+        «вопросов нет» на собственный только что принятый ответ. Реестр —
+        `self._answered_comment_ids`, тот же, что уже ведёт `_answer_followup`
+        для реплик: заводить второй ради того же самого признака незачем.
+        """
+        if (comment.comment_id is not None
+                and comment.comment_id in self._answered_comment_ids):
+            return (self._phase, self._stage, False)
+        if commands.parse_command(comment.text) != commands.HARNESS_ANSWER:
+            return None
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        verdict = await workflow.execute_activity(
+            activities.answer_question,
+            args=[issue, self._open_question,
+                  commands.parse_command_args(comment.text), comment.comment_id],
+            start_to_close_timeout=timedelta(minutes=3),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if verdict == "accepted":
+            self._open_question = ""
+            return await self._begin_development(issue)
+        return (self._phase, self._stage, False)
+
+    async def _start_development(self, issue: IssueInput) -> tuple:
+        """Гейт критерия приёмки, а затем — передача задачи агенту разработки.
+
+        Одна точка на все входы — решение человека `build-me`, автостарт и
+        принятый ответ на вопрос о критерии (см. `_phase_await_build`). Точка
+        входа ОДНА и до этой задачи вела прямиком к разработке; гейт встаёт
+        перед ней, не заменяя её — сама передача осталась в `_begin_development`.
+
+        Маркер обязателен: у припаркованных прогонов решение «начать
+        разработку» УЖЕ лежит в истории на этом месте, и новый код запланировал
+        бы здесь активность, которой там нет, — реплей упал бы недетерминизмом.
+        Так легли 29 прогонов из 149 после коммита `ac625e7`.
+        """
+        if workflow.patched("issue-lifecycle-acceptance-gate"):
+            # Тело Issue живёт снаружи воркфлоу — активность, не чтение здесь:
+            # реплей обязан быть детерминированным, а тело меняется без нас.
+            criterion = await workflow.execute_activity(
+                activities.read_acceptance_criterion, issue,
+                start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+            if not criterion:
+                # Отказ модели — не отказ гейта: варианты — только подспорье,
+                # вопрос задаётся всё равно, при пустом списке — свободным
+                # текстом (см. `Question.options`/`ask_question`).
+                options = await workflow.execute_activity(
+                    activities.propose_acceptance_options, issue,
+                    start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                )
+                self._open_question = await workflow.execute_activity(
+                    activities.ask_question,
+                    args=[issue, "howtodemo",
+                          "**Не вижу, чем принимать эту задачу.** "
+                          "Разработку не начинаю, пока не будет критерия готовности.",
+                          options],
+                    start_to_close_timeout=timedelta(minutes=3),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                # Ждём в READY_FOR_DEV: та же фаза, что и до вопроса, поэтому
+                # write_label=False — метка `ready-for-dev` уже стоит, вопрос
+                # не меняет то, что видно как состояние Issue снаружи.
+                return (lifecycle.READY_FOR_DEV, "awaiting-acceptance-criterion", False)
+        return await self._begin_development(issue)
+
+    async def _begin_development(self, issue: IssueInput) -> tuple:
+        """Передать задачу агенту разработки — без повторной проверки критерия.
+
+        Отдельная функция, а не хвост `_start_development`, по одной причине:
+        принятый ответ на вопрос о критерии (`_phase_await_build`) знает, что
+        критерий только что записан — `_place_decision` в `answer_question`
+        (`worker/activities.py`) положил его в блок HOWTODEMO ДО того, как
+        сюда вернулось управление. Дёрнуть `_start_development` заново означало
+        бы честный, но ЛИШНИЙ круг `read_acceptance_criterion` за тем же самым
+        текстом — активность, которая станет предсказуемым `True` в 100%
+        случаев, кроме одного: тело Issue успели поправить руками между
+        ответом и этим вызовом, и тогда лишний круг превратился бы в вопрос
+        по уже отвеченному критерию. Дешевле и честнее звать разработку
+        напрямую: `answer_question` вернула `accepted` — этого достаточно.
+
+        Одна точка на оба оставшихся входа — решение человека `build-me` и
+        автостарт. Две копии этого вызова разъехались бы на первой же правке
+        ретраев, и один из входов молча остался бы со старым поведением.
+
         ISSUE-113: для подзадачи плана передаём root_issue и ветку родителя.
         """
         # ISSUE-113 пункт 2: вычисляем ветку так же, как в _phase_handoff
         source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
         branch = f"research/issue-{source}"
-        
+
         try:
             if workflow.patched("issue-lifecycle-develop-child"):
                 # Дочерний прогон: у стадии появляется свой WorkflowId, а

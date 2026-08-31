@@ -147,6 +147,8 @@ async def main() -> None:
             activities.escalate_to_human,
             activities.ask_question,
             activities.answer_question,
+            activities.propose_acceptance_options,
+            activities.read_acceptance_criterion,
             activities.post_error_label,
             activities.ack_comment_seen,
             activities.mark_analyzing,
