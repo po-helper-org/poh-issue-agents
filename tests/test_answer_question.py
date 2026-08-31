@@ -38,7 +38,7 @@ def github(monkeypatch, issue):
     monkeypatch.setattr(a.github_client, "remove_label",
                         lambda repo, number, label: state["labels"].discard(label))
     monkeypatch.setattr(a.github_client, "add_reaction",
-                        lambda repo, comment_id, content:
+                        lambda repo, comment_id, content, issue_number=None:
                             state["reactions"].append(content))
     return state
 

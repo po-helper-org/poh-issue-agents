@@ -528,7 +528,15 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
     if not answer:
         if comment_id is not None:
             for reaction in _EMPTY_ANSWER_REACTIONS:
-                github_client.add_reaction(issue.repo, comment_id, reaction)
+                # M8 (Minor, финальное ревью): без `issue_number` GitLab-клиент
+                # (`worker/gitlab_client.py`) бросает `ValueError` — реакция
+                # адресуется у него не только `comment_id`, но и номером
+                # задачи в пути запроса. У GitHub-клиента лишний аргумент
+                # безвреден (тот же порядок параметров). Именно этот вызов
+                # получает retry-политику I1 — без issue_number устойчивый
+                # отказ на GitLab положил бы весь цикл Issue на пустой команде.
+                github_client.add_reaction(issue.repo, comment_id, reaction,
+                                           issue_number=issue.issue_number)
         return "empty"
 
     # Ревью, находка 2 (Important): `len(answer) <= _MAX_OPTION_NUMBER_DIGITS`
@@ -562,6 +570,37 @@ def read_open_question_id(issue: IssueInput) -> str:
     body = github_client.get_issue_body(issue.repo, issue.issue_number)
     question = questions.read_open(body)
     return question.id if question is not None else ""
+
+
+@activity.defn
+def report_answer_question_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать отказ `answer_question` видимым — событием в Sentry и
+    комментарием человеку (финальное ревью, находка I1, Important).
+
+    До правки `answer_question` звалась с `maximum_attempts=1` без перехвата:
+    единственный сбой (502 от GitHub, таймаут) ронял весь `IssueLifecycle`.
+    Человек, который только что ответил на вопрос, не узнавал, что ответ не
+    принят, — по докстрину `report_criterion_gate_stall` рядом, тот же класс
+    отказа: «шаг отработал, никто не спорит, результата нет».
+
+    Sentry — ПЕРЕД комментарием (тот же порядок, что у `report_criterion_
+    gate_stall` и `post_error_label`): id события уезжает в комментарий
+    ссылкой.
+
+    Текст комментария не утверждает, что ответ потерян безвозвратно —
+    активность идемпотентна по каждому следствию (см. докстринг `answer_
+    question`), и следующая попытка (человек повторит команду, ретрай
+    воркфлоу) с тем же аргументом отработает корректно.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_answer_question_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Не смог обработать ответ на вопрос — попробуйте отправить команду "
+        "ещё раз."
+        + sentry_setup.debug_reference(event_id),
+    )
 
 
 @activity.defn

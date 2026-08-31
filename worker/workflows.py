@@ -1987,13 +1987,55 @@ class IssueLifecycle:
         if comment.comment_id is not None:
             self._answered_comment_ids.append(comment.comment_id)
             del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
-        verdict = await workflow.execute_activity(
-            activities.answer_question,
-            args=[issue, self._open_question,
-                  commands.parse_command_args(comment.text), comment.comment_id],
-            start_to_close_timeout=timedelta(minutes=3),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
+        try:
+            # Находка I1 (Important, финальное ревью). Было `maximum_attempts=
+            # 1` и без перехвата: единственный отказ (502 от GitHub, таймаут)
+            # ронял ВЕСЬ `IssueLifecycle` — Issue теряла владельца состояния
+            # целиком, а человек, только что ответивший на вопрос, не узнавал,
+            # что ответ не принят. Соседняя `ask_question` идёт с тремя
+            # попытками, а `_answer_followup` рядом гасит свой сбой тем же
+            # приёмом (перехват + лог) — оснований держать здесь одну попытку
+            # без перехвата не было: активность идемпотентна по каждому
+            # следствию (см. её докстринг), ретрай безопасен.
+            #
+            # `workflow.patched` здесь НЕ нужен: retry-политика — параметр
+            # сервера повторов, а не часть команды, которую реплей сверяет с
+            # историей (проверено напрямую — прогон записан с `maximum_
+            # attempts=1`, реплей той же истории кодом с `maximum_attempts=3`
+            # проходит чисто), а перехват исключения не переставляет ни одной
+            # уже записанной команды: он лишь ловит то, что раньше улетало
+            # наружу и валило прогон. У прогона, уже упавшего здесь старым
+            # кодом, живой истории для реплея больше нет — падать ему было
+            # больше некуда.
+            verdict = await workflow.execute_activity(
+                activities.answer_question,
+                args=[issue, self._open_question,
+                      commands.parse_command_args(comment.text), comment.comment_id],
+                start_to_close_timeout=timedelta(minutes=3),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as exc:
+            workflow.logger.warning("не разобрал ответ на открытый вопрос: %s",
+                                    _failure_reason(exc))
+            # Новая активность — новая команда в истории, которой у уже
+            # припаркованных (тем более уже упавших) старым кодом прогонов
+            # быть не могло: маркер обязателен по обычной причине.
+            if workflow.patched("issue-lifecycle-answer-question-failure-notice"):
+                try:
+                    await workflow.execute_activity(
+                        activities.report_answer_question_failure,
+                        args=[issue, _failure_reason(exc)],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as notify_exc:
+                    # Уведомление не имеет права ронять то, что оно уведомляет
+                    # (тот же приём, что у `report_criterion_gate_stall` в
+                    # `_start_development`).
+                    workflow.logger.warning(
+                        "не смог уведомить об отказе разбора ответа: %s",
+                        _failure_reason(notify_exc))
+            return (self._phase, self._stage, False)
         if verdict == "accepted":
             self._open_question = ""
             return await self._begin_development(issue)

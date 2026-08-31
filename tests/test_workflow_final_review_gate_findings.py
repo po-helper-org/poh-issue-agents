@@ -18,6 +18,7 @@ import uuid
 
 import pytest
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
@@ -398,3 +399,63 @@ async def test_harness_answer_without_open_question_gets_explicit_reply():
     assert "answer:''" in _calls, (
         "команда без вопроса обязана дойти до answer_question с пустым "
         "указателем и получить детерминированный ответ «вопросов нет»")
+
+
+# ---------------------------------------------------------------------------
+# I1 (Important): сбой `answer_question` не должен убивать весь цикл.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def i1_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@activity.defn(name="answer_question")
+async def i1_answer_fails(issue: IssueInput, question_id: str, text: str,
+                          comment_id: int | None) -> str:
+    _calls.append("answer-attempt")
+    # non_retryable — падает на первой же попытке, не выжидая всю
+    # retry-политику виртуальным временем (тот же приём, что в
+    # tests/test_workflow_acceptance_gate.py::criterion_read_fails).
+    raise ApplicationError("GitHub 502: комментарий не отправился", non_retryable=True)
+
+
+@activity.defn(name="report_answer_question_failure")
+async def i1_notify(issue: IssueInput, reason: str) -> None:
+    _calls.append("notified")
+
+
+@pytest.mark.asyncio
+async def test_answer_question_failure_does_not_kill_the_lifecycle():
+    """Без правки: `worker/workflows.py` зовёт `answer_question` с
+    `maximum_attempts=1` и без перехвата. Единственный сбой активности
+    (здесь — устойчивый `ApplicationError`) улетает наружу и роняет ВЕСЬ
+    `IssueLifecycle` в Failed — Issue теряет владельца состояния целиком.
+
+    Без правки `handle.result()` ниже бросает `WorkflowFailureError`, и тест
+    падает на этой строке. Человек, ответивший на вопрос, ничего не узнаёт о
+    том, что ответ не принят, — находка I1 требует и перехвата, и заметного
+    сообщения (здесь — вызов `report_answer_question_failure`).
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      i1_criterion_absent, options_stub, ask_stub,
+                                      i1_answer_fails, i1_notify, dev_forbidden],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "ask" in _calls)
+            await handle.signal("user_comment", args=["/harness-answer 1", 101])
+            await _await_calls(env, lambda: "notified" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()  # без правки — WorkflowFailureError здесь
+
+    assert "notified" in _calls, "человек обязан получить заметное сообщение об отказе"
+    assert "development" not in _calls
+

@@ -274,6 +274,37 @@ def capture_followups_failure(issue, exc_type: str, message: str) -> Optional[st
             level="error")
 
 
+def capture_answer_question_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`answer_question` (worker/activities.py) не разобрала ответ человека на
+    открытый вопрос — после исчерпания ретраев (финальное ревью, находка I1,
+    Important).
+
+    Раньше вызов шёл с `maximum_attempts=1` и без перехвата: единственный сбой
+    ронял весь `IssueLifecycle`, а без этого события отказ не был виден
+    оператору вовсе — та же причина, что и у `capture_criterion_gate_stall`
+    выше (`workflow.logger.warning` не поднимается до события Sentry, порог
+    `event_level=ERROR`).
+
+    fingerprint по (answer_question_failure, exc_type): аутейдж GitHub,
+    повторяющийся на разных Issue, обязан группироваться в одну группу.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:answer-question")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["answer_question_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"answer_question failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")
+
+
 def capture_criterion_gate_stall(issue, exc_type: str, message: str) -> Optional[str]:
     """Гейт критерия приёмки (`_start_development`, workflows.py) не смог
     прочитать критерий и остался на парковке той же фазы — цикл жив,
