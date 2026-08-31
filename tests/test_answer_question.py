@@ -304,6 +304,26 @@ def test_is_confirmation_rejects_plain_free_text(answer):
     assert a._is_confirmation(answer) is False
 
 
+@pytest.mark.parametrize("value", sorted(a._CONFIRMATIONS))
+def test_is_confirmation_accepts_every_declared_value(value):
+    """Ревью, находка 3 (Minor). Прямыми тестами выше (регистр, пунктуация,
+    английские формы) покрыты 6 из 15 значений `_CONFIRMATIONS` — «да» и
+    «согласен» через регистр/пунктуацию, «yes»/«y»/«ok»/«okay» через
+    английские формы. Остальные девять («ага», «угу», «ок», «окей»,
+    «подтверждаю», «верно», «точно», «согласна», «+») не проверялись ни
+    разу — молчаливая опечатка при добавлении или правке одного из них в
+    `_CONFIRMATIONS` осталась бы незамеченной.
+
+    Параметризация берёт значения из САМОГО множества `_CONFIRMATIONS`, а не
+    из захардкоженного в тесте списка: новое значение, дописанное в набор,
+    само попадёт в этот тест без правки здесь. При этом тест не переписывает
+    формулу `_is_confirmation` (сравнение нормализованной строки с
+    множеством) — он вызывает саму функцию на её же образцовых, уже
+    нормализованных значениях и проверяет факт распознавания, не залезая в
+    то, ЧЕМ она сравнивает."""
+    assert a._is_confirmation(value) is True
+
+
 def test_confirmation_records_answer_and_amendments(github, issue, monkeypatch):
     """Второй ответ применяет и решение, и правки прежних записей (A20, A21)."""
     github["body"] = questions.append_decision(github["body"], questions.Decision(
@@ -650,27 +670,65 @@ def test_free_text_answer_survives_corrupted_draft_markers(github, issue, monkey
     assert "было 404; стало 405" in github["comments"][0]
 
 
-def test_draft_repair_path_does_not_touch_journal_corruption(github, issue):
+def test_draft_repair_path_does_not_touch_journal_corruption(github, issue, monkeypatch):
     """Путь починки (`issue_blocks.discard_draft`, используемый только из
     `questions.clear_draft`/`write_draft`) жёстко привязан к DRAFT — у него
     нет параметра для имени блока, распространить его на ANSWERS/QUESTION
     нельзя даже по ошибке.
 
-    Тело здесь испорчено СРАЗУ по двум блокам — и DRAFT, и ANSWERS — чтобы
-    доказать это не структурой сигнатуры (см. ниже), а поведением: если бы
-    починка была общей на все блоки, ответ бы тихо прошёл. Она не общая —
-    порча ANSWERS по-прежнему валит `answer_question` необработанным
-    `ValueError`, ровно как и до этой правки, потому что для записи
-    (в отличие от временной заметки-черновика) громкий отказ — осознанная
-    защита истории решений, и её нельзя ослаблять черновиковой починкой.
+    Повторное ревью (Important): прежняя версия этого теста была
+    тавтологической — она отвечала НОМЕРОМ варианта, а `_record_decision`
+    (см. её докстринг в `worker/activities.py`) зовёт `append_decision`
+    ПЕРВЫМ, до `clear_draft`. При порче ANSWERS `append_decision` падал
+    раньше, чем дело вообще доходило до `clear_draft`/`discard_draft` — тест
+    прошёл бы одинаково, даже расширь мы починку и на журнал: путь починки в
+    нём попросту не исполнялся НИ РАЗУ, `discard_draft` не звался вовсе (см.
+    ниже, как это доказано фактом, а не архивным утверждением).
+
+    В `_apply_interpretation` (путь ПОДТВЕРЖДЕНИЯ уже показанного черновика
+    словом согласия, а не путь ответа номером) порядок ОБРАТНЫЙ: `clear_draft`
+    вызывается ДО `append_decision`. Этот тест теперь бьёт именно по нему:
+    тело испорчено СРАЗУ по обоим блокам — DRAFT и ANSWERS, — и спай на
+    `issue_blocks.discard_draft` подтверждает ФАКТОМ, что починка черновика
+    действительно исполнилась (а не осталась лишь теоретически возможной),
+    и лишь после этого следует громкий отказ журнала.
+
+    Вход — прямой вызов `a._apply_interpretation`, а не `a.answer_question`,
+    и это не срезание угла, а необходимость: чтобы дойти до
+    `_apply_interpretation` через публичный `answer_question`, черновик
+    сперва обязан пройти `questions.read_draft` (внутри `_confirm_free_text`)
+    — а она использует ТОТ ЖЕ `_matched_block`, что и `issue_blocks.strip`
+    внутри `clear_draft`, на ТОМ ЖЕ теле. Испорченный настолько, чтобы
+    уронить `clear_draft` (и включить починку), черновик уронил бы и
+    `read_draft` тоже — та лишь тихо вернёт None (см. её докстринг), и путь
+    подтверждения вообще не начнётся: `pending is None` уводит код в ветку
+    нового толкования, а не в `_apply_interpretation`. Проверить именно
+    ЭТОТ порядок вызовов можно только позвав функцию напрямую.
     """
     _open(github)
-    github["body"] = _corrupt_draft_markers(github["body"])
-    start, _end = issue_blocks._markers(issue_blocks.ANSWERS)
-    github["body"] += f"\n{start}\nоборванный маркер журнала без конца"
+    question = questions.read_open(github["body"])
+
+    body = _corrupt_draft_markers(github["body"])
+    answers_start, _answers_end = issue_blocks._markers(issue_blocks.ANSWERS)
+    body += f"\n{answers_start}\nоборванный маркер журнала без конца"
+
+    real_discard_draft = issue_blocks.discard_draft
+    discard_draft_calls = []
+
+    def spy_discard_draft(corrupted_body):
+        discard_draft_calls.append(corrupted_body)
+        return real_discard_draft(corrupted_body)
+
+    monkeypatch.setattr(issue_blocks, "discard_draft", spy_discard_draft)
 
     with pytest.raises(ValueError):
-        a.answer_question(issue, "howtodemo-1", "1", 101)
+        a._apply_interpretation(issue, body, question,
+                                {"answer": "было 404; стало 405"})
+
+    assert discard_draft_calls, (
+        "discard_draft обязан быть вызван реально, а не просто оказаться "
+        "теоретически достижимым — иначе тест снова не касается пути, "
+        "который заявляет проверенным (см. докстринг выше)")
 
 
 def test_discard_draft_has_no_block_name_parameter():

@@ -457,3 +457,37 @@ def test_append_decision_refuses_when_answer_contains_marker_like_text():
         answer=f"в документации написано: {start} ... {end}")
     with pytest.raises(ValueError):
         questions.append_decision("описание", poisoned)
+
+
+def test_write_draft_reraises_content_marker_collision_without_repairing_body(caplog):
+    """Ревью, находка 4 (Minor, повторное ревью). `write_draft` раньше ловил
+    `ValueError` из `issue_blocks.write` одной веткой, не различая причину:
+    порчена ли МАРКЕРНАЯ структура уже существующего в `body` блока DRAFT
+    (тогда чинит `discard_draft`, см. `test_draft_roundtrip_and_clear` и
+    соседние тесты) или ЗАПИСЫВАЕМОЕ толкование само процитировало маркер
+    известного блока (`issue_blocks.ContentContainsBlockMarker`) — тогда
+    `body` ни при чём, и починка тела ничего не даёт: повторная запись того
+    же содержимого упала бы с тем же исключением снова, но уже
+    необработанным и с ложным диагнозом «тело повреждено» в логе.
+
+    Тело здесь абсолютно здоровое — ни одного маркера DRAFT в нём нет.
+    Порчено СОДЕРЖИМОЕ толкования (человек процитировал в ответе кусок,
+    дословно похожий на маркер блока QUESTION, — тот же сценарий, что у
+    `test_append_decision_refuses_when_answer_contains_marker_like_text` для
+    журнала, только со стороны черновика).
+    """
+    start, end = issue_blocks._markers(issue_blocks.QUESTION)
+    poisoned = questions.Draft(
+        question_id="howtodemo-1",
+        interpretation={"answer": f"в документации написано: {start} ... {end}",
+                       "amendments": []})
+    body = "здоровое тело задачи без единого маркера DRAFT"
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(issue_blocks.ContentContainsBlockMarker):
+            questions.write_draft(body, poisoned, issue_ref="o/r#7")
+
+    assert "содержим" in caplog.text.lower(), \
+        "лог обязан назвать содержимое толкования истинной причиной отказа"
+    assert "тело повреждено" not in caplog.text.lower(), \
+        "тело здорово — лог не должен приписывать порчу ему"
