@@ -335,3 +335,66 @@ async def test_reasked_question_repoints_the_workflow_pointer():
         "а не с указателем, оставшимся от возрождённого")
     assert "development" in _calls
 
+
+# ---------------------------------------------------------------------------
+# I3 (Important): `/harness-answer` без открытого вопроса не должен тонуть в
+# диалоге уточнений — спека A18 требует явного «вопросов нет».
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def i3_criterion_present(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return "было 404; стало 405 с Allow: POST"
+
+
+@activity.defn(name="answer_question")
+async def i3_answer_no_question(issue: IssueInput, question_id: str, text: str,
+                                comment_id: int | None) -> str:
+    _calls.append(f"answer:{question_id!r}")
+    assert question_id == "", "указатель обязан быть пустым — вопроса не было"
+    return "no-question"
+
+
+@pytest.mark.asyncio
+async def test_harness_answer_without_open_question_gets_explicit_reply():
+    """Без правки: ветка разбора ответа в `_phase_await_build` заходит
+    ТОЛЬКО при непустом `self._open_question`. Команда `/harness-answer`,
+    когда указателя нет (гейт даже не спрашивал — критерий уже есть),
+    проваливается в `_answer_followup` — диалог уточнений, а не
+    детерминированный ответ «вопросов нет» (спека A18: молчание
+    недопустимо).
+
+    Без правки `_calls` содержит `"followup:/harness-answer 1"` вместо
+    `"answer:''"`, и тест падает на `assert "followup" not in ...`.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      i3_criterion_present, i3_answer_no_question,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            # Критерий уже есть — гейт молчит, вопроса не было и не будет
+            # (см. test_development_starts_when_criterion_is_present в
+            # tests/test_workflow_acceptance_gate.py). Команда `/harness-
+            # answer` отправлена ПЕРЕД решением `build-me` — оба сигнала
+            # читаются из общей очереди в порядке отправки (FIFO), поэтому
+            # команда обязана дойти до `_phase_await_build` РАНЬШЕ, чем
+            # решение сдвинет фазу.
+            await handle.signal("user_comment", args=["/harness-answer 1", 101])
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "answer:''" in _calls
+                               or any(c.startswith("followup:") for c in _calls))
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert not any(c.startswith("followup:") for c in _calls), (
+        "команда без вопроса не должна попадать в диалог уточнений")
+    assert "answer:''" in _calls, (
+        "команда без вопроса обязана дойти до answer_question с пустым "
+        "указателем и получить детерминированный ответ «вопросов нет»")

@@ -1925,6 +1925,34 @@ class IssueLifecycle:
             # ведём: два разных протокола ответа на один и тот же комментарий
             # запутали бы человека больше, чем короткое молчание.
             return (self._phase, self._stage, False)
+        if (isinstance(decision, UserComment) and not self._open_question
+                and commands.parse_command(decision.text) == commands.HARNESS_ANSWER
+                and workflow.patched(
+                    "issue-lifecycle-answer-command-without-open-question")):
+            # Финальное ревью ветки, находка I3 (Important). Спека A18: команда
+            # `/harness-answer`, которой не на что отвечать, обязана получить
+            # явный ответ — «вопросов сейчас нет» — а не тонуть молча. Ветка
+            # выше срабатывает только при непустом `self._open_question`, и
+            # без этой добавки та же команда без указателя проваливалась в
+            # диалог уточнений ниже (`_answer_followup`): модель толковала её
+            # как произвольную реплику, а при исчерпанном потолке реплик
+            # ответа не было вовсе — молчание неотличимо от проглоченной
+            # команды. Зовём ту же `_answer_open_question` с ПУСТЫМ указателем:
+            # активность `answer_question` (`worker/activities.py`) на пустом
+            # `question_id` без открытого вопроса в теле сама отдаёт
+            # детерминированное «сейчас я не задавал вопроса» (см. её
+            # докстринг) — это и есть честный ответ на команду, которой
+            # нечего отвечать.
+            #
+            # `workflow.patched` обязателен: у прогонов, уже стоящих здесь
+            # СТАРЫМ кодом, этой ветки в истории нет — `/harness-answer` без
+            # указателя у них уже ушёл (или тонул) по ветке диалога уточнений
+            # ниже, и новая ветка означала бы для них другую историю на
+            # реплее.
+            nxt = await self._answer_open_question(issue, decision)
+            if nxt is not None:
+                return nxt
+            return (self._phase, self._stage, False)
         if isinstance(decision, UserComment) and workflow.patched(
                 "issue-lifecycle-followup-answer"):
             # Маркер обязателен: у припаркованных прогонов отброшенные реплики
