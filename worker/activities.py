@@ -642,6 +642,39 @@ def read_acceptance_criterion(issue: IssueInput) -> str:
 
 
 @activity.defn
+def close_answered_by_body_edit(issue: IssueInput) -> None:
+    """Снять вопрос гейта критерия, если человек ответил на него ВПИСЫВАНИЕМ
+    критерия в тело, а не командой `/harness-answer` (спека A23: «команда —
+    удобство, а не единственная дверь»).
+
+    Финальное ревью ветки, находка I4 (Important). `_start_development`
+    (`worker/workflows.py`) верно пропускает задачу в разработку, как только
+    `read_acceptance_criterion` вернул непустой текст, — но раньше это никак
+    не трогало ни блок открытого вопроса в теле, ни метку
+    `NEEDS_HUMAN_ANSWER`: они оставались висеть на задаче, уже ушедшей в
+    разработку, и ничто их больше не снимало. Выборка `needs-human:*`
+    переставала быть полной очередью к людям.
+
+    Снимаем ТЕМ ЖЕ путём, что и обычный ответ командой: записываем решение в
+    журнал (текстом уже вписанного в тело критерия) и чистим блок вопроса и
+    метку — `_record_decision` уже умеет это одним атомарным обращением к
+    телу (запись в журнал, `_place_decision`, `clear_open`, `clear_draft`,
+    снятие метки). `_place_decision` при этом просто перезапишет блок
+    HOWTODEMO тем же текстом, что там уже лежит, — безвредный no-op.
+
+    Идемпотентна тривиально: если открытого вопроса уже нет (снят предыдущим
+    проходом этой же ветки, либо его и не было — обычный путь без гейта),
+    функция ничего не делает и ничего не пишет в тело.
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    question = questions.read_open(body)
+    if question is None:
+        return
+    criterion = _howtodemo_block(body)
+    _record_decision(issue, body, question, criterion)
+
+
+@activity.defn
 def report_criterion_gate_stall(issue: IssueInput, reason: str) -> None:
     """Сделать отказ гейта критерия приёмки видимым — событием в Sentry и
     комментарием человеку.

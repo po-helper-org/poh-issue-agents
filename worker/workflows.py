@@ -2247,6 +2247,38 @@ class IssueLifecycle:
                 # write_label=False — метка `ready-for-dev` уже стоит, вопрос
                 # не меняет то, что видно как состояние Issue снаружи.
                 return (lifecycle.READY_FOR_DEV, "awaiting-acceptance-criterion", False)
+            if self._open_question and workflow.patched(
+                    "issue-lifecycle-criterion-filled-by-hand-closes-question"):
+                # Находка I4 (Important, финальное ревью). Критерий появился
+                # НЕ через `/harness-answer` (тогда `self._open_question` уже
+                # был бы очищен веткой `accepted` выше) — значит, человек
+                # вписал его в тело руками. Спека A23: «вопрос снимается,
+                # работа продолжается» — команда удобство, а не единственная
+                # дверь. Без этой правки блок вопроса и метка `NEEDS_HUMAN_
+                # ANSWER` оставались висеть на задаче, уже ушедшей в
+                # разработку, и ничто их больше не снимало — выборка
+                # `needs-human:*` переставала быть полной очередью к людям.
+                #
+                # Сбой снятия — уборка состояния, а не условие входа в
+                # разработку: сетевой сбой здесь не должен блокировать
+                # передачу задачи агенту, только оставить блок/метку висеть
+                # до следующего успешного прохода этой ветки.
+                #
+                # `workflow.patched` обязателен: у прогонов, уже стоящих
+                # здесь СТАРЫМ кодом с указателем на вопрос, этой активности
+                # в истории нет.
+                try:
+                    await workflow.execute_activity(
+                        activities.close_answered_by_body_edit, issue,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as e:
+                    workflow.logger.warning(
+                        "не снял устаревший вопрос гейта критерия: %s",
+                        _failure_reason(e))
+                else:
+                    self._open_question = ""
         return await self._begin_development(issue)
 
     async def _begin_development(self, issue: IssueInput) -> tuple:

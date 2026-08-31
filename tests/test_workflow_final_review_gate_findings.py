@@ -460,7 +460,6 @@ async def test_answer_question_failure_does_not_kill_the_lifecycle():
     assert "development" not in _calls
 
 
-
 # ---------------------------------------------------------------------------
 # I2 (Important): срок ответа на вопрос — 72 часа, а не остаток парковки.
 # ---------------------------------------------------------------------------
@@ -521,3 +520,68 @@ async def test_criterion_question_resets_the_park_deadline():
     assert new_remaining_hours > 24, (
         "срок ответа на вопрос обязан отсчитываться заново (72 часа), "
         f"а не от остатка исходной парковки (осталось {new_remaining_hours:.1f} ч)")
+
+
+# ---------------------------------------------------------------------------
+# I4 (Important): критерий, вписанный в тело руками, обязан снять вопрос.
+# ---------------------------------------------------------------------------
+
+_i4_criterion_calls = {"n": 0}
+
+
+@activity.defn(name="read_acceptance_criterion")
+async def i4_criterion_then_filled_by_hand(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    _i4_criterion_calls["n"] += 1
+    if _i4_criterion_calls["n"] == 1:
+        return ""
+    # Второй заход — человек вписал критерий в тело САМ, минуя
+    # `/harness-answer` (спека A23).
+    return "было 404; стало 405 с Allow: POST"
+
+
+@activity.defn(name="close_answered_by_body_edit")
+async def i4_close_answered(issue: IssueInput) -> None:
+    _calls.append("close-answered")
+
+
+@pytest.mark.asyncio
+async def test_criterion_filled_by_hand_closes_the_stale_question():
+    """Без правки: `_start_development` при непустом критерии сразу зовёт
+    `_begin_development`, не трогая ни указатель, ни блок вопроса, ни метку
+    ожидания. Вопрос, заданный гейтом РАНЬШЕ (когда критерия ещё не было),
+    остаётся висеть на задаче, уже ушедшей в разработку.
+
+    Без правки `"close-answered"` никогда не появляется в `_calls` — тест
+    падает на первом же `assert`.
+    """
+    _i4_criterion_calls["n"] = 0
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      i4_criterion_then_filled_by_hand,
+                                      options_stub, ask_stub, i4_close_answered,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            # Первый заход: критерия нет, гейт задаёт вопрос.
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "ask" in _calls)
+
+            # Человек не отвечает командой — вписывает критерий в тело сам и
+            # снова нажимает «в разработку» (любой второй `build-me`
+            # заново заводит `_start_development`, см. test_criterion_gate_
+            # stall_is_reported_once_per_series в tests/test_workflow_
+            # acceptance_gate.py — тот же приём).
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert "close-answered" in _calls, (
+        "критерий, вписанный руками, обязан снять устаревший вопрос гейта")
+    assert "development" in _calls
