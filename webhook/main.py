@@ -581,6 +581,34 @@ async def _start_howtodemo(client, repo: str, payload: dict, issue_number: int,
                   repo, issue_number)
 
 
+async def _signal_user_comment(client, repo: str, issue_number: int, payload: dict,
+                               *, no_lifecycle_log: str) -> None:
+    """Доставка комментария живому циклу сигналом `user_comment`.
+
+    Общая часть двух вызывающих: явной ветки `/harness-answer` и общего пути
+    «не команда» в конце обработчика `issue_comment`. Обе точки вычисляли
+    `wf_id`, брали handle, слали один и тот же сигнал и ловили одно и то же
+    широкое исключение — отличался только текст лога при отсутствии цикла.
+    Две копии одного кода расходятся при первой же правке одной из них, и ни
+    один тест такое расхождение не поймает (ревью Task 7, находка 1); текст
+    лога — единственное, чем вызывающие осмысленно отличаются, поэтому он и
+    остаётся параметром, а не хардкодится здесь.
+
+    `except Exception` — намеренно широкий и намеренно тихий: реакции на
+    сигнал без живого цикла всё равно не будет, у вебхука нет ни клиента, ни
+    сетевой зависимости, чтобы написать в GitHub о неудаче (см.
+    `webhook/requirements.txt`) — весь ввод-вывод делают активности воркера.
+    Диагностика уходит только в лог.
+    """
+    wf_id = workflow_id_for(repo, issue_number)
+    handle = client.get_workflow_handle(wf_id)
+    try:
+        await handle.signal("user_comment",
+                            args=[payload["comment"]["body"], payload["comment"]["id"]])
+    except Exception:
+        _log.info(no_lifecycle_log, repo, issue_number)
+
+
 async def _handle_delivery(payload: dict, x_github_event: str,
                            x_github_delivery: str | None):
     # Allowlist: действуем только на репозитории из ISSUE_AGENT_REPOS (пусто/* —
@@ -816,17 +844,14 @@ async def _handle_delivery(payload: dict, x_github_event: str,
             # Единственная команда, которая идёт в `user_comment`: её адресат —
             # цикл, задавший вопрос, а не отдельный workflow. Дорогую стадию
             # она не запускает, поэтому прав по AGENT_TRIGGER_ALLOWLIST здесь
-            # не спрашиваем — так решено спекой A8.
-            wf_id = workflow_id_for(repo, issue_number)
-            handle = client.get_workflow_handle(wf_id)
-            try:
-                await handle.signal("user_comment",
-                                    args=[payload["comment"]["body"],
-                                          payload["comment"]["id"]])
-            except Exception:
-                # Цикла нет — отвечать некому. Поднимать его ответом на
-                # незаданный вопрос смысла нет.
-                _log.info("ответ без живого цикла: %s#%s", repo, issue_number)
+            # не спрашиваем — так решено спекой A8. Ранний возврат — намеренно
+            # отдельная ветка, а не совпадение с общим путём ниже: если тот
+            # когда-нибудь обрастёт проверкой прав для других команд, у
+            # `/harness-answer` её быть не должно, и явная ветка не даст ей
+            # прилипнуть по ошибке.
+            await _signal_user_comment(
+                client, repo, issue_number, payload,
+                no_lifecycle_log="ответ без живого цикла: %s#%s")
             return {"ok": True}
 
         if command == RELEASE:
@@ -911,28 +936,22 @@ async def _handle_delivery(payload: dict, x_github_event: str,
             )
             return {"ok": True}
 
-        wf_id = workflow_id_for(repo, issue_number)
-        handle = client.get_workflow_handle(wf_id)
-        try:
-            await handle.signal("user_comment", args=[payload["comment"]["body"],
-                                                       payload["comment"]["id"]])
-        except Exception:
-            # Сознательное исключение из правила «сигнал поднимает цикл».
-            # Команды (`/analyze`, `/estimate`, метки решения) идут через
-            # signal-with-start и проходят гейт на дорогую стадию; обычный
-            # комментарий гейта не проходит — им можно завести триаж на любом
-            # Issue репозитория, включая тысячи старых. Цена ошибки здесь —
-            # веер LLM-прогонов, а польза — доставка реплики в цикл, которого
-            # нет; поэтому комментарий по-прежнему best-effort.
-            # Реакции на такой комментарий не будет: вебхук в GitHub не ходит
-            # вовсе — у него нет ни клиента, ни зависимости для сети (см.
-            # `webhook/requirements.txt`), весь ввод-вывод делают активности
-            # воркера. Здесь стоял `from worker import github_client`, который
-            # не мог сработать ни в контейнере (образ вебхука каталога
-            # `worker/` не содержит), ни в тестах (там имя `worker`
-            # перехватывает модуль `worker/worker.py`), — и `except Exception`
-            # это молча съедал.
-            _log.info("no live lifecycle for %s#%s — комментарий не доставлен",
-                      repo, issue_number)
+        # Сознательное исключение из правила «сигнал поднимает цикл».
+        # Команды (`/analyze`, `/estimate`, метки решения) идут через
+        # signal-with-start и проходят гейт на дорогую стадию; обычный
+        # комментарий гейта не проходит — им можно завести триаж на любом
+        # Issue репозитория, включая тысячи старых. Цена ошибки здесь —
+        # веер LLM-прогонов, а польза — доставка реплики в цикл, которого
+        # нет; поэтому комментарий по-прежнему best-effort. Отсутствие цикла
+        # (и любая иная ошибка сигнала) гасится внутри `_signal_user_comment`
+        # тем же широким `except Exception`, что и у `/harness-answer` — здесь
+        # это тоже разумно: раньше на этом месте стоял `from worker import
+        # github_client`, который не мог сработать ни в контейнере (образ
+        # вебхука каталога `worker/` не содержит), ни в тестах (там имя
+        # `worker` перехватывает модуль `worker/worker.py`), и широкий except
+        # это молча съедал.
+        await _signal_user_comment(
+            client, repo, issue_number, payload,
+            no_lifecycle_log="no live lifecycle for %s#%s — комментарий не доставлен")
 
     return {"ok": True}
