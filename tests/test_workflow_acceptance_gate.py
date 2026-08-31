@@ -15,6 +15,7 @@ import uuid
 
 import pytest
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -142,6 +143,17 @@ async def criterion_present(issue: IssueInput) -> str:
     return "было 404; стало 405 с Allow: POST"
 
 
+# Ревью, находка 1 (Important): устойчивый отказ GitHub (после исчерпания
+# ретраев) не должен ронять весь IssueLifecycle. `non_retryable=True` —
+# активность падает на первой же попытке, не выжидая всю ретрай-политику
+# `read_acceptance_criterion` (3 попытки) виртуальным временем, — тот же
+# приём, что уже есть в `tests/test_lifecycle_loop.py` для аналогичной цели.
+@activity.defn(name="read_acceptance_criterion")
+async def criterion_read_fails(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    raise ApplicationError("GitHub 503: тело Issue не отдаётся", non_retryable=True)
+
+
 @activity.defn(name="propose_acceptance_options")
 async def options_stub(issue: IssueInput) -> list[str]:
     _calls.append("propose")
@@ -204,6 +216,43 @@ async def _await_calls(env, predicate, tries: int = 200) -> bool:
     return predicate()
 
 
+async def _await_quiescence(env, handle, tries: int = 50) -> None:
+    """Ждёт, пока прогон полностью разберёт уже отправленные сигналы —
+    признак наблюдаемый, но не деловой: длина истории (`history_length`)
+    не растёт два опроса подряд.
+
+    Ревью, находка 4 (Minor): у обычной реплики при открытом вопросе гейта
+    нет НАБЛЮДАЕМОГО ДЕЛОВОГО следствия — `_answer_open_question` возвращает
+    `None`, ветка гейта в `_phase_await_build` отвечает молчанием, ни одна
+    активность не зовётся (см. докстрины обеих). Ждать появления записи в
+    `_calls`, как остальные тесты этого файла (`_await_calls`), здесь
+    буквально нечего — предиката, который стал бы истинным, не существует.
+
+    Но «нечем доказать эффект» не значит «сгодится любой тайм-аут»: сон на
+    фиксированное время доказывает только «эффекта не было за N секунд», а не
+    «эффекта не будет» — гонка между отправкой сигнала и тем, успеет ли
+    локальный воркер его разобрать до истечения тайм-аута, никуда не девается,
+    просто становится маловероятной. Здесь используется другой наблюдаемый
+    признак: `handle.describe().history_length` — сколько событий Event
+    History прогона видно снаружи. Доставка сигнала ВСЕГДА добавляет запись
+    (`WorkflowExecutionSignaled`), а её разбор воркером — минимум ещё три
+    (`WorkflowTaskScheduled`/`Started`/`Completed`), вне зависимости от того,
+    вызвала ли реплика хоть одну активность. Как только длина истории
+    перестаёт расти между двумя опросами подряд, воркеру больше нечего
+    обработать по этому сигналу прямо сейчас — то есть либо эффект уже
+    случился (и виден в `_calls`), либо не случится вовсе. Это утверждение
+    про КОНКРЕТНЫЙ момент, а не предположение о достаточности произвольного
+    интервала.
+    """
+    prev = -1
+    for _ in range(tries):
+        cur = (await handle.describe()).history_length
+        if cur == prev:
+            return
+        prev = cur
+        await env.sleep(1)
+
+
 def _issue() -> IssueInput:
     return IssueInput(repo="o/r", issue_number=163, title="GET /quote отдаёт 404",
                       body="сейчас 404, ожидается 405", author_login="u",
@@ -254,6 +303,40 @@ async def test_development_starts_when_criterion_is_present():
 
     assert "development" in _calls
     assert "ask" not in _calls
+
+
+@pytest.mark.asyncio
+async def test_criterion_read_failure_does_not_kill_the_lifecycle():
+    """Ревью, находка 1 (Important): устойчивый отказ чтения критерия не
+    должен ронять весь `IssueLifecycle` в `Failed`.
+
+    До правки `read_acceptance_criterion` в `_start_development` ничем не
+    защищён: ошибка активности после исчерпания попыток пролетает через
+    `_start_development`, `_phase_await_build` и диспетчеризацию фаз в
+    `_run_phase_loop` (там перехвата тоже нет) — и роняет весь прогон. Issue
+    теряет владельца состояния целиком. Без правки `handle.result()` ниже
+    бросает `WorkflowFailureError`, и тест падает уже на этой строке.
+
+    Гейт при этом обязан держать закрыто: разработка не начинается — мы не
+    знаем, есть критерий или нет, а пропустить задачу в разработку из-за
+    сетевого сбоя хуже, чем не начать её вовремя (см. комментарий в самом
+    `_start_development`, откуда взят и выбор — park, а не «нет критерия»).
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_COMMON, criterion_read_fails, dev_forbidden]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "read-criterion" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()  # без правки — WorkflowFailureError здесь
+
+    assert "ask" not in _calls, "сбой чтения не «критерий отсутствует» — вопрос не задаём"
+    assert "development" not in _calls
 
 
 @pytest.mark.asyncio
@@ -345,11 +428,15 @@ async def test_comment_without_command_does_not_answer():
             # веткой `_answer_followup` вместо гейта, а тест — про сам гейт.
             await _await_calls(env, lambda: "ask" in _calls)
             await handle.signal("user_comment", args=["а нам это вообще надо?", 102])
-            # У обычной реплики нет наблюдаемого следствия (никакая активность
-            # не зовётся, см. `_answer_open_question`) — ждём фиксированный
-            # запас виртуального времени, чтобы очередь сигналов гарантированно
-            # опустела до отправки `issue_closed`.
-            await env.sleep(5)
+            # Ревью, находка 4 (Minor): у обычной реплики нет наблюдаемого
+            # ДЕЛОВОГО следствия (никакая активность не зовётся, см.
+            # `_answer_open_question`) — ждать появления записи в `_calls`,
+            # как в остальных тестах файла, здесь нечего. Вместо фиксированного
+            # сна на «скорее всего достаточно» ждём наблюдаемый, но другой
+            # признак — стабилизацию длины истории прогона (см. докстринг
+            # `_await_quiescence`): она доказывает, что сигнал РАЗОБРАН, а не
+            # что прошло сколько-то виртуального времени.
+            await _await_quiescence(env, handle)
             await handle.signal("issue_closed", "тест")
             await handle.result()
 
