@@ -104,6 +104,17 @@ SEEN_EVENTS_KEPT = 50
 # workflow-task timeout с запасом, а не впритык.
 HISTORY_EVENT_THRESHOLD = 800
 
+# Находка F3 (Important, второй круг финального ревью). Пока открыт вопрос
+# гейта критерия приёмки, парковка (`_phase_await_build`) периодически
+# перечитывает тело Issue — критерий, вписанный человеком напрямую (A23),
+# иначе не подхватывается вообще: правки тела вебхук не доставляет сигналом.
+# Интервал — тот же порядок, что у периодической проверки доклада ревью в
+# `_phase_pr_review` (`timedelta(minutes=30)` там же по файлу): достаточно
+# редко, чтобы не превратиться в дорогой цикл (до находки C1 подхват той же
+# правки телом стоил вызова МОДЕЛИ на каждом обороте), и достаточно часто,
+# чтобы `DEVELOP_AUTOSTART` не требовал действия человека.
+CRITERION_RECHECK_INTERVAL = timedelta(minutes=30)
+
 
 # Потолок разворота `.cause` в `_failure_reason`. Сегодняшняя цепочка стадии
 # разработки — три уровня (ChildWorkflowError → ActivityError →
@@ -824,13 +835,26 @@ class IssueLifecycle:
         от событий, а одна фаза может стоить и трёх событий, и трёхсот."""
         return workflow.info().get_current_history_length() >= HISTORY_EVENT_THRESHOLD
 
-    async def _park(self, kind: str, who: str, reason: str, hours: int) -> timedelta:
+    async def _park(self, kind: str, who: str, reason: str, hours: int,
+                    *, wake_within: timedelta | None = None) -> timedelta:
         """Встать в ожидание: описать его и вернуть срок таймера.
 
         Одно место на все точки парковки. Разнесённые «поставить таймер» и
         «записать, чего ждём» разошлись бы при первой же правке одной из них —
         и получилось бы ожидание с таймером, но без причины, то есть ровно то,
         что чинит #39.
+
+        `wake_within` (находка F3, Important, второй круг финального ревью) —
+        промежуточное пробуждение РАНЬШЕ настоящего дедлайна, для точек,
+        которым нужно периодически что-то перепроверить, не отменяя сам
+        дедлайн. Описание (`self._awaiting`, метка очереди) считается ТОЛЬКО
+        от `hours` — человек видит настоящий срок, а не урезанный внутренний
+        таймер; `wake_within` укорачивает лишь ВОЗВРАЩАЕМЫЙ таймаут, который
+        достаётся `_wait_for_signal`. Тест `tests/test_awaiting_wiring.py::
+        test_every_parking_point_fills_the_waiting` статически требует, чтобы
+        аргументом `_wait_for_signal` был именно `await self._park(...)`, —
+        отдельная переменная с урезанным таймаутом этой проверке не годится, а
+        значит урезание обязано жить ВНУТРИ `_park`, а не рядом с ним.
         """
         since = self._phase_since or workflow.now()
         self._awaiting = Awaiting(
@@ -839,7 +863,10 @@ class IssueLifecycle:
             deadline_epoch=(since + timedelta(hours=hours)).timestamp(),
         )
         await self._publish_awaiting()
-        return self._park_timeout(hours)
+        remaining = self._park_timeout(hours)
+        if wake_within is not None and wake_within < remaining:
+            return wake_within
+        return remaining
 
     async def _publish_awaiting(self) -> None:
         """Отражение ожидания в GitHub: очередь к людям должна быть полной.
@@ -1895,12 +1922,88 @@ class IssueLifecycle:
             kind = awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV)
             who = awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV)
             reason = awaiting_mod.reason_for_phase(lifecycle.READY_FOR_DEV)
-        decision = await self._wait_for_signal(await self._park(
-            kind, who=who, reason=reason,
-            hours=awaiting_mod.deadline_hours(kind,
-                                              deadlines.build_decision_hours
-                                              if kind in awaiting_mod.BLOCKED_ON_HUMAN
-                                              else None)))
+        hours = awaiting_mod.deadline_hours(
+            kind, deadlines.build_decision_hours
+            if kind in awaiting_mod.BLOCKED_ON_HUMAN else None)
+        if self._open_question and workflow.patched(
+                "issue-lifecycle-criterion-recheck-while-parked"):
+            # Находка F3 (Important, второй круг финального ревью). Спека
+            # A23 обещает: критерий, вписанный в тело РУКАМИ, — рабочая
+            # дверь, не хуже команды `/harness-answer`. Но правки тела Issue
+            # вебхук не обрабатывает вовсе — сигнала на них нет, — а выйти
+            # из этой парковки может только сигнал (команда, `build-me`,
+            # событие агента). Под `DEVELOP_AUTOSTART`, чей смысл именно в
+            # отсутствии действия человека, это означало: задача с вопросом
+            # гейта, отвеченным правкой тела, просидит здесь весь срок
+            # парковки и закроется — то самое действие человека
+            # (`/harness-answer` или повторный `build-me`), которого
+            # автостарт обязан избегать, становится ЕДИНСТВЕННОЙ дверью.
+            #
+            # До находки C1 (см. её комментарий выше) бесконечный виток
+            # автостарта хотя бы подхватывал вписанный руками критерий — но
+            # ценой вызова МОДЕЛИ на каждом обороте (за 27 секунд виртуального
+            # времени — 7090 вызовов). Здесь цена другая и на порядки меньше:
+            # `read_acceptance_criterion` — чтение тела БЕЗ модели, раз в
+            # `CRITERION_RECHECK_INTERVAL`, а не на каждой миллисекунде.
+            #
+            # Перепроверяем ТОЛЬКО пока открыт вопрос ГЕЙТА КРИТЕРИЯ:
+            # обычная парковка `build-me` (self._open_question пуст) в
+            # перечитывании не нуждается — там нечему появиться в теле
+            # без ведома цикла, кроме решения человека, а оно и так сигнал.
+            #
+            # `wake_within` укорачивает только ВОЗВРАЩАЕМЫЙ `_park` таймаут
+            # (см. её докстринг) — описание ожидания и дедлайн, которые
+            # видит человек, считаются от полного `hours`, без урезания.
+            decision = await self._wait_for_signal(await self._park(
+                kind, who=who, reason=reason, hours=hours,
+                wake_within=CRITERION_RECHECK_INTERVAL))
+            if decision is None and self._park_timeout(hours) > timedelta(0):
+                # Таймаут промежуточной перепроверки, а не реальный дедлайн
+                # парковки (тот — когда `_park_timeout` уже вернул 0, ветка
+                # `if decision is None` ниже, общая с обычным путём).
+                # Критерий читаем БЕЗ модели — `propose_acceptance_options`/
+                # `ask_question` здесь не нужны: вопрос уже открыт,
+                # спрашивать заново нечего, а если критерий нашёлся — это же
+                # `_start_development` его увидит и без нашей помощи (см.
+                # ветку «критерий вписан руками», находка I4, выше).
+                criterion = ""
+                try:
+                    criterion = await workflow.execute_activity(
+                        activities.read_acceptance_criterion, issue,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as e:
+                    # Сбой перепроверки не хуже поведения без неё вовсе —
+                    # держим парковку, следующая перепроверка (или реальный
+                    # сигнал) попробует снова. Видимость такого сбоя не
+                    # заводим отдельно: `_start_development` (тот же гейт)
+                    # уже делает `read_acceptance_criterion` видимым через
+                    # `report_criterion_gate_stall`, а перепроверка — то же
+                    # чтение, просто вызванное чаще.
+                    workflow.logger.warning(
+                        "периодическая перепроверка критерия приёмки не "
+                        "удалась: %s", _failure_reason(e))
+                if criterion:
+                    # Критерий появился без единого сигнала от человека —
+                    # именно то, что обещает A23. `_start_development` сам
+                    # обнаружит непустой критерий, снимет устаревший вопрос
+                    # гейта (находка I4) и передаст задачу в разработку.
+                    return await self._start_development(issue)
+                # Критерия всё ещё нет — держим парковку. `(self._phase,
+                # self._stage, False)` — та же пара, что и у остальных
+                # веток «постороннее событие фазу не двигает» в этом
+                # обработчике: внешний цикл (`_run_phase_loop`) вызовет
+                # `_phase_await_build` заново, `_park` пересчитает остаток
+                # срока от АБСОЛЮТНОГО дедлайна (`_phase_since` не
+                # менялся), и перепроверка продолжится со следующим
+                # промежутком. Пропусти этот `return` — код провалился бы
+                # в `if decision is None` ниже и закрыл бы цикл по
+                # промежуточному таймауту, а не по реальному дедлайну.
+                return (self._phase, self._stage, False)
+        else:
+            decision = await self._wait_for_signal(
+                await self._park(kind, who=who, reason=reason, hours=hours))
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди

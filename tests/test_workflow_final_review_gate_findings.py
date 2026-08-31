@@ -251,6 +251,86 @@ async def test_autostart_waits_for_answer_instead_of_looping_forever():
 
 
 # ---------------------------------------------------------------------------
+# F3 (Important, второй круг финального ревью): критерий, вписанный руками,
+# обязан подхватываться под автостартом БЕЗ единого сигнала от человека.
+# ---------------------------------------------------------------------------
+
+_f3_criterion_calls = {"n": 0}
+
+
+@activity.defn(name="read_acceptance_criterion")
+async def f3_criterion_filled_after_a_while(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    _f3_criterion_calls["n"] += 1
+    # Первые перепроверки — критерия ещё нет. Человек вписывает его в тело
+    # руками ПОЗЖЕ, не отправляя контуру ни одного сигнала (правки тела
+    # вебхук не доставляет вовсе).
+    if _f3_criterion_calls["n"] < 3:
+        return ""
+    return "было 404; стало 405 с Allow: POST"
+
+
+@activity.defn(name="close_answered_by_body_edit")
+async def f3_close_answered(issue: IssueInput) -> None:
+    _calls.append("close-answered")
+
+
+@pytest.mark.asyncio
+async def test_autostart_picks_up_a_hand_edited_criterion_without_any_signal():
+    """Без правки: парковка гейта критерия ждёт ТОЛЬКО сигнала — команды,
+    `build-me`, события агента. Правки тела Issue вебхук не доставляет
+    сигналом вовсе, а под `DEVELOP_AUTOSTART` (чей смысл именно в
+    отсутствии действия человека) задача с вписанным руками критерием
+    просидела бы весь срок парковки МОЛЧА и закрылась — то самое действие
+    человека (`/harness-answer` или повторный `build-me`), которого
+    автостарт обязан избегать, стало бы единственной дверью (спека A23
+    обещает обратное).
+
+    Тест НИ РАЗУ не посылает `human_decision`/`user_comment` — только
+    закрывает Issue в конце, когда разработка уже должна была начаться.
+    Без правки `_await_calls(..., "development" in _calls)` не дожидается
+    условия за отведённые попытки, и тест падает по таймауту этого цикла
+    ожидания.
+    """
+    _calls.clear()
+    _f3_criterion_calls["n"] = 0
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      f3_criterion_filled_after_a_while,
+                                      options_stub, ask_stub, f3_close_answered,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            # Автостарт сам доходит до гейта, задаёт вопрос и паркуется —
+            # без единого сигнала.
+            await _await_calls(env, lambda: "ask" in _calls)
+
+            # Три интервала перепроверки (`CRITERION_RECHECK_INTERVAL` =
+            # 30 минут) с запасом — ни одного сигнала за всё это время.
+            await env.sleep(95 * 60)
+
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert _calls.count("propose") == 1, (
+        "модель зовётся один раз — на саму постановку вопроса, а не на "
+        "каждую перепроверку критерия")
+    assert _calls.count("ask") == 1
+    assert "close-answered" in _calls, (
+        "устаревший вопрос гейта обязан сняться тем же путём, что и при "
+        "ответе командой (находка I4)")
+    assert "development" in _calls, (
+        "критерий, вписанный руками, обязан довести цикл до разработки "
+        "БЕЗ единого сигнала от человека")
+
+
+# ---------------------------------------------------------------------------
 # Общая заглушка срока для сценариев без автостарта (C2, I1, I3, I4).
 # ---------------------------------------------------------------------------
 
