@@ -247,3 +247,91 @@ async def test_autostart_waits_for_answer_instead_of_looping_forever():
             await handle.result()
 
     assert "development" in _calls, "ответ на вопрос обязан довести цикл до разработки"
+
+
+# ---------------------------------------------------------------------------
+# Общая заглушка срока для сценариев без автостарта (C2, I1, I3, I4).
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_deadlines")
+async def deadlines_no_autostart() -> Deadlines:
+    return Deadlines(pr_fix_enabled=False, research_autostart=True)
+
+
+# ---------------------------------------------------------------------------
+# C2 (Critical): возрождение вопроса не переставляет указатель.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def c2_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@activity.defn(name="answer_question")
+async def c2_answer_reasked_then_gate_by_pointer(
+        issue: IssueInput, question_id: str, text: str, comment_id: int | None) -> str:
+    """Симулирует РЕАЛЬНОЕ поведение активности: вопрос "howtodemo-1" отвечен
+    первым ответом, но пропал из тела (человек стёр раздел руками) — вопрос
+    возрождается под НОВЫМ id "howtodemo-2" (A22). Второй ответ засчитывается
+    "accepted", ТОЛЬКО если он пришёл с АКТУАЛЬНЫМ id "howtodemo-2" — то есть
+    только если воркфлоу успел переставить свой указатель. Со СТАРЫМ id
+    "howtodemo-1" второй (и любой следующий) вызов застрял бы на "reasked"
+    же — ровно тот дефект C2 описывает: «по кругу до истечения срока».
+    """
+    _calls.append(f"answer:{question_id}")
+    if question_id == "howtodemo-1":
+        return "reasked"
+    if question_id == "howtodemo-2":
+        return "accepted"
+    return "no-question"
+
+
+@activity.defn(name="read_open_question_id")
+async def c2_read_open_question_id(issue: IssueInput) -> str:
+    _calls.append("read-open-id")
+    return "howtodemo-2"
+
+
+@pytest.mark.asyncio
+async def test_reasked_question_repoints_the_workflow_pointer():
+    """Без правки: контракт `answer_question` — голая строка-вердикт, и
+    воркфлоу очищает `self._open_question` только на `accepted`. После
+    `reasked` указатель остаётся на СТАРОМ, уже недействительном id — а
+    активность (см. заглушку выше) реалистично засчитывает только ответ с
+    АКТУАЛЬНЫМ id. Без правки второй ответ human'а уйдёт со СТАРЫМ id,
+    получит СНОВА "reasked", и `"development"` в `_calls` не появится
+    никогда — тест падает на ожидании `"development" in _calls`.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      c2_criterion_absent, options_stub, ask_stub,
+                                      c2_answer_reasked_then_gate_by_pointer,
+                                      c2_read_open_question_id, dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "ask" in _calls)
+
+            # Первый ответ — на исходный вопрос "howtodemo-1". Активность
+            # (заглушка) отвечает "reasked": вопрос «пропал и возродился».
+            await handle.signal("user_comment", args=["/harness-answer 1", 101])
+            await _await_calls(env, lambda: "answer:howtodemo-1" in _calls)
+
+            # Второй ответ человека — на ЛЮБОЙ (уже неважно какой) текст.
+            # Указатель воркфлоу решает, с каким id уйдёт вызов активности.
+            await handle.signal("user_comment", args=["/harness-answer 1", 102])
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert "answer:howtodemo-2" in _calls, (
+        "второй вызов активности обязан уйти с АКТУАЛЬНЫМ id вопроса, "
+        "а не с указателем, оставшимся от возрождённого")
+    assert "development" in _calls
+

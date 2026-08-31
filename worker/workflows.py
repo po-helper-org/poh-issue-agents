@@ -1969,6 +1969,34 @@ class IssueLifecycle:
         if verdict == "accepted":
             self._open_question = ""
             return await self._begin_development(issue)
+        if verdict == "reasked" and workflow.patched(
+                "issue-lifecycle-reasked-question-repoints-pointer"):
+            # Находка C2 (Critical, финальное ревью). Спека A22: возрождённый
+            # вопрос заводит НОВЫЙ идентификатор, указатель переставляется.
+            # Контракт `answer_question` этого не позволяет — активность
+            # возвращает голую строку-вердикт (см. её докстринг, почему тип
+            # возврата НЕ меняется: смена на структуру ломает десериализацию
+            # уже записанных в историю bare-строк). Указатель узнаём отдельным,
+            # новым вызовом: без него `self._open_question` остался бы на
+            # исчезнувшем id, и следующий ответ человека натыкался бы на «этот
+            # вопрос устарел» — а актуальный вопрос и был тем, на который он
+            # отвечал (по кругу до истечения срока парковки).
+            #
+            # `workflow.patched` обязателен: у прогонов, уже стоящих здесь
+            # СТАРЫМ кодом (указатель на вопрос уже в истории), новая
+            # активность здесь была бы командой, которой в их истории нет.
+            try:
+                self._open_question = await workflow.execute_activity(
+                    activities.read_open_question_id, issue,
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as exc:
+                # Сбой оставляет указатель СТАРЫМ — не хуже поведения без
+                # правки; лог для видимости, цикл не роняем.
+                workflow.logger.warning(
+                    "не переставил указатель на возрождённый вопрос: %s",
+                    _failure_reason(exc))
         return (self._phase, self._stage, False)
 
     async def _start_development(self, issue: IssueInput) -> tuple:
