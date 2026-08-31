@@ -437,11 +437,13 @@ class IssueLifecycle:
         # парковку: досиживать срок в закрытом Issue незачем.
         self._closed_by: str | None = None
         # Отказ гейта критерия приёмки (`_start_development`) уже показан хотя
-        # бы раз в ЭТОЙ серии подряд идущих отказов. Не переносится через
-        # continue-as-new — тот же выбор, что и у `_howtodemo_started` выше:
-        # худшее последствие пропажи флага на границе — лишнее повторное
-        # сообщение при очень редком стечении обстоятельств (длинная история
-        # и пустая очередь сигналов ровно в момент отказа), а не тишина.
+        # бы раз в ЭТОЙ серии подряд идущих отказов. Значение по умолчанию —
+        # для свежего прогона; при continue-as-new оно приезжает из
+        # `carried.criterion_gate_notified` в `run()` — см. её докстринг в
+        # `shared/workflow_types.py` за тем, почему флаг ОБЯЗАН переживать
+        # перезапуск (находка 2 ревью: без переноса дедупликация «одно
+        # сообщение на серию» ломается именно на задаче, застрявшей на этом
+        # гейте, — не в редком случае, а в обычном).
         self._criterion_gate_notified = False
 
     @workflow.query
@@ -778,6 +780,7 @@ class IssueLifecycle:
             self._answered_comment_ids = list(carried.answered_comment_ids)
             self._rework_rounds = carried.rework_rounds
             self._open_question = carried.open_question
+            self._criterion_gate_notified = carried.criterion_gate_notified
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -811,6 +814,7 @@ class IssueLifecycle:
             answered_comment_ids=list(self._answered_comment_ids),
             rework_rounds=self._rework_rounds,
             open_question=self._open_question,
+            criterion_gate_notified=self._criterion_gate_notified,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -2010,14 +2014,50 @@ class IssueLifecycle:
                     # Issue не место для счётчика ретраев одного и того же
                     # сбоя. Флаг сбрасывается ниже сразу после успешного
                     # чтения — следующий отказ будет уже НОВОЙ серией и снова
-                    # заслуживает своего сообщения.
-                    self._criterion_gate_notified = True
-                    await workflow.execute_activity(
-                        activities.report_criterion_gate_stall,
-                        args=[issue, _failure_reason(e)],
-                        start_to_close_timeout=timedelta(seconds=30),
-                        retry_policy=RetryPolicy(maximum_attempts=5),
-                    )
+                    # заслуживает своего сообщения. Сам флаг переживает
+                    # continue-as-new через `LifecycleState.criterion_gate_
+                    # notified` (см. её докстринг в shared/workflow_types.py) —
+                    # ревью посчитало механику: порог истории проверяется
+                    # ПОСЛЕ каждого перехода фазы, включая холостой «остались
+                    # на месте после отказа», а очередь сигналов сразу после
+                    # разбора одного сигнала почти всегда пуста. Для задачи,
+                    # застрявшей на этом гейте, порог набирается быстро, и без
+                    # переноса каждый перезапуск открывал бы новую «серию» —
+                    # находка 2 (Important).
+                    try:
+                        await workflow.execute_activity(
+                            activities.report_criterion_gate_stall,
+                            args=[issue, _failure_reason(e)],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=5),
+                        )
+                    except Exception as notify_exc:
+                        # Находка 1 (Important): уведомление не имеет права
+                        # ронять то, что оно уведомляет. Причина отказа
+                        # чтения критерия — обычно та же недоступность
+                        # GitHub, а `report_criterion_gate_stall` зовёт тот же
+                        # `github_client.post_comment`, ничем не защищённый:
+                        # не перехватить здесь значило бы воспроизвести
+                        # падение цикла другим заходом — тем же необработанным
+                        # отказом, просто из другой активности. Маркер
+                        # обязателен по тем же причинам, что и выше: без него
+                        # это новая ветка решения, которой не было в истории
+                        # прогонов, уже отправивших уведомление старым кодом.
+                        if workflow.patched(
+                                "issue-lifecycle-acceptance-gate-stall-notice-safe"):
+                            # Флаг НЕ поднимаем (см. `else` ниже) — попытка не
+                            # считается состоявшейся: сообщение не дошло ни
+                            # оператору (Sentry), ни человеку (комментарий), и
+                            # следующий отказ гейта в этой же серии обязан
+                            # попробовать уведомить снова, а не молчать до
+                            # конца серии.
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе гейта критерия "
+                                "приёмки: %s", _failure_reason(notify_exc))
+                        else:
+                            raise
+                    else:
+                        self._criterion_gate_notified = True
                 return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
             # Критерий прочитан (пусть даже пустым) — если серия отказов и
             # была, она закончилась здесь. Следующий отказ — уже новая серия,

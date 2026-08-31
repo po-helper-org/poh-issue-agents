@@ -17,8 +17,9 @@ import pytest
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
+from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
+import workflows as workflows_module
 from shared.workflow_types import (
     ClassificationResult,
     CommentIntent,
@@ -166,6 +167,19 @@ async def stall_reported(issue: IssueInput, reason: str) -> None:
     _calls.append("stall-notice")
 
 
+# Ревью, находка 1 (Important): уведомление об отказе гейта само не должно
+# ронять цикл, который оно уведомляет. Воспроизводит РЕАЛЬНУЮ причину отказа
+# из ревью — недоступность GitHub роняет и чтение критерия, и
+# `github_client.post_comment` внутри `report_criterion_gate_stall` одним и
+# тем же способом, `non_retryable=True` — по той же причине, что и у
+# `criterion_read_fails`: падает на первой же попытке, не выжидая всю
+# ретрай-политику (5 попыток) виртуальным временем.
+@activity.defn(name="report_criterion_gate_stall")
+async def stall_report_fails(issue: IssueInput, reason: str) -> None:
+    _calls.append("stall-notice-failed")
+    raise ApplicationError("GitHub 503: комментарий не отправился", non_retryable=True)
+
+
 @activity.defn(name="propose_acceptance_options")
 async def options_stub(issue: IssueInput) -> list[str]:
     _calls.append("propose")
@@ -276,6 +290,11 @@ _COMMON = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub,
            post_priority, escalate, trigger_build, dev_dispatch_stub,
            interpret_ack, ack_seen_stub, options_stub, ask_stub, answer_accepted,
            stall_reported]
+
+# Тем же именем активности `report_criterion_gate_stall` в одном Worker'е
+# нельзя зарегистрировать дважды — тестам про отказ УВЕДОМЛЕНИЯ (находка 1)
+# нужен стенд без `stall_reported`, но с остальными заглушками `_COMMON`.
+_COMMON_SANS_STALL_STUB = [a for a in _COMMON if a is not stall_reported]
 
 
 @pytest.mark.asyncio
@@ -394,6 +413,105 @@ async def test_criterion_gate_stall_is_reported_once_per_series():
     assert _calls.count("read-criterion") == 2, "гейт должен был отказать дважды подряд"
     assert _calls.count("stall-notice") == 1, (
         "сообщение — одно на серию отказов, а не на каждую попытку")
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_does_not_kill_the_lifecycle():
+    """Ревью, находка 1 (Important): уведомление об отказе гейта не должно
+    само ронять цикл, который оно уведомляет.
+
+    Причина отказа `read_acceptance_criterion` — обычно та же недоступность
+    GitHub, а `report_criterion_gate_stall` (`worker/activities.py`) зовёт тот
+    же `github_client.post_comment`, ничем не защищённый. Без перехвата в
+    `_start_development` ретраи уведомления (5 попыток) тоже отказывают, и
+    необработанная ошибка вылетает из `except`-блока наружу — правка,
+    чинившая падение цикла на отказе чтения критерия, воспроизводит его же
+    падение с другого захода.
+
+    До правки `handle.result()` ниже бросает `WorkflowFailureError`, а
+    заглушка уведомления в остальных тестах файла (`stall_reported`) никогда
+    не бросает — поэтому ни один из них этот путь не ловит.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_COMMON_SANS_STALL_STUB, criterion_read_fails,
+                                      stall_report_fails, dev_forbidden]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "stall-notice-failed" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()  # без правки — WorkflowFailureError здесь
+
+    assert "development" not in _calls, "разработка не должна была начаться"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(120)
+async def test_stall_notice_dedup_survives_continue_as_new(monkeypatch):
+    """Ревью, находка 2 (Important): флаг «уже уведомили» обязан пережить
+    continue-as-new, иначе дедупликация «одно сообщение на серию» ломается
+    ровно там, ради чего писалась.
+
+    Ревьюер разобрал механику: проверка порога истории в `_run_phase_loop`
+    стоит ПОСЛЕ КАЖДОГО перехода фазы — включая холостой переход "остались на
+    месте после отказа гейта", — а очередь сигналов сразу после разбора
+    одного сигнала почти всегда пуста. Для задачи, уже прошедшей триаж и
+    застрявшей на этом гейте (ровно целевой сценарий этой правки), порог
+    набирается быстро. Порог опущен искусственно (`HISTORY_EVENT_THRESHOLD`),
+    чтобы не растягивать тест на сотни реальных событий — сама механика
+    сценария от боевого не отличается (см. `test_continue_as_new_truncates_
+    history_without_losing_state` в tests/test_lifecycle_loop.py, тот же
+    приём). `workflow_runner=UnsandboxedWorkflowRunner()` обязателен по той
+    же причине, что и там: песочница импортирует свою копию модуля, и
+    monkeypatch порога до воркфлоу не доехал бы.
+
+    Сценарий: первый отказ гейта уведомляет и поднимает флаг, затем прогон
+    обязан хотя бы раз перезапуститься (continue-as-new) ПОСЛЕ этого — важен
+    именно порядок, — и только тогда приходит второй отказ той же серии. Без
+    переноса флага в `LifecycleState.criterion_gate_notified` `__init__`
+    после перезапуска снова ставит `False`, и второй отказ шлёт ВТОРОЕ
+    сообщение о той же самой серии.
+    """
+    _calls.clear()
+    monkeypatch.setattr(workflows_module, "HISTORY_EVENT_THRESHOLD", 15)
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_COMMON, criterion_read_fails, dev_forbidden],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: _calls.count("stall-notice") == 1)
+            gen_at_notice = await handle.query(IssueLifecycle.generation)
+
+            # Безобидный сигнал (любое решение, кроме "build-me", —
+            # `_phase_await_build` возвращает "остались на месте" молча, см.
+            # `if decision != "build-me"`) даёт ЕЩЁ ОДИН холостой переход
+            # фазы ПОСЛЕ уведомления — ровно тот момент, когда в реальности
+            # continue-as-new и получает свой шанс: очередь сигналов пуста
+            # сразу после разбора, порог истории уже набран. Ждём именно
+            # перезапуска, случившегося ПОСЛЕ уведомления, — важен порядок, а
+            # не сам факт, что флаг когда-то был True.
+            await handle.signal("human_decision", "no-build")
+            await _await_quiescence(env, handle)
+            assert await handle.query(IssueLifecycle.generation) > gen_at_notice, (
+                "перезапуск после уведомления не случился — порог не сработал")
+
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: _calls.count("read-criterion") >= 2)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert _calls.count("read-criterion") == 2, "гейт должен был отказать дважды подряд"
+    assert _calls.count("stall-notice") == 1, (
+        "флаг дедупликации не пережил continue-as-new — сообщение продублировалось")
 
 
 @pytest.mark.asyncio
