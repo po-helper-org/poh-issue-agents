@@ -1,8 +1,12 @@
 """Сквозной путь: вопрос, ответ, журнал, критерий у исполнителя.
 
-Отказ, ради которого написано: poh-demo-checkout#163 прошёл разработку целиком,
-а критерий приёмки так и не доехал — сценарий в теле был, но контур его не
-увидел и никого не спросил.
+Отказ, ради которого затеяна работа: poh-demo-checkout#163 прошёл разработку
+целиком, а критерий приёмки так и не доехал — сценарий в теле был, но контур
+его не увидел и никого не спросил. Там причиной был конкретно распознаватель
+заголовка (не узнавал русское «## Как принимаем») — это закрыто отдельно, и
+тело задачи ниже вообще без заголовка. Этот тест воспроизводит более общую
+часть того же отказа — страховочный путь: когда сценарий не находится НИКАК,
+гейт обязан спросить человека, а не пропустить задачу молча.
 
 Тест идёт по активностям, а не по воркфлоу: цикл проверен в Task 8, здесь
 важно, что решение доезжает до потребителя и накапливается в задаче.
@@ -15,7 +19,7 @@ pytest не подтягивает фикстуры между тестовым�
 import pytest
 
 import activities as a
-from shared import agent_comment, issue_blocks, labels, questions, task_context
+from shared import agent_comment, issue_blocks, labels, questions
 from shared.workflow_types import IssueInput
 
 
@@ -66,14 +70,13 @@ def github(monkeypatch, issue):
     return state
 
 
-def test_full_path_question_answer_journal_criterion(github, issue, tmp_path):
-    """Пять фактов одним прогоном:
+def test_full_path_question_answer_journal_criterion(github, issue):
+    """Четыре факта одним прогоном:
 
     1. до ответа критерия нет — гейт задачу не пропустил бы;
     2. вопрос задан, назвал команду, повесил метку;
     3. пустая команда получила реакции и вопрос не закрыла;
-    4. ответ номером записал решение в журнал И в блок критерия;
-    5. критерий пригоден для записи в `.harness/howtodemo.md`.
+    4. ответ номером записал решение в журнал И в блок критерия.
     """
     assert a.read_acceptance_criterion(issue) == ""
 
@@ -103,10 +106,15 @@ def test_full_path_question_answer_journal_criterion(github, issue, tmp_path):
     assert "405 с Allow: POST" in criterion
     assert issue_blocks.read(github["body"], issue_blocks.HOWTODEMO) == criterion
 
-    harness = tmp_path / task_context.DIR
-    harness.mkdir()
-    (harness / task_context.HOWTODEMO).write_text(criterion, encoding="utf-8")
-    assert "405 с Allow: POST" in (harness / task_context.HOWTODEMO).read_text()
+    # Дальше по пути критерий должен доехать до `.harness/howtodemo.md` у
+    # исполнителя — но эту запись делает `_dev_prepare` (`worker/
+    # activities.py`) поверх настоящего git-клона задачи, а не активности
+    # вопроса/ответа, проверяемые здесь. Гонять здесь `_dev_prepare` ради
+    # одной строки значило бы тащить в этот тест клон репозитория и всю его
+    # подготовку — дублирование другого теста, а не проверка. Этот шаг уже
+    # проверен по-настоящему (реальный вызов `_dev_prepare`, реальный файл в
+    # клоне): tests/test_dev_task_assembly.py::
+    # test_howtodemo_scenario_reaches_the_harness_file.
 
 
 def test_second_question_after_the_first_is_closed(github, issue):
