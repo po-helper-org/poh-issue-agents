@@ -251,3 +251,32 @@ def test_ask_question_ignores_comment_feed_entirely(github, issue):
     assert len(github["comments"]) == 501  # второй вызов не задвоил комментарий
     marker = questions.comment_marker("howtodemo-1")
     assert sum(marker in c for c in github["comments"]) == 1
+
+
+def test_open_question_of_a_different_kind_is_a_conflict_not_a_reuse(github, issue):
+    """Финальное ревью ветки, находка I5 (Important).
+
+    Ранний возврат срабатывал на ЛЮБОМ открытом вопросе, не сверяя вид: если
+    вопрос вида `howtodemo` уже открыт, а вызывают `ask_question` с видом
+    `mvp-bounds` (второй потребитель механизма — спека обещает выбор из
+    вариантов плана), активность БЕЗ ПРАВКИ молча вернула бы id ЧУЖОГО
+    вопроса `howtodemo-1`, ничего не написав про `mvp-bounds` в тело и не
+    опубликовав комментарий с его текстом и вариантами. Вызывающий код
+    (воркфлоу) поставил бы этот чужой id себе в указатель, будучи уверенным,
+    что свой вопрос задан, — а он просто пропал.
+
+    Без правки этот тест падает дважды: `pytest.raises` не срабатывает
+    (исключения нет), а `second == "howtodemo-1"` — id вопроса, который
+    никто не спрашивал про `mvp-bounds`.
+    """
+    first = a.ask_question(issue, "howtodemo", "Чем принимать?", ["а"])
+    assert first == "howtodemo-1"
+
+    with pytest.raises(a.ConflictingOpenQuestion):
+        a.ask_question(issue, "mvp-bounds", "Что входит в MVP?", ["только /quote"])
+
+    # Открытый вопрос — по-прежнему исходный howtodemo, без следов mvp-bounds.
+    stored = questions.read_open(github["body"])
+    assert stored.id == "howtodemo-1"
+    assert stored.kind == "howtodemo"
+    assert len(github["comments"]) == 1  # второго комментария (про MVP) не было

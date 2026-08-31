@@ -216,6 +216,25 @@ def escalate_to_human(issue: IssueInput, reason: str = "") -> None:
     github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_HUMAN_TRIAGE)
 
 
+class ConflictingOpenQuestion(RuntimeError):
+    """`ask_question` вызван для вида `kind`, а открытый вопрос — ДРУГОГО вида.
+
+    Финальное ревью ветки, находка I5 (Important). В теле Issue один слот на
+    открытый вопрос (`questions.write_open`/`read_open`), а ранний возврат
+    ниже раньше срабатывал на ЛЮБОМ открытом вопросе, не сверяя вид: второй
+    потребитель механизма (спека обещает `mvp-bounds`, выбор из вариантов
+    плана) получил бы в ответ id ЧУЖОГО висящего вопроса, поставил бы его
+    себе в указатель и посчитал бы, что свой вопрос задан, — а сам текст и
+    варианты потерялись бы молча, не оставив следа («шаг отработал, успех
+    доложен, результата нет» — худший класс отказа в этом контуре). Сегодня
+    потребитель один (`howtodemo`), и в проде эта ветка не достижима — но раз
+    слот один, а не по слоту на вид, два одновременно открытых вопроса разных
+    видов в принципе несовместимы с форматом тела. Падаем громко здесь и
+    сейчас, а не подсовываем чужой id: чинить дешевле сейчас, чем после того,
+    как второй потребитель появится и словит эту находку на проде.
+    """
+
+
 @activity.defn
 def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) -> str:
     """Задать человеку вопрос и повесить метку ожидания.
@@ -273,10 +292,17 @@ def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) ->
     Явной подписи `agent_comment.sign(...)` здесь нет: `github_client.
     post_comment` подписывает каждый исходящий комментарий сам, в
     единственной точке отправки.
+
+    Открытый вопрос ДРУГОГО вида (`question.kind != kind`) — не «уже задано»,
+    а конфликт: см. `ConflictingOpenQuestion` (находка I5 финального ревью).
     """
     body = github_client.get_issue_body(issue.repo, issue.issue_number)
 
     question = questions.read_open(body)
+    if question is not None and question.kind != kind:
+        raise ConflictingOpenQuestion(
+            f"вопрос вида {question.kind!r} (id={question.id!r}) уже открыт — "
+            f"нельзя задать поверх него вопрос вида {kind!r}")
     if question is None:
         question = questions.Question(
             id=questions.next_question_id(questions.read_journal(body), kind),
