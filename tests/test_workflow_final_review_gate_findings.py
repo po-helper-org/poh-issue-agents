@@ -22,6 +22,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
+from shared import lifecycle
 from shared.workflow_types import (
     ClassificationResult,
     CommentIntent,
@@ -30,6 +31,7 @@ from shared.workflow_types import (
     DuplicateResult,
     GateResult,
     IssueInput,
+    LifecycleState,
     PriorityResult,
     ProtocolState,
 )
@@ -721,3 +723,72 @@ async def test_close_answered_by_body_edit_failure_is_reported_and_does_not_bloc
         "отказ уборки состояния не должен блокировать передачу в разработку")
 
 
+# ---------------------------------------------------------------------------
+# F7 (Important, второй круг финального ревью): пустой указатель ЭТОГО
+# прогона — не то же самое, что «вопроса нет в природе» (спека A24).
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_open_question_id")
+async def f7_read_open_question(issue: IssueInput) -> str:
+    _calls.append("read-open-id")
+    return "howtodemo-9"
+
+
+@activity.defn(name="answer_question")
+async def f7_answer_by_pointer(issue: IssueInput, question_id: str, text: str,
+                               comment_id: int | None) -> str:
+    # Реалистичное поведение настоящей активности (см. её докстринг, ветка
+    # `question.id != question_id`): при РЕАЛЬНО открытом вопросе пустой
+    # или неверный id получает «вопрос устарел», а не разбор ответа.
+    _calls.append(f"answer:{question_id!r}")
+    return "accepted" if question_id == "howtodemo-9" else "no-question"
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_over_a_live_question_repoints_before_answering():
+    """Без правки: пустой `self._open_question` в ветке `/harness-answer`
+    без открытого вопроса (находка I3) трактуется как «вопроса нет вовсе».
+    Но прогон, поднятый ЗАНОВО поверх ЖИВОЙ задачи (спека A24 — например,
+    событие внешнего агента: `webhook/main.py:_lifecycle_args_for` несёт
+    снимок с фазой, но БЕЗ указателя на вопрос гейта), стартует с пустым
+    указателем, даже если в теле УЖЕ висит открытый вопрос из прошлого
+    прогона.
+
+    Без правки `_answer_open_question` зовёт `answer_question` сразу с
+    `question_id=""`, минуя `read_open_question_id`, и заглушка (повторяющая
+    реальное поведение активности) отвечает `"no-question"` на пустой id при
+    РЕАЛЬНО открытом вопросе — человек, ответивший на актуальный вопрос,
+    получил бы «этот вопрос уже устарел». Тест падает на
+    `assert "read-open-id" in _calls` и на `"answer:'howtodemo-9'"`.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      f7_read_open_question, f7_answer_by_pointer,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            # Снимок несёт фазу READY_FOR_DEV (как после события внешнего
+            # агента — A24), но НЕ несёт указателя на открытый вопрос: он
+            # заводится только внутри `_start_development` ЭТОГО прогона,
+            # которого здесь никогда не было.
+            carried = LifecycleState(phase=lifecycle.READY_FOR_DEV,
+                                     stage="awaiting-build-decision")
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, args=[_issue(), carried],
+                id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await handle.signal("user_comment", args=["/harness-answer текст ответа", 101])
+            await _await_calls(env, lambda: any(c.startswith("answer:") for c in _calls))
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert "read-open-id" in _calls, (
+        "указатель обязан проверяться перед ответом, а не считаться пустым "
+        "по умолчанию")
+    assert "answer:'howtodemo-9'" in _calls, (
+        "команда обязана уйти с АКТУАЛЬНЫМ id открытого вопроса, а не с "
+        "пустым указателем свежего прогона")
+    assert "answer:''" not in _calls

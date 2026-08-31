@@ -1,8 +1,8 @@
 """Прямые тесты на тела новых уведомляющих активностей второго круга
-финального ревью — `report_question_close_failure` (находка F6) первой,
-`report_question_repoint_failure` (находка F9) и три уже существовавшие
-активности, покрытые только заглушками по имени (находка F5), — следующими
-коммитами этой же ветки.
+финального ревью — `report_question_close_failure` (находка F6),
+`report_question_repoint_failure` (находка F9) — и (следующим коммитом этой
+же ветки) трёх уже существовавших активностей, покрытых только заглушками по
+имени в `tests/test_workflow_final_review_gate_findings.py` (находка F5).
 
 Модель здесь не зовётся никогда: все проверяемые активности — сеть (GitHub,
 Sentry) и разбор тела, ни одна не обращается к `llm`.
@@ -50,3 +50,13 @@ def test_report_question_close_failure_posts_a_comment(github, issue):
     comment = github["comments"][0].lower()
     assert "не смог снять устаревший вопрос" in comment
     assert "needs-human:answer" in comment
+
+
+# --- report_question_repoint_failure (F9, новая активность этого круга) ---
+
+def test_report_question_repoint_failure_is_sentry_only_without_a_comment(github, issue):
+    """Находка F9: событие Sentry, БЕЗ второго, спорящего комментария — тот,
+    что относится к самому ответу («вопрос пропал» / вердикт активности),
+    уже ушёл раньше (см. докстринг активности)."""
+    a.report_question_repoint_failure(issue, "RuntimeError: тело недоступно")
+    assert github["comments"] == []

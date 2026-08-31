@@ -2052,6 +2052,51 @@ class IssueLifecycle:
             # указателя у них уже ушёл (или тонул) по ветке диалога уточнений
             # ниже, и новая ветка означала бы для них другую историю на
             # реплее.
+            #
+            # Находка F7 (Important, второй круг финального ревью). Пустой
+            # `self._open_question` здесь означает «этот ПРОГОН вопрос не
+            # заводил», а не «вопроса нет в природе» — спека A24 требует:
+            # «новый цикл читает тело... вопрос открыт — переставляет
+            # указатель... не задавая вопрос заново». Прогон, поднятый
+            # заново поверх ЖИВОЙ задачи (событие внешнего агента,
+            # `webhook/main.py:_lifecycle_args_for` — снимок несёт фазу, но
+            # не указатель на вопрос), стартует с пустым указателем, даже
+            # если в теле УЖЕ висит открытый вопрос гейта из прошлого
+            # прогона. Без проверки `answer_question` (`worker/
+            # activities.py`) получит `question_id=""` при РЕАЛЬНО открытом
+            # вопросе и ответит «этот вопрос уже устарел, сейчас открыт
+            # другой» (ветка `question.id != question_id`) — человеку,
+            # ответившему на самый что ни на есть актуальный вопрос.
+            #
+            # Лечится тем же вызовом, что уже переставляет указатель после
+            # `reasked` (находка C2) — `read_open_question_id`.
+            if workflow.patched("issue-lifecycle-repoint-open-question-on-answer"):
+                try:
+                    self._open_question = await workflow.execute_activity(
+                        activities.read_open_question_id, issue,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    # Сбой оставляет указатель пустым — не хуже поведения без
+                    # этой правки (I3 по-прежнему честно ответит «вопросов
+                    # нет», просто может ошибиться, если вопрос был). Видимость
+                    # отказа — находка F9, тот же приём чуть ниже по файлу.
+                    workflow.logger.warning(
+                        "не проверил актуальный открытый вопрос перед "
+                        "ответом: %s", _failure_reason(exc))
+                    if workflow.patched("issue-lifecycle-question-repoint-failure-notice"):
+                        try:
+                            await workflow.execute_activity(
+                                activities.report_question_repoint_failure,
+                                args=[issue, _failure_reason(exc)],
+                                start_to_close_timeout=timedelta(seconds=30),
+                                retry_policy=RetryPolicy(maximum_attempts=3),
+                            )
+                        except Exception as notify_exc:
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе проверки "
+                                "открытого вопроса: %s", _failure_reason(notify_exc))
             nxt = await self._answer_open_question(issue, decision)
             if nxt is not None:
                 return nxt
@@ -2166,10 +2211,42 @@ class IssueLifecycle:
                 )
             except Exception as exc:
                 # Сбой оставляет указатель СТАРЫМ — не хуже поведения без
-                # правки; лог для видимости, цикл не роняем.
+                # правки; цикл не роняем.
+                #
+                # Находка F9 (Important, второй круг финального ревью). До
+                # этой правки видимость отказа была ТОЛЬКО строкой `workflow.
+                # logger.warning` — хлебной крошкой для Sentry (порог
+                # `event_level=ERROR` у `LoggingIntegration`, а не WARNING,
+                # см. докстринг `sentry_setup`), оператор её не увидит.
+                # Человек тем временем по кругу получает «этот вопрос уже
+                # устарел» на СВОЙ актуальный ответ (указатель остался на
+                # исчезнувшем id) и не понимает, почему. Событие — по
+                # образцу уже заведённого уведомления об отказе `answer_
+                # question` (находка I1, `report_answer_question_failure`);
+                # переиспользуем ту же активность `read_open_question_id`-
+                # уведомления, что и находка F7 чуть выше — обе про один и
+                # тот же отказ (чтение актуального открытого вопроса), просто
+                # в разных точках вызова.
+                #
+                # Без комментария человеку: тот, что уже ушёл на «reasked»
+                # чуть выше, честно объясняет, что делать («ответьте
+                # текстом») — второй, спорящий с ним («не смог обработать
+                # ответ, попробуйте ещё раз») тут же в ленте только запутает.
                 workflow.logger.warning(
                     "не переставил указатель на возрождённый вопрос: %s",
                     _failure_reason(exc))
+                if workflow.patched("issue-lifecycle-question-repoint-failure-notice"):
+                    try:
+                        await workflow.execute_activity(
+                            activities.report_question_repoint_failure,
+                            args=[issue, _failure_reason(exc)],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        )
+                    except Exception as notify_exc:
+                        workflow.logger.warning(
+                            "не смог уведомить об отказе проверки открытого "
+                            "вопроса: %s", _failure_reason(notify_exc))
         return (self._phase, self._stage, False)
 
     async def _start_development(self, issue: IssueInput) -> tuple:

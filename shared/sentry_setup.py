@@ -334,6 +334,38 @@ def capture_criterion_gate_stall(issue, exc_type: str, message: str) -> Optional
             level="error")
 
 
+def capture_question_repoint_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`read_open_question_id` (worker/activities.py) не смогла подтвердить
+    актуальный открытый вопрос — воркфлоу зовёт её в двух точках (находки
+    C2/F7, финальное ревью): переставить указатель после `reasked` и
+    проверить его перед ответом на `/harness-answer` с пустым указателем.
+
+    Указатель в обоих случаях остаётся НЕактуальным, а человек по кругу
+    получает «этот вопрос уже устарел» на СВОЙ актуальный ответ — до этого
+    события отказ был виден только `workflow.logger.warning` (тот же порог
+    `event_level=ERROR`, что и у `capture_criterion_gate_stall` выше).
+
+    fingerprint по (question_repoint_failure, exc_type): группируем по типу
+    сбоя, а не по issue — иначе один и тот же сетевой аутейдж GitHub заводит
+    отдельную группу на каждую задачу.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:read-open-question-id")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["question_repoint_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"read_open_question_id failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")
+
+
 def capture_question_close_failure(issue, exc_type: str, message: str) -> Optional[str]:
     """`close_answered_by_body_edit` (worker/activities.py) не смогла снять
     устаревший вопрос гейта критерия при переходе в разработку (находка F6,

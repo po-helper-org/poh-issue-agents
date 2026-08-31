@@ -630,6 +630,35 @@ def report_answer_question_failure(issue: IssueInput, reason: str) -> None:
 
 
 @activity.defn
+def report_question_repoint_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать видимым отказ `read_open_question_id`, вызванной, чтобы
+    переставить указатель воркфлоу на актуальный открытый вопрос (находка F9,
+    Important, второй круг финального ревью — общая для двух точек вызова:
+    после исхода `reasked` активности `answer_question`, находка C2, и перед
+    ответом на `/harness-answer` с пустым указателем, находка F7).
+
+    Только Sentry, БЕЗ комментария человеку — в обеих точках вызова к моменту
+    отказа человек уже получил (или вот-вот получит) СВОЙ ответ на команду:
+    после `reasked` — комментарий «вопрос пропал, ответьте текстом» из самой
+    `answer_question`; при пустом указателе — детерминированный вердикт той
+    же активности, вызванной следом. Второй, спорящий с ним комментарий
+    («не смог обработать, попробуйте ещё раз») в обоих случаях не подсказал
+    бы, что делать, а только запутал бы — в отличие от `report_answer_
+    question_failure`, где отказ вообще не дал ответу дойти до `answer_
+    question`.
+
+    До этой правки видимость отказа была только `workflow.logger.warning` —
+    хлебной крошкой для Sentry (порог `event_level=ERROR`, не WARNING, см.
+    докстринг `sentry_setup`), оператор её не видел вовсе, а указатель
+    оставался НЕактуальным: следующий ответ человека получал бы «этот вопрос
+    уже устарел, сейчас открыт другой» — на СВОЙ же актуальный ответ.
+    """
+    exc_type, _, message = reason.partition(": ")
+    sentry_setup.capture_question_repoint_failure(
+        issue, exc_type or "unknown", message or reason)
+
+
+@activity.defn
 def propose_acceptance_options(issue: IssueInput) -> list[str]:
     """Варианты критерия приёмки от модели. Отказала — пустой список.
 
