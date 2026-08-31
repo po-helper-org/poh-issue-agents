@@ -321,6 +321,15 @@ def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) ->
 # засорять ленту задачи.
 _EMPTY_ANSWER_REACTIONS = ("confused", "-1")
 
+# Ревью, находка 2 (Important). `str.isdigit()` истинен и для строки в тысячи
+# символов, а `int()` на такой строке в Python 3.12 бросает `ValueError:
+# Exceeds the limit (4300 digits)...` — необработанное исключение вместо
+# любого из объявленных исходов активности. У вопроса не бывает больше трёх
+# вариантов (см. A9 в `docs/superpowers/specs/2026-08-29-harness-answer-
+# command-design.md`) — порог с большим запасом, чтобы отсечь заведомо-не-
+# номер строку ДО вызова `int()`, а не поймать её исключением постфактум.
+_MAX_OPTION_NUMBER_DIGITS = 4
+
 
 def _record_decision(issue: IssueInput, body: str, question: questions.Question,
                      answer: str, supersedes: str = "") -> None:
@@ -342,7 +351,8 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
     `accepted`    — решение записано, ожидание снято.
     `confirm`     — толкование показано, ждём второго ответа.
     `empty`       — команда без содержания, вопрос остался открытым.
-    `no-question` — вопроса не задавали.
+    `no-question` — вопроса не задавали, либо открытый вопрос — не тот, на
+                    который отвечает эта команда (ревью, находка 3).
     `reasked`     — блок вопроса пропал из тела, вопрос задан заново.
 
     Номер и свободный текст разведены намеренно: выбирая номер, человек
@@ -369,11 +379,31 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
                 "Сейчас я не задавал вопроса — отвечать не на что.")
             return "no-question"
 
+        journal = questions.read_journal(body)
+
+        # Ревью, находка 1 (Important). Запись в журнал и очистка блока
+        # вопроса в `_record_decision` идут ОДНИМ обращением к телу —
+        # промежуточного состояния там нет. Но снятие метки
+        # `NEEDS_HUMAN_ANSWER` следом — ОТДЕЛЬНЫЙ сетевой вызов, и он может
+        # упасть уже ПОСЛЕ того, как решение необратимо легло в журнал.
+        # Активность в этом случае падает исключением, но следующий вызов с
+        # ТЕМ ЖЕ `question_id` увидит: открытого вопроса в теле больше нет —
+        # и, не заглянув в журнал, ушёл бы в ветку ниже с выводом «вопрос
+        # пропал»: опубликовал бы комментарий про недействительные варианты
+        # и заново повесил бы метку, хотя ответ человека уже записан. Тот же
+        # приём идемпотентности по каждому следствию, что уже применён в
+        # `ask_question`: решение по этому `question_id` в журнале уже есть
+        # — значит, вопрос не пропал, а отвечен; довершаем недостающее
+        # (метку) и докладываем «принято», не трогая журнал повторно.
+        if any(decision.question_id == question_id for decision in journal):
+            github_client.remove_label(issue.repo, issue.issue_number,
+                                       labels.NEEDS_HUMAN_ANSWER)
+            return "accepted"
+
         # Прогон ждёт ответа, а блока в теле нет: его стёрли или переписали
         # тело руками. Варианты НЕ перегенерируем: старый комментарий с
         # нумерацией остался в ленте, и новая нумерация сделала бы ответ «2»
         # двусмысленным.
-        journal = questions.read_journal(body)
         kind = question_id.rsplit("-", 1)[0] or "answer"
 
         # Пропавший `question_id` в журнал никогда не попадал: блок исчез ДО
@@ -408,13 +438,38 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
                                 labels.NEEDS_HUMAN_ANSWER)
         return "reasked"
 
+    # Ревью, находка 3 (Important). Дальше код работает с ЛЮБЫМ открытым
+    # вопросом, найденным в теле, не сверяя его id с тем, что пришёл в вызов.
+    # Прогон передаёт сюда id вопроса, на который он сам ждёт ответа
+    # (указатель прогона — см. docs/superpowers/specs/2026-08-29-harness-
+    # answer-command-design.md, раздел «Кто где живёт»). Если к моменту
+    # обработки в теле открыт УЖЕ ДРУГОЙ вопрос — например, после
+    # возрождения (ветка выше), которое как раз меняет id, — команда с
+    # устаревшим id не должна молча зачитываться ответом на текущий вопрос
+    # исходом «принято» без подтверждения. Исход переиспользован из уже
+    # объявленных: с точки зрения ЭТОЙ команды вопроса, на который она
+    # отвечает, больше нет — то же самое `no-question`, что и при полном
+    # отсутствии открытого вопроса.
+    if question.id != question_id:
+        github_client.post_comment(
+            issue.repo, issue.issue_number,
+            "Этот вопрос уже устарел — сейчас открыт другой. Ответ не учтён, "
+            "отвечайте на актуальный вопрос в этой задаче.")
+        return "no-question"
+
     if not answer:
         if comment_id is not None:
             for reaction in _EMPTY_ANSWER_REACTIONS:
                 github_client.add_reaction(issue.repo, comment_id, reaction)
         return "empty"
 
-    if answer.isdigit() and 1 <= int(answer) <= len(question.options):
+    # Ревью, находка 2 (Important): `len(answer) <= _MAX_OPTION_NUMBER_DIGITS`
+    # проверяется ДО `int(answer)`, и при строке длиннее порога `and`
+    # накоротко замыкается, не доходя до `int()` вовсе (см. докстринг
+    # константы) — иначе строка из тысяч цифр роняла бы активность
+    # необработанным `ValueError` вместо любого объявленного исхода.
+    if (answer.isdigit() and len(answer) <= _MAX_OPTION_NUMBER_DIGITS
+            and 1 <= int(answer) <= len(question.options)):
         _record_decision(issue, body, question, question.options[int(answer) - 1])
         return "accepted"
 
