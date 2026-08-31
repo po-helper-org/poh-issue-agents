@@ -379,7 +379,7 @@ def _place_decision(body: str, kind: str, answer: str) -> str:
 
 
 def _record_decision(issue: IssueInput, body: str, question: questions.Question,
-                     answer: str, supersedes: str = "") -> None:
+                     answer: str, supersedes: str = "", *, place: bool = True) -> None:
     """Записать решение в журнал, закрыть вопрос, снять метку ожидания.
 
     Черновик толкования чистим здесь же (`questions.clear_draft`), а не
@@ -398,11 +398,22 @@ def _record_decision(issue: IssueInput, body: str, question: questions.Question,
     безусловно: к моменту, когда для ТЕКУЩЕГО вопроса пишется решение,
     любой черновик в теле — либо его же (стал не нужен, ответили в обход),
     либо ещё более старый чужой (тем более не нужен).
+
+    `place=False` (находка F8, Minor, второй круг финального ревью) —
+    ответ НЕ дублируется в размеченный блок `_DECISION_DESTINATION`. Нужно
+    вызывающему, для которого текст ответа УЖЕ взят из самого тела (см.
+    `close_answered_by_body_edit`): если источником был не размеченный
+    блок, а обычный раздел по заголовку, `place=True` создал бы ВТОРОЙ
+    экземпляр того же текста — уже в размеченном блоке, — а чтение
+    (`_howtodemo_block`) отдаёт приоритет размеченному блоку над разделом,
+    так что последующие правки человеком заголовка молча перестали бы
+    учитываться.
     """
     body = questions.append_decision(body, questions.Decision(
         question_id=question.id, kind=question.kind, question=question.text,
         answer=answer, supersedes=supersedes))
-    body = _place_decision(body, question.kind, answer)
+    if place:
+        body = _place_decision(body, question.kind, answer)
     body = questions.clear_open(body)
     body = questions.clear_draft(body, issue_ref=f"{issue.repo}#{issue.issue_number}")
     github_client.update_issue_body(issue.repo, issue.issue_number, body)
@@ -713,20 +724,50 @@ def close_answered_by_body_edit(issue: IssueInput) -> None:
     Снимаем ТЕМ ЖЕ путём, что и обычный ответ командой: записываем решение в
     журнал (текстом уже вписанного в тело критерия) и чистим блок вопроса и
     метку — `_record_decision` уже умеет это одним атомарным обращением к
-    телу (запись в журнал, `_place_decision`, `clear_open`, `clear_draft`,
-    снятие метки). `_place_decision` при этом просто перезапишет блок
-    HOWTODEMO тем же текстом, что там уже лежит, — безвредный no-op.
+    телу (запись в журнал, `clear_open`, `clear_draft`, снятие метки).
 
-    Идемпотентна тривиально: если открытого вопроса уже нет (снят предыдущим
-    проходом этой же ветки, либо его и не было — обычный путь без гейта),
-    функция ничего не делает и ничего не пишет в тело.
+    `place=False` (находка F8, Minor, второй круг финального ревью): текст
+    ответа уже ВЗЯТ из тела (`_howtodemo_block` читает либо размеченный
+    блок, либо раздел по заголовку — см. её докстринг), класть его же
+    обратно в размеченный блок незачем. Если источником был раздел по
+    заголовку (человек вписал критерий заголовком, а не через `/harness-
+    answer`), запись всё равно создала бы там ВТОРОЙ, размеченный экземпляр
+    — а чтение отдаёт приоритет размеченному блоку над разделом, так что
+    дальнейшие правки заголовка человеком молча переставали бы учитываться.
+
+    НЕ идемпотентна тривиально, хотя раньше докстринг это утверждал.
+    `_record_decision` пишет тело ОДНИМ обращением, но снимает метку
+    `NEEDS_HUMAN_ANSWER` ОТДЕЛЬНЫМ, следующим сетевым вызовом (тот же край,
+    что уже закрыт в `answer_question` — см. её комментарий «Ревью, находка
+    1»). Падение именно на этом, втором вызове раньше означало: повтор
+    видит — блока вопроса в теле уже нет (записан прошлой попыткой) — и
+    молча возвращается, доложив успех, а метка остаётся висеть НАВСЕГДА:
+    `_start_development` эту активность по данной задаче больше не позовёт,
+    фаза уже ушла в разработку. Находка F1 (Important, второй круг
+    финального ревью) — ровно тот дефект, ради устранения которого сама
+    активность (I4) и заводилась, доложенный как успех.
+
+    `answer_question` тот же край закрывает сверкой ответа с журналом ПО
+    `question_id` — но у ЭТОЙ функции id нет: вопрос обнаруживается заново
+    каждый вызов, и к моменту повтора он уже пропал из тела вместе со своим
+    id. Прямой и дешёвый признак прерванной попытки — сама метка:
+    `_record_decision` снимает её ПОСЛЕДНЕЙ, значит если открытого вопроса
+    уже нет, а метка всё ещё висит — предыдущая попытка прервалась ровно
+    между записью тела и снятием метки, и остаётся только довершить этот
+    один недостающий шаг.
     """
     body = github_client.get_issue_body(issue.repo, issue.issue_number)
     question = questions.read_open(body)
     if question is None:
+        current_labels = [label["name"] for label in
+                          github_client.get_issue(issue.repo, issue.issue_number
+                                                  ).get("labels", [])]
+        if labels.has(current_labels, labels.NEEDS_HUMAN_ANSWER):
+            github_client.remove_label(issue.repo, issue.issue_number,
+                                       labels.NEEDS_HUMAN_ANSWER)
         return
     criterion = _howtodemo_block(body)
-    _record_decision(issue, body, question, criterion)
+    _record_decision(issue, body, question, criterion, place=False)
 
 
 @activity.defn

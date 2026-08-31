@@ -78,6 +78,13 @@ def test_capture_helpers_are_noop_when_disabled(monkeypatch):
     assert sentry_setup.capture_estimate_failure(req, "расчёт", "ValueError", "bad") is None
     assert sentry_setup.capture_followups_failure(issue, "RuntimeError", "boom") is None
     assert sentry_setup.capture_criterion_gate_stall(issue, "RuntimeError", "boom") is None
+    # Находка F5 (второй круг финального ревью): `capture_answer_question_
+    # failure` не звалась НИ РАЗУ ни в одном тесте — воркфлоу-тесты заглушают
+    # саму активность `report_answer_question_failure` по имени и до неё
+    # никогда не доходят. То же для двух новых хелперов этого круга (F6, F9).
+    assert sentry_setup.capture_answer_question_failure(issue, "RuntimeError", "boom") is None
+    assert sentry_setup.capture_question_repoint_failure(issue, "RuntimeError", "boom") is None
+    assert sentry_setup.capture_question_close_failure(issue, "RuntimeError", "boom") is None
 
 
 # --- Ссылка на событие для комментария в Issue ---
