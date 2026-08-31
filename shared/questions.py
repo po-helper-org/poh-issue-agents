@@ -434,8 +434,41 @@ def read_draft(body: str | None) -> Draft | None:
     return parse_draft(payload)
 
 
-def write_draft(body: str | None, draft: Draft) -> str:
-    return issue_blocks.write(body, issue_blocks.DRAFT, render_draft(draft))
+def write_draft(body: str | None, draft: Draft, *, issue_ref: str = "") -> str:
+    """Тело с записанным (или добавленным) черновиком.
+
+    Находка (Important, ревью по задаче про порчу маркеров черновика).
+    Раньше пробрасывала `ValueError` из `issue_blocks.write` наружу
+    необработанным — при испорченных маркерах DRAFT (тело правили руками,
+    невидимый HTML-маркер снесло наполовину) любой свободный ответ на ЛЮБОЙ
+    вопрос задачи ронял `answer_question` целиком: `read_draft` на такой же
+    порче деградирует тихо до None (см. её докстринг), а запись — нет, и
+    диалог с человеком останавливался до ручной починки разметки, о
+    существовании которой он не знает.
+
+    Починка: `ValueError` от `issue_blocks.write` ловим и снимаем ЛЮБЫЕ
+    остатки маркеров DRAFT (`issue_blocks.discard_draft` — путь, жёстко
+    привязанный к DRAFT и не применимый к ANSWERS/QUESTION, см. её
+    докстринг), после чего пишем черновик в уже расчищенное тело. Для
+    ANSWERS и QUESTION громкий отказ `issue_blocks` не смягчается — это
+    записи, а не заметка, и там отказ защищает историю от затирания
+    (см. докстринг модуля `issue_blocks`).
+
+    Потерять испорченный черновик не страшно (это заметка, не запись, см.
+    докстринг `Draft`), а вот заблокировать разговор с человеком из-за него
+    — недопустимо, поэтому починка тут не молчаливая: она обязана попасть в
+    лог с указанием причины и, если вызывающий его передал, задачи
+    (`issue_ref`) — молчаливая правка тела была бы дефектом сама по себе.
+    """
+    try:
+        return issue_blocks.write(body, issue_blocks.DRAFT, render_draft(draft))
+    except ValueError as exc:
+        logger.warning(
+            "тело повреждено для блока %s — маркеры сняты принудительно, "
+            "новый черновик записан в расчищенное тело (задача %s): %s",
+            issue_blocks.DRAFT, issue_ref or "?", exc)
+        cleaned = issue_blocks.discard_draft(body)
+        return issue_blocks.write(cleaned, issue_blocks.DRAFT, render_draft(draft))
 
 
 def mark_draft_announced(body: str | None, draft: Draft) -> str:
@@ -453,8 +486,29 @@ def mark_draft_announced(body: str | None, draft: Draft) -> str:
     return write_draft(body, dataclasses.replace(draft, announced=True))
 
 
-def clear_draft(body: str | None) -> str:
-    return issue_blocks.strip(body, issue_blocks.DRAFT)
+def clear_draft(body: str | None, *, issue_ref: str = "") -> str:
+    """Тело без черновика — тем же приёмом починки, что и `write_draft`.
+
+    Находка (Important, тот же случай, что у `write_draft`, см. её
+    докстринг). Раньше пробрасывала `ValueError` из `issue_blocks.strip`
+    наружу необработанным: `_record_decision` в `worker/activities.py`
+    вызывает `clear_draft` БЕЗУСЛОВНО при записи любого решения — в том
+    числе когда человек ответил номером варианта, к черновику вообще не
+    имеющим отношения, — и порча маркеров DRAFT ронял бы такой ответ тоже,
+    не только свободный текст.
+
+    `issue_ref` — тот же необязательный параметр только для лога, что и у
+    `write_draft`: значения по умолчанию достаточно, чтобы существующие
+    вызовы (в том числе прямые из тестов) продолжали работать без изменений.
+    """
+    try:
+        return issue_blocks.strip(body, issue_blocks.DRAFT)
+    except ValueError as exc:
+        logger.warning(
+            "тело повреждено для блока %s — маркеры сняты принудительно, "
+            "черновик отброшен без восстановления (задача %s): %s",
+            issue_blocks.DRAFT, issue_ref or "?", exc)
+        return issue_blocks.discard_draft(body)
 
 
 def read_journal(body: str | None) -> list[Decision]:

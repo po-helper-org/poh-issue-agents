@@ -356,7 +356,7 @@ def _record_decision(issue: IssueInput, body: str, question: questions.Question,
         question_id=question.id, kind=question.kind, question=question.text,
         answer=answer, supersedes=supersedes))
     body = questions.clear_open(body)
-    body = questions.clear_draft(body)
+    body = questions.clear_draft(body, issue_ref=f"{issue.repo}#{issue.issue_number}")
     github_client.update_issue_body(issue.repo, issue.issue_number, body)
     github_client.remove_label(issue.repo, issue.issue_number,
                                labels.NEEDS_HUMAN_ANSWER)
@@ -659,7 +659,8 @@ def _confirm_free_text(issue: IssueInput, body: str, question: questions.Questio
 
     draft = questions.Draft(question_id=question.id,
                             interpretation=interpretation.model_dump())
-    body = questions.write_draft(body, draft)
+    body = questions.write_draft(body, draft,
+                                 issue_ref=f"{issue.repo}#{issue.issue_number}")
     github_client.update_issue_body(issue.repo, issue.issue_number, body)
     return _announce_draft(issue, body, draft, interpretation)
 
@@ -676,7 +677,7 @@ def _apply_interpretation(issue: IssueInput, body: str, question: questions.Ques
     `ask_question`.
     """
     interpretation = answer_interpretation.Interpretation(**payload)
-    body = questions.clear_draft(body)
+    body = questions.clear_draft(body, issue_ref=f"{issue.repo}#{issue.issue_number}")
     body = questions.append_decision(body, questions.Decision(
         question_id=question.id, kind=question.kind, question=question.text,
         answer=interpretation.answer))

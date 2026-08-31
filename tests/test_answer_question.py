@@ -1,7 +1,9 @@
+import inspect
+
 import pytest
 
 import activities as a
-from shared import agent_comment, labels, questions
+from shared import agent_comment, issue_blocks, labels, questions
 from shared.workflow_types import IssueInput
 
 
@@ -238,6 +240,68 @@ def test_free_text_shows_interpretation_and_waits(github, issue, monkeypatch):
     assert a.answer_question(issue, "howtodemo-1", "405 везде кроме POST", 101) == "confirm"
     assert "405 на любой метод кроме POST" in github["comments"][0]
     assert questions.read_journal(github["body"]) == []
+
+
+# --- ревью: прямые тесты на `_is_confirmation`/`_CONFIRMATIONS` (Minor).
+# Раньше эта граница проверялась только косвенно, через
+# `test_confirmation_records_answer_and_amendments` ниже — единственный
+# сценарий, где согласием служит ровно "да". Регистр, хвостовая пунктуация,
+# английские формы и — самое важное — поправка, лишь НАЧИНАЮЩАЯСЯ со слова
+# согласия, не были защищены ни одним прямым утверждением: молчаливая
+# регрессия (например, замена сравнения на проверку префикса) прошла бы
+# косвенный сценарий незамеченной.
+
+@pytest.mark.parametrize("answer", ["да", "Да", "ДА", "дА", "СоГласен"])
+def test_is_confirmation_ignores_case(answer):
+    """Согласие узнаётся независимо от регистра (см. докстринг
+    `_is_confirmation`: сравнение идёт по строке, приведённой к нижнему
+    регистру)."""
+    assert a._is_confirmation(answer) is True
+
+
+@pytest.mark.parametrize("answer", [
+    "да.", "Да!", "да,", "да;", "да:", "да?", "  да  ", "\tда\t",
+])
+def test_is_confirmation_ignores_trailing_punctuation_and_whitespace(answer):
+    """Хвостовая пунктуация и пробелы по краям не мешают распознать согласие
+    (см. докстринг `_is_confirmation`: человек с равной вероятностью
+    напишет «Да.», «ОК!» или «да»)."""
+    assert a._is_confirmation(answer) is True
+
+
+@pytest.mark.parametrize("answer", ["yes", "YES", "y", "Y", "ok", "Ok", "okay", "OKAY."])
+def test_is_confirmation_accepts_english_forms(answer):
+    """Английские формы согласия из `_CONFIRMATIONS` распознаются наравне с
+    русскими — список смешанный намеренно (см. определение `_CONFIRMATIONS`)."""
+    assert a._is_confirmation(answer) is True
+
+
+@pytest.mark.parametrize("answer", [
+    "да, но поменяйте формулировку",
+    "да не то, что я имел в виду",
+    "yes but change the wording",
+    "ok, только замените слово",
+    "согласен, однако поправьте дату",
+])
+def test_is_confirmation_rejects_amendment_that_merely_starts_with_agreement_word(answer):
+    """Главный случай (ревью, находка 3 в докстринге `_confirm_free_text`,
+    п. 3). Поправка, лишь НАЧИНАЮЩАЯСЯ со слова согласия, подтверждением уже
+    показанного черновика НЕ является — `_is_confirmation` сравнивает
+    нормализованную строку ЦЕЛИКОМ со списком известных согласий, а не
+    проверяет префикс. Без этого различия правка вроде «да, но поменяйте
+    формулировку» молча зачлась бы подтверждением ПЕРВОГО, непроверенного
+    толкования, хотя контур прямо обещал человеку принять именно
+    поправленный текст (см. `_confirm_free_text`, ветка находки 3, и
+    `test_correction_after_interpretation_is_reinterpreted_not_silently_confirmed`
+    для явного «нет, я имел в виду другое»)."""
+    assert a._is_confirmation(answer) is False
+
+
+@pytest.mark.parametrize("answer", ["", "нет", "не согласен", "может быть", "перепишите иначе"])
+def test_is_confirmation_rejects_plain_free_text(answer):
+    """Обычный несогласный или посторонний текст — не согласие (граничный
+    случай, дополняющий поправку с хвостом выше)."""
+    assert a._is_confirmation(answer) is False
 
 
 def test_confirmation_records_answer_and_amendments(github, issue, monkeypatch):
@@ -521,3 +585,98 @@ def test_correction_after_interpretation_is_reinterpreted_not_silently_confirmed
     assert a.answer_question(issue, "howtodemo-1", "да", 103) == "accepted"
     journal = questions.read_journal(github["body"])
     assert [d.answer for d in journal] == ["ВТОРОЕ толкование (поправленное)"]
+
+
+# --- ревью: испорченные маркеры черновика не должны блокировать разговор
+# (Important). Черновик — временная заметка ("показал толкование → человек
+# подтвердил"), а не запись вроде журнала или вопроса. `read_draft` при
+# порче маркеров DRAFT деградирует мягко до None и предупреждения в лог (это
+# уже покрыто `test_read_draft_logs_warning_on_corrupted_markers` в
+# `tests/test_questions.py`), но `clear_draft`/`write_draft` раньше
+# пробрасывали `ValueError` из `issue_blocks` наружу необработанным.
+# `_record_decision` вызывает `clear_draft` БЕЗУСЛОВНО при записи ЛЮБОГО
+# решения, а `_confirm_free_text` вызывает `write_draft` при ЛЮБОМ новом
+# свободном ответе — значит порча ронял бы `answer_question` на КАЖДОМ
+# вызове, даже когда сам вопрос к черновику отношения не имеет.
+
+def _corrupt_draft_markers(body: str) -> str:
+    """Тело с оборванным маркером блока DRAFT: старт есть, конца нет.
+
+    Тот же приём порчи, что и в `tests/test_issue_blocks.py`
+    (`test_orphaned_start_marker_is_corrupted_body_not_append_signal`) и в
+    `tests/test_questions.py` (`test_read_draft_logs_warning_on_corrupted_markers`)
+    — реалистичная модель того, как человек, правя описание задачи руками,
+    случайно сносит половину невидимого HTML-комментария: закрывающий маркер
+    пропадает, открывающий остаётся один.
+    """
+    start, _end = issue_blocks._markers(issue_blocks.DRAFT)
+    return f"{body}\n{start}\nоборванный маркер черновика без конца"
+
+
+def test_number_answer_survives_corrupted_draft_markers(github, issue):
+    """Ответ НОМЕРОМ варианта к черновику отношения не имеет вовсе, но
+    `_record_decision` безусловно зовёт `clear_draft` при записи решения
+    (см. её докстринг) — без починки в `shared/questions.py` этот тест
+    падает необработанным `ValueError` из `shared/issue_blocks.py`, а не
+    одним из объявленных исходов активности.
+    """
+    _open(github)
+    github["body"] = _corrupt_draft_markers(github["body"])
+
+    assert a.answer_question(issue, "howtodemo-1", "1", 101) == "accepted"
+
+    journal = questions.read_journal(github["body"])
+    assert [d.answer for d in journal] == ["было 404; стало 405"]
+    assert questions.read_open(github["body"]) is None
+    assert labels.NEEDS_HUMAN_ANSWER not in github["labels"]
+
+
+def test_free_text_answer_survives_corrupted_draft_markers(github, issue, monkeypatch):
+    """Свободный текст на вопрос, вообще не связанный с черновиком: толкование
+    считается, а `write_draft` при попытке записать НОВЫЙ черновик натыкается
+    на старую порчу маркеров. Без починки в `shared/questions.py` этот тест
+    падает необработанным `ValueError`, а не исходом `confirm`.
+    """
+    _open(github)
+    github["body"] = _corrupt_draft_markers(github["body"])
+    monkeypatch.setattr(a, "_interpret_answer",
+        lambda question, journal, answer:
+            a.answer_interpretation.Interpretation(answer="было 404; стало 405"))
+
+    assert a.answer_question(issue, "howtodemo-1", "какой-то текст", 101) == "confirm"
+
+    draft = questions.read_draft(github["body"])
+    assert draft is not None and draft.question_id == "howtodemo-1"
+    assert "было 404; стало 405" in github["comments"][0]
+
+
+def test_draft_repair_path_does_not_touch_journal_corruption(github, issue):
+    """Путь починки (`issue_blocks.discard_draft`, используемый только из
+    `questions.clear_draft`/`write_draft`) жёстко привязан к DRAFT — у него
+    нет параметра для имени блока, распространить его на ANSWERS/QUESTION
+    нельзя даже по ошибке.
+
+    Тело здесь испорчено СРАЗУ по двум блокам — и DRAFT, и ANSWERS — чтобы
+    доказать это не структурой сигнатуры (см. ниже), а поведением: если бы
+    починка была общей на все блоки, ответ бы тихо прошёл. Она не общая —
+    порча ANSWERS по-прежнему валит `answer_question` необработанным
+    `ValueError`, ровно как и до этой правки, потому что для записи
+    (в отличие от временной заметки-черновика) громкий отказ — осознанная
+    защита истории решений, и её нельзя ослаблять черновиковой починкой.
+    """
+    _open(github)
+    github["body"] = _corrupt_draft_markers(github["body"])
+    start, _end = issue_blocks._markers(issue_blocks.ANSWERS)
+    github["body"] += f"\n{start}\nоборванный маркер журнала без конца"
+
+    with pytest.raises(ValueError):
+        a.answer_question(issue, "howtodemo-1", "1", 101)
+
+
+def test_discard_draft_has_no_block_name_parameter():
+    """Структурная гарантия того же требования, что и у теста выше: у
+    `issue_blocks.discard_draft` нет параметра для имени блока вовсе — значит
+    направить его на ANSWERS или QUESTION нельзя не только по факту (см.
+    поведенческий тест), но и по самой сигнатуре функции, опечаткой в вызове.
+    """
+    assert list(inspect.signature(issue_blocks.discard_draft).parameters) == ["body"]
