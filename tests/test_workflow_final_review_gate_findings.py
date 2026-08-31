@@ -459,3 +459,65 @@ async def test_answer_question_failure_does_not_kill_the_lifecycle():
     assert "notified" in _calls, "человек обязан получить заметное сообщение об отказе"
     assert "development" not in _calls
 
+
+
+# ---------------------------------------------------------------------------
+# I2 (Important): срок ответа на вопрос — 72 часа, а не остаток парковки.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def i2_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@pytest.mark.asyncio
+async def test_criterion_question_resets_the_park_deadline():
+    """Без правки: вопрос гейта задаётся возвратом в ТУ ЖЕ фазу, а `_enter`
+    при совпадении фазы не трогает `_phase_since` (срок парковки считается
+    от него). Человек, нажавший «в разработку» под конец исходного
+    72-часового окна `awaiting-build-decision`, получил бы на ОТВЕТ по
+    вопросу только то, что осталось от СТАРОГО срока, — здесь это доводится
+    до почти нуля: `build-me` отправлен, когда до истечения исходного окна
+    осталось около часа.
+
+    Без правки второй запрос `awaiting()` покажет `deadline_epoch`, почти
+    совпадающий с ПЕРВЫМ (± пара секунд на обработку сигналов), — тест
+    падает на `assert new_remaining > 24`, потому что за такой остаток не
+    наберётся и часа.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      i2_criterion_absent, options_stub, ask_stub,
+                                      dev_forbidden],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            # Дожидаемся исходной парковки READY_FOR_DEV (build_decision_hours
+            # = 72 по умолчанию) и почти исчерпываем её срок ПЕРЕД тем, как
+            # человек нажмёт «в разработку».
+            await _await_quiescence(env, handle)
+            initial = await handle.query(IssueLifecycle.awaiting)
+            assert initial is not None
+            await env.sleep(71 * 3600)
+
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "ask" in _calls)
+            await _await_quiescence(env, handle)
+
+            after_question = await handle.query(IssueLifecycle.awaiting)
+            assert after_question is not None
+            now_epoch = (await env.get_current_time()).timestamp()
+            new_remaining_hours = (after_question.deadline_epoch - now_epoch) / 3600
+
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert new_remaining_hours > 24, (
+        "срок ответа на вопрос обязан отсчитываться заново (72 часа), "
+        f"а не от остатка исходной парковки (осталось {new_remaining_hours:.1f} ч)")
