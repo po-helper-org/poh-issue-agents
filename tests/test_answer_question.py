@@ -225,3 +225,19 @@ def test_empty_command_delivered_twice_keeps_question_open(github, issue):
     assert github["reactions"] == ["confused", "-1", "confused", "-1"]
     assert questions.read_open(github["body"]) is not None
     assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
+
+
+def test_superscript_digit_is_free_text_not_option_number(github, issue):
+    """Правка 1 ревью (Important). `str.isdigit()` возвращает True для
+    надстрочной единицы ¹ (U+00B9), но `int('¹')` бросает ValueError. Замена
+    на `str.isdecimal()` отсеивает такие символы, и они трактуются как
+    свободный текст, а не как номер варианта. Эти символы приезжают
+    копипастом из нумерованных списков сторонних приложений."""
+    _open(github)
+
+    # Надстрочная единица, которая проходит isdigit() но не isdecimal()
+    assert a.answer_question(issue, "howtodemo-1", "¹", 101) == "confirm"
+
+    # Свободный текст, а не решение: вопрос остаётся открытым, в журнал ничего не записалось
+    assert questions.read_open(github["body"]) is not None
+    assert questions.read_journal(github["body"]) == []

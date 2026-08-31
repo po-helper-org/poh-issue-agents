@@ -324,10 +324,9 @@ _EMPTY_ANSWER_REACTIONS = ("confused", "-1")
 # Ревью, находка 2 (Important). `str.isdigit()` истинен и для строки в тысячи
 # символов, а `int()` на такой строке в Python 3.12 бросает `ValueError:
 # Exceeds the limit (4300 digits)...` — необработанное исключение вместо
-# любого из объявленных исходов активности. У вопроса не бывает больше трёх
-# вариантов (см. A9 в `docs/superpowers/specs/2026-08-29-harness-answer-
-# command-design.md`) — порог с большим запасом, чтобы отсечь заведомо-не-
-# номер строку ДО вызова `int()`, а не поймать её исключением постфактум.
+# любого из объявленных исходов активности. Порог с большим запасом, чтобы
+# отсечь заведомо-не-номер строку ДО вызова `int()`, а не поймать её
+# исключением постфактум.
 _MAX_OPTION_NUMBER_DIGITS = 4
 
 
@@ -468,7 +467,7 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
     # накоротко замыкается, не доходя до `int()` вовсе (см. докстринг
     # константы) — иначе строка из тысяч цифр роняла бы активность
     # необработанным `ValueError` вместо любого объявленного исхода.
-    if (answer.isdigit() and len(answer) <= _MAX_OPTION_NUMBER_DIGITS
+    if (answer.isdecimal() and len(answer) <= _MAX_OPTION_NUMBER_DIGITS
             and 1 <= int(answer) <= len(question.options)):
         _record_decision(issue, body, question, question.options[int(answer) - 1])
         return "accepted"
