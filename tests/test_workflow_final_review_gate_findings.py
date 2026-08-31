@@ -665,3 +665,59 @@ async def test_criterion_filled_by_hand_closes_the_stale_question():
     assert "close-answered" in _calls, (
         "критерий, вписанный руками, обязан снять устаревший вопрос гейта")
     assert "development" in _calls
+
+
+# ---------------------------------------------------------------------------
+# F6 (Important, второй круг финального ревью): отказ `close_answered_by_
+# body_edit` обязан стать заметным, а не только строкой в логе.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="close_answered_by_body_edit")
+async def f6_close_fails(issue: IssueInput) -> None:
+    _calls.append("close-attempt")
+    raise RuntimeError("GitHub 502: снятие метки не отправилось")
+
+
+@activity.defn(name="report_question_close_failure")
+async def f6_notify(issue: IssueInput, reason: str) -> None:
+    _calls.append("close-notified")
+
+
+@pytest.mark.asyncio
+async def test_close_answered_by_body_edit_failure_is_reported_and_does_not_block_development():
+    """Без правки: отказ `close_answered_by_body_edit` уходит только в
+    `workflow.logger.warning` — событие Sentry не заводится, комментария
+    человеку нет. Активности `report_question_close_failure` в этой ветке
+    ДО правки не существует вовсе.
+
+    Без правки `"close-notified"` никогда не появляется в `_calls` — тест
+    падает на первом `assert`. Разработка при этом обязана начаться в любом
+    случае (отказ снятия — уборка состояния, а не условие входа).
+    """
+    _i4_criterion_calls["n"] = 0
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, deadlines_no_autostart,
+                                      i4_criterion_then_filled_by_hand,
+                                      options_stub, ask_stub, f6_close_fails,
+                                      f6_notify, dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "ask" in _calls)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()  # отказ снятия не должен ронять цикл
+
+    assert "close-attempt" in _calls
+    assert "close-notified" in _calls, (
+        "отказ снятия устаревшего вопроса гейта обязан стать заметным")
+    assert "development" in _calls, (
+        "отказ уборки состояния не должен блокировать передачу в разработку")
+
+

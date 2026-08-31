@@ -701,6 +701,33 @@ def close_answered_by_body_edit(issue: IssueInput) -> None:
 
 
 @activity.defn
+def report_question_close_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать видимым отказ `close_answered_by_body_edit` (находка F6,
+    Important, второй круг финального ревью).
+
+    Вызывается из `_start_development` (`worker/workflows.py`) ПОСЛЕ того,
+    как решение продолжить в разработку УЖЕ принято, — отказ здесь не
+    условие входа, а сорвавшаяся уборка (блок вопроса и метка `NEEDS_HUMAN_
+    ANSWER` могли остаться висеть на задаче, ушедшей в разработку). До этой
+    правки видимость была только `workflow.logger.warning` — хлебной
+    крошкой для Sentry (порог `event_level=ERROR`, не WARNING, см. докстринг
+    `sentry_setup`), а комментарий человеку с обещанием «донастрою при
+    следующем проходе» был бы неправдой: следующего прохода этой ветки НЕ
+    будет — фаза уже уезжает из READY_FOR_DEV вместе с этим самым вызовом.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_question_close_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Разработка началась, но не смог снять устаревший вопрос гейта "
+        "критерия приёмки — блок вопроса и метка `needs-human:answer` могли "
+        "остаться в теле. Если метка не снимется сама, снимите её вручную."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
+@activity.defn
 def report_criterion_gate_stall(issue: IssueInput, reason: str) -> None:
     """Сделать отказ гейта критерия приёмки видимым — событием в Sentry и
     комментарием человеку.

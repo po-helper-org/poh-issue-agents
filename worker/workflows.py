@@ -2364,8 +2364,36 @@ class IssueLifecycle:
                 #
                 # Сбой снятия — уборка состояния, а не условие входа в
                 # разработку: сетевой сбой здесь не должен блокировать
-                # передачу задачи агенту, только оставить блок/метку висеть
-                # до следующего успешного прохода этой ветки.
+                # передачу задачи агенту.
+                #
+                # Находка F6 (Important, второй круг финального ревью).
+                # Прежний комментарий здесь обещал «блок/метка повисят до
+                # следующего успешного прохода этой ветки» — неправда: НИЖЕ,
+                # сразу за перехватом, безусловно идёт `_begin_development`
+                # — фаза уезжает из READY_FOR_DEV, и `_start_development`
+                # (а с ним и эта ветка) по ЭТОЙ задаче больше не позовут,
+                # пока она не вернётся сюда заново (rework — см. `MAX_REWORK_
+                # ROUNDS` — либо новый цикл разработки). «Следующего прохода»
+                # в смысле «сейчас доделает» — не будет никогда.
+                #
+                # Отказ был и НЕВИДИМ: только `workflow.logger.warning`, а
+                # порог Sentry — `event_level=ERROR`, WARNING до него не
+                # поднимается (см. докстринг `sentry_setup`) — ни оператор,
+                # ни человек ничего не видели.
+                #
+                # Указатель чистим БЕЗУСЛОВНО, независимо от исхода —
+                # раньше `self._open_question = ""` стоял в `else` и
+                # выполнялся только при успехе. Решение продолжить в
+                # разработку УЖЕ принято (критерий найден) — снятие вопроса
+                # в теле дальше просто уборка, а НЕ снятая уборка не должна
+                # переживать в указателе `self._open_question` дольше самого
+                # решения: не почисти его — задача, которая когда-нибудь
+                # ВЕРНЁТСЯ в READY_FOR_DEV (rework), унаследует указатель на
+                # УЖЕ несуществующий вопрос, и автостарт (`_phase_await_
+                # build`, `autostart_blocked_by_open_question`) заблокируется
+                # им навсегда, ничего не спрашивая и не паркуясь по-настоящему
+                # — мёртвый указатель молча выключил бы автостарт для всей
+                # оставшейся жизни задачи.
                 #
                 # `workflow.patched` обязателен: у прогонов, уже стоящих
                 # здесь СТАРЫМ кодом с указателем на вопрос, этой активности
@@ -2380,8 +2408,19 @@ class IssueLifecycle:
                     workflow.logger.warning(
                         "не снял устаревший вопрос гейта критерия: %s",
                         _failure_reason(e))
-                else:
-                    self._open_question = ""
+                    if workflow.patched("issue-lifecycle-question-close-failure-notice"):
+                        try:
+                            await workflow.execute_activity(
+                                activities.report_question_close_failure,
+                                args=[issue, _failure_reason(e)],
+                                start_to_close_timeout=timedelta(seconds=30),
+                                retry_policy=RetryPolicy(maximum_attempts=3),
+                            )
+                        except Exception as notify_exc:
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе снятия вопроса "
+                                "гейта: %s", _failure_reason(notify_exc))
+                self._open_question = ""
         return await self._begin_development(issue)
 
     async def _begin_development(self, issue: IssueInput) -> tuple:

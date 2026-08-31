@@ -332,3 +332,34 @@ def capture_criterion_gate_stall(issue, exc_type: str, message: str) -> Optional
             f"acceptance criterion gate stalled: {getattr(issue, 'repo', '?')}"
             f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
             level="error")
+
+
+def capture_question_close_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`close_answered_by_body_edit` (worker/activities.py) не смогла снять
+    устаревший вопрос гейта критерия при переходе в разработку (находка F6,
+    Important, второй круг финального ревью).
+
+    Вызывается ПОСЛЕ того, как решение продолжить в разработку уже принято
+    — отказ не условие входа, а сорвавшаяся уборка (блок вопроса и метка
+    `NEEDS_HUMAN_ANSWER` могли остаться висеть на задаче, ушедшей в
+    разработку), и «следующего прохода», который довершил бы её сам,
+    для этой задачи может не быть вовсе — фаза уже уезжает.
+
+    fingerprint по (question_close_failure, exc_type): та же причина, что и
+    у соседних `capture_*_failure` — группировка по типу сбоя, а не по issue.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:close-answered-by-body-edit")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["question_close_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"close_answered_by_body_edit failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")

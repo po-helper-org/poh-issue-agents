@@ -153,6 +153,7 @@ async def main() -> None:
             activities.close_answered_by_body_edit,
             activities.report_criterion_gate_stall,
             activities.report_answer_question_failure,
+            activities.report_question_close_failure,
             activities.post_error_label,
             activities.ack_comment_seen,
             activities.mark_analyzing,
