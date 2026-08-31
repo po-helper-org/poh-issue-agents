@@ -333,12 +333,31 @@ _MAX_OPTION_NUMBER_DIGITS = 4
 
 def _record_decision(issue: IssueInput, body: str, question: questions.Question,
                      answer: str, supersedes: str = "") -> None:
-    """Записать решение в журнал, закрыть вопрос, снять метку ожидания."""
+    """Записать решение в журнал, закрыть вопрос, снять метку ожидания.
+
+    Черновик толкования чистим здесь же (`questions.clear_draft`), а не
+    только в `_apply_interpretation` (ревью, находка 2, Critical). Эта
+    функция — единственное место, где решение по вопросу может лечь в
+    журнал В ОБХОД черновика: человек ответил номером варианта, хотя перед
+    этим уже получил свободным ответом черновик толкования (кто-то ответил
+    текстом, увидел вопрос предложенных вариантов и всё же выбрал номер).
+    Не почисти его здесь — черновик остался бы висеть в теле уже без
+    открытого вопроса, к которому относится (`Draft.question_id` того
+    вопроса, что только что закрылся), и следующий свободный ответ на
+    СОВЕРШЕННО ДРУГОЙ вопрос этой же задачи нашёл бы его как «пока никем не
+    подтверждённый». Сама привязка по `question_id` (см. докстринг `Draft`)
+    уже не даёт такому чужому черновику быть принятым за подтверждение — но
+    без очистки он просто вечно лежал бы мёртвым грузом в теле. Чистим
+    безусловно: к моменту, когда для ТЕКУЩЕГО вопроса пишется решение,
+    любой черновик в теле — либо его же (стал не нужен, ответили в обход),
+    либо ещё более старый чужой (тем более не нужен).
+    """
     body = questions.append_decision(body, questions.Decision(
         question_id=question.id, kind=question.kind, question=question.text,
         answer=answer, supersedes=supersedes))
-    github_client.update_issue_body(issue.repo, issue.issue_number,
-                                    questions.clear_open(body))
+    body = questions.clear_open(body)
+    body = questions.clear_draft(body)
+    github_client.update_issue_body(issue.repo, issue.issue_number, body)
     github_client.remove_label(issue.repo, issue.issue_number,
                                labels.NEEDS_HUMAN_ANSWER)
 
@@ -501,28 +520,128 @@ def _interpret_answer(question: questions.Question,
     return interpretation
 
 
+# Короткие ответы, которыми человек подтверждает уже ПОКАЗАННЫЙ черновик
+# толкования (ревью, находка 3, Important). Список короткий и детерминированный
+# намеренно: понять, СОГЛАСЕН ли человек с уже показанным текстом, — задача
+# не того калибра, чтобы звать для неё модель (лишняя задержка и лишний повод
+# `_interpret_answer` отказать на простом «да»). Всё, что в список не попало,
+# — НОВЫЙ свободный ответ и подлежит толкованию заново.
+_CONFIRMATIONS = frozenset({
+    "да", "ага", "угу", "yes", "y", "ок", "окей", "ok", "okay",
+    "подтверждаю", "верно", "точно", "согласен", "согласна", "+",
+})
+
+
+def _is_confirmation(answer: str) -> bool:
+    """Согласие с уже показанным черновиком, а не новый ответ.
+
+    Ревью, находка 3 (Important). Сравнение — по нормализованной строке
+    (нижний регистр, без хвостовой пунктуации и пробелов по краям): человек
+    с равной вероятностью напишет «Да.», «ОК!» или «да» — буквальное
+    сравнение отсеяло бы часть этих форм как «непонятный» ответ и заставило
+    бы модель толковать очевидное согласие как новый текст.
+    """
+    return answer.strip().lower().strip(" \t.!?,;:") in _CONFIRMATIONS
+
+
+def _announce_draft(issue: IssueInput, body: str, draft: questions.Draft,
+                    interpretation: answer_interpretation.Interpretation) -> str:
+    """Опубликовать комментарий с толкованием и отметить черновик показанным.
+
+    Ревью, находка 1 (Critical). Черновик к моменту вызова уже лежит в теле
+    НЕПОКАЗАННЫМ (`announced=False`) — эта функция публикует комментарий и
+    ТОЛЬКО ПОСЛЕ его успешной отправки переводит признак в `announced=True`.
+    Тот же порядок и то же обоснование, что у `ask_question` (см. её
+    докстринг, пункты 1-3): проставить признак раньше комментария значило бы,
+    что он может соврать про комментарий, которого на самом деле не было, и
+    ретрай активности на неотправленный комментарий отреагировал бы так же,
+    как на подтверждённый человеком черновик, — применил бы толкование,
+    которого никто не видел.
+
+    Остаётся узкое, сознательно допустимое окно: комментарий ушёл, а
+    следующий `update_issue_body` (запись признака) упал. Повторный вызов
+    увидит `announced=False` и опубликует комментарий ВТОРОЙ раз — лишний
+    комментарий в ленте несравнимо дешевле черновика, применённого без
+    показа. Окно покрыто тестом
+    `test_duplicate_comment_if_crash_between_comment_and_announce` в
+    `tests/test_answer_question.py`, по образцу
+    `test_duplicate_comment_if_crash_between_comment_and_flag` из
+    `tests/test_ask_question.py`.
+    """
+    journal = questions.read_journal(body)
+    github_client.post_comment(issue.repo, issue.issue_number,
+        answer_interpretation.render_interpretation(interpretation, journal)
+        + "\n\nЕсли верно — подтвердите:\n\n```\n/harness-answer да\n```\n\n"
+          "Если нет — пришлите поправленный текст той же командой.")
+
+    body = questions.mark_draft_announced(body, draft)
+    github_client.update_issue_body(issue.repo, issue.issue_number, body)
+    return "confirm"
+
+
 def _confirm_free_text(issue: IssueInput, body: str, question: questions.Question,
                        answer: str) -> str:
     """Показать толкование ответа и ждать подтверждения (A15, A20, A21).
 
-    Висящий черновик (`questions.read_draft`) — признак того, что это ВТОРОЙ
-    ответ на этот же вопрос: первый уже показал толкование и записал его
-    черновиком в тело. Толкование восстанавливается ИЗ ЧЕРНОВИКА, а не
-    разбором текста предыдущего комментария — правка формулировки вокруг
-    сломала бы восстановление молча (тот же принцип, что у всего модуля
-    `shared/questions.py`, см. его докстринг).
+    Три находки ревью растут из одного корня: черновик писался в тело РАНЬШЕ,
+    чем человек его увидел, а вторым ответом считался ЛЮБОЙ следующий,
+    независимо от вопроса и текста. Починка — три независимых проверки перед
+    тем, как черновик станет решением:
 
-    Текст ВТОРОГО ответа заново не толкуется — он играет роль простого
-    подтверждения, каким бы ни было его буквальное содержимое («да» или
-    что-то ещё). Более тонкая обработка («это не то, что я имел в виду»)
-    сюда сознательно не входит: A15 требует лишь показать толкование и
-    дождаться подтверждения, а её отдельная обработка — материал для
-    следующей задачи, не этой.
+    1. Черновик обязан принадлежать ИМЕННО этому вопросу
+       (`pending.question_id == question.id`, находка 2, Critical). Открытый
+       вопрос в теле всегда один, но человек мог ответить на него номером
+       варианта в обход толкования (`_record_decision` в этом случае чистит
+       черновик — см. её докстринг) или вопрос мог возродиться под новым id
+       (`answer_question`, ветка "reasked") — в обоих случаях висящий
+       черновик принадлежит вопросу, которого больше нет, и не может быть
+       подтверждением текущего.
+    2. Черновик обязан быть ПОКАЗАННЫМ (`pending.announced`, находка 1,
+       Critical). Обрыв между записью черновика и публикацией комментария
+       (сеть, отказ GitHub) роняет активность; Temporal повторяет её теми же
+       аргументами, и без этой проверки повтор нашёл бы записанный, но не
+       показанный черновик и зачёл бы его вторым ответом — решение ушло бы
+       в журнал, а человек толкования ни разу не увидел. При
+       `announced=False` модель заново НЕ зовём — толкование уже посчитано
+       и лежит в черновике, недостающее — публикация, её и доделываем
+       (`_announce_draft`).
+    3. Текст ВТОРОГО ответа обязан быть СОГЛАСИЕМ (`_is_confirmation`,
+       находка 3, Important). Комментарий с толкованием прямо обещает
+       человеку: «если нет — пришлите поправленный текст той же командой».
+       Раньше код это обещание не выполнял — любой второй ответ подтверждал
+       прежнее толкование, даже если это была явная поправка. Теперь
+       несогласие (всё, что не входит в короткий список аффирмативных
+       ответов) трактуется как НОВЫЙ свободный ответ: старый черновик
+       отбрасывается, ответ толкуется заново, а результат ЗАМЕНЯЕТ прежний
+       черновик и снова показывается человеку — падать в ветку ниже с
+       `pending = None` для этого достаточно, других изменений не нужно.
+
+    Провалилась любая из трёх проверок — переходим к обычному пути первого
+    ответа: журнал, толкование моделью (`_interpret_answer`), новый черновик
+    НЕПОКАЗАННЫМ и его показ (`_announce_draft`).
     """
     pending = questions.read_draft(body)
-    if pending is not None:
-        _apply_interpretation(issue, body, question, pending)
-        return "accepted"
+    if pending is not None and pending.question_id == question.id:
+        if pending.announced:
+            if _is_confirmation(answer):
+                _apply_interpretation(issue, body, question, pending.interpretation)
+                return "accepted"
+            # Находка 3: не согласие — новый свободный ответ. Старый
+            # черновик отбрасываем, ниже он будет истолкован и заменён заново.
+            pending = None
+        else:
+            # Находка 1, узкое окно: черновик уже в теле, но человек его ещё
+            # не видел. Модель заново не зовём — толкование в черновике уже
+            # есть, недостающая часть — публикация комментария и признак.
+            interpretation = answer_interpretation.Interpretation(**pending.interpretation)
+            return _announce_draft(issue, body, pending, interpretation)
+    elif pending is not None:
+        # Находка 2: черновик принадлежит другому, уже закрытому или
+        # возрождённому вопросу — подтверждением ТЕКУЩЕГО быть не может.
+        # Молча отбрасываем и разбираем ответ как новый; сам черновик
+        # почистит `_record_decision`/`_apply_interpretation`, когда решение
+        # по вопросу, которому он принадлежал, будет записано.
+        pending = None
 
     journal = questions.read_journal(body)
     try:
@@ -538,14 +657,11 @@ def _confirm_free_text(issue: IssueInput, body: str, question: questions.Questio
             "```\n/harness-answer здесь ваш ответ\n```")
         return "confirm"
 
-    github_client.update_issue_body(
-        issue.repo, issue.issue_number,
-        questions.write_draft(body, interpretation.model_dump()))
-    github_client.post_comment(issue.repo, issue.issue_number,
-        answer_interpretation.render_interpretation(interpretation, journal)
-        + "\n\nЕсли верно — подтвердите:\n\n```\n/harness-answer да\n```\n\n"
-          "Если нет — пришлите поправленный текст той же командой.")
-    return "confirm"
+    draft = questions.Draft(question_id=question.id,
+                            interpretation=interpretation.model_dump())
+    body = questions.write_draft(body, draft)
+    github_client.update_issue_body(issue.repo, issue.issue_number, body)
+    return _announce_draft(issue, body, draft, interpretation)
 
 
 def _apply_interpretation(issue: IssueInput, body: str, question: questions.Question,

@@ -374,9 +374,11 @@ def test_read_open_is_none_when_json_broken_inside_intact_markers():
 
 
 def test_draft_roundtrip_and_clear():
-    payload = {"answer": "405 везде кроме POST", "amendments": []}
-    body = questions.write_draft("описание", payload)
-    assert questions.read_draft(body) == payload
+    draft = questions.Draft(question_id="howtodemo-1",
+                            interpretation={"answer": "405 везде кроме POST",
+                                           "amendments": []})
+    body = questions.write_draft("описание", draft)
+    assert questions.read_draft(body) == draft
     assert questions.read_draft(questions.clear_draft(body)) is None
 
 
@@ -390,6 +392,54 @@ def test_read_draft_logs_warning_on_corrupted_markers(caplog):
         result = questions.read_draft(corrupted)
     assert result is None
     assert issue_blocks.DRAFT in caplog.text
+
+
+# --- ревью правки: черновик привязан к вопросу и признаётся показанным
+# отдельно от факта записи (находки 1 и 2, обе Critical) ---
+
+def test_draft_roundtrip_carries_question_id_and_announced_flag():
+    """Оба новых поля черновика — обычные поля `Draft`, участвуют в
+    сериализации наравне с толкованием, а не хранятся где-то отдельно (тот же
+    принцип, что уже проверен для `Question.announced`, см.
+    `test_question_roundtrip_carries_announced_flag`)."""
+    original = questions.Draft(question_id="mvp-bounds-1",
+                               interpretation={"answer": "только /quote",
+                                              "amendments": []},
+                               announced=True)
+    restored = questions.parse_draft(questions.render_draft(original))
+    assert restored == original
+    assert restored.question_id == "mvp-bounds-1"
+    assert restored.announced is True
+
+
+def test_parse_draft_is_none_for_legacy_block_without_question_id():
+    """Черновик, записанный версией кода задачи 6 (голый `Interpretation.
+    model_dump()`, без ключа `question_id` вовсе), не подставляется как
+    валидный черновик текущего вопроса — `question_id` в нём взять неоткуда,
+    и молчаливое угадывание опаснее, чем «черновика нет» (см. докстринг
+    `parse_draft`): второй ответ человека просто истолкуется заново."""
+    legacy_payload = ('## Ожидает подтверждения\n\n```json\n'
+                      '{"answer": "405 везде кроме POST", "amendments": []}\n'
+                      '```')
+    assert questions.parse_draft(legacy_payload) is None
+
+
+def test_mark_draft_announced_sets_flag_and_keeps_other_fields():
+    """`mark_draft_announced` меняет только `announced`, `question_id` и
+    `interpretation` переживают запись без изменений — тот же контракт, что
+    у `mark_announced` для вопроса
+    (см. `test_mark_announced_sets_flag_and_keeps_other_fields`)."""
+    draft = questions.Draft(question_id="howtodemo-1",
+                            interpretation={"answer": "405", "amendments": []})
+    body = questions.write_draft("описание задачи", draft)
+    assert questions.read_draft(body).announced is False
+
+    body = questions.mark_draft_announced(body, draft)
+    stored = questions.read_draft(body)
+    assert stored.announced is True
+    assert stored.question_id == draft.question_id
+    assert stored.interpretation == draft.interpretation
+    assert "описание задачи" in body
 
 
 def test_append_decision_refuses_when_answer_contains_marker_like_text():

@@ -296,3 +296,228 @@ def test_superscript_digit_is_free_text_not_option_number(github, issue):
     # Свободный текст, а не решение: вопрос остаётся открытым, в журнал ничего не записалось
     assert questions.read_open(github["body"]) is not None
     assert questions.read_journal(github["body"]) == []
+
+
+# --- ревью по итогам brief'а task-6: черновик показан раньше, чем подтверждён (находки 1-3) ---
+
+def test_retry_does_not_apply_unseen_interpretation(github, issue, monkeypatch):
+    """Находка 1 (Critical). Ретрай применяет толкование, которого человек не видел.
+
+    Черновик пишется в тело РАНЬШЕ, чем уходит комментарий. Если публикация
+    комментария падает (сеть, отказ GitHub), активность падает следом, а
+    Temporal повторяет её ТЕМИ ЖЕ аргументами — тем же `question_id` и тем же
+    текстом. Без правки повторный вызов находил в теле уже записанный
+    черновик и, не различая «черновик показан» и «черновик просто записан»,
+    считал это ВТОРЫМ ответом человека — фиксировал решение и закрывал
+    вопрос, хотя комментарий с толкованием так и не ушёл ни разу.
+
+    Без правки в `worker/activities.py` этот тест падает: второй вызов
+    (ретрай) возвращает `accepted`, журнал не пуст, а комментарий за всё
+    время так и не был отправлен.
+    """
+    _open(github)
+    monkeypatch.setattr(a, "_interpret_answer",
+        lambda question, journal, answer:
+            a.answer_interpretation.Interpretation(answer="405 на любой метод кроме POST"))
+    monkeypatch.setattr(a.github_client, "post_comment",
+        lambda repo, number, body: (_ for _ in ()).throw(RuntimeError("сеть моргнула")))
+
+    with pytest.raises(RuntimeError):
+        a.answer_question(issue, "howtodemo-1", "405 везде кроме POST", 101)
+
+    # Черновик уже лежит в теле, но человеку он ни разу не показан.
+    draft = questions.read_draft(github["body"])
+    assert draft is not None and draft.announced is False
+    assert github["comments"] == []
+    assert questions.read_journal(github["body"]) == []
+    assert questions.read_open(github["body"]) is not None
+
+    # "Второй вызов" здесь — ретрай Temporal, не второй ответ человека:
+    # аргументы те же самые. Модель на неотправленный черновик звать нельзя —
+    # толкование уже посчитано, недостающая часть — публикация.
+    def no_model(*args, **kwargs):
+        raise AssertionError("на неотправленный черновик модель звать нельзя")
+
+    monkeypatch.setattr(a, "_interpret_answer", no_model)
+    monkeypatch.setattr(a.github_client, "post_comment",
+        lambda repo, number, body: github["comments"].append(agent_comment.sign(body)))
+
+    result = a.answer_question(issue, "howtodemo-1", "405 везде кроме POST", 101)
+
+    assert result == "confirm"
+    assert len(github["comments"]) == 1
+    assert questions.read_journal(github["body"]) == []
+    assert questions.read_open(github["body"]) is not None
+    assert questions.read_draft(github["body"]).announced is True
+
+
+def test_duplicate_comment_if_crash_between_comment_and_announce(github, issue, monkeypatch):
+    """Узкое окно, названное в докстринге `_announce_draft` (постановка задачи
+    прямо требует: назвать окно в комментарии к коду и покрыть тестом, как
+    сделано для `ask_question`). Комментарий с толкованием успешно уходит, а
+    следующий `update_issue_body` — запись признака `announced=True` — падает.
+    В сохранённом теле признак так и остался `False`, и повторный вызов, не
+    отличая этот случай от «комментарий вообще не публиковался», честно
+    публикует его ВТОРОЙ раз.
+
+    Сознательно допустимое поведение, а не дефект: тот же компромисс, что и
+    в `ask_question` (`test_duplicate_comment_if_crash_between_comment_and_flag`
+    в `tests/test_ask_question.py`). Альтернатива — проставлять признак ДО
+    комментария — переносит риск обрыва на шаг раньше и возвращает дефект
+    находки 1 (черновик, применённый без показа), что несравнимо хуже
+    лишнего комментария в ленте.
+    """
+    _open(github)
+    monkeypatch.setattr(a, "_interpret_answer",
+        lambda question, journal, answer:
+            a.answer_interpretation.Interpretation(answer="405 на любой метод кроме POST"))
+
+    calls = {"n": 0}
+    real_update = a.github_client.update_issue_body
+
+    def flaky_update(repo, number, body):
+        calls["n"] += 1
+        if calls["n"] == 2:  # 1-й вызов пишет черновик непоказанным, 2-й — признак announced
+            raise RuntimeError("сеть моргнула перед записью признака")
+        real_update(repo, number, body)
+
+    monkeypatch.setattr(a.github_client, "update_issue_body", flaky_update)
+
+    with pytest.raises(RuntimeError):
+        a.answer_question(issue, "howtodemo-1", "405 везде кроме POST", 101)
+
+    assert len(github["comments"]) == 1
+    assert questions.read_draft(github["body"]).announced is False
+
+    def no_model(*args, **kwargs):
+        raise AssertionError("на уже посчитанное толкование модель звать нельзя")
+
+    monkeypatch.setattr(a, "_interpret_answer", no_model)
+    monkeypatch.setattr(a.github_client, "update_issue_body", real_update)
+
+    result = a.answer_question(issue, "howtodemo-1", "405 везде кроме POST", 101)
+
+    assert result == "confirm"
+    assert len(github["comments"]) == 2  # окно сработало — второй экземпляр в ленте, это ожидаемо
+    assert questions.read_draft(github["body"]).announced is True
+
+
+def test_direct_number_answer_clears_leftover_draft_of_the_same_question(github, issue, monkeypatch):
+    """Находка 2 (Critical), первая защита — очистка черновика при записи
+    решения (`_record_decision`). Вопрос сперва получил свободный ответ
+    (черновик записан и показан), но вместо подтверждения человек ответил на
+    ТОТ ЖЕ вопрос номером варианта — решение уходит в обход черновика.
+
+    Без правки `_record_decision` черновик не трогает вовсе: он остаётся
+    висеть в теле уже без открытого вопроса, к которому относился, и готов
+    перехватить следующий свободный ответ на любой другой вопрос задачи (см.
+    следующий тест). Этот тест проверяет ближний, наблюдаемый прямо здесь
+    симптом: без правки черновик переживает решение, записанное в обход него.
+    """
+    _open(github)
+    monkeypatch.setattr(a, "_interpret_answer",
+        lambda question, journal, answer:
+            a.answer_interpretation.Interpretation(answer="было 405, а не 404"))
+
+    assert a.answer_question(issue, "howtodemo-1", "какой-то текст", 101) == "confirm"
+    assert questions.read_draft(github["body"]) is not None
+
+    # Вместо подтверждения — номер варианта на тот же вопрос.
+    assert a.answer_question(issue, "howtodemo-1", "1", 102) == "accepted"
+
+    assert questions.read_draft(github["body"]) is None, \
+        "черновик обязан исчезнуть вместе с вопросом, которому он принадлежал"
+    journal = questions.read_journal(github["body"])
+    assert [d.answer for d in journal] == ["было 404; стало 405"]
+
+
+def test_stale_draft_does_not_hijack_answer_to_a_different_question(github, issue, monkeypatch):
+    """Находка 2 (Critical), вторая защита — привязка черновика к своему
+    вопросу (`Draft.question_id`). Она нужна не только как страховка от
+    забывчивости `_record_decision`: если вопрос пропадает из тела ДО того,
+    как висящий черновик подтверждён (человек стёр раздел руками), вопрос
+    возрождается под НОВЫМ id (`answer_question`, ветка "reasked"), а
+    решения по старому вопросу так и не было — `_record_decision` тут ни
+    разу не срабатывает, чистить черновик некому.
+
+    Без привязки по `question_id` черновик, оставшийся от пропавшего
+    вопроса, читался бы как черновик ВОЗРОЖДЁННОГО вопроса просто потому,
+    что в теле он один. Без правки этот тест падает: последний вызов
+    возвращает `accepted` со СТАРЫМ текстом, модель для НОВОГО свободного
+    ответа ни разу не позвана.
+    """
+    _open(github)
+    monkeypatch.setattr(a, "_interpret_answer",
+        lambda question, journal, answer:
+            a.answer_interpretation.Interpretation(answer="СТАРОЕ толкование пропавшего вопроса"))
+
+    assert a.answer_question(issue, "howtodemo-1", "какой-то текст", 101) == "confirm"
+    draft_before = questions.read_draft(github["body"])
+    assert draft_before is not None and draft_before.question_id == "howtodemo-1"
+
+    # Раздел вопроса стёрли руками, черновик остался болтаться без него.
+    github["body"] = questions.clear_open(github["body"])
+
+    # Активность видит пропажу и возрождает вопрос под НОВЫМ id.
+    assert a.answer_question(issue, "howtodemo-1", "1", 101) == "reasked"
+    revived = questions.read_open(github["body"])
+    assert revived.id != "howtodemo-1"
+
+    monkeypatch.setattr(a, "_interpret_answer",
+        lambda question, journal, answer:
+            a.answer_interpretation.Interpretation(answer="НОВОЕ толкование возрождённого вопроса"))
+
+    result = a.answer_question(issue, revived.id, "новый ответ", 104)
+
+    assert result == "confirm"
+    assert questions.read_journal(github["body"]) == []
+    new_draft = questions.read_draft(github["body"])
+    assert new_draft.question_id == revived.id
+    assert new_draft.interpretation["answer"] == "НОВОЕ толкование возрождённого вопроса"
+
+
+def test_correction_after_interpretation_is_reinterpreted_not_silently_confirmed(
+        github, issue, monkeypatch):
+    """Находка 3 (Important). Контур публикует человеку: «Если нет —
+    пришлите поправленный текст той же командой». Без правки код это
+    обещание не выполнял: ЛЮБОЙ второй ответ на показанный черновик
+    применялся как подтверждение, независимо от своего текста, — поправка
+    молча терялась, а фиксировалось первое, непроверенное толкование.
+
+    Без правки этот тест падает: второй вызов возвращает `accepted` с
+    ПЕРВЫМ толкованием, модель для поправленного текста не звалась, и
+    журнал оказывается не пуст в точке, где по сценарию решения ещё быть не
+    должно.
+    """
+    _open(github)
+    calls = []
+
+    def fake_interpret(question, journal, answer):
+        calls.append(answer)
+        if answer == "первый ответ":
+            return a.answer_interpretation.Interpretation(answer="ПЕРВОЕ толкование")
+        return a.answer_interpretation.Interpretation(answer="ВТОРОЕ толкование (поправленное)")
+
+    monkeypatch.setattr(a, "_interpret_answer", fake_interpret)
+
+    assert a.answer_question(issue, "howtodemo-1", "первый ответ", 101) == "confirm"
+    assert "ПЕРВОЕ толкование" in github["comments"][0]
+    assert questions.read_draft(github["body"]).interpretation["answer"] == "ПЕРВОЕ толкование"
+
+    # Второй ответ — НЕ согласие, а поправленный текст.
+    result = a.answer_question(issue, "howtodemo-1", "нет, я имел в виду другое", 102)
+
+    assert result == "confirm"
+    assert calls == ["первый ответ", "нет, я имел в виду другое"], \
+        "поправленный текст обязан истолковываться заново, а не игнорироваться"
+    assert questions.read_journal(github["body"]) == [], \
+        "по непроверенному первому толкованию решение записываться не должно"
+    assert "ВТОРОЕ толкование" in github["comments"][-1], \
+        "человек обязан увидеть НОВОЕ толкование, а не молчаливую замену"
+    draft = questions.read_draft(github["body"])
+    assert draft.interpretation["answer"] == "ВТОРОЕ толкование (поправленное)"
+
+    # Короткое согласие подтверждает именно АКТУАЛЬНОЕ (второе) толкование.
+    assert a.answer_question(issue, "howtodemo-1", "да", 103) == "accepted"
+    journal = questions.read_journal(github["body"])
+    assert [d.answer for d in journal] == ["ВТОРОЕ толкование (поправленное)"]

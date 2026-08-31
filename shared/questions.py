@@ -329,7 +329,89 @@ def clear_open(body: str | None) -> str:
     return issue_blocks.strip(body, issue_blocks.QUESTION)
 
 
-def read_draft(body: str | None) -> dict | None:
+@dataclass(frozen=True)
+class Draft:
+    """Толкование свободного ответа, ожидающее подтверждения человеком.
+
+    Черновик, а не журнал: пока не подтверждён, ни в решения, ни в ANSWERS
+    не попадает — второй ответ восстанавливает его отсюда, а не разбором
+    прозы предыдущего комментария (тот же принцип, что у остального модуля,
+    см. его докстринг).
+
+    Ревью `worker/activities.py:_confirm_free_text`, находки 1 и 2 (обе
+    Critical).
+
+    `announced` — признак «комментарий с этим толкованием уже опубликован»,
+    заведённый по образцу `Question.announced` (см. её докстринг: та же
+    задача — отличить «записано в тело» от «увидено человеком» — решается
+    здесь для другой стороны того же протокола вопрос/ответ). Без него
+    ретрай `answer_question` после обрыва между записью черновика и
+    публикацией комментария находил бы уже лежащий в теле черновик и считал
+    ЕГО вторым ответом — толкование фиксировалось бы решением, хотя человек
+    его ни разу не видел (находка 1). Подтверждать можно только черновик с
+    `announced=True`; для `announced=False` активность обязана доделать
+    недостающую публикацию, а не толковать ответ заново и не принимать
+    решение — тем же приёмом, каким `ask_question` доделывает недостающий
+    комментарий, не создавая вопрос заново.
+
+    `question_id` привязывает черновик к вопросу, для которого он написан.
+    Открытый вопрос в теле всегда один, но его id со временем меняется:
+    вопрос закрывается решением либо возрождается заново под новым id
+    (`answer_question`, ветка "reasked"). Черновик, оставшийся от вопроса,
+    который уже закрыт или возрождён, — чужой: подтверждать им ДРУГОЙ,
+    ныне открытый вопрос нельзя (находка 2). Без этой привязки забытый
+    черновик — человек ответил на свой вопрос номером варианта вместо
+    подтверждения показанного толкования, и черновик остался висеть, —
+    молча перехватывал бы СЛЕДУЮЩИЙ свободный ответ на СОВЕРШЕННО ДРУГОЙ
+    вопрос этой же задачи, не позвав модель и проигнорировав то, что
+    человек написал на самом деле.
+
+    `interpretation` — сырой `answer_interpretation.Interpretation.
+    model_dump()`, а не сама pydantic-модель: зависимость идёт в обратную
+    сторону (`answer_interpretation` импортирует этот модуль, не наоборот),
+    и толкование хранится так же, как `Question` хранит kind/text/options —
+    обычным JSON-совместимым словарём.
+    """
+
+    question_id: str
+    interpretation: dict
+    announced: bool = False
+
+
+def render_draft(draft: Draft) -> str:
+    return _wrap({"question_id": draft.question_id,
+                  "interpretation": draft.interpretation,
+                  "announced": draft.announced},
+                 "## Ожидает подтверждения")
+
+
+def parse_draft(payload: str | None) -> Draft | None:
+    """Черновик из содержимого ОДНОГО размеченного блока, не из тела Issue целиком.
+
+    Тот же контракт, что у `parse_question`/`parse_journal` (см. их
+    докстринги и `_unwrap`): кусок с более чем одним забором кода —
+    испорченный вход, результат — None.
+
+    Черновик, записанный ДО поля `question_id` (версией кода задачи 6, где
+    в блоке лежал голый `Interpretation.model_dump()` без этого ключа),
+    сюда не попадёт: `data["question_id"]` поднимет KeyError, и функция
+    вернёт None — «черновика нет», как и для любой другой порчи. Это
+    осознанно: такой черновик по построению не мог быть ни объявлен, ни
+    привязан к вопросу под новой логикой, и представлять его как валидный
+    было бы неверно — второй ответ человека попросту истолкуется заново.
+    """
+    data = _unwrap(payload)
+    if not isinstance(data, dict):
+        return None
+    try:
+        return Draft(question_id=str(data["question_id"]),
+                    interpretation=dict(data["interpretation"]),
+                    announced=bool(data.get("announced", False)))
+    except (KeyError, TypeError):
+        return None
+
+
+def read_draft(body: str | None) -> Draft | None:
     """Толкование, ожидающее подтверждения. Нет или испорчено — None.
 
     Второй `/harness-answer` на тот же вопрос узнаётся ПО ЭТОМУ черновику
@@ -344,17 +426,31 @@ def read_draft(body: str | None) -> dict | None:
     логе, даже когда для вызывающего это лишь повод истолковать ответ заново.
     """
     try:
-        payload = _unwrap(issue_blocks.read(body, issue_blocks.DRAFT))
+        payload = issue_blocks.read(body, issue_blocks.DRAFT)
     except ValueError as exc:
         logger.warning("тело повреждено для блока %s — черновика нет: %s",
                        issue_blocks.DRAFT, exc)
         return None
-    return payload if isinstance(payload, dict) else None
+    return parse_draft(payload)
 
 
-def write_draft(body: str | None, payload: dict) -> str:
-    return issue_blocks.write(body, issue_blocks.DRAFT,
-                              _wrap(payload, "## Ожидает подтверждения"))
+def write_draft(body: str | None, draft: Draft) -> str:
+    return issue_blocks.write(body, issue_blocks.DRAFT, render_draft(draft))
+
+
+def mark_draft_announced(body: str | None, draft: Draft) -> str:
+    """Тело с тем же черновиком, но с признаком `announced=True`.
+
+    Ревью, находка 1 (Critical, см. докстринг `Draft.announced`). Вызывать
+    ПОСЛЕ того, как комментарий с толкованием успешно ушёл человеку, а не
+    раньше и не вместо `write_draft` при создании черновика — признак обязан
+    отражать факт показа, а не намерение его показать. Тот же порядок и то
+    же обоснование, что у `mark_announced` для вопроса (см. её докстринг).
+
+    `draft` здесь — тот же объект, что вернул `read_draft`/только что был
+    записан `write_draft`: `dataclasses.replace` меняет только `announced`.
+    """
+    return write_draft(body, dataclasses.replace(draft, announced=True))
 
 
 def clear_draft(body: str | None) -> str:
