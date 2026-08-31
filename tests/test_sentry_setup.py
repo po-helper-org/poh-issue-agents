@@ -77,6 +77,7 @@ def test_capture_helpers_are_noop_when_disabled(monkeypatch):
     assert sentry_setup.capture_analysis_failure(analyze, "RuntimeError", "boom") is None
     assert sentry_setup.capture_estimate_failure(req, "расчёт", "ValueError", "bad") is None
     assert sentry_setup.capture_followups_failure(issue, "RuntimeError", "boom") is None
+    assert sentry_setup.capture_criterion_gate_stall(issue, "RuntimeError", "boom") is None
 
 
 # --- Ссылка на событие для комментария в Issue ---

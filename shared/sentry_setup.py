@@ -272,3 +272,32 @@ def capture_followups_failure(issue, exc_type: str, message: str) -> Optional[st
             f"dev followups failed: {getattr(issue, 'repo', '?')}"
             f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
             level="error")
+
+
+def capture_criterion_gate_stall(issue, exc_type: str, message: str) -> Optional[str]:
+    """Гейт критерия приёмки (`_start_development`, workflows.py) не смог
+    прочитать критерий и остался на парковке той же фазы — цикл жив,
+    разработка правильно не начинается, но БЕЗ этого события отказ виден
+    только `workflow.logger.warning`, который порог `event_level=ERROR` у
+    `LoggingIntegration` не поднимает до события (та же причина, что и у
+    `capture_followups_failure` выше) — оператор его не увидит.
+
+    fingerprint по (criterion_gate_stall, exc_type): аутейдж GitHub,
+    повторяющийся на разных Issue, обязан группироваться в одну группу, а не
+    заводить её на каждую задачу отдельно.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:acceptance-criterion")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["criterion_gate_stall", exc_type]
+        return sentry_sdk.capture_message(
+            f"acceptance criterion gate stalled: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")

@@ -557,6 +557,46 @@ def read_acceptance_criterion(issue: IssueInput) -> str:
     return _howtodemo_block(body)
 
 
+@activity.defn
+def report_criterion_gate_stall(issue: IssueInput, reason: str) -> None:
+    """Сделать отказ гейта критерия приёмки видимым — событием в Sentry и
+    комментарием человеку.
+
+    Ревью: `_start_development` (workflows.py) правильно НЕ роняет цикл на
+    устойчивом отказе `read_acceptance_criterion` — остаётся на парковке той
+    же фазы и не начинает разработку. Но без этой активности отказ был виден
+    только `workflow.logger.warning` — хлебной крошкой для Sentry (порог
+    `event_level=ERROR` в `sentry_setup.configure`, а не WARNING), то есть
+    оператору не виден вовсе. Человеку тоже не видно ничего: фаза и стадия те
+    же, `mark_awaiting` не зовётся (желаемое состояние очереди не менялось) —
+    нажатие «в разработку» неотличимо от «команду ещё не заметили». Это тот
+    самый класс отказа, который в контуре считается худшим: шаг отработал,
+    никто не спорит, результата нет.
+
+    Текст комментария намеренно не утверждает «критерия нет» — это было бы
+    ложью: критерий, возможно, ЕСТЬ, тело Issue просто не прочиталось. Честно
+    можно сказать только «не смог проверить, повторю».
+
+    Sentry — ПЕРЕД комментарием (как в `post_error_label` рядом): id события
+    уезжает в комментарий ссылкой, иначе человек видит «не смог» и не знает,
+    где искать подробности.
+
+    Зовётся из воркфлоу не чаще раза на серию подряд идущих отказов
+    (`self._criterion_gate_notified` в `_start_development`) — сама
+    активность этого не знает и не должна: дедупликация по сериям это выбор
+    воркфлоу, а не побочный эффект.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_criterion_gate_stall(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Не смог проверить критерий приёмки — повторю при следующей "
+        "попытке. Разработку пока не начинаю."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
 def _interpret_answer(question: questions.Question,
                       journal: list[questions.Decision], answer: str
                       ) -> answer_interpretation.Interpretation:

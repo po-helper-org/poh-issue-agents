@@ -154,6 +154,18 @@ async def criterion_read_fails(issue: IssueInput) -> str:
     raise ApplicationError("GitHub 503: тело Issue не отдаётся", non_retryable=True)
 
 
+# Ревью, находка (Important): отказ чтения критерия, ради которого воркфлоу
+# держит гейт закрытым, до правки не был виден никому — только
+# `workflow.logger.warning` (хлебная крошка Sentry, порог `event_level=ERROR`
+# её не поднимает до события). Стаб под именем реальной активности —
+# `report_criterion_gate_stall` (worker/activities.py) — так тест проверяет
+# именно факт вызова воркфлоу этой активности, а не устройство Sentry/GitHub
+# внутри неё.
+@activity.defn(name="report_criterion_gate_stall")
+async def stall_reported(issue: IssueInput, reason: str) -> None:
+    _calls.append("stall-notice")
+
+
 @activity.defn(name="propose_acceptance_options")
 async def options_stub(issue: IssueInput) -> list[str]:
     _calls.append("propose")
@@ -262,7 +274,8 @@ def _issue() -> IssueInput:
 _COMMON = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub,
            set_phase_stub, gate_ok, classify_bug, duplicate_none, score_p1,
            post_priority, escalate, trigger_build, dev_dispatch_stub,
-           interpret_ack, ack_seen_stub, options_stub, ask_stub, answer_accepted]
+           interpret_ack, ack_seen_stub, options_stub, ask_stub, answer_accepted,
+           stall_reported]
 
 
 @pytest.mark.asyncio
@@ -337,6 +350,50 @@ async def test_criterion_read_failure_does_not_kill_the_lifecycle():
 
     assert "ask" not in _calls, "сбой чтения не «критерий отсутствует» — вопрос не задаём"
     assert "development" not in _calls
+    # Ревью (Important): отказ должен быть виден хотя бы одной аудитории —
+    # здесь это Sentry-событие и комментарий человеку, оба за одним вызовом
+    # `report_criterion_gate_stall` (см. её докстринг в worker/activities.py).
+    # До правки этой активности не существовало вовсе — воркфлоу звал только
+    # `workflow.logger.warning`, и эта строка падала бы на `assert "stall-notice"
+    # in _calls`, потому что `_calls` о ней ничего не знает.
+    assert "stall-notice" in _calls
+
+
+@pytest.mark.asyncio
+async def test_criterion_gate_stall_is_reported_once_per_series():
+    """Отказ виден — но не на каждую попытку, а один раз на серию подряд
+    идущих отказов.
+
+    Без правки в `_start_development` нет вообще никакого наблюдаемого следа
+    (см. `test_criterion_read_failure_does_not_kill_the_lifecycle` выше) — этот
+    тест ловит СОСЕДНИЙ отказ: если правку сделать наивно (звать
+    `report_criterion_gate_stall` без дедупликации, на каждый отказ), лента
+    Issue получала бы копию одного и того же предупреждения на каждый повтор
+    решения человека. Это ровно тот шум, которого требование явно просит
+    избежать: "повторные отказы не засыпают ленту".
+
+    Сценарий — человек дважды подряд нажимает «в разработку» (тот самый
+    случай, ради которого видимость и нужна: первый клик не дал видимого
+    эффекта, и человек нажимает снова). Обе попытки отказывают одинаково.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_COMMON, criterion_read_fails, dev_forbidden]):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: _calls.count("read-criterion") >= 1)
+            await handle.signal("human_decision", "build-me")
+            await _await_calls(env, lambda: _calls.count("read-criterion") >= 2)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert _calls.count("read-criterion") == 2, "гейт должен был отказать дважды подряд"
+    assert _calls.count("stall-notice") == 1, (
+        "сообщение — одно на серию отказов, а не на каждую попытку")
 
 
 @pytest.mark.asyncio

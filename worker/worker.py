@@ -149,6 +149,7 @@ async def main() -> None:
             activities.answer_question,
             activities.propose_acceptance_options,
             activities.read_acceptance_criterion,
+            activities.report_criterion_gate_stall,
             activities.post_error_label,
             activities.ack_comment_seen,
             activities.mark_analyzing,
