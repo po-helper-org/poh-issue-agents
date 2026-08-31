@@ -32,6 +32,7 @@ import forge
 github_client = forge
 import llm
 from shared import (
+    answer_interpretation,
     bft,
     decomposition,
     develop,
@@ -356,9 +357,11 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
 
     Номер и свободный текст разведены намеренно: выбирая номер, человек
     утверждает текст, который прочитал дословно, — толковать нечего. Свободный
-    текст контур истолкует заново в следующей задаче (`_interpret_answer`),
-    здесь же толкование заменено прямой записью текста — `_confirm_free_text`
-    просто показывает человеку, что записал, дословно.
+    текст контур толкует моделью (`_interpret_answer`, `shared.
+    answer_interpretation`) и показывает человеку результат ДО того, как за
+    него заплатят прогоном — `_confirm_free_text` ждёт второго ответа, а
+    восстанавливает толкование из черновика в теле Issue (`questions.
+    read_draft`), не из текста собственного предыдущего комментария.
 
     Комментарии здесь передаются в `github_client.post_comment` НЕ обёрнутыми
     в `agent_comment.sign(...)`: подпись ставится один раз, внутри самого
@@ -475,14 +478,112 @@ def answer_question(issue: IssueInput, question_id: str, text: str,
     return _confirm_free_text(issue, body, question, answer)
 
 
+def _interpret_answer(question: questions.Question,
+                      journal: list[questions.Decision], answer: str
+                      ) -> answer_interpretation.Interpretation:
+    """Толкование свободного ответа моделью. Бросает — значит не вышло.
+
+    Журнал передаётся целиком (A20): человек вправе одной командой ответить
+    на текущий вопрос и заодно поправить решение, принятое раньше.
+    """
+    interpretation = llm.extract(
+        answer_interpretation.SYSTEM_PROMPT,
+        answer_interpretation.build_user_message(question, journal, answer),
+        answer_interpretation.Interpretation,
+        model=llm.MODEL_GATE,
+    )
+    # Правки, ссылающиеся на несуществующую запись журнала, — модель
+    # выдумала идентификатор. Отказ здесь уходит тем же путём, что и отказ
+    # самой модели (см. `except Exception` в `_confirm_free_text`): вопрос
+    # остаётся открытым, человек получает честный текст вместо толкования,
+    # которое завело бы решение по вопросу, которого не было.
+    answer_interpretation.validate(interpretation, journal)
+    return interpretation
+
+
 def _confirm_free_text(issue: IssueInput, body: str, question: questions.Question,
                        answer: str) -> str:
-    """Показать, что понял, и ждать подтверждения. Толкование — в Task 6."""
+    """Показать толкование ответа и ждать подтверждения (A15, A20, A21).
+
+    Висящий черновик (`questions.read_draft`) — признак того, что это ВТОРОЙ
+    ответ на этот же вопрос: первый уже показал толкование и записал его
+    черновиком в тело. Толкование восстанавливается ИЗ ЧЕРНОВИКА, а не
+    разбором текста предыдущего комментария — правка формулировки вокруг
+    сломала бы восстановление молча (тот же принцип, что у всего модуля
+    `shared/questions.py`, см. его докстринг).
+
+    Текст ВТОРОГО ответа заново не толкуется — он играет роль простого
+    подтверждения, каким бы ни было его буквальное содержимое («да» или
+    что-то ещё). Более тонкая обработка («это не то, что я имел в виду»)
+    сюда сознательно не входит: A15 требует лишь показать толкование и
+    дождаться подтверждения, а её отдельная обработка — материал для
+    следующей задачи, не этой.
+    """
+    pending = questions.read_draft(body)
+    if pending is not None:
+        _apply_interpretation(issue, body, question, pending)
+        return "accepted"
+
+    journal = questions.read_journal(body)
+    try:
+        interpretation = _interpret_answer(question, journal, answer)
+    except Exception as err:
+        # Модель отказала или толкование сослалось на несуществующую запись
+        # журнала — вопрос остаётся открытым, человек получает честный текст
+        # вместо утонувшей ошибки (тот же принцип, что у A25: доложить
+        # неудачу, а не молчать о ней).
+        logger.warning("толкование ответа на %s не вышло: %s", question.id, err)
+        github_client.post_comment(issue.repo, issue.issue_number,
+            "Разобрать ответ не смог — попробуйте сформулировать иначе:\n\n"
+            "```\n/harness-answer здесь ваш ответ\n```")
+        return "confirm"
+
+    github_client.update_issue_body(
+        issue.repo, issue.issue_number,
+        questions.write_draft(body, interpretation.model_dump()))
     github_client.post_comment(issue.repo, issue.issue_number,
-        f"Записал так:\n\n{answer}\n\n"
-        "Если верно — подтвердите:\n\n```\n/harness-answer да\n```\n\n"
-        "Если нет — пришлите поправленный текст той же командой.")
+        answer_interpretation.render_interpretation(interpretation, journal)
+        + "\n\nЕсли верно — подтвердите:\n\n```\n/harness-answer да\n```\n\n"
+          "Если нет — пришлите поправленный текст той же командой.")
     return "confirm"
+
+
+def _apply_interpretation(issue: IssueInput, body: str, question: questions.Question,
+                          payload: dict) -> None:
+    """Записать подтверждённое толкование: решение по текущему вопросу и все правки.
+
+    Черновик и все решения складываются в ОДНО тело в памяти — сеть трогается
+    один раз, `update_issue_body` вызывается ПОСЛЕ всего цикла правок, а не
+    на каждой из них. При обрыве до этого вызова на GitHub ничего не
+    меняется, и повторный ответ безопасно начинает с того же черновика —
+    тот же приём идемпотентности по следствию, что уже применён в
+    `ask_question`.
+    """
+    interpretation = answer_interpretation.Interpretation(**payload)
+    body = questions.clear_draft(body)
+    body = questions.append_decision(body, questions.Decision(
+        question_id=question.id, kind=question.kind, question=question.text,
+        answer=interpretation.answer))
+    for amendment in interpretation.amendments:
+        journal = questions.read_journal(body)
+        previous = next((d for d in journal
+                         if d.question_id == amendment.question_id), None)
+        if previous is None:
+            # `answer_interpretation.validate` уже проверила это при первом
+            # ответе, до того как черновик лёг в тело. Между двумя ответами
+            # тело Issue мог поправить человек — не доверяем ему повторно и
+            # тихо пропускаем правку в пустоту: завести решение по
+            # несуществующей записи хуже, чем потерять эту избыточную правку.
+            continue
+        body = questions.append_decision(body, questions.Decision(
+            question_id=questions.next_question_id(questions.read_journal(body),
+                                                   previous.kind),
+            kind=previous.kind, question=previous.question,
+            answer=amendment.answer, supersedes=amendment.question_id))
+    github_client.update_issue_body(issue.repo, issue.issue_number,
+                                    questions.clear_open(body))
+    github_client.remove_label(issue.repo, issue.issue_number,
+                               labels.NEEDS_HUMAN_ANSWER)
 
 
 @activity.defn

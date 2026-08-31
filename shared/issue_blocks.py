@@ -36,9 +36,14 @@ QUESTION = "question"
 # раньше и почему передумали».
 ANSWERS = "answers"
 
+# Толкование свободного ответа, ожидающее подтверждения человеком. Черновик,
+# а не журнал: пока не подтверждён, ни в решения, ни в ANSWERS не попадает —
+# второй ответ восстанавливает его отсюда, а не разбором прозы комментария.
+DRAFT = "answer-draft"
+
 # Все известные модулю имена блоков. Добавление третьего блока должно пополнить
 # этот кортеж — no silent drift.
-_ALL_BLOCKS = (MVP_PLAN, GROW, HOWTODEMO, QUESTION, ANSWERS)
+_ALL_BLOCKS = (MVP_PLAN, GROW, HOWTODEMO, QUESTION, ANSWERS, DRAFT)
 
 
 def _markers(name: str) -> tuple[str, str]:

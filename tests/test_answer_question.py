@@ -227,6 +227,61 @@ def test_empty_command_delivered_twice_keeps_question_open(github, issue):
     assert labels.NEEDS_HUMAN_ANSWER in github["labels"]
 
 
+def test_free_text_shows_interpretation_and_waits(github, issue, monkeypatch):
+    """Свободный текст — толкование предъявлено, решение НЕ записано (A15)."""
+    _open(github)
+    monkeypatch.setattr(a, "_interpret_answer",
+                        lambda question, journal, answer:
+                            a.answer_interpretation.Interpretation(
+                                answer="405 на любой метод кроме POST"))
+
+    assert a.answer_question(issue, "howtodemo-1", "405 везде кроме POST", 101) == "confirm"
+    assert "405 на любой метод кроме POST" in github["comments"][0]
+    assert questions.read_journal(github["body"]) == []
+
+
+def test_confirmation_records_answer_and_amendments(github, issue, monkeypatch):
+    """Второй ответ применяет и решение, и правки прежних записей (A20, A21)."""
+    github["body"] = questions.append_decision(github["body"], questions.Decision(
+        question_id="howtodemo-1", kind="howtodemo", question="Чем принимать?",
+        answer="старое решение"))
+    github["body"] = questions.write_open(github["body"], questions.Question(
+        id="mvp-bounds-1", kind="mvp-bounds", text="Что в MVP?", options=()))
+    github["labels"].add(labels.NEEDS_HUMAN_ANSWER)
+
+    monkeypatch.setattr(a, "_interpret_answer",
+                        lambda question, journal, answer:
+                            a.answer_interpretation.Interpretation(
+                                answer="только /quote",
+                                amendments=[a.answer_interpretation.Amendment(
+                                    question_id="howtodemo-1", answer="наоборот")]))
+
+    assert a.answer_question(issue, "mvp-bounds-1", "только /quote, а то — наоборот", 101) == "confirm"
+    assert a.answer_question(issue, "mvp-bounds-1", "да", 102) == "accepted"
+
+    journal = questions.read_journal(github["body"])
+    assert len(journal) == 3, "старая запись осталась, добавились две новые"
+    live = {d.question_id: d.answer for d in questions.effective(journal)}
+    assert live["mvp-bounds-1"] == "только /quote"
+    assert "наоборот" in " ".join(live.values())
+    assert "старое решение" in " ".join(d.answer for d in journal), \
+        "отменённая запись видна в журнале"
+
+
+def test_model_failure_keeps_the_question_open(github, issue, monkeypatch):
+    """Модель отказала — вопрос стоит, человек получает честный текст."""
+    _open(github)
+
+    def boom(question, journal, answer):
+        raise RuntimeError("модель недоступна")
+
+    monkeypatch.setattr(a, "_interpret_answer", boom)
+
+    assert a.answer_question(issue, "howtodemo-1", "какой-то текст", 101) == "confirm"
+    assert "не смог" in github["comments"][0].lower()
+    assert questions.read_open(github["body"]) is not None
+
+
 def test_superscript_digit_is_free_text_not_option_number(github, issue):
     """Правка 1 ревью (Important). `str.isdigit()` возвращает True для
     надстрочной единицы ¹ (U+00B9), но `int('¹')` бросает ValueError. Замена

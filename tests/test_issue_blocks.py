@@ -197,3 +197,9 @@ def test_question_and_answers_blocks_are_known():
     """Оба блока в реестре: порча тела даёт громкую ошибку, а не перезапись."""
     assert issue_blocks.QUESTION in issue_blocks._ALL_BLOCKS
     assert issue_blocks.ANSWERS in issue_blocks._ALL_BLOCKS
+
+
+def test_draft_block_is_known():
+    """Черновик толкования тоже в реестре — иначе запись в него могла бы
+    молча отравить соседний блок (см. докстринг модуля)."""
+    assert issue_blocks.DRAFT in issue_blocks._ALL_BLOCKS

@@ -373,6 +373,25 @@ def test_read_open_is_none_when_json_broken_inside_intact_markers():
     assert questions.read_open(broken) is None
 
 
+def test_draft_roundtrip_and_clear():
+    payload = {"answer": "405 везде кроме POST", "amendments": []}
+    body = questions.write_draft("описание", payload)
+    assert questions.read_draft(body) == payload
+    assert questions.read_draft(questions.clear_draft(body)) is None
+
+
+def test_read_draft_logs_warning_on_corrupted_markers(caplog):
+    """Тот же случай, что у read_open/read_journal (ревью, находка 2), со
+    стороны черновика толкования: порча маркеров не должна тонуть в логе без
+    следа, даже когда для вызывающего это лишь повод истолковать ответ заново."""
+    start, _end = issue_blocks._markers(issue_blocks.DRAFT)
+    corrupted = f"{start}\nоборванный маркер без конца"
+    with caplog.at_level("WARNING"):
+        result = questions.read_draft(corrupted)
+    assert result is None
+    assert issue_blocks.DRAFT in caplog.text
+
+
 def test_append_decision_refuses_when_answer_contains_marker_like_text():
     """Ревью, находка 3 (Minor). Ответ человека, дословно содержащий маркер
     чужого блока (например, процитированный кусок документации), не должен

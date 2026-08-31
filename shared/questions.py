@@ -329,6 +329,38 @@ def clear_open(body: str | None) -> str:
     return issue_blocks.strip(body, issue_blocks.QUESTION)
 
 
+def read_draft(body: str | None) -> dict | None:
+    """Толкование, ожидающее подтверждения. Нет или испорчено — None.
+
+    Второй `/harness-answer` на тот же вопрос узнаётся ПО ЭТОМУ черновику
+    (`worker/activities.py:_confirm_free_text`), а не разбором текста
+    предыдущего комментария — правка формулировки вокруг сломала бы
+    восстановление молча (тот же принцип, что у остального модуля, см. его
+    докстринг). Порча блока здесь безопасно деградирует до «черновика нет»:
+    следующий ответ человека будет истолкован заново, а не потерян.
+
+    Логируем причину тем же приёмом, что и `read_open`/`read_journal`
+    (ревью, находка 2 у обеих): порча блока не должна тонуть без следа в
+    логе, даже когда для вызывающего это лишь повод истолковать ответ заново.
+    """
+    try:
+        payload = _unwrap(issue_blocks.read(body, issue_blocks.DRAFT))
+    except ValueError as exc:
+        logger.warning("тело повреждено для блока %s — черновика нет: %s",
+                       issue_blocks.DRAFT, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_draft(body: str | None, payload: dict) -> str:
+    return issue_blocks.write(body, issue_blocks.DRAFT,
+                              _wrap(payload, "## Ожидает подтверждения"))
+
+
+def clear_draft(body: str | None) -> str:
+    return issue_blocks.strip(body, issue_blocks.DRAFT)
+
+
 def read_journal(body: str | None) -> list[Decision]:
     """Журнал решений из тела Issue. Нет блока или он испорчен — [].
 
