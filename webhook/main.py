@@ -14,7 +14,10 @@ Webhook receiver: вход контура. Проверяет подпись, т
                                `/bft` и `/bft-deep` — IssueBft (хвост команды
                                уезжает в прогон как замечания/уточнения); любой
                                другой комментарий — сигнал уже идущему workflow
-                               (используется циклом уточнений)
+                               (используется циклом уточнений); `/harness-answer`
+                               — тем же сигналом `user_comment`, но отдельной
+                               веткой: адресат — цикл, задавший вопрос, прав по
+                               AGENT_TRIGGER_ALLOWLIST не спрашивает (спека A8)
 - issues.labeled           -> `run:<команда>` запускает тот же воркфлоу, что и
                                команда в комментарии (run:analyze ->
                                IssueAnalysis, run:estimate -> IssueEstimation,
@@ -47,6 +50,7 @@ from shared.commands import (
     BFT,
     BFT_DEEP,
     ESTIMATE,
+    HARNESS_ANSWER,
     HOWTODEMO,
     RELEASE,
     RESEARCH,
@@ -807,6 +811,23 @@ async def _handle_delivery(payload: dict, x_github_event: str,
         # команда НЕ уходит в user_comment, иначе её съел бы цикл уточнений
         # intake gate как ответ на уточняющий вопрос.
         command = parse_command(payload["comment"].get("body") or "")
+
+        if command == HARNESS_ANSWER:
+            # Единственная команда, которая идёт в `user_comment`: её адресат —
+            # цикл, задавший вопрос, а не отдельный workflow. Дорогую стадию
+            # она не запускает, поэтому прав по AGENT_TRIGGER_ALLOWLIST здесь
+            # не спрашиваем — так решено спекой A8.
+            wf_id = workflow_id_for(repo, issue_number)
+            handle = client.get_workflow_handle(wf_id)
+            try:
+                await handle.signal("user_comment",
+                                    args=[payload["comment"]["body"],
+                                          payload["comment"]["id"]])
+            except Exception:
+                # Цикла нет — отвечать некому. Поднимать его ответом на
+                # незаданный вопрос смысла нет.
+                _log.info("ответ без живого цикла: %s#%s", repo, issue_number)
+            return {"ok": True}
 
         if command == RELEASE:
             if not _may_start_expensive(payload, "/release", repo, issue_number):
