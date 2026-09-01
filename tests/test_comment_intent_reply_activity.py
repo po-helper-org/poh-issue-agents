@@ -22,6 +22,7 @@ import uuid
 
 import pytest
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -137,6 +138,28 @@ ACTIVITIES = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub,
               interpret_as_proceed, post_followup_reply_stub, ack_comment_seen_stub]
 
 
+# --- находка R3 (ревью fix/activity-arg-types): устойчивый отказ публикации
+# ответа не должен ронять цикл ---
+
+@activity.defn(name="post_followup_reply")
+async def post_followup_reply_always_fails(repo: str, issue_number: int, message: str) -> None:
+    """Имитация устойчивого отказа GitHub (rate limit, 5xx после ретраев).
+
+    `non_retryable=True` — падает на первой же попытке, не выжидая всю
+    ретрай-политику (`RetryPolicy(maximum_attempts=3)` в `worker/
+    workflows.py`) виртуальным временем — тот же приём, что и у
+    `criterion_read_fails` в tests/test_workflow_acceptance_gate.py.
+    """
+    raise ApplicationError("GitHub 503: комментарий не отправился", non_retryable=True)
+
+
+ACTIVITIES_REPLY_FAILS = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub,
+                          set_phase_stub, gate_sufficient, duplicate_detected, post_comment_stub,
+                          add_label_stub, classify_stub, score_priority_stub, post_priority_stub,
+                          interpret_as_proceed, post_followup_reply_always_fails,
+                          ack_comment_seen_stub]
+
+
 def _issue() -> IssueInput:
     return IssueInput(repo="o/r", issue_number=166, title="Чек-аут демо",
                       body="описание", author_login="u", author_type="User",
@@ -193,4 +216,75 @@ async def test_proceed_reply_reaches_the_end_and_posts_the_message():
             assert (await handle.describe()).status.name == "RUNNING", (
                 "TypeError активности (неверная арность `ack_comment_seen`) "
                 "не должен ронять весь цикл Issue"
+            )
+
+
+async def _await_quiescence(env, handle, tries: int = 50) -> None:
+    """Ждёт, пока прогон разберёт уже отправленный сигнал — признак
+    наблюдаемый, но не деловой: длина истории (`history_length`) не растёт
+    два опроса подряд.
+
+    По образцу одноимённой функции в tests/test_workflow_acceptance_gate.py
+    (см. её докстринг за полным обоснованием). Нужен здесь по той же
+    причине: у отказа публикации ответа, погашенного перехватом, нет
+    положительного наблюдаемого следствия в `_replies` — предиката, который
+    стал бы истинным, не существует, а сон на фиксированное время доказывал
+    бы только «эффекта не было за N секунд», а не «эффекта не будет».
+    """
+    prev = -1
+    for _ in range(tries):
+        cur = (await handle.describe()).history_length
+        if cur == prev:
+            return
+        prev = cur
+        await env.sleep(1)
+
+
+@pytest.mark.timeout(90)
+async def test_proceed_reply_failure_does_not_fail_the_cycle():
+    """Находка R3 (ревью `fix/activity-arg-types`): устойчивый отказ САМОЙ
+    ПУБЛИКАЦИИ ответа (`post_followup_reply`) не должен ронять `IssueLifecycle`.
+
+    После починки Дефекта 2 (`post_followup_reply` вместо `ack_comment_seen`)
+    сама активность стала звать GitHub с правильными аргументами — но её
+    вызов в `_handle_comment_intent` не был обёрнут перехватом, в отличие от
+    соседней ветки `question` в той же функции (`worker/workflows.py:1939`)
+    и всех уведомлений рядом. Значит устойчивый отказ ЧИСТО ИНФОРМАЦИОННОГО
+    ответа (GitHub недоступен даже после трёх попыток) снова ронял весь цикл
+    Issue — тот самый класс отказа, ради которого чинился Дефект 2, просто
+    с другим триггером (отказ GitHub вместо неверной арности).
+
+    Без правки (перехвата вокруг `post_followup_reply`) этот тест падает:
+    `ActivityError`/`ApplicationError` пробрасывается наружу из
+    `_handle_comment_intent`, весь прогон `IssueLifecycle` уходит в FAILED.
+    """
+    _replies.clear()
+    _ack_calls.clear()
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueAnalysis, IssueEstimation],
+                          activities=ACTIVITIES_REPLY_FAILS):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await _await_phase(env, handle, lifecycle.DUPLICATE)
+            assert (await handle.describe()).status.name == "RUNNING"
+
+            await handle.signal(IssueLifecycle.user_comment,
+                                args=["Продолжай, пожалуйста", 43])
+
+            await _await_quiescence(env, handle)
+
+            assert _ack_calls == [], (
+                "старая (неверная) активность не должна вызываться из живого пути"
+            )
+            # Ответ не дошёл (публикация отказала), но цикл обязан выжить:
+            # фаза осталась той же боковой парковкой, статус — RUNNING.
+            assert await handle.query(IssueLifecycle.phase) == lifecycle.DUPLICATE
+            assert (await handle.describe()).status.name == "RUNNING", (
+                "устойчивый отказ публикации ответа (post_followup_reply) не "
+                "должен ронять весь цикл Issue — это чисто информационное "
+                "уведомление, а не деловое решение"
             )

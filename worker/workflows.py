@@ -1860,13 +1860,29 @@ class IssueLifecycle:
             # есть, и для их реплея прежняя (ошибочная) команда сохранена
             # веткой `else` — замена везде разом уронила бы такой реплей
             # недетерминизмом (другой тип активности в той же точке истории).
+            #
+            # Находка R3 (ревью `fix/activity-arg-types`). `post_followup_
+            # reply` публикует комментарий в GitHub — тот же класс отказа,
+            # что и починка Дефекта 2 в целом: устойчивый отказ ЧИСТО
+            # ИНФОРМАЦИОННОГО ответа не имеет права ронять весь
+            # `IssueLifecycle`. Без перехвата — ровно так и было бы: три
+            # попытки исчерпаны, `ActivityError` пробрасывается наружу,
+            # прогон уходит в FAILED из-за того, что не смог ответить на
+            # реплику, хотя сама реплика (`intent.intent == "proceed"`) уже
+            # обработана и фаза не меняется. Соседняя ветка `question` в этой
+            # же функции гасит свой отказ так же (см. ниже), приём общий.
             if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
-                await workflow.execute_activity(
-                    activities.post_followup_reply,
-                    args=[issue.repo, issue.issue_number, intent.reason],
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=RetryPolicy(maximum_attempts=3),
-                )
+                try:
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number, intent.reason],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "не ответил на подтверждение продолжения: %s",
+                        _failure_reason(exc))
             else:
                 await workflow.execute_activity(
                     activities.ack_comment_seen,
@@ -1882,15 +1898,24 @@ class IssueLifecycle:
                 # Потолок исчерпан — отвечаем, что больше не переделываем.
                 # `workflow.patched` — та же замена активности, тот же довод,
                 # что и в ветке `proceed` выше.
+                #
+                # Находка R3 — тот же перехват и тот же довод, что у ветки
+                # `proceed` выше по функции: отказ информационного ответа не
+                # должен ронять цикл.
                 if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
-                    await workflow.execute_activity(
-                        activities.post_followup_reply,
-                        args=[issue.repo, issue.issue_number,
-                              f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
-                              "Продолжай работу в текущем состоянии или поставь метку для перехода."],
-                        start_to_close_timeout=timedelta(seconds=30),
-                        retry_policy=RetryPolicy(maximum_attempts=3),
-                    )
+                    try:
+                        await workflow.execute_activity(
+                            activities.post_followup_reply,
+                            args=[issue.repo, issue.issue_number,
+                                  f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                  "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        )
+                    except Exception as exc:
+                        workflow.logger.warning(
+                            "не ответил про исчерпанный потолок возвратов: %s",
+                            _failure_reason(exc))
                 else:
                     await workflow.execute_activity(
                         activities.ack_comment_seen,
@@ -1910,15 +1935,23 @@ class IssueLifecycle:
 
             # В других фазах rework не поддерживаем — отвечаем, что не можем.
             # `workflow.patched` — тот же довод, что и выше по функции.
+            #
+            # Находка R3 — тот же перехват и тот же довод, что у ветки
+            # `proceed` выше по функции.
             if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
-                await workflow.execute_activity(
-                    activities.post_followup_reply,
-                    args=[issue.repo, issue.issue_number,
-                          f"Возврат этапа в фазе {self._phase} не поддерживается. "
-                          "Продолжай работу или поставь метку для перехода."],
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=RetryPolicy(maximum_attempts=3),
-                )
+                try:
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number,
+                              f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                              "Продолжай работу или поставь метку для перехода."],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "не ответил про неподдержанный возврат этапа: %s",
+                        _failure_reason(exc))
             else:
                 await workflow.execute_activity(
                     activities.ack_comment_seen,
@@ -1951,13 +1984,21 @@ class IssueLifecycle:
             # Подтверждение — отвечаем, чего ждём, и перечисляем доступные
             # ходы. `workflow.patched` — тот же довод, что и в ветке `proceed`
             # выше по функции.
+            #
+            # Находка R3 — тот же перехват и тот же довод, что у ветки
+            # `proceed` выше по функции.
             if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
-                await workflow.execute_activity(
-                    activities.post_followup_reply,
-                    args=[issue.repo, issue.issue_number, intent.reason],
-                    start_to_close_timeout=timedelta(seconds=30),
-                    retry_policy=RetryPolicy(maximum_attempts=3),
-                )
+                try:
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number, intent.reason],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "не ответил на подтверждение (ack): %s",
+                        _failure_reason(exc))
             else:
                 await workflow.execute_activity(
                     activities.ack_comment_seen,
