@@ -1264,3 +1264,175 @@ async def test_fresh_run_over_a_live_question_repoints_before_answering():
         "команда обязана уйти с АКТУАЛЬНЫМ id открытого вопроса, а не с "
         "пустым указателем свежего прогона")
     assert "answer:''" not in _calls
+
+
+# ---------------------------------------------------------------------------
+# H1 (Important, точечная правка после мержа финального ревью). Десятый исход
+# гейта: `propose_acceptance_options` — единственный вызов внутри гейта, не
+# обёрнутый ни во что. Гоняется с ВКЛЮЧЁННЫМ автостартом: находка именно про
+# то, что автостарт сам доходит до этого вызова без единого сигнала человека,
+# — с выключенным автостартом отличий от уже покрытых тестов гейта не видно
+# вовсе.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def h1_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@activity.defn(name="propose_acceptance_options")
+async def h1_propose_options_fails(issue: IssueInput) -> list[str]:
+    _calls.append("propose")
+    # ИНФРАСТРУКТУРНЫЙ отказ — не отказ МОДЕЛИ (тело настоящей активности его
+    # само гасит и отдаёт пустой список, см. её докстринг в `worker/
+    # activities.py`): например, таймаут активности при перезапуске воркера
+    # посреди вызова. non_retryable не обязателен (у вызова и так `maximum_
+    # attempts=1`), но исключает саму возможность спутать счётчик с ретраями.
+    raise ApplicationError(
+        "activity timeout: перезапуск воркера посреди вызова модели",
+        non_retryable=True)
+
+
+_h1_seen_options: dict[str, list[str] | None] = {"value": None}
+
+
+@activity.defn(name="ask_question")
+async def h1_ask_records_options(issue: IssueInput, kind: str, text: str,
+                                 options: list[str]) -> str:
+    _calls.append("ask")
+    _h1_seen_options["value"] = options
+    return "howtodemo-1"
+
+
+@pytest.mark.asyncio
+async def test_autostart_survives_persistent_propose_options_failure():
+    """H1 (Important, точечная правка после мержа) — САМА находка.
+
+    Без правки: исключение из `propose_acceptance_options` ничем не
+    перехвачено — улетает наружу через `_start_development`, `_phase_await_
+    build` и цикл фаз (широкого перехвата нет нигде) и роняет ВЕСЬ
+    `IssueLifecycle`: Issue теряет владельца состояния молча, ни комментария,
+    ни метки. `ask_question` при этом не зовётся вовсе — гейт умирает раньше,
+    чем успевает задать вопрос свободным текстом, — тест падает на
+    `_calls.count("ask") == 1` (вызова нет вовсе) и не доходит до разработки.
+    """
+    _calls.clear()
+    _h1_seen_options["value"] = None
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      h1_criterion_absent, h1_propose_options_fails,
+                                      h1_ask_records_options, c1_answer_accepted,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            # Без правки вопрос не будет задан никогда — исключение роняет
+            # прогон раньше. С правкой — инфраструктурный отказ подсказки не
+            # мешает спросить свободным текстом (пустой список вариантов —
+            # тот же исход, что и у отказа МОДЕЛИ внутри самой активности).
+            await _await_calls(env, lambda: "ask" in _calls)
+            await _await_quiescence(env, handle)
+
+            assert _calls.count("propose") == 1, (
+                "вызов подсказки вариантов — один раз на заход в гейт")
+            assert _calls.count("ask") == 1, (
+                "инфраструктурный отказ propose_acceptance_options не должен "
+                "останавливать постановку вопроса свободным текстом")
+            assert _h1_seen_options["value"] == [], (
+                "при отказе propose_acceptance_options вопрос обязан уйти с "
+                "пустым списком вариантов — тем же исходом, что и у отказа "
+                "модели внутри самой активности")
+
+            await handle.signal("user_comment", args=["/harness-answer 1", 101])
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert "development" in _calls, (
+        "гейт обязан пережить инфраструктурный отказ propose_acceptance_"
+        "options и довести задачу до разработки, а не терять владельца "
+        "состояния Issue молча")
+
+
+# ---------------------------------------------------------------------------
+# H2 (Important, точечная правка после мержа финального ревью). Восстановление
+# признака из снимка ПРОМЕЖУТОЧНОГО коммита этой же ветки: защита автостарта
+# по указателю (`self._open_question`) уже была, единого признака `self.
+# _acceptance_gate_stalled` ещё не было — снимок его не несёт, поле по
+# умолчанию `False`. Прод при мерже не затронут (в `main` нет ни поля, ни
+# маркеров ветки) — риск только для стенда, где ветка катается пинами на
+# промежуточные коммиты.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def h2_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@pytest.mark.asyncio
+async def test_carried_snapshot_without_stalled_flag_still_blocks_autostart():
+    """Без правки: `run()` присваивает `self._acceptance_gate_stalled =
+    carried.acceptance_gate_stalled` напрямую (`False` — поля в снимке ещё не
+    было), хотя вопрос (`self._open_question`) уже открыт и ждёт ответа.
+    `_phase_await_build` смотрит только на новый признак — короткое замыкание
+    `and` не блокирует автостарт, и `_start_development` зовётся заново ПОВЕРХ
+    уже заданного вопроса: гейт перечитывает критерий и, застав его снова
+    пустым, задаёт ВТОРОЙ вопрос тем же вызовом `ask_question` — дубль поверх
+    уже висящего в теле Issue вопроса.
+
+    В проде тот же разрыв — источник недетерминизма на РЕПЛЕЕ уже идущего
+    прогона: маркер `issue-lifecycle-autostart-waits-for-answer`, записанный в
+    историю под промежуточным кодом (где условие было безусловным `self._open_
+    question and workflow.patched(...)`), новый код на этом же месте не
+    вызывает вовсе из-за короткого замыкания — следующая команда сверяется не
+    с той записью истории, и прогон заклинивает на бесконечных повторах задачи
+    воркфлоу. Настоящий реплей сохранённой истории здесь не воспроизвести без
+    отдельной фикстуры — тест проверяет НАБЛЮДАЕМОЕ следствие того же неверного
+    восстановления признака на свежем прогоне: гейт не имеет права трогать
+    критерий заново, пока висит открытый вопрос, унаследованный из снимка.
+    """
+    _calls.clear()
+    carried = LifecycleState(
+        phase=lifecycle.READY_FOR_DEV,
+        stage="awaiting-acceptance-criterion",
+        open_question="howtodemo-1",
+        acceptance_gate_stalled=False,  # снимок промежуточного коммита — поля ещё не было
+    )
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      h2_criterion_absent, options_stub, ask_stub,
+                                      c1_answer_accepted, dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, args=[_issue(), carried],
+                id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await _await_quiescence(env, handle)
+
+            assert "read-criterion" not in _calls, (
+                "уже открытый вопрос, унаследованный из снимка, обязан "
+                "блокировать автостарт — гейт не имеет права перечитывать "
+                "критерий и звать себя заново, пока человек не ответил на "
+                "уже заданный вопрос")
+            assert "ask" not in _calls, (
+                "гейт не должен задавать ВТОРОЙ вопрос поверх уже висящего в "
+                "теле Issue")
+
+            await handle.signal("user_comment", args=["/harness-answer 1", 101])
+            await _await_calls(env, lambda: "development" in _calls)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert "development" in _calls, (
+        "ответ на унаследованный вопрос обязан довести цикл до разработки")
+    assert "ask" not in _calls, (
+        "ни на каком шаге гейт не должен был переспрашивать заново")
