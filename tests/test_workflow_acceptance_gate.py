@@ -119,10 +119,13 @@ async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
 # комментарий попадёт в общий путь `_phase_park`, а не в гейт (у гейта
 # указатель `self._open_question` к этому моменту уже пуст). Оба пути этого
 # файла не проверяют — активности здесь только не дают упасть на
-# незарегистрированной активности.
+# незарегистрированной активности либо на несовпадении сигнатуры (шестой
+# параметр `recent_artifacts` — та же история, что чинит
+# tests/test_activity_arg_types.py: воркфлоу обязан передавать его явно).
 @activity.defn(name="interpret_user_comment")
 async def interpret_ack(issue: IssueInput, comment_text: str, current_phase: str,
-                        classification_label, awaiting_reason) -> CommentIntent:
+                        classification_label, awaiting_reason,
+                        recent_artifacts=None) -> CommentIntent:
     return CommentIntent(intent="ack", reason="")
 
 

@@ -1344,9 +1344,17 @@ class IssueLifecycle:
                     retry_policy=default_retry,
                 )
                 if gate.status == "VAGUE" and not issue.interactive:
+                    # `reason` передан явно вторым аргументом: активность
+                    # принимает `reason: str = ""`, и вызов одним позиционным
+                    # `issue` даёт Temporal несовпадение числа аргументов с
+                    # числом параметров сигнатуры — типы выбрасываются для
+                    # ОБОИХ параметров, включая `issue` (см. докстринг
+                    # tests/test_activity_arg_types.py).
                     await workflow.execute_activity(
                         activities.escalate_to_human,
-                        issue,
+                        args=[issue, "Задача осталась неоднозначной (VAGUE) после "
+                                     "intake gate, а прогон неинтерактивный — "
+                                     "уточнить не у кого. Передаю на ручной разбор."],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
                     return (lifecycle.ESCALATED, "escalated", True)
@@ -1358,7 +1366,9 @@ class IssueLifecycle:
                     if round_count > MAX_CLARIFICATION_ROUNDS:
                         await workflow.execute_activity(
                             activities.escalate_to_human,
-                            issue,
+                            args=[issue, f"Уточнение не сузило запрос за "
+                                         f"{MAX_CLARIFICATION_ROUNDS} раундов — "
+                                         "передаю на ручной разбор."],
                             start_to_close_timeout=timedelta(seconds=30),
                         )
                         return (lifecycle.ESCALATED, "escalated", True)
@@ -1564,10 +1574,21 @@ class IssueLifecycle:
             return await self._analysis_requested(issue)
         if isinstance(decision, UserComment):
             # Разбор намерения из реплики человека
+            #
+            # Все 6 параметров активности переданы явно, включая
+            # `recent_artifacts=None`: у `interpret_user_comment` их шесть, а
+            # Temporal сверяет ЧИСЛО переданных аргументов с числом параметров
+            # сигнатуры (temporalio/worker/_activity.py) и при несовпадении
+            # выбрасывает типы для ВСЕХ параметров разом, а не только для
+            # пропущенного — активность получает сырой JSON вместо `IssueInput`
+            # (живой отказ: `poh-demo-checkout#166`, `AttributeError: 'dict'
+            # object has no attribute 'repo'`). Цикл не ведёт артефактов этапа
+            # ни в одном поле состояния, поэтому `None` здесь — не заглушка,
+            # а честное отсутствие данных.
             intent = await workflow.execute_activity(
                 activities.interpret_user_comment,
                 args=[issue, decision.text, self._phase, self._classification_label,
-                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED)],
+                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED), None],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
@@ -3057,11 +3078,14 @@ class IssueLifecycle:
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
         if isinstance(signal, UserComment):
-            # Разбор намерения из реплики человека
+            # Разбор намерения из реплики человека. `recent_artifacts=None`
+            # передан явно шестым аргументом — см. комментарий у такого же
+            # вызова в `_phase_await_decision` про потерю типов при неполном
+            # списке аргументов (poh-demo-checkout#166).
             intent = await workflow.execute_activity(
                 activities.interpret_user_comment,
                 args=[issue, signal.text, self._phase, self._classification_label,
-                      awaiting_mod.reason_for_phase(self._phase)],
+                      awaiting_mod.reason_for_phase(self._phase), None],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
@@ -3118,14 +3142,29 @@ class IssueLifecycle:
         истории обязан идти по тому же коду, иначе Temporal уронит прогон
         недетерминизмом. Удалять — только когда все прогоны этого поколения
         завершатся (workflow.deprecate_patch).
+
+        Исключение из «без изменений» — достройка списка аргументов там, где
+        Temporal сегодня выбрасывает типы (см. tests/test_activity_arg_types.py).
+        Это не решение workflow: активность, её порядок и число вызовов не
+        меняются, меняется только содержимое ScheduleActivityTask.input —
+        а его определитель недетерминизма при реплее не сверяет (сверяет тип
+        активности и порядок команд). Раз число выброшенных типов не влияет на
+        то, ЧТО куда переходит, маркер patched здесь не нужен — ровно тот же
+        довод, что и в основном фазовом цикле для той же категории дефекта.
         """
         default_retry = RetryPolicy(maximum_attempts=3)
 
         try:
             # --- Zero-cost предфильтры ---
+            # `origin_agent=False` явным вторым аргументом: этот сценарий
+            # старше самого параметра (провенанс агента `_run_linear` не
+            # проверял никогда), и False — не заглушка, а точное повторение
+            # прежнего поведения. Без явного значения Temporal получил бы 1
+            # аргумент на активность с двумя параметрами и выбросил типы
+            # целиком, отдав `issue` активности сырым словарём.
             skip_reason = await workflow.execute_activity(
                 activities.prefilter_bot_and_security,
-                issue,
+                args=[issue, False],
                 start_to_close_timeout=timedelta(seconds=30),
             )
             if skip_reason is not None:
@@ -3186,10 +3225,17 @@ class IssueLifecycle:
 
                 # Batch/backfill mode: no human answers clarifications for 39 issues,
                 # so a VAGUE issue must escalate, not park on _wait_for_signal() forever.
+                #
+                # `reason` вторым аргументом явно — активность принимает
+                # `reason: str = ""`, а одним позиционным `issue` Temporal
+                # получает 1 аргумент на 2 параметра и выбрасывает типы
+                # целиком (см. tests/test_activity_arg_types.py).
                 if gate.status == "VAGUE" and not issue.interactive:
                     await workflow.execute_activity(
                         activities.escalate_to_human,
-                        issue,
+                        args=[issue, "Задача осталась неоднозначной (VAGUE) после "
+                                     "intake gate, а прогон неинтерактивный — "
+                                     "уточнить не у кого. Передаю на ручной разбор."],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
                     self._stage = "escalated"
@@ -3202,7 +3248,9 @@ class IssueLifecycle:
                     if round_count > MAX_CLARIFICATION_ROUNDS:
                         await workflow.execute_activity(
                             activities.escalate_to_human,
-                            issue,
+                            args=[issue, f"Уточнение не сузило запрос за "
+                                         f"{MAX_CLARIFICATION_ROUNDS} раундов — "
+                                         "передаю на ручной разбор."],
                             start_to_close_timeout=timedelta(seconds=30),
                         )
                         self._stage = "escalated"
@@ -3250,10 +3298,14 @@ class IssueLifecycle:
                     return
 
                 # --- Классификация (более сильная модель) ---
+                # `bft_on_triage=False` явно: этот сценарий старше самой БФТ
+                # на триаже (маркер `issue-lifecycle-bft` заведён только для
+                # фазового цикла), и False здесь — точное повторение прежнего
+                # поведения, а не заглушка.
                 self._stage = "classify"
                 classification = await workflow.execute_activity(
                     activities.classify_issue,
-                    issue,
+                    args=[issue, False],
                     start_to_close_timeout=timedelta(seconds=180),
                     retry_policy=default_retry,
                 )
@@ -3372,9 +3424,14 @@ class IssueLifecycle:
         build_decision = await self._wait_for_signal(
             timedelta(hours=deadlines.build_decision_hours))
         if build_decision == "build-me":
+            # `root_issue=None, branch=None` явно: `_run_linear` старше
+            # ISSUE-113 (подзадачи плана и заранее вычисленная ветка) и своей
+            # ветки не считает. С обоими None активность внутри
+            # (`_dev_resolve_branch`) выводит `research/issue-{issue_number}`
+            # — ровно то же имя, что получалось здесь и раньше неявно.
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
-                issue,
+                args=[issue, None, None],
                 start_to_close_timeout=timedelta(seconds=90),
                 # Одна попытка — по той же причине, что и на основном пути
                 # (`_start_development`): ретрай прогоняет агента заново.
