@@ -24,6 +24,7 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
 from activities import ConflictingOpenQuestion
 from shared import lifecycle
+from shared.agent_events import STARTED, AgentEvent
 from shared.workflow_types import (
     ClassificationResult,
     CommentIntent,
@@ -254,6 +255,259 @@ async def test_autostart_waits_for_answer_instead_of_looping_forever():
 
 
 # ---------------------------------------------------------------------------
+# G1 (Critical, третий круг финального ревью). РЕЦИДИВ C1 с другой стороны:
+# правка C1 блокирует автостарт признаком «есть указатель на открытый
+# вопрос» (`self._open_question` непуст). Но указатель — лишь ОДИН из исходов
+# гейта. Устойчивый отказ ЧТЕНИЯ критерия или отказ ПОСТАНОВКИ вопроса
+# оставляют указатель пустым точно так же, как если бы гейт не звался вовсе,
+# — и автостарт видел «вопроса нет», снова и снова вызывая гейт заново без
+# единого таймера, парковки или сигнала между оборотами. Тесты ниже
+# воспроизводят оба исхода — гоняются с ВКЛЮЧЁННЫМ автостартом, иначе они
+# ничем не отличались бы от уже существующих тестов гейта в
+# tests/test_workflow_acceptance_gate.py, где автостарт выключен и находка не
+# видна вовсе.
+# ---------------------------------------------------------------------------
+
+@activity.defn(name="read_acceptance_criterion")
+async def g1_criterion_read_fails(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    # non_retryable — тот же приём, что и `criterion_read_fails` в
+    # tests/test_workflow_acceptance_gate.py: без него три попытки
+    # `RetryPolicy(maximum_attempts=3)` размазали бы счётчик виртуальным
+    # временем ретрая внутри ОДНОГО вызова гейта, а тест — про то, повторяется
+    # ли САМ вызов гейта на каждом обороте, а не про арифметику ретраев.
+    raise ApplicationError("GitHub 503: тело Issue не отдаётся", non_retryable=True)
+
+
+@activity.defn(name="report_criterion_gate_stall")
+async def g1_read_failure_notified(issue: IssueInput, reason: str) -> None:
+    _calls.append("stall-notice")
+
+
+@pytest.mark.asyncio
+async def test_autostart_does_not_loop_on_persistent_criterion_read_failure():
+    """G1 (Critical) — устойчивый отказ ЧТЕНИЯ критерия под автостартом.
+
+    Без правки: `self._open_question` никогда не становится непустым (отказ
+    происходит ДО постановки вопроса), автостарт не видит в этом препятствия
+    и на следующем же обороте фазового цикла зовёт `_start_development`
+    заново — `read_acceptance_criterion` на КАЖДОМ витке. После `_await_
+    quiescence` счётчик уже заметно больше единицы (виток успевает
+    повториться много раз за то время, что уходит на стабилизацию `history_
+    length`), а получасовой досып ниже только увеличивает разрыв.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      g1_criterion_read_fails, options_stub, ask_stub,
+                                      g1_read_failure_notified, dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await _await_calls(env, lambda: "read-criterion" in _calls)
+            await _await_quiescence(env, handle)
+
+            assert _calls.count("read-criterion") == 1, (
+                "устойчивый отказ чтения критерия обязан парковать цикл, а "
+                "не звать гейт заново на каждом витке")
+            assert "propose" not in _calls, (
+                "модель не должна звать вовсе — отказ ЧТЕНИЯ, до постановки "
+                "вопроса дело не доходит")
+
+            # `self._open_question` здесь пуст на всём протяжении (вопрос
+            # никогда не задавался) — периодическая перепроверка критерия
+            # (`issue-lifecycle-criterion-recheck-while-parked`) в этой ветке
+            # не участвует вовсе, так что получасовой досып ничем не должен
+            # быть особенным: без правки счётчик вырос бы и без него, с
+            # правкой — не должен вырасти и с ним.
+            await env.sleep(30 * 60)
+
+            assert _calls.count("read-criterion") == 1, (
+                "цикл обязан оставаться на парковке — ни таймер этой парковки "
+                "(его тут и нет), ни сигнал не наступали")
+
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+
+@activity.defn(name="read_acceptance_criterion")
+async def g1_criterion_absent(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    return ""
+
+
+@activity.defn(name="ask_question")
+async def g1_ask_question_fails(issue: IssueInput, kind: str, text: str,
+                                options: list[str]) -> str:
+    _calls.append("ask")
+    # non_retryable — по той же причине, что и у `g1_criterion_read_fails`
+    # выше: без него `RetryPolicy(maximum_attempts=3)` у `ask_question`
+    # размазала бы счётчик тремя попытками НА КАЖДЫЙ оборот витка.
+    raise ApplicationError("GitHub 422: тело issue не обновилось", non_retryable=True)
+
+
+@activity.defn(name="report_ask_question_gate_failure")
+async def g1_ask_failure_notified(issue: IssueInput, reason: str) -> None:
+    _calls.append("ask-stall-notice")
+
+
+@pytest.mark.asyncio
+async def test_autostart_does_not_loop_on_persistent_ask_question_failure():
+    """G1 (Critical) — САМА находка третьего круга финального ревью.
+
+    Устойчивый отказ ПОСТАНОВКИ вопроса (запись в GitHub — 403/422 на
+    обновлении тела или публикации комментария) читается прекрасно и не
+    пишется никогда: `read_acceptance_criterion` отрабатывает успешно
+    (критерия нет), а падает именно `ask_question` — присваивание
+    `self._open_question = ...` в `_start_development` не происходит,
+    исключение брошено ДО него. `ConflictingOpenQuestion` для воспроизведения
+    не нужен: она сегодня недостижима вовсе (см. докстринг у `_phase_await_
+    build`) — подойдёт любой устойчивый отказ, переживший ретраи.
+
+    Без правки: `self._open_question` остаётся пустым, автостарт видит
+    «вопроса нет» и на каждом обороте зовёт гейт заново — чтение критерия,
+    МОДЕЛЬ (`propose_acceptance_options`), снова отказ `ask_question`. Ни
+    таймера, ни парковки, ни ожидания сигнала.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      g1_criterion_absent, options_stub,
+                                      g1_ask_question_fails, g1_ask_failure_notified,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            await _await_calls(env, lambda: "ask" in _calls)
+            await _await_quiescence(env, handle)
+
+            assert _calls.count("read-criterion") == 1, (
+                "чтение критерия — один раз на заход в гейт, а не на каждый "
+                "виток автостарта")
+            assert _calls.count("propose") == 1, (
+                "модель критерия приёмки должна звать один раз, а не на "
+                "каждом витке цикла")
+            assert _calls.count("ask") == 1, (
+                "постановка вопроса — одна попытка на заход в гейт, а не "
+                "оборот за оборотом")
+
+            # Час виртуального времени без единого сигнала — `self._open_
+            # question` пуст на всём протяжении (присваивание так и не
+            # произошло), периодическая перепроверка критерия здесь тоже не
+            # участвует. Без правки счётчики продолжали бы расти и на этом
+            # интервале.
+            await env.sleep(60 * 60)
+
+            assert _calls.count("ask") == 1, (
+                "устойчивый отказ постановки вопроса обязан парковать цикл — "
+                "пустой self._open_question не должен пускать автостарт "
+                "обратно в гейт")
+            assert _calls.count("propose") == 1, (
+                "модель не должна звать заново на каждом витке при "
+                "устойчивом отказе постановки вопроса")
+
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+
+# ---------------------------------------------------------------------------
+# Находка при сквозной проверке всех выходов гейта (задание «проверь сам, нет
+# ли ЕЩЁ путей выхода из гейта, ведущих обратно в автостарт без парковки»).
+# `verdict == "accepted"` в `_answer_open_question` чистит `self._open_
+# question`, но раньше не чистил `self._acceptance_gate_stalled` — а его
+# поднимает та же успешная постановка вопроса, что и создала отвечаемый
+# вопрос. `IN_DEVELOPMENT -> READY_FOR_DEV` («задача возвращена в очередь») —
+# РЕАЛЬНЫЙ переход в таблице `shared/lifecycle.py`, доступный через
+# `AgentEvent`, а не гипотетический: без сброса задача, вернувшаяся в очередь
+# уже с записанным критерием, наткнулась бы на устаревший `True` в `_phase_
+# await_build` и автостарт молча выключился бы для неё до конца жизни.
+# ---------------------------------------------------------------------------
+
+_returned_to_queue_criterion_calls = {"n": 0}
+
+
+@activity.defn(name="read_acceptance_criterion")
+async def returned_to_queue_criterion(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    _returned_to_queue_criterion_calls["n"] += 1
+    if _returned_to_queue_criterion_calls["n"] == 1:
+        return ""  # первый заход — критерия нет, вопрос будет задан
+    # Ко второму заходу критерий уже записан — тем же ответом, что принял
+    # вопрос гейта.
+    return "было 404; стало 405 с Allow: POST"
+
+
+@activity.defn(name="answer_question")
+async def returned_to_queue_answer_accepted(
+        issue: IssueInput, question_id: str, text: str, comment_id: int | None) -> str:
+    _calls.append(f"answer:{question_id}")
+    return "accepted"
+
+
+@pytest.mark.asyncio
+async def test_accepted_answer_does_not_leave_a_stale_gate_flag_after_returning_to_queue():
+    """Без правки: после `verdict == "accepted"` флаг остаётся `True`.
+    Задача уходит в разработку (`in-development`), внешний агент возвращает
+    её в очередь — фаза снова `ready-for-dev`, но `_phase_await_build` видит
+    устаревший `self._acceptance_gate_stalled == True` (от давно отвеченного
+    и решённого вопроса) и НЕ пускает автостарт обратно в гейт — задача,
+    которую DEVELOP_AUTOSTART обязан довести до разработки без единого
+    касания человека, паркуется и ждёт сигнала, который по замыслу
+    автостарта никогда не придёт.
+    """
+    _calls.clear()
+    _returned_to_queue_criterion_calls["n"] = 0
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      returned_to_queue_criterion, options_stub,
+                                      ask_stub, returned_to_queue_answer_accepted,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            # Автостарт сам доходит до гейта и задаёт вопрос — без единого
+            # сигнала.
+            await _await_calls(env, lambda: "ask" in _calls)
+            # Человек отвечает — гейт пройден, разработка стартует (dispatch:
+            # фаза уходит в `in-development` и ждёт события агента).
+            await handle.signal("user_comment", args=["/harness-answer 1", 101])
+            await _await_calls(env, lambda: "development" in _calls)
+
+            # Внешний агент возвращает задачу в очередь — переход РАЗРЕШЁН
+            # таблицей переходов (`IN_DEVELOPMENT -> READY_FOR_DEV`, «задача
+            # возвращена в очередь»). Критерий уже записан вторым заходом
+            # заглушки — гейт обязан пропустить задачу молча, автостарту
+            # спрашивать уже нечего.
+            await handle.signal(IssueLifecycle.agent_event, AgentEvent(
+                repo="o/r", agent="dev-agent", phase=lifecycle.READY_FOR_DEV,
+                status=STARTED, ref="163"))
+
+            await _await_calls(env, lambda: _calls.count("development") >= 2)
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert _calls.count("development") == 2, (
+        "автостарт обязан снова передать задачу в разработку без единого "
+        "сигнала человека — устаревший флаг гейта не должен выключать "
+        "автостарт для задачи, вернувшейся в очередь")
+    assert _calls.count("ask") == 1, (
+        "критерий уже записан ко второму заходу — гейт не должен спрашивать "
+        "заново")
+
+
+# ---------------------------------------------------------------------------
 # F3 (Important, второй круг финального ревью): критерий, вписанный руками,
 # обязан подхватываться под автостартом БЕЗ единого сигнала от человека.
 # ---------------------------------------------------------------------------
@@ -331,6 +585,85 @@ async def test_autostart_picks_up_a_hand_edited_criterion_without_any_signal():
     assert "development" in _calls, (
         "критерий, вписанный руками, обязан довести цикл до разработки "
         "БЕЗ единого сигнала от человека")
+
+
+# ---------------------------------------------------------------------------
+# G2 (Important, третий круг финального ревью): отказ ПЕРЕПРОВЕРКИ критерия
+# (та же перепроверка, что и в тесте F3 выше, только читающая ничего) обязан
+# стать видимым, а не молчать до истечения всего срока парковки. Прежний
+# комментарий у этой ветки утверждал, что видимость обеспечит
+# `_start_development` — но пока вопрос гейта открыт (а он открыт всё время
+# перепроверки по определению — см. условие `issue-lifecycle-criterion-
+# recheck-while-parked`), автостарт заблокирован (находка G1 выше) и человек
+# не сигналит, значит `_start_development` в это время не позовётся вовсе.
+# ---------------------------------------------------------------------------
+
+_g2_criterion_calls = {"n": 0}
+
+
+@activity.defn(name="read_acceptance_criterion")
+async def g2_criterion_fails_after_the_question_is_asked(issue: IssueInput) -> str:
+    _calls.append("read-criterion")
+    _g2_criterion_calls["n"] += 1
+    if _g2_criterion_calls["n"] == 1:
+        return ""  # первый заход гейта — критерия нет, вопрос будет задан
+    # Все последующие чтения — уже перепроверка внутри парковки. Устойчивый
+    # отказ: истёкший токен, отозванные права, переименованный репозиторий.
+    raise ApplicationError("GitHub 401: токен отозван", non_retryable=True)
+
+
+@activity.defn(name="report_criterion_gate_stall")
+async def g2_stall_reported(issue: IssueInput, reason: str) -> None:
+    _calls.append("stall-notice")
+
+
+@pytest.mark.asyncio
+async def test_recheck_failure_series_is_reported_once_while_parked():
+    """G2 (Important). Без правки: `"stall-notice"` не появляется в `_calls`
+    вовсе — исключение в перепроверке уходило только в `workflow.logger.
+    warning` (хлебная крошка Sentry, порог `event_level=ERROR` её не
+    поднимает до события). С наивной правкой (уведомление без дедупликации)
+    тест поймал бы копию сообщения на КАЖДУЮ из нескольких перепроверок за
+    95 минут — общий с гейтом флаг `self._criterion_gate_notified` держит
+    ровно одно уведомление на серию.
+    """
+    _calls.clear()
+    _g2_criterion_calls["n"] = 0
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with Worker(env.client, task_queue=tq,
+                          workflows=[IssueLifecycle, IssueDevelopment],
+                          activities=[*_BASE, c1_deadlines_autostart,
+                                      g2_criterion_fails_after_the_question_is_asked,
+                                      options_stub, ask_stub, g2_stall_reported,
+                                      dev_started],
+                          workflow_runner=UnsandboxedWorkflowRunner()):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+
+            # Автостарт сам доходит до гейта и задаёт вопрос — без единого
+            # сигнала.
+            await _await_calls(env, lambda: "ask" in _calls)
+
+            # Три интервала перепроверки (`CRITERION_RECHECK_INTERVAL` = 30
+            # минут) с запасом — несколько подряд отказов одной серии.
+            await env.sleep(95 * 60)
+
+            await handle.signal("issue_closed", "тест")
+            await handle.result()
+
+    assert _calls.count("ask") == 1, (
+        "вопрос задаётся один раз на постановку, а не на каждую перепроверку")
+    assert _calls.count("read-criterion") >= 4, (
+        "перепроверка обязана была случиться несколько раз за 95 минут — "
+        f"было {_calls.count('read-criterion')}")
+    assert "stall-notice" in _calls, (
+        "устойчивый отказ перепроверки обязан стать видимым — Sentry-событие "
+        "и комментарий человеку, а не только warning в логе воркера")
+    assert _calls.count("stall-notice") == 1, (
+        "уведомление — одно на серию подряд идущих отказов, а не на каждую "
+        "перепроверку")
+    assert "development" not in _calls
 
 
 # ---------------------------------------------------------------------------
@@ -693,8 +1026,16 @@ async def f4_ask_conflicts(issue: IssueInput, kind: str, text: str,
         f"задать поверх него вопрос вида {kind!r}")
 
 
-@activity.defn(name="report_criterion_gate_stall")
+@activity.defn(name="report_ask_question_gate_failure")
 async def f4_notify(issue: IssueInput, reason: str) -> None:
+    # Находка G2 (третий круг финального ревью): для СВЕЖЕГО прогона (без
+    # предшествующей истории) `workflow.patched("issue-lifecycle-ask-
+    # question-failure-message")` возвращает True, и уведомление об отказе
+    # `ask_question` теперь уходит через ОТДЕЛЬНУЮ активность `report_ask_
+    # question_gate_failure` — не через `report_criterion_gate_stall`,
+    # которая лжёт про причину (см. её докстринг). Здесь всё ещё падает
+    # `ask_question`, а не чтение критерия — имя заглушки просто следует за
+    # правильной активностью.
     _calls.append("notified")
 
 

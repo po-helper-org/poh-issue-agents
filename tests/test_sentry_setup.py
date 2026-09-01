@@ -85,6 +85,9 @@ def test_capture_helpers_are_noop_when_disabled(monkeypatch):
     assert sentry_setup.capture_answer_question_failure(issue, "RuntimeError", "boom") is None
     assert sentry_setup.capture_question_repoint_failure(issue, "RuntimeError", "boom") is None
     assert sentry_setup.capture_question_close_failure(issue, "RuntimeError", "boom") is None
+    # Находка G2 (третий круг финального ревью): новый хелпер этого круга —
+    # тот же приём, что и у соседей выше.
+    assert sentry_setup.capture_ask_question_gate_failure(issue, "RuntimeError", "boom") is None
 
 
 # --- Ссылка на событие для комментария в Issue ---

@@ -837,6 +837,39 @@ def report_criterion_gate_stall(issue: IssueInput, reason: str) -> None:
     )
 
 
+@activity.defn
+def report_ask_question_gate_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать видимым отказ `ask_question`, вызванной гейтом критерия
+    приёмки (`_start_development`, worker/workflows.py), — третий круг
+    финального ревью, находка G2 (Important).
+
+    До правки эта ветка переиспользовала `report_criterion_gate_stall` —
+    активность, чей текст утверждает «не смог проверить критерий приёмки».
+    Здесь это НЕПРАВДА: к моменту этого вызова критерий уже прочитан
+    (`read_acceptance_criterion` отработал успешно и вернул пустую строку —
+    иначе гейт не дошёл бы до постановки вопроса вовсе), отказала ПОСТАНОВКА
+    вопроса — обычно запись в GitHub (403/422 на обновлении тела Issue или
+    публикации комментария), а не чтение. Человеку сообщалось не то, что
+    сломалось: «проверю критерий ещё раз» вместо «не смог задать вопрос,
+    оценка не опубликована».
+
+    Текст ниже честен именно про этот шаг и не обещает того же, что обещает
+    `report_criterion_gate_stall`.
+
+    Sentry — ПЕРЕД комментарием, тем же порядком, что и у соседних `report_*`
+    в этом файле: id события уезжает в комментарий ссылкой.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_ask_question_gate_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Критерий приёмки не найден, но не смог задать об этом вопрос — "
+        "повторю при следующей попытке. Разработку пока не начинаю."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
 def _interpret_answer(question: questions.Question,
                       journal: list[questions.Decision], answer: str
                       ) -> answer_interpretation.Interpretation:

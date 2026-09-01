@@ -152,6 +152,7 @@ async def main() -> None:
             activities.read_open_question_id,
             activities.close_answered_by_body_edit,
             activities.report_criterion_gate_stall,
+            activities.report_ask_question_gate_failure,
             activities.report_answer_question_failure,
             activities.report_question_repoint_failure,
             activities.report_question_close_failure,
