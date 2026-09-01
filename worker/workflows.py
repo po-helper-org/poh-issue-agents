@@ -1845,43 +1845,88 @@ class IssueLifecycle:
                 if bug:
                     return (lifecycle.READY_FOR_DEV, "bug", True)
             
-            # В других фазах proceed — просто ответ, что продолжаем
-            await workflow.execute_activity(
-                activities.ack_comment_seen,
-                args=[issue, intent.reason],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
-            return (self._phase, self._stage, False)
-        
-        elif intent.intent == "rework":
-            # Проверяем потолок возвратов этапа
-            if self._rework_rounds >= self._rework_max_rounds:
-                # Потолок исчерпан — отвечаем, что больше не переделываем
+            # В других фазах proceed — просто ответ, что продолжаем.
+            #
+            # `workflow.patched` обязателен: замена активности МЕНЯЕТ команду
+            # в истории. `ack_comment_seen` принимает один `CommentAckInput`
+            # и делает ровно одно — ставит реакцию `eyes`; здесь же нужно
+            # ОПУБЛИКОВАТЬ готовый текст («продолжаем», «потолок исчерпан»,
+            # «возврат не поддерживается», «подтверждение принято»). Прежний
+            # вызов передавал `(issue, текст)` — не просто не тот тип, а не та
+            # активность и не та арность: `TypeError`, три попытки, и без
+            # перехвата исключения — падение всего цикла Issue. Эти четыре
+            # ветки сегодня падают ВСЕГДА, поэтому живых прогонов, дошедших до
+            # следующего шага ЗА ними, нет; но истории уже упавших прогонов
+            # есть, и для их реплея прежняя (ошибочная) команда сохранена
+            # веткой `else` — замена везде разом уронила бы такой реплей
+            # недетерминизмом (другой тип активности в той же точке истории).
+            if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
                 await workflow.execute_activity(
-                    activities.ack_comment_seen,
-                    args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
-                                 "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                    activities.post_followup_reply,
+                    args=[issue.repo, issue.issue_number, intent.reason],
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )
+            else:
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, intent.reason],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            return (self._phase, self._stage, False)
+
+        elif intent.intent == "rework":
+            # Проверяем потолок возвратов этапа
+            if self._rework_rounds >= self._rework_max_rounds:
+                # Потолок исчерпан — отвечаем, что больше не переделываем.
+                # `workflow.patched` — та же замена активности, тот же довод,
+                # что и в ветке `proceed` выше.
+                if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number,
+                              f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                              "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                else:
+                    await workflow.execute_activity(
+                        activities.ack_comment_seen,
+                        args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                     "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
                 return (self._phase, self._stage, False)
-            
+
             self._rework_rounds += 1
-            
+
             # Возврат в created с репликой в контексте
             if self._phase == lifecycle.CLASSIFIED:
                 # Возвращаемся в created, триаж перезапустится
                 return (lifecycle.CREATED, "rework", True)
-            
-            # В других фазах rework не поддерживаем — отвечаем, что не можем
-            await workflow.execute_activity(
-                activities.ack_comment_seen,
-                args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
-                             "Продолжай работу или поставь метку для перехода."],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+
+            # В других фазах rework не поддерживаем — отвечаем, что не можем.
+            # `workflow.patched` — тот же довод, что и выше по функции.
+            if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                await workflow.execute_activity(
+                    activities.post_followup_reply,
+                    args=[issue.repo, issue.issue_number,
+                          f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                          "Продолжай работу или поставь метку для перехода."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            else:
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                                 "Продолжай работу или поставь метку для перехода."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
             return (self._phase, self._stage, False)
         
         elif intent.intent == "question":
@@ -1903,13 +1948,23 @@ class IssueLifecycle:
             return (self._phase, self._stage, False)
         
         elif intent.intent == "ack":
-            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные ходы
-            await workflow.execute_activity(
-                activities.ack_comment_seen,
-                args=[issue, intent.reason],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные
+            # ходы. `workflow.patched` — тот же довод, что и в ветке `proceed`
+            # выше по функции.
+            if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                await workflow.execute_activity(
+                    activities.post_followup_reply,
+                    args=[issue.repo, issue.issue_number, intent.reason],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            else:
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, intent.reason],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
             return (self._phase, self._stage, False)
         
         else:

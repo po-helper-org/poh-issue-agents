@@ -21,6 +21,11 @@ JSON во все параметры сразу, а не только в проп
 искать её приходится не там.
 
 Проверка статическая: разбор AST, без Temporal и без импорта воркера.
+
+Уточнение (Дефект 2, `_handle_comment_intent`): ветка `else` под
+`if workflow.patched(...):` в разбор не идёт — она нарочно хранит СТАРУЮ
+форму вызова ради детерминизма реплея уже упавших историй, и сигнатура,
+актуальная сейчас, к ней не относится. См. `_walk_skip_patched_else` ниже.
 """
 
 import ast
@@ -80,13 +85,48 @@ def _passed_count(call: ast.Call) -> int | None:
     return 1 if len(call.args) > 1 else 0
 
 
+def _is_workflow_patched_call(node: ast.expr) -> bool:
+    """True для `workflow.patched(...)` — проверка поколения истории прогона."""
+    return (isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "patched")
+
+
+def _walk_skip_patched_else(root: ast.AST):
+    """Как `ast.walk`, но не заходит в `else` у `if workflow.patched(...):`.
+
+    Найдено при правке Дефекта 2 (`_handle_comment_intent`, замена
+    `ack_comment_seen` на `post_followup_reply`): ветка `else` под
+    `workflow.patched` нарочно хранит СТАРУЮ, уже упавшую в проде форму
+    вызова — ради детерминизма реплея историй, которые эту форму уже
+    записали (сама ветка живьём больше не исполняется: `patched()` для
+    любого нового решения возвращает True, в `else` попадает только реплей
+    уже закрытой историей). Сверять её с сигнатурой, актуальной СЕЙЧАС, —
+    подгонять под настоящее то, что нарочно осталось прошлым; такое
+    несовпадение число-аргументов не дефект, а условие совместимости,
+    и здесь это ложное срабатывание при обходе AST в лоб.
+
+    Раздельно ветка `if` (новое решение) по-прежнему разбирается как обычно:
+    именно она обязана передавать все аргументы актуальной сигнатуры.
+    """
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, ast.If) and _is_workflow_patched_call(node.test):
+            stack.append(node.test)
+            stack.extend(node.body)
+            continue  # node.orelse сознательно не обходим
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _call_sites() -> list[tuple[str, str, int, int]]:
     """Места планирования активностей: файл, имя, строка, сколько передано."""
     sites: list[tuple[str, str, int, int]] = []
     for filename in _CALLER_FILES:
         path = WORKER_DIR / filename
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
+        for node in _walk_skip_patched_else(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func

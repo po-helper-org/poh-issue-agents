@@ -1275,6 +1275,27 @@ def mark_ready_for_dev(issue: IssueInput, priority_tier: str, branch: str) -> No
 
 
 @activity.defn
+def post_followup_reply(repo: str, issue_number: int, message: str) -> None:
+    """Публикация готового текста в Issue — без модели.
+
+    Заведена взамен ошибочного использования `ack_comment_seen` в
+    `_handle_comment_intent` (четыре ветки: «продолжаем», «потолок возвратов
+    исчерпан», «возврат этапа не поддерживается», «подтверждение принято»).
+    `ack_comment_seen` принимает один датакласс `CommentAckInput` и ставит
+    только реакцию `eyes` — её вызывали с ДВУМЯ позиционными аргументами
+    (`issue`, текст), что для активности с одним параметром — не просто
+    неверная типизация, а неверная арность: каждый такой вызов падал
+    `TypeError`, три попытки, и без перехвата исключения ронял весь цикл
+    Issue.
+
+    Тонкая, по образцу `post_agents_off_notice`: текст уже собран в месте
+    вызова (разбор намерения делает `interpret_user_comment`), второй раз
+    гонять его через модель незачем и это был бы лишний расход бюджета (R4).
+    """
+    github_client.post_comment(repo, issue_number, message)
+
+
+@activity.defn
 def post_agents_off_notice(repo: str, issue_number: int, what: str) -> None:
     """Короткий ответ на явную команду человека при поднятом рубильнике.
 
