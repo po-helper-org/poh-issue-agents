@@ -117,9 +117,19 @@ async def dev_begin_dispatch(issue: IssueInput) -> DevelopPlan:
 async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
 
 
+# Гейт критерия приёмки (задача 8): `_start_development` перед передачей в
+# разработку читает критерий из тела Issue. Этот файл проверяет цепочку
+# событий внешнего агента, а не гейт — критерий уже есть, чтобы разработка
+# стартовала молча, без вопроса.
+@activity.defn(name="read_acceptance_criterion")
+async def criterion_present(issue: IssueInput) -> str:
+    return "было 404; стало 405"
+
+
 ACTIVITIES = [prefilter_ok, protocol_default, deadlines_stub, set_phase_stub,
               gate_ok, classify_bug, duplicate_none, score_p1, post_priority,
-              escalate, trigger_build, dev_begin_dispatch, dev_dispatch_stub]
+              escalate, trigger_build, dev_begin_dispatch, dev_dispatch_stub,
+              criterion_present]
 
 
 def _issue() -> IssueInput:

@@ -1,3 +1,4 @@
+from shared import commands
 from shared.commands import ANALYZE, ESTIMATE, build_analyze_input, parse_command
 from shared.workflow_ids import analysis_workflow_id
 
@@ -64,3 +65,30 @@ def test_build_analyze_input_tolerates_null_body():
         "comment": {"id": 1},
     }
     assert build_analyze_input(payload).body == ""
+
+
+def test_harness_answer_is_a_command_with_multiline_tail():
+    """Ответ человека — команда с многострочным хвостом.
+
+    Сценарий приёмки в одну строку не пишут, поэтому хвост забирается
+    целиком, как у /bft-deep.
+    """
+    body = "/harness-answer 405 на любой метод кроме POST\nREADME не трогаем"
+    assert commands.parse_command(body) == commands.HARNESS_ANSWER
+    assert commands.parse_command_args(body) == \
+        "405 на любой метод кроме POST\nREADME не трогаем"
+
+
+def test_harness_answer_with_number_only():
+    assert commands.parse_command("/harness-answer 1") == commands.HARNESS_ANSWER
+    assert commands.parse_command_args("/harness-answer 1") == "1"
+
+
+def test_harness_answer_with_empty_tail():
+    """Пустой хвост — команда есть, содержания нет. Разбирает вызывающий."""
+    assert commands.parse_command("/harness-answer") == commands.HARNESS_ANSWER
+    assert commands.parse_command_args("/harness-answer") == ""
+
+
+def test_quoted_harness_answer_is_not_a_command():
+    assert commands.parse_command("> /harness-answer 1") is None

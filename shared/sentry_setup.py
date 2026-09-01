@@ -272,3 +272,159 @@ def capture_followups_failure(issue, exc_type: str, message: str) -> Optional[st
             f"dev followups failed: {getattr(issue, 'repo', '?')}"
             f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
             level="error")
+
+
+def capture_answer_question_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`answer_question` (worker/activities.py) не разобрала ответ человека на
+    открытый вопрос — после исчерпания ретраев (финальное ревью, находка I1,
+    Important).
+
+    Раньше вызов шёл с `maximum_attempts=1` и без перехвата: единственный сбой
+    ронял весь `IssueLifecycle`, а без этого события отказ не был виден
+    оператору вовсе — та же причина, что и у `capture_criterion_gate_stall`
+    выше (`workflow.logger.warning` не поднимается до события Sentry, порог
+    `event_level=ERROR`).
+
+    fingerprint по (answer_question_failure, exc_type): аутейдж GitHub,
+    повторяющийся на разных Issue, обязан группироваться в одну группу.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:answer-question")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["answer_question_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"answer_question failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")
+
+
+def capture_criterion_gate_stall(issue, exc_type: str, message: str) -> Optional[str]:
+    """Гейт критерия приёмки (`_start_development`, workflows.py) не смог
+    прочитать критерий и остался на парковке той же фазы — цикл жив,
+    разработка правильно не начинается, но БЕЗ этого события отказ виден
+    только `workflow.logger.warning`, который порог `event_level=ERROR` у
+    `LoggingIntegration` не поднимает до события (та же причина, что и у
+    `capture_followups_failure` выше) — оператор его не увидит.
+
+    fingerprint по (criterion_gate_stall, exc_type): аутейдж GitHub,
+    повторяющийся на разных Issue, обязан группироваться в одну группу, а не
+    заводить её на каждую задачу отдельно.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:acceptance-criterion")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["criterion_gate_stall", exc_type]
+        return sentry_sdk.capture_message(
+            f"acceptance criterion gate stalled: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")
+
+
+def capture_ask_question_gate_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`ask_question`, вызванная гейтом критерия приёмки (`_start_development`,
+    workflows.py), не смогла задать вопрос — третий круг финального ревью,
+    находка G2 (Important).
+
+    Отдельный хелпер, а не переиспользование `capture_criterion_gate_stall`
+    рядом: тот сообщает об отказе ЧТЕНИЯ критерия, а здесь критерий уже
+    прочитан, отказала ПОСТАНОВКА вопроса — другой шаг стадии
+    `gate:acceptance-criterion`, другая типичная причина (запись в GitHub, а
+    не чтение), и смешивать их в одном тег `stage` значило бы группировать в
+    Sentry два разных отказа под одной и той же историей.
+
+    fingerprint по (ask_question_gate_failure, exc_type): та же причина, что
+    и у соседних `capture_*_failure` — группировка по типу сбоя, а не по issue.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:ask-question")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["ask_question_gate_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"acceptance criterion gate could not ask a question: "
+            f"{getattr(issue, 'repo', '?')}#{getattr(issue, 'issue_number', '?')} "
+            f"({exc_type})",
+            level="error")
+
+
+def capture_question_repoint_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`read_open_question_id` (worker/activities.py) не смогла подтвердить
+    актуальный открытый вопрос — воркфлоу зовёт её в двух точках (находки
+    C2/F7, финальное ревью): переставить указатель после `reasked` и
+    проверить его перед ответом на `/harness-answer` с пустым указателем.
+
+    Указатель в обоих случаях остаётся НЕактуальным, а человек по кругу
+    получает «этот вопрос уже устарел» на СВОЙ актуальный ответ — до этого
+    события отказ был виден только `workflow.logger.warning` (тот же порог
+    `event_level=ERROR`, что и у `capture_criterion_gate_stall` выше).
+
+    fingerprint по (question_repoint_failure, exc_type): группируем по типу
+    сбоя, а не по issue — иначе один и тот же сетевой аутейдж GitHub заводит
+    отдельную группу на каждую задачу.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:read-open-question-id")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["question_repoint_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"read_open_question_id failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")
+
+
+def capture_question_close_failure(issue, exc_type: str, message: str) -> Optional[str]:
+    """`close_answered_by_body_edit` (worker/activities.py) не смогла снять
+    устаревший вопрос гейта критерия при переходе в разработку (находка F6,
+    Important, второй круг финального ревью).
+
+    Вызывается ПОСЛЕ того, как решение продолжить в разработку уже принято
+    — отказ не условие входа, а сорвавшаяся уборка (блок вопроса и метка
+    `NEEDS_HUMAN_ANSWER` могли остаться висеть на задаче, ушедшей в
+    разработку), и «следующего прохода», который довершил бы её сам,
+    для этой задачи может не быть вовсе — фаза уже уезжает.
+
+    fingerprint по (question_close_failure, exc_type): та же причина, что и
+    у соседних `capture_*_failure` — группировка по типу сбоя, а не по issue.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("repo", getattr(issue, "repo", None))
+        scope.set_tag("issue", str(getattr(issue, "issue_number", None)))
+        scope.set_tag("stage", "gate:close-answered-by-body-edit")
+        scope.set_tag("exc_type", exc_type)
+        scope.set_extra("message", message)
+        scope.fingerprint = ["question_close_failure", exc_type]
+        return sentry_sdk.capture_message(
+            f"close_answered_by_body_edit failed: {getattr(issue, 'repo', '?')}"
+            f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
+            level="error")

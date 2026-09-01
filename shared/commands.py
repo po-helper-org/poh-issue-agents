@@ -32,10 +32,22 @@ RELEASE = "release"
 # из письма БФТ в его треде) и проверяет по нему открытый PR. Отдельная команда,
 # а не флаг у /release: приёмка идёт ДО мержа и не выкатывает ничего.
 HOWTODEMO = "howtodemo"
+# Ответ человека на вопрос, заданный контуром. Команда ОБЩАЯ, не привязанная к
+# поводу: тем же способом контур спрашивает про критерий приёмки, про границы
+# MVP, про выбор из вариантов плана. Один способ ответа на любой вопрос лучше
+# выводка команд под каждый повод.
+#
+# Дорогую стадию не запускает — меток прогона у неё быть не должно, см.
+# NO_RUN_LABEL_COMMANDS и исключение в shared/label_catalog.py.
+HARNESS_ANSWER = "harness-answer"
 
 _COMMANDS = {"/estimate": ESTIMATE, "/analyze": ANALYZE, "/research": RESEARCH,
              "/bft": BFT, "/bft-deep": BFT_DEEP, "/release": RELEASE,
-             "/howtodemo": HOWTODEMO}
+             "/howtodemo": HOWTODEMO, "/harness-answer": HARNESS_ANSWER}
+
+# Команды, не запускающие дорогую стадию: у них нет прогона, а значит нет и
+# меток его состояния.
+NO_RUN_LABEL_COMMANDS = frozenset({HARNESS_ANSWER})
 
 # Схема имён — namespace через двоеточие, как в протоколе агентов v1
 # (needs-human:*, origin:agent). `run:*` — идёт прогон, `done:*` — проработано,

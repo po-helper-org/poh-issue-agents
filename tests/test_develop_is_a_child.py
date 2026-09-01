@@ -158,11 +158,20 @@ async def publish_ok(issue: IssueInput, branch: str) -> int | None:
     return 101
 
 
+# Гейт критерия приёмки (задача 8): `_start_development` перед передачей в
+# разработку читает критерий из тела Issue. Этот файл проверяет, что
+# разработка — дочерний прогон, а не гейт — критерий уже есть, чтобы
+# разработка стартовала молча, без вопроса.
+@activity.defn(name="read_acceptance_criterion")
+async def criterion_present(issue: IssueInput) -> str:
+    return "было 404; стало 405"
+
+
 ALL_ACTIVITIES = [prefilter_ok, protocol_default, deadlines_autostart, set_phase_stub,
                   gate_ok, classify_bug, duplicate_none, score_p1, post_priority,
                   escalate, post_error, ready, no_open_questions, awaiting_stub,
                   begin_local, dispatch_stub, prepare_ok, announce_ok, agent_ok,
-                  followups_ok, checks_ok, publish_ok]
+                  followups_ok, checks_ok, publish_ok, criterion_present]
 
 
 def _issue() -> IssueInput:

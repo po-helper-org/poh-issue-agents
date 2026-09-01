@@ -25,7 +25,7 @@ from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.workflow import ParentClosePolicy
 
 with workflow.unsafe.imports_passed_through():
-    from shared import bft, labels, lifecycle
+    from shared import bft, commands, labels, lifecycle
     from shared.commands import ANALYZE, BFT, BFT_DEEP, ESTIMATE, RESEARCH
     from shared.workflow_ids import (
         analysis_workflow_id,
@@ -103,6 +103,17 @@ SEEN_EVENTS_KEPT = 50
 # спотыкалась консолидация (~990 событий): реплей должен укладываться в
 # workflow-task timeout с запасом, а не впритык.
 HISTORY_EVENT_THRESHOLD = 800
+
+# Находка F3 (Important, второй круг финального ревью). Пока открыт вопрос
+# гейта критерия приёмки, парковка (`_phase_await_build`) периодически
+# перечитывает тело Issue — критерий, вписанный человеком напрямую (A23),
+# иначе не подхватывается вообще: правки тела вебхук не доставляет сигналом.
+# Интервал — тот же порядок, что у периодической проверки доклада ревью в
+# `_phase_pr_review` (`timedelta(minutes=30)` там же по файлу): достаточно
+# редко, чтобы не превратиться в дорогой цикл (до находки C1 подхват той же
+# правки телом стоил вызова МОДЕЛИ на каждом обороте), и достаточно часто,
+# чтобы `DEVELOP_AUTOSTART` не требовал действия человека.
+CRITERION_RECHECK_INTERVAL = timedelta(minutes=30)
 
 
 # Потолок разворота `.cause` в `_failure_reason`. Сегодняшняя цепочка стадии
@@ -392,6 +403,26 @@ class IssueLifecycle:
         # ответа. Потолок — из `Deadlines`, вместе с остальными тумблерами.
         self._followup_rounds = 0
         self._answered_comment_ids: list[int] = []
+        # Идентификатор открытого вопроса к человеку. Пусто — вопроса нет.
+        # Прогон хранит ТОЛЬКО указатель: содержание вопроса живёт в теле
+        # Issue (`shared.questions`) — копия здесь разошлась бы с телом при
+        # первой правке руками.
+        self._open_question = ""
+        # Гейт критерия приёмки (`_start_development`) на последнем заходе НЕ
+        # пропустил задачу дальше в разработку — неважно, почему: спросил и
+        # ждёт ответа, не смог прочитать критерий, не смог задать вопрос.
+        # Третий круг финального ревью, находка G1 (Critical): раньше
+        # автостарт (`_phase_await_build`) решал это по `self._open_question`
+        # непустому — но указатель отражает лишь ОДИН из исходов гейта.
+        # Устойчивый отказ ЧТЕНИЯ критерия или отказ ПОСТАНОВКИ вопроса
+        # оставляют указатель пустым точно так же, как если бы гейт вообще не
+        # звался, — и автостарт, глядя только на указатель, звал гейт заново
+        # на каждом обороте цикла: чтение, МОДЕЛЬ, попытка задать вопрос,
+        # снова отказ, без единого таймера или сигнала между оборотами. Этот
+        # флаг покрывает все исходы гейта разом (см. докстринг `_phase_await_
+        # build` и присваивания в `_start_development`) и снимается только
+        # когда критерий найден и гейт передаёт задачу дальше.
+        self._acceptance_gate_stalled = False
         self._followup_max_rounds = Deadlines().followup_max_rounds
         # Сколько раз человек вернул этап на пересборку (rework intent).
         # Потолок нужен, чтобы пара «переделай» ↔ «переделал» не стояла по
@@ -431,6 +462,15 @@ class IssueLifecycle:
         # Кто закрыл Issue на GitHub. None — открыт. Закрытие обрывает любую
         # парковку: досиживать срок в закрытом Issue незачем.
         self._closed_by: str | None = None
+        # Отказ гейта критерия приёмки (`_start_development`) уже показан хотя
+        # бы раз в ЭТОЙ серии подряд идущих отказов. Значение по умолчанию —
+        # для свежего прогона; при continue-as-new оно приезжает из
+        # `carried.criterion_gate_notified` в `run()` — см. её докстринг в
+        # `shared/workflow_types.py` за тем, почему флаг ОБЯЗАН переживать
+        # перезапуск (находка 2 ревью: без переноса дедупликация «одно
+        # сообщение на серию» ломается именно на задаче, застрявшей на этом
+        # гейте, — не в редком случае, а в обычном).
+        self._criterion_gate_notified = False
 
     @workflow.query
     def stage(self) -> str:
@@ -765,6 +805,30 @@ class IssueLifecycle:
             self._followup_rounds = carried.followup_rounds
             self._answered_comment_ids = list(carried.answered_comment_ids)
             self._rework_rounds = carried.rework_rounds
+            self._open_question = carried.open_question
+            self._criterion_gate_notified = carried.criterion_gate_notified
+            # H2 (точечная правка после мержа, финальное ревью). Снимок
+            # ПРОМЕЖУТОЧНОГО коммита этой же ветки (защита автостарта по
+            # указателю уже была, единого признака `acceptance_gate_stalled`
+            # ещё не было) этого поля не несёт вовсе — датакласс подставляет
+            # умолчание `False`. Голое присваивание тогда «забывало» открытый
+            # вопрос: `self._open_question` восстанавливался бы непустым, а
+            # признак «гейт не пропустил» — снятым, хотя ИМЕННО непустой
+            # указатель и означает, что гейт не пропустил задачу дальше (см.
+            # докстринг `autostart_blocked_by_gate_stall` в `_phase_await_
+            # build`). `self._acceptance_gate_stalled and workflow.patched(
+            # "issue-lifecycle-autostart-waits-for-answer")` — тот же маркер,
+            # что и старая защита по указателю, — короткое замыкание `and`
+            # тогда пропускало сам вызов `workflow.patched`, и реплей такого
+            # прогона расходился с уже записанной историей (там, где старый
+            # код звал этот маркер и парковался по таймеру, новый — без
+            # вызова маркера планировал бы чтение критерия заново).
+            # Восстановление «сохранённый признак ИЛИ непустой указатель»
+            # воспроизводит ТУ ЖЕ истинность условия, что и старый код
+            # (`self._open_question`), — маркер вызывается на той же позиции
+            # с тем же исходом, новый флаг здесь не нужен.
+            self._acceptance_gate_stalled = (
+                carried.acceptance_gate_stalled or bool(carried.open_question))
             self._generation = carried.generation
             if carried.phase_since_epoch:
                 # Перезапуск цикла не должен обнулять срок парковки: иначе
@@ -797,6 +861,9 @@ class IssueLifecycle:
             followup_rounds=self._followup_rounds,
             answered_comment_ids=list(self._answered_comment_ids),
             rework_rounds=self._rework_rounds,
+            open_question=self._open_question,
+            criterion_gate_notified=self._criterion_gate_notified,
+            acceptance_gate_stalled=self._acceptance_gate_stalled,
             generation=self._generation + 1,
             phase_since_epoch=self._phase_since.timestamp() if self._phase_since else 0.0,
         )
@@ -806,13 +873,26 @@ class IssueLifecycle:
         от событий, а одна фаза может стоить и трёх событий, и трёхсот."""
         return workflow.info().get_current_history_length() >= HISTORY_EVENT_THRESHOLD
 
-    async def _park(self, kind: str, who: str, reason: str, hours: int) -> timedelta:
+    async def _park(self, kind: str, who: str, reason: str, hours: int,
+                    *, wake_within: timedelta | None = None) -> timedelta:
         """Встать в ожидание: описать его и вернуть срок таймера.
 
         Одно место на все точки парковки. Разнесённые «поставить таймер» и
         «записать, чего ждём» разошлись бы при первой же правке одной из них —
         и получилось бы ожидание с таймером, но без причины, то есть ровно то,
         что чинит #39.
+
+        `wake_within` (находка F3, Important, второй круг финального ревью) —
+        промежуточное пробуждение РАНЬШЕ настоящего дедлайна, для точек,
+        которым нужно периодически что-то перепроверить, не отменяя сам
+        дедлайн. Описание (`self._awaiting`, метка очереди) считается ТОЛЬКО
+        от `hours` — человек видит настоящий срок, а не урезанный внутренний
+        таймер; `wake_within` укорачивает лишь ВОЗВРАЩАЕМЫЙ таймаут, который
+        достаётся `_wait_for_signal`. Тест `tests/test_awaiting_wiring.py::
+        test_every_parking_point_fills_the_waiting` статически требует, чтобы
+        аргументом `_wait_for_signal` был именно `await self._park(...)`, —
+        отдельная переменная с урезанным таймаутом этой проверке не годится, а
+        значит урезание обязано жить ВНУТРИ `_park`, а не рядом с ним.
         """
         since = self._phase_since or workflow.now()
         self._awaiting = Awaiting(
@@ -821,7 +901,10 @@ class IssueLifecycle:
             deadline_epoch=(since + timedelta(hours=hours)).timestamp(),
         )
         await self._publish_awaiting()
-        return self._park_timeout(hours)
+        remaining = self._park_timeout(hours)
+        if wake_within is not None and wake_within < remaining:
+            return wake_within
+        return remaining
 
     async def _publish_awaiting(self) -> None:
         """Отражение ожидания в GitHub: очередь к людям должна быть полной.
@@ -1821,12 +1904,70 @@ class IssueLifecycle:
         ставится (`_phase_handoff` отработал раньше) — она сообщает состояние
         задачи, а не то, кто именно её возьмёт.
         """
+        # Финальное ревью ветки, находка C1 (Critical). Автостарт звал
+        # `_start_development` БЕЗУСЛОВНО — в том числе когда гейт критерия
+        # приёмки уже задал вопрос (`self._open_question` непуст) и вернул
+        # управление в ЭТУ ЖЕ фазу (`_enter` при совпадении фазы не паркует, а
+        # просто меняет стадию — см. её докстринг). Цикл делал виток и снова
+        # попадал в автостарт, снова в гейт: `propose_acceptance_options`
+        # (МОДЕЛЬ) и `ask_question` звались на каждом витке заново,
+        # `_wait_for_signal` в этой ветке не вызывался вовсе — ответ человека
+        # командой `/harness-answer` НИКОГДА не читался из очереди сигналов.
+        # На стенде `DEVELOP_AUTOSTART=1` — это боевой режим, а не гипотеза.
+        #
+        # Третий круг финального ревью, находка G1 (Critical) — РЕЦИДИВ того
+        # же дефекта с другой стороны. Правка C1 выше блокировала автостарт
+        # признаком «есть указатель на открытый вопрос» (`self._open_
+        # question` непуст). Но указатель — лишь ОДИН из исходов гейта:
+        # `_start_development` может НЕ пропустить задачу дальше и без
+        # единого открытого вопроса — устойчивый отказ ЧТЕНИЯ критерия
+        # (`read_acceptance_criterion`: недоступный GitHub, отозванный токен)
+        # или отказ ПОСТАНОВКИ вопроса (`ask_question` не смог записать тело
+        # или опубликовать комментарий — 403/422 при абсолютно исправном
+        # ЧТЕНИИ). В обоих случаях присваивание `self._open_question = ...`
+        # в `_start_development` не происходит вовсе (исключение бросается
+        # ДО или ВО ВРЕМЯ него) — указатель остаётся пустым, автостарт видит
+        # «вопроса нет как нет» и как ни в чём не бывало зовёт гейт заново:
+        # на КАЖДОМ обороте — чтение критерия, МОДЕЛЬ
+        # (`propose_acceptance_options`), `ask_question`, снова отказ, снова
+        # комментарий человеку, снова событие Sentry. Ни таймера, ни
+        # парковки, ни ожидания сигнала — оборот занимает секунды.
+        #
+        # Правильный признак — не «есть указатель на вопрос», а «гейт
+        # ОТРАБОТАЛ И НЕ ПРОПУСТИЛ задачу дальше»: `self._acceptance_gate_
+        # stalled` заводится в `_start_development` на ВСЕХ исходах, которые
+        # держат фазу на месте (отказ чтения, отказ постановки вопроса,
+        # вопрос успешно задан и ждёт ответа), и снимается только когда
+        # критерий найден и гейт передаёт задачу в `_begin_development`. Один
+        # признак покрывает все исходы гейта сразу — не два отдельных костыля
+        # на каждый новый способ отказать. Указатель `self._open_question`
+        # при этом никуда не делся: он по-прежнему нужен `_answer_open_
+        # question` и перепроверке ниже, чтобы знать, НА ЧТО отвечает
+        # человек, — но решать, можно ли автостарту звать гейт снова, теперь
+        # не его дело.
+        #
+        # `workflow.patched` обязателен по прежней причине (см. комментарий
+        # C1 выше) и с прежней гарантией: у прогонов, уже застрявших в этом
+        # витке кодом БЕЗ этого признака, короткое замыкание `and` не давало
+        # `workflow.patched` исполниться вовсе — ни указатель, ни новый флаг
+        # в их истории до этой правки не поднимались. Значит на реплее такой
+        # истории `patched()` вернёт False ровно до конца УЖЕ ЗАПИСАННЫХ
+        # событий (маркер этого имени в них ни разу не встречался — сверка
+        # идёт по факту наличия marker-события, а не по причине, по которой
+        # его не позвали), а сразу за концом истории — True: прогон
+        # запаркуется на первом же необработанном обороте, не выдумав ни
+        # одной лишней команды на уже случившихся событиях.
+        autostart_blocked_by_gate_stall = (
+            self._acceptance_gate_stalled
+            and workflow.patched("issue-lifecycle-autostart-waits-for-answer")
+        )
         # Автостарт — только у задачи, которая владеет своим планом. Подзадачи
         # исполняет РОДИТЕЛЬ: один прогон агента на весь объём MVP и один PR на
         # фичу. Дай автостарт каждой подзадаче — и на одном репозитории
         # одновременно работают N агентов: конфликты, N PR вместо одного и N
         # ревью, ни одно из которых не про целую фичу.
-        if deadlines.develop_autostart and not self._plan_member:
+        if (deadlines.develop_autostart and not self._plan_member
+                and not autostart_blocked_by_gate_stall):
             return await self._start_development(issue)
 
         # Подзадача плана ждёт РОДИТЕЛЯ, а не человека: тот исполняет весь объём
@@ -1847,12 +1988,144 @@ class IssueLifecycle:
             kind = awaiting_mod.kind_for_phase(lifecycle.READY_FOR_DEV)
             who = awaiting_mod.who_for_phase(lifecycle.READY_FOR_DEV)
             reason = awaiting_mod.reason_for_phase(lifecycle.READY_FOR_DEV)
-        decision = await self._wait_for_signal(await self._park(
-            kind, who=who, reason=reason,
-            hours=awaiting_mod.deadline_hours(kind,
-                                              deadlines.build_decision_hours
-                                              if kind in awaiting_mod.BLOCKED_ON_HUMAN
-                                              else None)))
+        hours = awaiting_mod.deadline_hours(
+            kind, deadlines.build_decision_hours
+            if kind in awaiting_mod.BLOCKED_ON_HUMAN else None)
+        if self._open_question and workflow.patched(
+                "issue-lifecycle-criterion-recheck-while-parked"):
+            # Находка F3 (Important, второй круг финального ревью). Спека
+            # A23 обещает: критерий, вписанный в тело РУКАМИ, — рабочая
+            # дверь, не хуже команды `/harness-answer`. Но правки тела Issue
+            # вебхук не обрабатывает вовсе — сигнала на них нет, — а выйти
+            # из этой парковки может только сигнал (команда, `build-me`,
+            # событие агента). Под `DEVELOP_AUTOSTART`, чей смысл именно в
+            # отсутствии действия человека, это означало: задача с вопросом
+            # гейта, отвеченным правкой тела, просидит здесь весь срок
+            # парковки и закроется — то самое действие человека
+            # (`/harness-answer` или повторный `build-me`), которого
+            # автостарт обязан избегать, становится ЕДИНСТВЕННОЙ дверью.
+            #
+            # До находки C1 (см. её комментарий выше) бесконечный виток
+            # автостарта хотя бы подхватывал вписанный руками критерий — но
+            # ценой вызова МОДЕЛИ на каждом обороте (за 27 секунд виртуального
+            # времени — 7090 вызовов). Здесь цена другая и на порядки меньше:
+            # `read_acceptance_criterion` — чтение тела БЕЗ модели, раз в
+            # `CRITERION_RECHECK_INTERVAL`, а не на каждой миллисекунде.
+            #
+            # Перепроверяем ТОЛЬКО пока открыт вопрос ГЕЙТА КРИТЕРИЯ:
+            # обычная парковка `build-me` (self._open_question пуст) в
+            # перечитывании не нуждается — там нечему появиться в теле
+            # без ведома цикла, кроме решения человека, а оно и так сигнал.
+            #
+            # `wake_within` укорачивает только ВОЗВРАЩАЕМЫЙ `_park` таймаут
+            # (см. её докстринг) — описание ожидания и дедлайн, которые
+            # видит человек, считаются от полного `hours`, без урезания.
+            decision = await self._wait_for_signal(await self._park(
+                kind, who=who, reason=reason, hours=hours,
+                wake_within=CRITERION_RECHECK_INTERVAL))
+            if decision is None and self._park_timeout(hours) > timedelta(0):
+                # Таймаут промежуточной перепроверки, а не реальный дедлайн
+                # парковки (тот — когда `_park_timeout` уже вернул 0, ветка
+                # `if decision is None` ниже, общая с обычным путём).
+                # Критерий читаем БЕЗ модели — `propose_acceptance_options`/
+                # `ask_question` здесь не нужны: вопрос уже открыт,
+                # спрашивать заново нечего, а если критерий нашёлся — это же
+                # `_start_development` его увидит и без нашей помощи (см.
+                # ветку «критерий вписан руками», находка I4, выше).
+                criterion = ""
+                try:
+                    criterion = await workflow.execute_activity(
+                        activities.read_acceptance_criterion, issue,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as e:
+                    # Сбой перепроверки не хуже поведения без неё вовсе —
+                    # держим парковку, следующая перепроверка (или реальный
+                    # сигнал) попробует снова.
+                    #
+                    # Третий круг финального ревью, находка G2 (Important).
+                    # Комментарий здесь раньше утверждал, что отказ станет
+                    # видимым через `_start_development` (тот же гейт зовёт
+                    # `read_acceptance_criterion` и уведомляет о его отказе
+                    # через `report_criterion_gate_stall`) — НЕПРАВДА.
+                    # Перепроверка работает только пока `self._open_question`
+                    # непуст, а это ровно то условие, которое ТЕПЕРЬ (после
+                    # находки G1 выше) блокирует автостарт: автостарт
+                    # заблокирован, человек не сигналит (иначе `_wait_for_
+                    # signal` вернул бы решение, а не таймаут промежуточной
+                    # перепроверки) — значит `_start_development` всё то
+                    # время, что идёт перепроверка, вообще не вызывается, и
+                    # обещанное ею уведомление никогда не приходит. Устойчивый
+                    # отказ (истёкший токен, отозванные права, переименованный
+                    # репозиторий) — до 144 провалившихся опросов за 72 часа
+                    # (`CRITERION_RECHECK_INTERVAL` = 30 минут), из видимости
+                    # только `workflow.logger.warning` (порог Sentry —
+                    # `event_level=ERROR`, WARNING до него не поднимается, см.
+                    # докстринг `sentry_setup`), а затем тихое закрытие по
+                    # сроку.
+                    #
+                    # Правка — тот же приём, что у гейта: одно уведомление на
+                    # СЕРИЮ подряд идущих отказов, через ОБЩИЙ с гейтом флаг
+                    # `self._criterion_gate_notified` — это тот же самый вызов
+                    # `read_acceptance_criterion`, просто с другой частотой, и
+                    # заводить под него отдельный флаг значило бы для
+                    # человека два разных уведомления об одном и том же
+                    # отказе сети.
+                    #
+                    # `workflow.patched` обязателен: у прогонов, уже стоящих
+                    # на этой перепроверке БЕЗ отправленного уведомления,
+                    # этой активности в их истории нет — реплей не должен
+                    # получить лишнюю команду, которой там не было.
+                    workflow.logger.warning(
+                        "периодическая перепроверка критерия приёмки не "
+                        "удалась: %s", _failure_reason(e))
+                    if (workflow.patched(
+                            "issue-lifecycle-criterion-recheck-stall-notice")
+                            and not self._criterion_gate_notified):
+                        try:
+                            await workflow.execute_activity(
+                                activities.report_criterion_gate_stall,
+                                args=[issue, _failure_reason(e)],
+                                start_to_close_timeout=timedelta(seconds=30),
+                                retry_policy=RetryPolicy(maximum_attempts=5),
+                            )
+                        except Exception as notify_exc:
+                            # Уведомление не имеет права ронять то, что оно
+                            # уведомляет (тот же приём, что и у самого гейта).
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе периодической "
+                                "перепроверки критерия: %s",
+                                _failure_reason(notify_exc))
+                        else:
+                            self._criterion_gate_notified = True
+                else:
+                    # Чтение удалось (пусть даже критерий всё ещё пуст) —
+                    # серия отказов, если она была, закончилась здесь. Тот же
+                    # флаг, что и у гейта (`_start_development`), — следующий
+                    # отказ, где бы он ни случился, уже новая серия и снова
+                    # заслуживает своего уведомления.
+                    self._criterion_gate_notified = False
+                if criterion:
+                    # Критерий появился без единого сигнала от человека —
+                    # именно то, что обещает A23. `_start_development` сам
+                    # обнаружит непустой критерий, снимет устаревший вопрос
+                    # гейта (находка I4) и передаст задачу в разработку.
+                    return await self._start_development(issue)
+                # Критерия всё ещё нет — держим парковку. `(self._phase,
+                # self._stage, False)` — та же пара, что и у остальных
+                # веток «постороннее событие фазу не двигает» в этом
+                # обработчике: внешний цикл (`_run_phase_loop`) вызовет
+                # `_phase_await_build` заново, `_park` пересчитает остаток
+                # срока от АБСОЛЮТНОГО дедлайна (`_phase_since` не
+                # менялся), и перепроверка продолжится со следующим
+                # промежутком. Пропусти этот `return` — код провалился бы
+                # в `if decision is None` ниже и закрыл бы цикл по
+                # промежуточному таймауту, а не по реальному дедлайну.
+                return (self._phase, self._stage, False)
+        else:
+            decision = await self._wait_for_signal(
+                await self._park(kind, who=who, reason=reason, hours=hours))
         if decision is None:
             self._stage = "done"
             return None  # срок вышел — цикл закрывается, задача осталась в очереди
@@ -1860,6 +2133,96 @@ class IssueLifecycle:
             return await self._agent_event(decision)
         if decision == AGENT_ANALYZE:
             return await self._analysis_requested(issue)
+        if (isinstance(decision, UserComment) and self._open_question
+                and workflow.patched("issue-lifecycle-question-answer")):
+            # Гейт критерия приёмки задал вопрос — маркер обязателен: у
+            # прогонов, припаркованных здесь ДО этой задачи, указателя
+            # `self._open_question` в истории нет и быть не может, а значит
+            # эта ветка для них попросту недостижима на реплее; без маркера
+            # реплей всё равно упал бы, не найдя действие, которое исполнил
+            # старый код на этом же месте.
+            nxt = await self._answer_open_question(issue, decision)
+            if nxt is not None:
+                return nxt
+            # Не команда `/harness-answer` — вопрос всё ещё открыт, а
+            # обычная реплика ответом не считается (A5). Диалог по
+            # припаркованной задаче (`_answer_followup`) сюда намеренно не
+            # ведём: два разных протокола ответа на один и тот же комментарий
+            # запутали бы человека больше, чем короткое молчание.
+            return (self._phase, self._stage, False)
+        if (isinstance(decision, UserComment) and not self._open_question
+                and commands.parse_command(decision.text) == commands.HARNESS_ANSWER
+                and workflow.patched(
+                    "issue-lifecycle-answer-command-without-open-question")):
+            # Финальное ревью ветки, находка I3 (Important). Спека A18: команда
+            # `/harness-answer`, которой не на что отвечать, обязана получить
+            # явный ответ — «вопросов сейчас нет» — а не тонуть молча. Ветка
+            # выше срабатывает только при непустом `self._open_question`, и
+            # без этой добавки та же команда без указателя проваливалась в
+            # диалог уточнений ниже (`_answer_followup`): модель толковала её
+            # как произвольную реплику, а при исчерпанном потолке реплик
+            # ответа не было вовсе — молчание неотличимо от проглоченной
+            # команды. Зовём ту же `_answer_open_question` с ПУСТЫМ указателем:
+            # активность `answer_question` (`worker/activities.py`) на пустом
+            # `question_id` без открытого вопроса в теле сама отдаёт
+            # детерминированное «сейчас я не задавал вопроса» (см. её
+            # докстринг) — это и есть честный ответ на команду, которой
+            # нечего отвечать.
+            #
+            # `workflow.patched` обязателен: у прогонов, уже стоящих здесь
+            # СТАРЫМ кодом, этой ветки в истории нет — `/harness-answer` без
+            # указателя у них уже ушёл (или тонул) по ветке диалога уточнений
+            # ниже, и новая ветка означала бы для них другую историю на
+            # реплее.
+            #
+            # Находка F7 (Important, второй круг финального ревью). Пустой
+            # `self._open_question` здесь означает «этот ПРОГОН вопрос не
+            # заводил», а не «вопроса нет в природе» — спека A24 требует:
+            # «новый цикл читает тело... вопрос открыт — переставляет
+            # указатель... не задавая вопрос заново». Прогон, поднятый
+            # заново поверх ЖИВОЙ задачи (событие внешнего агента,
+            # `webhook/main.py:_lifecycle_args_for` — снимок несёт фазу, но
+            # не указатель на вопрос), стартует с пустым указателем, даже
+            # если в теле УЖЕ висит открытый вопрос гейта из прошлого
+            # прогона. Без проверки `answer_question` (`worker/
+            # activities.py`) получит `question_id=""` при РЕАЛЬНО открытом
+            # вопросе и ответит «этот вопрос уже устарел, сейчас открыт
+            # другой» (ветка `question.id != question_id`) — человеку,
+            # ответившему на самый что ни на есть актуальный вопрос.
+            #
+            # Лечится тем же вызовом, что уже переставляет указатель после
+            # `reasked` (находка C2) — `read_open_question_id`.
+            if workflow.patched("issue-lifecycle-repoint-open-question-on-answer"):
+                try:
+                    self._open_question = await workflow.execute_activity(
+                        activities.read_open_question_id, issue,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    # Сбой оставляет указатель пустым — не хуже поведения без
+                    # этой правки (I3 по-прежнему честно ответит «вопросов
+                    # нет», просто может ошибиться, если вопрос был). Видимость
+                    # отказа — находка F9, тот же приём чуть ниже по файлу.
+                    workflow.logger.warning(
+                        "не проверил актуальный открытый вопрос перед "
+                        "ответом: %s", _failure_reason(exc))
+                    if workflow.patched("issue-lifecycle-question-repoint-failure-notice"):
+                        try:
+                            await workflow.execute_activity(
+                                activities.report_question_repoint_failure,
+                                args=[issue, _failure_reason(exc)],
+                                start_to_close_timeout=timedelta(seconds=30),
+                                retry_policy=RetryPolicy(maximum_attempts=3),
+                            )
+                        except Exception as notify_exc:
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе проверки "
+                                "открытого вопроса: %s", _failure_reason(notify_exc))
+            nxt = await self._answer_open_question(issue, decision)
+            if nxt is not None:
+                return nxt
+            return (self._phase, self._stage, False)
         if isinstance(decision, UserComment) and workflow.patched(
                 "issue-lifecycle-followup-answer"):
             # Маркер обязателен: у припаркованных прогонов отброшенные реплики
@@ -1870,19 +2233,617 @@ class IssueLifecycle:
             return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
         return await self._start_development(issue)
 
-    async def _start_development(self, issue: IssueInput) -> tuple:
-        """Активность Develop: передать задачу агенту разработки.
+    async def _answer_open_question(self, issue: IssueInput,
+                                    comment: UserComment) -> tuple | None:
+        """Обработать `/harness-answer` на открытый вопрос гейта критерия.
 
-        Одна точка на оба входа — решение человека `build-me` и автостарт. Две
-        копии этого вызова разъехались бы на первой же правке ретраев, и один из
-        входов молча остался бы со старым поведением.
-        
+        `None` — комментарий не был обработан здесь (это не команда
+        `/harness-answer`, либо это её точный повтор, снятый защитой ниже);
+        вызывающий решает, что делать дальше.
+
+        Ревью, отказ ради которого это написано: вебхук доставляет каждое
+        событие ДВАЖДЫ (в истории `poh-demo-checkout#42` сигналов ровно
+        вдвое), и без защиты по `comment_id` один ответ человека принимался
+        бы дважды — второй раз уже при закрытом вопросе, то есть отвечал бы
+        «вопросов нет» на собственный только что принятый ответ. Реестр —
+        `self._answered_comment_ids`, тот же, что уже ведёт `_answer_followup`
+        для реплик: заводить второй ради того же самого признака незачем.
+        """
+        if (comment.comment_id is not None
+                and comment.comment_id in self._answered_comment_ids):
+            return (self._phase, self._stage, False)
+        if commands.parse_command(comment.text) != commands.HARNESS_ANSWER:
+            return None
+        if comment.comment_id is not None:
+            self._answered_comment_ids.append(comment.comment_id)
+            del self._answered_comment_ids[:-SEEN_EVENTS_KEPT]
+        try:
+            # Находка I1 (Important, финальное ревью). Было `maximum_attempts=
+            # 1` и без перехвата: единственный отказ (502 от GitHub, таймаут)
+            # ронял ВЕСЬ `IssueLifecycle` — Issue теряла владельца состояния
+            # целиком, а человек, только что ответивший на вопрос, не узнавал,
+            # что ответ не принят. Соседняя `ask_question` идёт с тремя
+            # попытками, а `_answer_followup` рядом гасит свой сбой тем же
+            # приёмом (перехват + лог) — оснований держать здесь одну попытку
+            # без перехвата не было: активность идемпотентна по каждому
+            # следствию (см. её докстринг), ретрай безопасен.
+            #
+            # `workflow.patched` здесь НЕ нужен: retry-политика — параметр
+            # сервера повторов, а не часть команды, которую реплей сверяет с
+            # историей (проверено напрямую — прогон записан с `maximum_
+            # attempts=1`, реплей той же истории кодом с `maximum_attempts=3`
+            # проходит чисто), а перехват исключения не переставляет ни одной
+            # уже записанной команды: он лишь ловит то, что раньше улетало
+            # наружу и валило прогон. У прогона, уже упавшего здесь старым
+            # кодом, живой истории для реплея больше нет — падать ему было
+            # больше некуда.
+            verdict = await workflow.execute_activity(
+                activities.answer_question,
+                args=[issue, self._open_question,
+                      commands.parse_command_args(comment.text), comment.comment_id],
+                start_to_close_timeout=timedelta(minutes=3),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as exc:
+            workflow.logger.warning("не разобрал ответ на открытый вопрос: %s",
+                                    _failure_reason(exc))
+            # Новая активность — новая команда в истории, которой у уже
+            # припаркованных (тем более уже упавших) старым кодом прогонов
+            # быть не могло: маркер обязателен по обычной причине.
+            if workflow.patched("issue-lifecycle-answer-question-failure-notice"):
+                try:
+                    await workflow.execute_activity(
+                        activities.report_answer_question_failure,
+                        args=[issue, _failure_reason(exc)],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as notify_exc:
+                    # Уведомление не имеет права ронять то, что оно уведомляет
+                    # (тот же приём, что у `report_criterion_gate_stall` в
+                    # `_start_development`).
+                    workflow.logger.warning(
+                        "не смог уведомить об отказе разбора ответа: %s",
+                        _failure_reason(notify_exc))
+            return (self._phase, self._stage, False)
+        if verdict == "accepted":
+            self._open_question = ""
+            # Третий круг финального ревью, находка G1 (заодно — самостоятельная
+            # находка при сквозной проверке всех выходов из гейта). Ответ принят
+            # — критерий записан, гейт по факту пройден, и путь сюда лежал через
+            # УСПЕШНУЮ постановку вопроса в `_start_development`, а она поднимает
+            # `self._acceptance_gate_stalled` в True. Не снять его здесь —
+            # значит унаследовать True другим, куда более поздним заходом в
+            # READY_FOR_DEV: правка I4 по соседству уже разбирала ровно эту
+            # ловушку для `self._open_question` (задача, вернувшаяся сюда на
+            # rework, наследует указатель на уже несуществующий вопрос) — здесь
+            # тот же механизм, только вместо указателя на КОНКРЕТНЫЙ вопрос
+            # ломается признак «гейт сейчас закрыт»: rework отправит задачу
+            # обратно в READY_FOR_DEV, `_phase_await_build` увидит `self.
+            # _acceptance_gate_stalled == True` от отвеченного (и давно
+            # решённого) вопроса и молча выключит автостарт для всей
+            # оставшейся жизни задачи, ничего не спрашивая и не паркуясь
+            # по-настоящему.
+            self._acceptance_gate_stalled = False
+            return await self._begin_development(issue)
+        if verdict == "reasked" and workflow.patched(
+                "issue-lifecycle-reasked-question-repoints-pointer"):
+            # Находка C2 (Critical, финальное ревью). Спека A22: возрождённый
+            # вопрос заводит НОВЫЙ идентификатор, указатель переставляется.
+            # Контракт `answer_question` этого не позволяет — активность
+            # возвращает голую строку-вердикт (см. её докстринг, почему тип
+            # возврата НЕ меняется: смена на структуру ломает десериализацию
+            # уже записанных в историю bare-строк). Указатель узнаём отдельным,
+            # новым вызовом: без него `self._open_question` остался бы на
+            # исчезнувшем id, и следующий ответ человека натыкался бы на «этот
+            # вопрос устарел» — а актуальный вопрос и был тем, на который он
+            # отвечал (по кругу до истечения срока парковки).
+            #
+            # `workflow.patched` обязателен: у прогонов, уже стоящих здесь
+            # СТАРЫМ кодом (указатель на вопрос уже в истории), новая
+            # активность здесь была бы командой, которой в их истории нет.
+            try:
+                self._open_question = await workflow.execute_activity(
+                    activities.read_open_question_id, issue,
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as exc:
+                # Сбой оставляет указатель СТАРЫМ — не хуже поведения без
+                # правки; цикл не роняем.
+                #
+                # Находка F9 (Important, второй круг финального ревью). До
+                # этой правки видимость отказа была ТОЛЬКО строкой `workflow.
+                # logger.warning` — хлебной крошкой для Sentry (порог
+                # `event_level=ERROR` у `LoggingIntegration`, а не WARNING,
+                # см. докстринг `sentry_setup`), оператор её не увидит.
+                # Человек тем временем по кругу получает «этот вопрос уже
+                # устарел» на СВОЙ актуальный ответ (указатель остался на
+                # исчезнувшем id) и не понимает, почему. Событие — по
+                # образцу уже заведённого уведомления об отказе `answer_
+                # question` (находка I1, `report_answer_question_failure`);
+                # переиспользуем ту же активность `read_open_question_id`-
+                # уведомления, что и находка F7 чуть выше — обе про один и
+                # тот же отказ (чтение актуального открытого вопроса), просто
+                # в разных точках вызова.
+                #
+                # Без комментария человеку: тот, что уже ушёл на «reasked»
+                # чуть выше, честно объясняет, что делать («ответьте
+                # текстом») — второй, спорящий с ним («не смог обработать
+                # ответ, попробуйте ещё раз») тут же в ленте только запутает.
+                workflow.logger.warning(
+                    "не переставил указатель на возрождённый вопрос: %s",
+                    _failure_reason(exc))
+                if workflow.patched("issue-lifecycle-question-repoint-failure-notice"):
+                    try:
+                        await workflow.execute_activity(
+                            activities.report_question_repoint_failure,
+                            args=[issue, _failure_reason(exc)],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        )
+                    except Exception as notify_exc:
+                        workflow.logger.warning(
+                            "не смог уведомить об отказе проверки открытого "
+                            "вопроса: %s", _failure_reason(notify_exc))
+        return (self._phase, self._stage, False)
+
+    async def _start_development(self, issue: IssueInput) -> tuple:
+        """Гейт критерия приёмки, а затем — передача задачи агенту разработки.
+
+        Одна точка на все входы — решение человека `build-me`, автостарт и
+        принятый ответ на вопрос о критерии (см. `_phase_await_build`). Точка
+        входа ОДНА и до этой задачи вела прямиком к разработке; гейт встаёт
+        перед ней, не заменяя её — сама передача осталась в `_begin_development`.
+
+        Маркер обязателен: у припаркованных прогонов решение «начать
+        разработку» УЖЕ лежит в истории на этом месте, и новый код запланировал
+        бы здесь активность, которой там нет, — реплей упал бы недетерминизмом.
+        Так легли 29 прогонов из 149 после коммита `ac625e7`.
+        """
+        if workflow.patched("issue-lifecycle-acceptance-gate"):
+            # Тело Issue живёт снаружи воркфлоу — активность, не чтение здесь:
+            # реплей обязан быть детерминированным, а тело меняется без нас.
+            try:
+                criterion = await workflow.execute_activity(
+                    activities.read_acceptance_criterion, issue,
+                    start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+            except Exception as e:
+                # Ревью, находка 1 (Important): устойчивый отказ GitHub (после
+                # исчерпания ретраев) не должен ронять весь IssueLifecycle —
+                # тогда Issue теряет владельца состояния целиком из-за
+                # временного сбоя сети. Симметрично `_clarify_open_questions`
+                # (там же рядом — чтение открытых вопросов аналитики) гасим
+                # сбой чтения, не давая ему остановить цикл.
+                #
+                # Но, В ОТЛИЧИЕ от неё, дальше НЕ идём как обычно (там сбой
+                # читает необязательное улучшение, задачу можно передать и без
+                # него). Здесь сам факт критерия — условие входа в разработку,
+                # а мы его не знаем: не прочитали, а не «прочитали и там
+                # пусто». Трактовать сбой чтения как «критерия нет» и тут же
+                # задать вопрос было бы неправдой человеку — критерий, возможно,
+                # ЕСТЬ, просто тело Issue не прочиталось, а «не вижу критерия»
+                # это утверждение о содержимом, а не о сети. Гейт обязан
+                # держать закрыто при неизвестном ответе: пропустить задачу в
+                # разработку из-за сетевого сбоя хуже, чем не начать её вовремя
+                # — поэтому остаёмся на парковке той же фазы, ничего не спрашивая
+                # и не решая. Следующий сигнал (человек повторит решение,
+                # дежурный по триажу заметит, внешний ретрай) снова вызовет
+                # этот же гейт.
+                workflow.logger.warning("не прочитал критерий приёмки: %s",
+                                        _failure_reason(e))
+                # Третий круг финального ревью, находка G1 (Critical).
+                # Гейт НЕ пропустил задачу дальше — признак этого решают не
+                # указателем на вопрос (его здесь и не было — до вопроса дело
+                # не дошло), а этим флагом: он покрывает ЛЮБОЙ исход гейта,
+                # который держит фазу на месте, и снимается только когда
+                # критерий найден (см. присваивание `False` ниже, сразу после
+                # успешного чтения). `_phase_await_build` читает именно его,
+                # чтобы решить, можно ли автостарту снова звать этот гейт —
+                # см. её докстринг про `autostart_blocked_by_gate_stall`.
+                self._acceptance_gate_stalled = True
+                # Ревью: отказ ВЫШЕ (парковка вместо падения) не спорят — но он
+                # НЕВИДИМ. `workflow.logger.warning` уходит в Sentry только
+                # хлебной крошкой (`LoggingIntegration(event_level=ERROR)` в
+                # `sentry_setup.configure` — порог ERROR, а не WARNING),
+                # оператор его не увидит. Человеку тоже не видно ничего: та же
+                # фаза, та же стадия, а `_publish_awaiting` не зовёт
+                # `mark_awaiting`, потому что желаемое состояние очереди не
+                # изменилось (см. `want == self._human_queue_labelled` в
+                # `_publish_awaiting`) — нажатие «в разработку» неотличимо
+                # от «команду ещё не заметили». Хуже: срок парковки при
+                # возврате в ту же фазу не сбрасывается — серия отказов близко
+                # к истечению срока закрыла бы цикл по таймауту, так и не
+                # показав, что решение человека вообще было получено.
+                #
+                # `workflow.patched` обязателен по тем же причинам, что и выше:
+                # прогоны, уже стоящие на этой парковке БЕЗ отправленного
+                # уведомления, на реплее не должны внезапно получить лишнюю
+                # активность в истории, которой там нет.
+                if workflow.patched("issue-lifecycle-acceptance-gate-stall-notice"
+                                    ) and not self._criterion_gate_notified:
+                    # Один раз на СЕРИЮ подряд идущих отказов, а не на каждую
+                    # попытку: человек, который жмёт «в разработку» повторно
+                    # (или дежурный, который повторяет сигнал), не должен
+                    # получать копию того же сообщения на каждый клик — лента
+                    # Issue не место для счётчика ретраев одного и того же
+                    # сбоя. Флаг сбрасывается ниже сразу после успешного
+                    # чтения — следующий отказ будет уже НОВОЙ серией и снова
+                    # заслуживает своего сообщения. Сам флаг переживает
+                    # continue-as-new через `LifecycleState.criterion_gate_
+                    # notified` (см. её докстринг в shared/workflow_types.py) —
+                    # ревью посчитало механику: порог истории проверяется
+                    # ПОСЛЕ каждого перехода фазы, включая холостой «остались
+                    # на месте после отказа», а очередь сигналов сразу после
+                    # разбора одного сигнала почти всегда пуста. Для задачи,
+                    # застрявшей на этом гейте, порог набирается быстро, и без
+                    # переноса каждый перезапуск открывал бы новую «серию» —
+                    # находка 2 (Important).
+                    try:
+                        await workflow.execute_activity(
+                            activities.report_criterion_gate_stall,
+                            args=[issue, _failure_reason(e)],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=5),
+                        )
+                    except Exception as notify_exc:
+                        # Находка 1 (Important): уведомление не имеет права
+                        # ронять то, что оно уведомляет. Причина отказа
+                        # чтения критерия — обычно та же недоступность
+                        # GitHub, а `report_criterion_gate_stall` зовёт тот же
+                        # `github_client.post_comment`, ничем не защищённый:
+                        # не перехватить здесь значило бы воспроизвести
+                        # падение цикла другим заходом — тем же необработанным
+                        # отказом, просто из другой активности. Маркер
+                        # обязателен по тем же причинам, что и выше: без него
+                        # это новая ветка решения, которой не было в истории
+                        # прогонов, уже отправивших уведомление старым кодом.
+                        if workflow.patched(
+                                "issue-lifecycle-acceptance-gate-stall-notice-safe"):
+                            # Флаг НЕ поднимаем (см. `else` ниже) — попытка не
+                            # считается состоявшейся: сообщение не дошло ни
+                            # оператору (Sentry), ни человеку (комментарий), и
+                            # следующий отказ гейта в этой же серии обязан
+                            # попробовать уведомить снова, а не молчать до
+                            # конца серии.
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе гейта критерия "
+                                "приёмки: %s", _failure_reason(notify_exc))
+                        else:
+                            raise
+                    else:
+                        self._criterion_gate_notified = True
+                return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
+            # Критерий прочитан (пусть даже пустым) — если серия отказов и
+            # была, она закончилась здесь. Следующий отказ — уже новая серия,
+            # и заслуживает нового сообщения (см. комментарий выше).
+            self._criterion_gate_notified = False
+            # Находка G1 (третий круг финального ревью). Чтение удалось —
+            # само по себе ЧТЕНИЕ гейт больше не стопорит. Если критерий
+            # пуст, ниже мы либо зададим вопрос, либо не сможем его задать —
+            # оба исхода снова поднимут флаг перед своим `return`; если
+            # критерий найден, флаг так и останется снятым, и гейт передаст
+            # задачу в `_begin_development` дальше по функции.
+            self._acceptance_gate_stalled = False
+            if not criterion:
+                # Отказ модели — не отказ гейта: варианты — только подспорье,
+                # вопрос задаётся всё равно, при пустом списке — свободным
+                # текстом (см. `Question.options`/`ask_question`).
+                #
+                # H1 (точечная правка после мержа, финальное ревью) — десятый
+                # исход гейта. Единственный вызов внутри гейта, который раньше
+                # не был обёрнут вовсе: одна попытка, потолок пять минут (SDK
+                # `worker/llm.py` своего таймаута не задаёт — по умолчанию у
+                # клиента 600 секунд, — плюс две повторные попытки у
+                # instructor, так что потолок перекрывается штатно, а не в
+                # теории). Тело активности само гасит отказ МОДЕЛИ и отдаёт
+                # пустой список (см. её докстринг в `worker/activities.py`) —
+                # но ИНФРАСТРУКТУРНЫЙ отказ (таймаут активности, перезапуск
+                # воркера посреди вызова) улетал бы отсюда наружу тем же
+                # необработанным исключением и ронял бы весь `IssueLifecycle`
+                # — Issue теряла бы владельца состояния молча, без комментария
+                # и без метки. Лечится тем же приёмом, что и у соседних
+                # активностей этого гейта (`read_acceptance_criterion` выше,
+                # `ask_question` ниже): перехват, пустой список вариантов —
+                # ровно то, что активность и так возвращает при отказе модели,
+                # так что для остального гейта это НЕ новый исход, а тот же
+                # самый «критерий не найден, вариантов нет», просто с другой
+                # причиной пустого списка.
+                #
+                # `workflow.patched` здесь не нужен — по той же причине, что
+                # и у обёртки `ask_question` по соседству: перехват не
+                # переставляет ни одной уже записанной команды, он лишь ловит
+                # то, что раньше улетало наружу и валило прогон целиком. У
+                # прогона, уже упавшего здесь старым кодом, живой истории для
+                # реплея больше нет — падать ему было больше некуда.
+                try:
+                    options = await workflow.execute_activity(
+                        activities.propose_acceptance_options, issue,
+                        start_to_close_timeout=timedelta(minutes=5),
+                        retry_policy=RetryPolicy(maximum_attempts=1),
+                    )
+                except Exception as e:
+                    workflow.logger.warning(
+                        "не смог подсказать варианты критерия приёмки: %s",
+                        _failure_reason(e))
+                    options = []
+                # Находка F2 (Important, второй круг финального ревью).
+                # Запоминаем ДО вызова `ask_question`, был ли вопрос уже
+                # открыт, — см. комментарий у сброса `_phase_since` ниже:
+                # решает именно это, а не сам факт вызова.
+                question_already_open = bool(self._open_question)
+                try:
+                    self._open_question = await workflow.execute_activity(
+                        activities.ask_question,
+                        args=[issue, "howtodemo",
+                              "**Не вижу, чем принимать эту задачу.** "
+                              "Разработку не начинаю, пока не будет критерия готовности.",
+                              options],
+                        start_to_close_timeout=timedelta(minutes=3),
+                        # Находка F4 (Important, второй круг финального
+                        # ревью). `ConflictingOpenQuestion` (находка I5) —
+                        # ДЕТЕРМИНИРОВАННЫЙ конфликт: в теле уже открыт
+                        # вопрос ДРУГОГО вида. Без списка нерепетируемых
+                        # типов три попытки трижды дёргали бы GitHub тем же
+                        # заведомо провальным запросом, прежде чем активность
+                        # упадёт. Сверка идёт по имени класса исключения, а
+                        # не по иерархии, — тем же приёмом, что и
+                        # `non_retryable_error_types=["RuntimeError"]` у
+                        # стадий FNR выше по файлу.
+                        retry_policy=RetryPolicy(
+                            maximum_attempts=3,
+                            non_retryable_error_types=["ConflictingOpenQuestion"],
+                        ),
+                    )
+                except Exception as e:
+                    # Находка F4 (Important, второй круг финального ревью).
+                    # Вызов раньше не был обёрнут вовсе: единственный отказ
+                    # (детерминированный конфликт выше или устойчивая
+                    # недоступность GitHub) улетал наружу и ронял ВЕСЬ
+                    # `IssueLifecycle` — Issue теряла владельца состояния
+                    # целиком. Гейт обязан пережить и то, и другое — тем же
+                    # приёмом, что и защита `read_acceptance_criterion` чуть
+                    # выше: остаёмся на парковке той же фазы, вопрос не
+                    # задан, а следующий сигнал (человек, автостарт, дежурный)
+                    # снова вызовет гейт.
+                    #
+                    # Уведомление — БЕЗ дедупликации по `self._criterion_
+                    # gate_notified`: этот флаг сбрасывается в `False` строкой
+                    # выше на КАЖДОЙ повторной попытке (сразу после успешного
+                    # чтения критерия), так что «одно на серию» здесь всё
+                    # равно не получилось бы — сериями владеет отказ ЧТЕНИЯ,
+                    # а не отказ ПОСТАНОВКИ вопроса. Отдельный флаг под это
+                    # решили не заводить: `ConflictingOpenQuestion` — редкий
+                    # детерминированный край, а не длящийся аутейдж, и
+                    # предпочли простоту `report_answer_question_failure`
+                    # (находка I1) — уведомляем на каждый отказ, а не
+                    # исхитряемся с ещё одним состоянием, которое пришлось бы
+                    # нести через continue-as-new.
+                    workflow.logger.warning(
+                        "не смог задать вопрос критерия приёмки: %s",
+                        _failure_reason(e))
+                    # Находка G1 (третий круг финального ревью) — САМА
+                    # находка. Без этого флага указатель `self._open_question`
+                    # остаётся пустым (присваивание выше не произошло —
+                    # исключение брошено ДО него), автостарт видит «вопроса
+                    # нет» и на следующем же обороте зовёт этот гейт заново:
+                    # чтение критерия (снова успех, снова пусто) — МОДЕЛЬ
+                    # (`propose_acceptance_options`) — снова этот же отказ
+                    # `ask_question`. Без парковки и без таймера, оборот за
+                    # оборотом. Флаг снимается только строкой выше, при
+                    # следующем успешном чтении критерия.
+                    self._acceptance_gate_stalled = True
+                    if workflow.patched("issue-lifecycle-ask-question-failure-safe"):
+                        try:
+                            # Находка G2 (третий круг финального ревью).
+                            # Раньше эта ветка переиспользовала `report_
+                            # criterion_gate_stall` — активность с текстом
+                            # «не смог проверить критерий приёмки». Здесь это
+                            # НЕПРАВДА: критерий прочитан отлично (мы уже
+                            # внутри `if not criterion:`, до этой строки дошли
+                            # именно потому, что чтение удалось), упала
+                            # ПОСТАНОВКА вопроса — другой шаг, другая причина,
+                            # другое лечение (для человека — не «подождите,
+                            # проверю», а «вопрос не дошёл, оценка не
+                            # опубликована»). Разводим сообщения отдельной
+                            # активностью `report_ask_question_gate_failure`.
+                            #
+                            # `workflow.patched` обязателен: у прогонов, уже
+                            # отправивших уведомление СТАРЫМ текстом через
+                            # `report_criterion_gate_stall` на этом самом
+                            # месте, реплей обязан продолжать звать ТУ ЖЕ
+                            # активность — переключение на новую было бы для
+                            # них другим типом команды на уже случившемся
+                            # событии, недетерминизм.
+                            if workflow.patched(
+                                    "issue-lifecycle-ask-question-failure-message"):
+                                await workflow.execute_activity(
+                                    activities.report_ask_question_gate_failure,
+                                    args=[issue, _failure_reason(e)],
+                                    start_to_close_timeout=timedelta(seconds=30),
+                                    retry_policy=RetryPolicy(maximum_attempts=5),
+                                )
+                            else:
+                                await workflow.execute_activity(
+                                    activities.report_criterion_gate_stall,
+                                    args=[issue, _failure_reason(e)],
+                                    start_to_close_timeout=timedelta(seconds=30),
+                                    retry_policy=RetryPolicy(maximum_attempts=5),
+                                )
+                        except Exception as notify_exc:
+                            # Уведомление не имеет права ронять то, что оно
+                            # уведомляет (тот же приём, что у `report_
+                            # criterion_gate_stall` двумя экранами выше).
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе постановки "
+                                "вопроса гейта: %s", _failure_reason(notify_exc))
+                    return (lifecycle.READY_FOR_DEV, "awaiting-build-decision", False)
+                # Находка I2 (Important, финальное ревью). Вопрос задаётся
+                # ВОЗВРАТОМ В ТУ ЖЕ ФАЗУ — `_enter` при совпадении фазы не
+                # трогает `_phase_since` (см. её докстринг), а срок парковки
+                # считается именно от него. Без сброса человек, нажавший «в
+                # разработку» на семьдесят первом часу исходной парковки
+                # `awaiting-build-decision`, получил бы на ОТВЕТ по вопросу
+                # считаные минуты — спека A26 обещает 72 часа. Вопрос — новое,
+                # отдельное ожидание со своим сроком, а не хвост уже идущей
+                # парковки; отсчёт обязан начаться заново.
+                #
+                # НО только В ПЕРВЫЙ РАЗ, когда указателя ещё не было
+                # (находка F2, Important, второй круг финального ревью —
+                # регресс правки выше). Безусловный сброс означал: повторный
+                # `build-me`/автостарт ПРИ УЖЕ ОТКРЫТОМ вопросе (вебхук
+                # доставляет каждое событие ДВАЖДЫ — см. докстринг
+                # `_answer_open_question`, а человек или дежурный вполне
+                # может прислать решение снова, пока критерий не найден)
+                # заново заходил сюда, `ask_question` идемпотентно возвращал
+                # id ТОГО ЖЕ вопроса (не публикуя второй комментарий — см. её
+                # докстринг), а срок ответа отсчитывался с нуля НА КАЖДЫЙ
+                # такой заход. Дедлайн превращался в «N часов с последнего
+                # шороха» — ровно то, против чего в этом файле заведён
+                # абсолютный предел парковки (`_park_timeout`, правило R3):
+                # вопрос — не НОВОЕ ожидание, если он уже был открыт до этого
+                # вызова.
+                #
+                # `workflow.patched` здесь не нужен: проверено напрямую —
+                # длительность таймера/парковки не входит в проверку
+                # детерминизма реплея (Replayer чисто проигрывает историю,
+                # записанную с одной длительностью, кодом, считающим другую;
+                # то же для retry-политики активности, см. комментарий в
+                # `_answer_open_question`). У прогона, уже стоящего на
+                # парковке с таймером, ЗАВЕДЁННЫМ до этой правки, сервер уже
+                # держит СТАРЫЙ срок — его код задним числом не продлевает
+                # (и не обязан: это обычное «правка начинает действовать для
+                # новых ожиданий», а не недетерминизм).
+                #
+                # Не чиним этим же заходом: что видит человек, ответивший на
+                # вопрос уже МЁРТВОГО прогона (срок истёк, `run()` вернулся,
+                # но открытый вопрос и метка остались в теле) — `/harness-
+                # answer` в этом случае уходит в воркфлоу голым сигналом,
+                # живого прогона для его приёма нет, и отказ гасится широким
+                # перехватом на стороне вебхука. Это отдельная, более крупная
+                # правка на стороне доставки сигнала (webhook/main.py):
+                # обнаружение мёртвого прогона и содержательный ответ
+                # человеку вместо тишины. Здесь она не сделана — называю
+                # прямо, а не молчу: смешивать её с правкой самого срока
+                # означало бы либо раздувать этот коммит, либо чинить
+                # доставку сигналов наспех.
+                if not question_already_open:
+                    self._phase_since = workflow.now()
+                # Находка G1 (третий круг финального ревью). Вопрос задан и
+                # ждёт ответа — гейт снова не пропустил задачу дальше, теперь
+                # уже сознательно (спрашивать заново нечего). Формально флаг
+                # тут почти всегда и так True (тот же `self._open_question`,
+                # который сейчас непуст, — сам по себе один из исходов гейта,
+                # для которого флаг заводился), но ставим его явно: этот
+                # `return` — самостоятельный исход гейта, и его видимость не
+                # должна зависеть от того, что где-то раньше сделала другая
+                # ветка.
+                self._acceptance_gate_stalled = True
+                # Ждём в READY_FOR_DEV: та же фаза, что и до вопроса, поэтому
+                # write_label=False — метка `ready-for-dev` уже стоит, вопрос
+                # не меняет то, что видно как состояние Issue снаружи.
+                return (lifecycle.READY_FOR_DEV, "awaiting-acceptance-criterion", False)
+            if self._open_question and workflow.patched(
+                    "issue-lifecycle-criterion-filled-by-hand-closes-question"):
+                # Находка I4 (Important, финальное ревью). Критерий появился
+                # НЕ через `/harness-answer` (тогда `self._open_question` уже
+                # был бы очищен веткой `accepted` выше) — значит, человек
+                # вписал его в тело руками. Спека A23: «вопрос снимается,
+                # работа продолжается» — команда удобство, а не единственная
+                # дверь. Без этой правки блок вопроса и метка `NEEDS_HUMAN_
+                # ANSWER` оставались висеть на задаче, уже ушедшей в
+                # разработку, и ничто их больше не снимало — выборка
+                # `needs-human:*` переставала быть полной очередью к людям.
+                #
+                # Сбой снятия — уборка состояния, а не условие входа в
+                # разработку: сетевой сбой здесь не должен блокировать
+                # передачу задачи агенту.
+                #
+                # Находка F6 (Important, второй круг финального ревью).
+                # Прежний комментарий здесь обещал «блок/метка повисят до
+                # следующего успешного прохода этой ветки» — неправда: НИЖЕ,
+                # сразу за перехватом, безусловно идёт `_begin_development`
+                # — фаза уезжает из READY_FOR_DEV, и `_start_development`
+                # (а с ним и эта ветка) по ЭТОЙ задаче больше не позовут,
+                # пока она не вернётся сюда заново (rework — см. `MAX_REWORK_
+                # ROUNDS` — либо новый цикл разработки). «Следующего прохода»
+                # в смысле «сейчас доделает» — не будет никогда.
+                #
+                # Отказ был и НЕВИДИМ: только `workflow.logger.warning`, а
+                # порог Sentry — `event_level=ERROR`, WARNING до него не
+                # поднимается (см. докстринг `sentry_setup`) — ни оператор,
+                # ни человек ничего не видели.
+                #
+                # Указатель чистим БЕЗУСЛОВНО, независимо от исхода —
+                # раньше `self._open_question = ""` стоял в `else` и
+                # выполнялся только при успехе. Решение продолжить в
+                # разработку УЖЕ принято (критерий найден) — снятие вопроса
+                # в теле дальше просто уборка, а НЕ снятая уборка не должна
+                # переживать в указателе `self._open_question` дольше самого
+                # решения: не почисти его — задача, которая когда-нибудь
+                # ВЕРНЁТСЯ в READY_FOR_DEV (rework), унаследует указатель на
+                # УЖЕ несуществующий вопрос. С находкой G1 это уже не блокирует
+                # автостарт напрямую (`_phase_await_build` читает `self.
+                # _acceptance_gate_stalled`, а не этот указатель, — см. её
+                # докстринг), но указатель всё равно не должен переживать
+                # решение: следующий `_answer_open_question` иначе искал бы
+                # ответ на вопрос, которого больше нет.
+                #
+                # `workflow.patched` обязателен: у прогонов, уже стоящих
+                # здесь СТАРЫМ кодом с указателем на вопрос, этой активности
+                # в истории нет.
+                try:
+                    await workflow.execute_activity(
+                        activities.close_answered_by_body_edit, issue,
+                        start_to_close_timeout=timedelta(minutes=2),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as e:
+                    workflow.logger.warning(
+                        "не снял устаревший вопрос гейта критерия: %s",
+                        _failure_reason(e))
+                    if workflow.patched("issue-lifecycle-question-close-failure-notice"):
+                        try:
+                            await workflow.execute_activity(
+                                activities.report_question_close_failure,
+                                args=[issue, _failure_reason(e)],
+                                start_to_close_timeout=timedelta(seconds=30),
+                                retry_policy=RetryPolicy(maximum_attempts=3),
+                            )
+                        except Exception as notify_exc:
+                            workflow.logger.warning(
+                                "не смог уведомить об отказе снятия вопроса "
+                                "гейта: %s", _failure_reason(notify_exc))
+                self._open_question = ""
+        return await self._begin_development(issue)
+
+    async def _begin_development(self, issue: IssueInput) -> tuple:
+        """Передать задачу агенту разработки — без повторной проверки критерия.
+
+        Отдельная функция, а не хвост `_start_development`, по одной причине:
+        принятый ответ на вопрос о критерии (`_phase_await_build`) знает, что
+        критерий только что записан — `_place_decision` в `answer_question`
+        (`worker/activities.py`) положил его в блок HOWTODEMO ДО того, как
+        сюда вернулось управление. Дёрнуть `_start_development` заново означало
+        бы честный, но ЛИШНИЙ круг `read_acceptance_criterion` за тем же самым
+        текстом — активность, которая станет предсказуемым `True` в 100%
+        случаев, кроме одного: тело Issue успели поправить руками между
+        ответом и этим вызовом, и тогда лишний круг превратился бы в вопрос
+        по уже отвеченному критерию. Дешевле и честнее звать разработку
+        напрямую: `answer_question` вернула `accepted` — этого достаточно.
+
+        Одна точка на оба оставшихся входа — решение человека `build-me` и
+        автостарт. Две копии этого вызова разъехались бы на первой же правке
+        ретраев, и один из входов молча остался бы со старым поведением.
+
         ISSUE-113: для подзадачи плана передаём root_issue и ветку родителя.
         """
         # ISSUE-113 пункт 2: вычисляем ветку так же, как в _phase_handoff
         source = self._root_issue if self._plan_member and self._root_issue else issue.issue_number
         branch = f"research/issue-{source}"
-        
+
         try:
             if workflow.patched("issue-lifecycle-develop-child"):
                 # Дочерний прогон: у стадии появляется свой WorkflowId, а

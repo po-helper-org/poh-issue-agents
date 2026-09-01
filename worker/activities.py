@@ -32,6 +32,8 @@ import forge
 github_client = forge
 import llm
 from shared import (
+    acceptance_proposal,
+    answer_interpretation,
     bft,
     decomposition,
     develop,
@@ -41,6 +43,7 @@ from shared import (
     markdown_fences,
     memory,
     pr_closing,
+    questions,
     repowise,
     sentry_setup,
     task_context,
@@ -211,6 +214,873 @@ def escalate_to_human(issue: IssueInput, reason: str = "") -> None:
                   "Передаю на ручной разбор.",
     )
     github_client.add_label(issue.repo, issue.issue_number, labels.NEEDS_HUMAN_TRIAGE)
+
+
+class ConflictingOpenQuestion(RuntimeError):
+    """`ask_question` вызван для вида `kind`, а открытый вопрос — ДРУГОГО вида.
+
+    Финальное ревью ветки, находка I5 (Important). В теле Issue один слот на
+    открытый вопрос (`questions.write_open`/`read_open`), а ранний возврат
+    ниже раньше срабатывал на ЛЮБОМ открытом вопросе, не сверяя вид: второй
+    потребитель механизма (спека обещает `mvp-bounds`, выбор из вариантов
+    плана) получил бы в ответ id ЧУЖОГО висящего вопроса, поставил бы его
+    себе в указатель и посчитал бы, что свой вопрос задан, — а сам текст и
+    варианты потерялись бы молча, не оставив следа («шаг отработал, успех
+    доложен, результата нет» — худший класс отказа в этом контуре). Сегодня
+    потребитель один (`howtodemo`), и в проде эта ветка не достижима — но раз
+    слот один, а не по слоту на вид, два одновременно открытых вопроса разных
+    видов в принципе несовместимы с форматом тела. Падаем громко здесь и
+    сейчас, а не подсовываем чужой id: чинить дешевле сейчас, чем после того,
+    как второй потребитель появится и словит эту находку на проде.
+    """
+
+
+@activity.defn
+def ask_question(issue: IssueInput, kind: str, text: str, options: list[str]) -> str:
+    """Задать человеку вопрос и повесить метку ожидания.
+
+    Возвращает идентификатор ОТКРЫТОГО вопроса — только что заданного либо уже
+    висевшего. Повторный вызов второго комментария не даёт: вопрос уже
+    объявлен, и второй его экземпляр человека только запутает.
+
+    У активности ТРИ следствия — блок в теле, комментарий, метка, — и она
+    обязана быть идемпотентной по каждому ОТДЕЛЬНО: обрыв между любыми двумя
+    шагами не должен ни потерять вопрос молча, ни задвоить его бесконечно при
+    каждом повторе.
+
+    Третий круг ревью этой активности (см. докстринг `questions.Question.
+    announced`). Первый круг чинил ранний возврат по одному общему признаку
+    «блок уже в теле» — обрыв между записью тела и комментарием прятал
+    вопрос от человека навсегда. Второй и третий круг чинили ОДИН И ТОТ ЖЕ
+    следующий дефект дважды: признак «комментарий уже опубликован» искали
+    перебором ЛЕНТЫ комментариев — сначала страницей 1 (самой старой),
+    потом прыжком на последнюю страницу (которая на ленте, где общее число
+    комментариев на единицу больше кратного странице, состоит из одного
+    элемента и теряет маркер с предыдущей страницы), и оба раза вдобавок
+    расходились поведением между GitHub и GitLab. Три захода на одну и ту же
+    находку — это не невезение, а сигнал, что чинили не там: у ленты
+    комментариев нет дешёвого и надёжного доступа «покажи последние N», и
+    опираться на неё как на хранилище признака не стоило вовсе.
+
+    Починка в этом круге — признак «объявлено» переехал туда же, где живёт
+    остальное состояние вопроса: в сам блок вопроса в теле Issue
+    (`Question.announced`). Тело читается ОДНИМ обращением, отдаётся целиком
+    и пагинации не имеет — ленте здесь просто нечем быть источником ошибки.
+    Порядок действий важен:
+
+    1. Блок вопроса пишется в тело ДО публикации комментария (как и раньше) —
+       иначе обрыв сразу после создания вопроса снова прячет его навсегда.
+    2. Признак `announced=True` проставляется ПОСЛЕ успешной публикации
+       комментария, а не до и не вместо неё — иначе он может соврать про
+       комментарий, которого на самом деле не было.
+    3. Из (1) и (2) следует узкое окно: обрыв МЕЖДУ успешной публикацией
+       комментария и записью признака (например, комментарий ушёл, а
+       следующий `update_issue_body` упал) при повторном вызове даст ВТОРОЙ
+       экземпляр комментария — активность увидит `announced=False` и
+       опубликует снова. Это сознательно допущено и не является дефектом:
+       единственная альтернатива — проставлять признак ДО комментария —
+       переносит обрыв на шаг раньше и снова прячет вопрос от человека
+       навсегда, а лишний комментарий в ленте несравнимо дешевле потерянного
+       вопроса. Окно покрыто тестом
+       `test_duplicate_comment_if_crash_between_comment_and_flag` в
+       `tests/test_ask_question.py`.
+
+    Метка проверяется тем же способом, что и раньше, — текущим списком меток
+    Issue (`github_client.get_issue`), она не зависит ни от ленты, ни от
+    признака `announced`.
+
+    Явной подписи `agent_comment.sign(...)` здесь нет: `github_client.
+    post_comment` подписывает каждый исходящий комментарий сам, в
+    единственной точке отправки.
+
+    Открытый вопрос ДРУГОГО вида (`question.kind != kind`) — не «уже задано»,
+    а конфликт: см. `ConflictingOpenQuestion` (находка I5 финального ревью).
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+
+    question = questions.read_open(body)
+    if question is not None and question.kind != kind:
+        raise ConflictingOpenQuestion(
+            f"вопрос вида {question.kind!r} (id={question.id!r}) уже открыт — "
+            f"нельзя задать поверх него вопрос вида {kind!r}")
+    if question is None:
+        question = questions.Question(
+            id=questions.next_question_id(questions.read_journal(body), kind),
+            kind=kind, text=text, options=tuple(options))
+        body = questions.write_open(body, question)
+        github_client.update_issue_body(issue.repo, issue.issue_number, body)
+
+    if not question.announced:
+        marker = questions.comment_marker(question.id)
+        lines = [question.text, ""]
+        if question.options:
+            for number, option in enumerate(question.options, start=1):
+                lines.append(f"**{number}.** {option}")
+            lines.append("")
+            lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
+            lines.append("")
+            lines.append(f"```\n/harness-answer 1\n```")
+            lines.append("")
+            lines.append("или своим текстом:")
+        else:
+            lines.append("**Отвечать нужно командой** — обычный комментарий я не читаю:")
+        lines.append("")
+        lines.append("```\n/harness-answer здесь ваш ответ\n```")
+        lines.append("")
+        lines.append(marker)
+        github_client.post_comment(issue.repo, issue.issue_number, "\n".join(lines))
+
+        # Признак — ПОСЛЕ успешной публикации (см. докстринг активности,
+        # пункт 2 и 3): обрыв здесь и до этой строки даёт узкое, но допустимое
+        # окно повторного комментария при следующем вызове.
+        body = questions.mark_announced(body, question)
+        github_client.update_issue_body(issue.repo, issue.issue_number, body)
+
+    current_labels = [label["name"] for label in
+                      github_client.get_issue(issue.repo, issue.issue_number).get("labels", [])]
+    if not labels.has(current_labels, labels.NEEDS_HUMAN_ANSWER):
+        github_client.add_label(issue.repo, issue.issue_number,
+                                labels.NEEDS_HUMAN_ANSWER)
+    return question.id
+
+
+# Реакции на пустую команду: «?!» и «Отказ» в наборе GitHub. Реакции, а не
+# комментарий: пустая команда — оговорка, и отвечать на неё абзацем значит
+# засорять ленту задачи.
+_EMPTY_ANSWER_REACTIONS = ("confused", "-1")
+
+# Ревью, находка 2 (Important). `str.isdigit()` истинен и для строки в тысячи
+# символов, а `int()` на такой строке в Python 3.12 бросает `ValueError:
+# Exceeds the limit (4300 digits)...` — необработанное исключение вместо
+# любого из объявленных исходов активности. Порог с большим запасом, чтобы
+# отсечь заведомо-не-номер строку ДО вызова `int()`, а не поймать её
+# исключением постфактум.
+_MAX_OPTION_NUMBER_DIGITS = 4
+
+# Помимо журнала, решение уходит туда, где его ждёт механизм, задавший вопрос
+# (A28: приёмка HowToDemo читает критерий из блока HOWTODEMO, а не из журнала
+# решений — журнал общий для всех видов вопросов, и заставлять приёмщика
+# разбирать его целиком означало бы держать знание о формате журнала в двух
+# независимых местах). Журнал общий; назначение объявляет вид вопроса. Без
+# этого правила журнал стал бы вторым источником правды о критерии — решение
+# лежало бы в ANSWERS, а `read_acceptance_criterion` (и приёмка) продолжали бы
+# видеть пустой блок HOWTODEMO.
+_DECISION_DESTINATION = {"howtodemo": issue_blocks.HOWTODEMO}
+
+
+def _place_decision(body: str, kind: str, answer: str) -> str:
+    """Тело с ответом, положенным в блок, который читает вид вопроса `kind`.
+
+    Вид без известного назначения (любой, кроме `howtodemo` сегодня) тело не
+    трогает — решению по нему довольно журнала.
+    """
+    block = _DECISION_DESTINATION.get(kind)
+    return issue_blocks.write(body, block, answer) if block else body
+
+
+def _record_decision(issue: IssueInput, body: str, question: questions.Question,
+                     answer: str, supersedes: str = "", *, place: bool = True) -> None:
+    """Записать решение в журнал, закрыть вопрос, снять метку ожидания.
+
+    Черновик толкования чистим здесь же (`questions.clear_draft`), а не
+    только в `_apply_interpretation` (ревью, находка 2, Critical). Эта
+    функция — единственное место, где решение по вопросу может лечь в
+    журнал В ОБХОД черновика: человек ответил номером варианта, хотя перед
+    этим уже получил свободным ответом черновик толкования (кто-то ответил
+    текстом, увидел вопрос предложенных вариантов и всё же выбрал номер).
+    Не почисти его здесь — черновик остался бы висеть в теле уже без
+    открытого вопроса, к которому относится (`Draft.question_id` того
+    вопроса, что только что закрылся), и следующий свободный ответ на
+    СОВЕРШЕННО ДРУГОЙ вопрос этой же задачи нашёл бы его как «пока никем не
+    подтверждённый». Сама привязка по `question_id` (см. докстринг `Draft`)
+    уже не даёт такому чужому черновику быть принятым за подтверждение — но
+    без очистки он просто вечно лежал бы мёртвым грузом в теле. Чистим
+    безусловно: к моменту, когда для ТЕКУЩЕГО вопроса пишется решение,
+    любой черновик в теле — либо его же (стал не нужен, ответили в обход),
+    либо ещё более старый чужой (тем более не нужен).
+
+    `place=False` (находка F8, Minor, второй круг финального ревью) —
+    ответ НЕ дублируется в размеченный блок `_DECISION_DESTINATION`. Нужно
+    вызывающему, для которого текст ответа УЖЕ взят из самого тела (см.
+    `close_answered_by_body_edit`): если источником был не размеченный
+    блок, а обычный раздел по заголовку, `place=True` создал бы ВТОРОЙ
+    экземпляр того же текста — уже в размеченном блоке, — а чтение
+    (`_howtodemo_block`) отдаёт приоритет размеченному блоку над разделом,
+    так что последующие правки человеком заголовка молча перестали бы
+    учитываться.
+    """
+    body = questions.append_decision(body, questions.Decision(
+        question_id=question.id, kind=question.kind, question=question.text,
+        answer=answer, supersedes=supersedes))
+    if place:
+        body = _place_decision(body, question.kind, answer)
+    body = questions.clear_open(body)
+    body = questions.clear_draft(body, issue_ref=f"{issue.repo}#{issue.issue_number}")
+    github_client.update_issue_body(issue.repo, issue.issue_number, body)
+    github_client.remove_label(issue.repo, issue.issue_number,
+                               labels.NEEDS_HUMAN_ANSWER)
+
+
+@activity.defn
+def answer_question(issue: IssueInput, question_id: str, text: str,
+                    comment_id: int | None) -> str:
+    """Принять ответ человека на открытый вопрос.
+
+    `accepted`    — решение записано, ожидание снято.
+    `confirm`     — толкование показано, ждём второго ответа.
+    `empty`       — команда без содержания, вопрос остался открытым.
+    `no-question` — вопроса не задавали, либо открытый вопрос — не тот, на
+                    который отвечает эта команда (ревью, находка 3).
+    `reasked`     — блок вопроса пропал из тела, вопрос задан заново.
+
+    Возвращает голую строку-вердикт, как и раньше (НЕ структуру с id нового
+    вопроса — финальное ревью ветки, находка C2, Critical, разбирает это
+    явно). Тип возврата активности — часть протокола Temporal: сериализованный
+    результат уже лежит в истории у любого прогона, который хоть раз дошёл до
+    исхода `reasked` СТАРЫМ кодом (bare-строка). Смени тип возврата на
+    структуру — и реплей такой истории попытается разобрать СТАРЫЙ payload
+    (голую JSON-строку) конвертером ПОД НОВУЮ аннотацию (dataclass), а тот
+    требует JSON-объект и падает `TypeError` на bare-строке (проверено
+    напрямую: `temporalio.converter.value_to_type(SomeDataclass, "accepted")`
+    бросает `Cannot convert to dataclass ..., value is <class 'str'> not
+    dict`). Это не «недетерминизм, ловимый workflow.patched» — это ЖЁСТКИЙ
+    сбой десериализации, который `workflow.patched` не лечит: маркер выбирает
+    ветку КОДА, а не формат уже записанных байт в истории. Отсюда контракт
+    активности остаётся `str` навсегда (или до заведомого вывода из
+    обращения всех прогонов, ответивших на вопрос ДО этой правки).
+
+    Новый id возрождённого вопроса (спека A22: «указатель переставляется»)
+    воркфлоу узнаёт ОТДЕЛЬНЫМ, новым вызовом активности `read_open_question_
+    id` СРАЗУ ПОСЛЕ исхода `reasked` (`_answer_open_question` в `worker/
+    workflows.py`) — а не через эту активность. Так контракт `answer_
+    question` не меняется вовсе, и все ~30 существующих тестов (`tests/
+    test_answer_question.py`, `tests/test_harness_answer_e2e.py`),
+    сравнивающие её результат с литералами вердиктов, остаются рабочими без
+    единой правки.
+
+    Номер и свободный текст разведены намеренно: выбирая номер, человек
+    утверждает текст, который прочитал дословно, — толковать нечего. Свободный
+    текст контур толкует моделью (`_interpret_answer`, `shared.
+    answer_interpretation`) и показывает человеку результат ДО того, как за
+    него заплатят прогоном — `_confirm_free_text` ждёт второго ответа, а
+    восстанавливает толкование из черновика в теле Issue (`questions.
+    read_draft`), не из текста собственного предыдущего комментария.
+
+    Комментарии здесь передаются в `github_client.post_comment` НЕ обёрнутыми
+    в `agent_comment.sign(...)`: подпись ставится один раз, внутри самого
+    `post_comment` (см. её докстринг и `worker/activities.py:ask_question`) —
+    повторная подпись здесь задвоила бы маркер агента в исходящем тексте.
+    """
+    answer = (text or "").strip()
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    question = questions.read_open(body)
+
+    if question is None:
+        if not question_id:
+            # Вопроса не задавали вовсе. Молчание здесь неотличимо от
+            # проглоченной команды.
+            github_client.post_comment(
+                issue.repo, issue.issue_number,
+                "Сейчас я не задавал вопроса — отвечать не на что.")
+            return "no-question"
+
+        journal = questions.read_journal(body)
+
+        # Ревью, находка 1 (Important). Запись в журнал и очистка блока
+        # вопроса в `_record_decision` идут ОДНИМ обращением к телу —
+        # промежуточного состояния там нет. Но снятие метки
+        # `NEEDS_HUMAN_ANSWER` следом — ОТДЕЛЬНЫЙ сетевой вызов, и он может
+        # упасть уже ПОСЛЕ того, как решение необратимо легло в журнал.
+        # Активность в этом случае падает исключением, но следующий вызов с
+        # ТЕМ ЖЕ `question_id` увидит: открытого вопроса в теле больше нет —
+        # и, не заглянув в журнал, ушёл бы в ветку ниже с выводом «вопрос
+        # пропал»: опубликовал бы комментарий про недействительные варианты
+        # и заново повесил бы метку, хотя ответ человека уже записан. Тот же
+        # приём идемпотентности по каждому следствию, что уже применён в
+        # `ask_question`: решение по этому `question_id` в журнале уже есть
+        # — значит, вопрос не пропал, а отвечен; довершаем недостающее
+        # (метку) и докладываем «принято», не трогая журнал повторно.
+        if any(decision.question_id == question_id for decision in journal):
+            github_client.remove_label(issue.repo, issue.issue_number,
+                                       labels.NEEDS_HUMAN_ANSWER)
+            return "accepted"
+
+        # Прогон ждёт ответа, а блока в теле нет: его стёрли или переписали
+        # тело руками. Варианты НЕ перегенерируем: старый комментарий с
+        # нумерацией остался в ленте, и новая нумерация сделала бы ответ «2»
+        # двусмысленным.
+        kind = question_id.rsplit("-", 1)[0] or "answer"
+
+        # Пропавший `question_id` в журнал никогда не попадал: блок исчез ДО
+        # того, как на него ответили, значит записи о нём в ANSWERS нет и
+        # `next_question_id` по журналу его не видит. Без подсказки счётчик
+        # честно решит, что вопросов вида `kind` ещё не было, и выдаст ТОТ ЖЕ
+        # номер, что стоял в пропавшем блоке (для "howtodemo-1" без записей в
+        # журнале — снова "howtodemo-1") — новый вопрос обманчиво совпал бы
+        # со старым, уже недействительным идентификатором. Подставляем
+        # пропавший id фиктивной записью ТОЛЬКО для расчёта следующего
+        # номера — в реальный журнал (и в тело Issue) она не попадает.
+        seeded = [*journal, questions.Decision(
+            question_id=question_id, kind=kind, question="", answer="")]
+        revived = questions.Question(
+            id=questions.next_question_id(seeded, kind), kind=kind,
+            text="Вопрос пропал из тела задачи — прежние варианты недействительны.",
+            options=())
+        body = questions.write_open(body, revived)
+        github_client.update_issue_body(issue.repo, issue.issue_number, body)
+        github_client.post_comment(issue.repo, issue.issue_number,
+            "Вопрос пропал из тела задачи, прежние варианты **недействительны**.\n\n"
+            "Ответьте своим текстом:\n\n```\n/harness-answer здесь ваш ответ\n```")
+
+        # Признак — ПОСЛЕ успешной публикации, тем же приёмом, что и в
+        # `ask_question` (см. её докстринг, пункты 1-3): иначе будущий вызов
+        # `ask_question` для того же вида вопроса увидит `announced=False` и
+        # опубликует комментарий ещё раз, хотя он уже ушёл прямо здесь.
+        body = questions.mark_announced(body, revived)
+        github_client.update_issue_body(issue.repo, issue.issue_number, body)
+
+        github_client.add_label(issue.repo, issue.issue_number,
+                                labels.NEEDS_HUMAN_ANSWER)
+        return "reasked"
+
+    # Ревью, находка 3 (Important). Дальше код работает с ЛЮБЫМ открытым
+    # вопросом, найденным в теле, не сверяя его id с тем, что пришёл в вызов.
+    # Прогон передаёт сюда id вопроса, на который он сам ждёт ответа
+    # (указатель прогона — см. docs/superpowers/specs/2026-08-29-harness-
+    # answer-command-design.md, раздел «Кто где живёт»). Если к моменту
+    # обработки в теле открыт УЖЕ ДРУГОЙ вопрос — например, после
+    # возрождения (ветка выше), которое как раз меняет id, — команда с
+    # устаревшим id не должна молча зачитываться ответом на текущий вопрос
+    # исходом «принято» без подтверждения. Исход переиспользован из уже
+    # объявленных: с точки зрения ЭТОЙ команды вопроса, на который она
+    # отвечает, больше нет — то же самое `no-question`, что и при полном
+    # отсутствии открытого вопроса.
+    if question.id != question_id:
+        github_client.post_comment(
+            issue.repo, issue.issue_number,
+            "Этот вопрос уже устарел — сейчас открыт другой. Ответ не учтён, "
+            "отвечайте на актуальный вопрос в этой задаче.")
+        return "no-question"
+
+    if not answer:
+        if comment_id is not None:
+            for reaction in _EMPTY_ANSWER_REACTIONS:
+                # M8 (Minor, финальное ревью): без `issue_number` GitLab-клиент
+                # (`worker/gitlab_client.py`) бросает `ValueError` — реакция
+                # адресуется у него не только `comment_id`, но и номером
+                # задачи в пути запроса. У GitHub-клиента лишний аргумент
+                # безвреден (тот же порядок параметров). Именно этот вызов
+                # получает retry-политику I1 — без issue_number устойчивый
+                # отказ на GitLab положил бы весь цикл Issue на пустой команде.
+                github_client.add_reaction(issue.repo, comment_id, reaction,
+                                           issue_number=issue.issue_number)
+        return "empty"
+
+    # Ревью, находка 2 (Important): `len(answer) <= _MAX_OPTION_NUMBER_DIGITS`
+    # проверяется ДО `int(answer)`, и при строке длиннее порога `and`
+    # накоротко замыкается, не доходя до `int()` вовсе (см. докстринг
+    # константы) — иначе строка из тысяч цифр роняла бы активность
+    # необработанным `ValueError` вместо любого объявленного исхода.
+    if (answer.isdecimal() and len(answer) <= _MAX_OPTION_NUMBER_DIGITS
+            and 1 <= int(answer) <= len(question.options)):
+        _record_decision(issue, body, question, question.options[int(answer) - 1])
+        return "accepted"
+
+    return _confirm_free_text(issue, body, question, answer)
+
+
+@activity.defn
+def read_open_question_id(issue: IssueInput) -> str:
+    """Id вопроса, актуально открытого в теле Issue прямо сейчас (пустая
+    строка — вопроса нет).
+
+    Финальное ревью ветки, находка C2 (Critical). `answer_question` на исходе
+    `reasked` заводит НОВЫЙ id (спека A22: «указатель переставляется»), но её
+    контракт — голая строка-вердикт (см. её докстринг, почему тип возврата не
+    меняется) и нового id не несёт. Воркфлоу зовёт эту активность СРАЗУ ПОСЛЕ
+    `reasked`, чтобы узнать актуальный id и переставить свой указатель
+    (`self._open_question` в `_answer_open_question`, `worker/workflows.py`).
+    Без этого шага указатель оставался бы на исчезнувшем `question_id`, и
+    следующий ответ человека натыкался бы на «этот вопрос устарел» — а
+    актуальный вопрос и был тем, на который он отвечал.
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    question = questions.read_open(body)
+    return question.id if question is not None else ""
+
+
+@activity.defn
+def report_answer_question_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать отказ `answer_question` видимым — событием в Sentry и
+    комментарием человеку (финальное ревью, находка I1, Important).
+
+    До правки `answer_question` звалась с `maximum_attempts=1` без перехвата:
+    единственный сбой (502 от GitHub, таймаут) ронял весь `IssueLifecycle`.
+    Человек, который только что ответил на вопрос, не узнавал, что ответ не
+    принят, — по докстрину `report_criterion_gate_stall` рядом, тот же класс
+    отказа: «шаг отработал, никто не спорит, результата нет».
+
+    Sentry — ПЕРЕД комментарием (тот же порядок, что у `report_criterion_
+    gate_stall` и `post_error_label`): id события уезжает в комментарий
+    ссылкой.
+
+    Текст комментария не утверждает, что ответ потерян безвозвратно —
+    активность идемпотентна по каждому следствию (см. докстринг `answer_
+    question`), и следующая попытка (человек повторит команду, ретрай
+    воркфлоу) с тем же аргументом отработает корректно.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_answer_question_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Не смог обработать ответ на вопрос — попробуйте отправить команду "
+        "ещё раз."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
+@activity.defn
+def report_question_repoint_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать видимым отказ `read_open_question_id`, вызванной, чтобы
+    переставить указатель воркфлоу на актуальный открытый вопрос (находка F9,
+    Important, второй круг финального ревью — общая для двух точек вызова:
+    после исхода `reasked` активности `answer_question`, находка C2, и перед
+    ответом на `/harness-answer` с пустым указателем, находка F7).
+
+    Только Sentry, БЕЗ комментария человеку — в обеих точках вызова к моменту
+    отказа человек уже получил (или вот-вот получит) СВОЙ ответ на команду:
+    после `reasked` — комментарий «вопрос пропал, ответьте текстом» из самой
+    `answer_question`; при пустом указателе — детерминированный вердикт той
+    же активности, вызванной следом. Второй, спорящий с ним комментарий
+    («не смог обработать, попробуйте ещё раз») в обоих случаях не подсказал
+    бы, что делать, а только запутал бы — в отличие от `report_answer_
+    question_failure`, где отказ вообще не дал ответу дойти до `answer_
+    question`.
+
+    До этой правки видимость отказа была только `workflow.logger.warning` —
+    хлебной крошкой для Sentry (порог `event_level=ERROR`, не WARNING, см.
+    докстринг `sentry_setup`), оператор её не видел вовсе, а указатель
+    оставался НЕактуальным: следующий ответ человека получал бы «этот вопрос
+    уже устарел, сейчас открыт другой» — на СВОЙ же актуальный ответ.
+    """
+    exc_type, _, message = reason.partition(": ")
+    sentry_setup.capture_question_repoint_failure(
+        issue, exc_type or "unknown", message or reason)
+
+
+@activity.defn
+def propose_acceptance_options(issue: IssueInput) -> list[str]:
+    """Варианты критерия приёмки от модели. Отказала — пустой список.
+
+    Пустой список НЕ пропускает задачу дальше: вопрос всё равно задаётся,
+    просто без вариантов, свободным текстом (`ask_question` уже умеет это —
+    см. её докстринг и `Question.options`).
+    """
+    try:
+        options = llm.extract(
+            acceptance_proposal.SYSTEM_PROMPT,
+            f"# {issue.title}\n\n{issue.body or ''}",
+            acceptance_proposal.AcceptanceOptions,
+            model=llm.MODEL_GATE,
+        )
+    except Exception as err:
+        activity.logger.warning("варианты критерия не построились: %s", err)
+        return []
+    return [acceptance_proposal.render_option(option) for option in options.options]
+
+
+@activity.defn
+def read_acceptance_criterion(issue: IssueInput) -> str:
+    """Критерий приёмки: утверждённый блок HOWTODEMO либо раздел в теле Issue.
+
+    Отдельная активность, а не чтение в воркфлоу: тело Issue живёт снаружи, и
+    ходить за ним из воркфлоу нельзя — реплей обязан быть детерминированным.
+
+    Переиспользует `_howtodemo_block` — ту же функцию, которой уже пользуется
+    `_dev_prepare` для сборки контекста задачи (см. её докстринг): критерий
+    приёмки и сценарий HowToDemo — одно и то же поле тела Issue, и заводить
+    вторую логику чтения означало бы держать два источника правды о том, что
+    считается утверждённым блоком, а что — разделом по заголовку.
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    return _howtodemo_block(body)
+
+
+@activity.defn
+def close_answered_by_body_edit(issue: IssueInput) -> None:
+    """Снять вопрос гейта критерия, если человек ответил на него ВПИСЫВАНИЕМ
+    критерия в тело, а не командой `/harness-answer` (спека A23: «команда —
+    удобство, а не единственная дверь»).
+
+    Финальное ревью ветки, находка I4 (Important). `_start_development`
+    (`worker/workflows.py`) верно пропускает задачу в разработку, как только
+    `read_acceptance_criterion` вернул непустой текст, — но раньше это никак
+    не трогало ни блок открытого вопроса в теле, ни метку
+    `NEEDS_HUMAN_ANSWER`: они оставались висеть на задаче, уже ушедшей в
+    разработку, и ничто их больше не снимало. Выборка `needs-human:*`
+    переставала быть полной очередью к людям.
+
+    Снимаем ТЕМ ЖЕ путём, что и обычный ответ командой: записываем решение в
+    журнал (текстом уже вписанного в тело критерия) и чистим блок вопроса и
+    метку — `_record_decision` уже умеет это одним атомарным обращением к
+    телу (запись в журнал, `clear_open`, `clear_draft`, снятие метки).
+
+    `place=False` (находка F8, Minor, второй круг финального ревью): текст
+    ответа уже ВЗЯТ из тела (`_howtodemo_block` читает либо размеченный
+    блок, либо раздел по заголовку — см. её докстринг), класть его же
+    обратно в размеченный блок незачем. Если источником был раздел по
+    заголовку (человек вписал критерий заголовком, а не через `/harness-
+    answer`), запись всё равно создала бы там ВТОРОЙ, размеченный экземпляр
+    — а чтение отдаёт приоритет размеченному блоку над разделом, так что
+    дальнейшие правки заголовка человеком молча переставали бы учитываться.
+
+    НЕ идемпотентна тривиально, хотя раньше докстринг это утверждал.
+    `_record_decision` пишет тело ОДНИМ обращением, но снимает метку
+    `NEEDS_HUMAN_ANSWER` ОТДЕЛЬНЫМ, следующим сетевым вызовом (тот же край,
+    что уже закрыт в `answer_question` — см. её комментарий «Ревью, находка
+    1»). Падение именно на этом, втором вызове раньше означало: повтор
+    видит — блока вопроса в теле уже нет (записан прошлой попыткой) — и
+    молча возвращается, доложив успех, а метка остаётся висеть НАВСЕГДА:
+    `_start_development` эту активность по данной задаче больше не позовёт,
+    фаза уже ушла в разработку. Находка F1 (Important, второй круг
+    финального ревью) — ровно тот дефект, ради устранения которого сама
+    активность (I4) и заводилась, доложенный как успех.
+
+    `answer_question` тот же край закрывает сверкой ответа с журналом ПО
+    `question_id` — но у ЭТОЙ функции id нет: вопрос обнаруживается заново
+    каждый вызов, и к моменту повтора он уже пропал из тела вместе со своим
+    id. Прямой и дешёвый признак прерванной попытки — сама метка:
+    `_record_decision` снимает её ПОСЛЕДНЕЙ, значит если открытого вопроса
+    уже нет, а метка всё ещё висит — предыдущая попытка прервалась ровно
+    между записью тела и снятием метки, и остаётся только довершить этот
+    один недостающий шаг.
+    """
+    body = github_client.get_issue_body(issue.repo, issue.issue_number)
+    question = questions.read_open(body)
+    if question is None:
+        current_labels = [label["name"] for label in
+                          github_client.get_issue(issue.repo, issue.issue_number
+                                                  ).get("labels", [])]
+        if labels.has(current_labels, labels.NEEDS_HUMAN_ANSWER):
+            github_client.remove_label(issue.repo, issue.issue_number,
+                                       labels.NEEDS_HUMAN_ANSWER)
+        return
+    criterion = _howtodemo_block(body)
+    _record_decision(issue, body, question, criterion, place=False)
+
+
+@activity.defn
+def report_question_close_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать видимым отказ `close_answered_by_body_edit` (находка F6,
+    Important, второй круг финального ревью).
+
+    Вызывается из `_start_development` (`worker/workflows.py`) ПОСЛЕ того,
+    как решение продолжить в разработку УЖЕ принято, — отказ здесь не
+    условие входа, а сорвавшаяся уборка (блок вопроса и метка `NEEDS_HUMAN_
+    ANSWER` могли остаться висеть на задаче, ушедшей в разработку). До этой
+    правки видимость была только `workflow.logger.warning` — хлебной
+    крошкой для Sentry (порог `event_level=ERROR`, не WARNING, см. докстринг
+    `sentry_setup`), а комментарий человеку с обещанием «донастрою при
+    следующем проходе» был бы неправдой: следующего прохода этой ветки НЕ
+    будет — фаза уже уезжает из READY_FOR_DEV вместе с этим самым вызовом.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_question_close_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Разработка началась, но не смог снять устаревший вопрос гейта "
+        "критерия приёмки — блок вопроса и метка `needs-human:answer` могли "
+        "остаться в теле. Если метка не снимется сама, снимите её вручную."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
+@activity.defn
+def report_criterion_gate_stall(issue: IssueInput, reason: str) -> None:
+    """Сделать отказ гейта критерия приёмки видимым — событием в Sentry и
+    комментарием человеку.
+
+    Ревью: `_start_development` (workflows.py) правильно НЕ роняет цикл на
+    устойчивом отказе `read_acceptance_criterion` — остаётся на парковке той
+    же фазы и не начинает разработку. Но без этой активности отказ был виден
+    только `workflow.logger.warning` — хлебной крошкой для Sentry (порог
+    `event_level=ERROR` в `sentry_setup.configure`, а не WARNING), то есть
+    оператору не виден вовсе. Человеку тоже не видно ничего: фаза и стадия те
+    же, `mark_awaiting` не зовётся (желаемое состояние очереди не менялось) —
+    нажатие «в разработку» неотличимо от «команду ещё не заметили». Это тот
+    самый класс отказа, который в контуре считается худшим: шаг отработал,
+    никто не спорит, результата нет.
+
+    Текст комментария намеренно не утверждает «критерия нет» — это было бы
+    ложью: критерий, возможно, ЕСТЬ, тело Issue просто не прочиталось. Честно
+    можно сказать только «не смог проверить, повторю».
+
+    Sentry — ПЕРЕД комментарием (как в `post_error_label` рядом): id события
+    уезжает в комментарий ссылкой, иначе человек видит «не смог» и не знает,
+    где искать подробности.
+
+    Зовётся из воркфлоу не чаще раза на серию подряд идущих отказов
+    (`self._criterion_gate_notified` в `_start_development`) — сама
+    активность этого не знает и не должна: дедупликация по сериям это выбор
+    воркфлоу, а не побочный эффект.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_criterion_gate_stall(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Не смог проверить критерий приёмки — повторю при следующей "
+        "попытке. Разработку пока не начинаю."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
+@activity.defn
+def report_ask_question_gate_failure(issue: IssueInput, reason: str) -> None:
+    """Сделать видимым отказ `ask_question`, вызванной гейтом критерия
+    приёмки (`_start_development`, worker/workflows.py), — третий круг
+    финального ревью, находка G2 (Important).
+
+    До правки эта ветка переиспользовала `report_criterion_gate_stall` —
+    активность, чей текст утверждает «не смог проверить критерий приёмки».
+    Здесь это НЕПРАВДА: к моменту этого вызова критерий уже прочитан
+    (`read_acceptance_criterion` отработал успешно и вернул пустую строку —
+    иначе гейт не дошёл бы до постановки вопроса вовсе), отказала ПОСТАНОВКА
+    вопроса — обычно запись в GitHub (403/422 на обновлении тела Issue или
+    публикации комментария), а не чтение. Человеку сообщалось не то, что
+    сломалось: «проверю критерий ещё раз» вместо «не смог задать вопрос,
+    оценка не опубликована».
+
+    Текст ниже честен именно про этот шаг и не обещает того же, что обещает
+    `report_criterion_gate_stall`.
+
+    Sentry — ПЕРЕД комментарием, тем же порядком, что и у соседних `report_*`
+    в этом файле: id события уезжает в комментарий ссылкой.
+    """
+    exc_type, _, message = reason.partition(": ")
+    event_id = sentry_setup.capture_ask_question_gate_failure(
+        issue, exc_type or "unknown", message or reason)
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        "⚠️ Критерий приёмки не найден, но не смог задать об этом вопрос — "
+        "повторю при следующей попытке. Разработку пока не начинаю."
+        + sentry_setup.debug_reference(event_id),
+    )
+
+
+def _interpret_answer(question: questions.Question,
+                      journal: list[questions.Decision], answer: str
+                      ) -> answer_interpretation.Interpretation:
+    """Толкование свободного ответа моделью. Бросает — значит не вышло.
+
+    Журнал передаётся целиком (A20): человек вправе одной командой ответить
+    на текущий вопрос и заодно поправить решение, принятое раньше.
+    """
+    interpretation = llm.extract(
+        answer_interpretation.SYSTEM_PROMPT,
+        answer_interpretation.build_user_message(question, journal, answer),
+        answer_interpretation.Interpretation,
+        model=llm.MODEL_GATE,
+    )
+    # Правки, ссылающиеся на несуществующую запись журнала, — модель
+    # выдумала идентификатор. Отказ здесь уходит тем же путём, что и отказ
+    # самой модели (см. `except Exception` в `_confirm_free_text`): вопрос
+    # остаётся открытым, человек получает честный текст вместо толкования,
+    # которое завело бы решение по вопросу, которого не было.
+    answer_interpretation.validate(interpretation, journal)
+    return interpretation
+
+
+# Короткие ответы, которыми человек подтверждает уже ПОКАЗАННЫЙ черновик
+# толкования (ревью, находка 3, Important). Список короткий и детерминированный
+# намеренно: понять, СОГЛАСЕН ли человек с уже показанным текстом, — задача
+# не того калибра, чтобы звать для неё модель (лишняя задержка и лишний повод
+# `_interpret_answer` отказать на простом «да»). Всё, что в список не попало,
+# — НОВЫЙ свободный ответ и подлежит толкованию заново.
+_CONFIRMATIONS = frozenset({
+    "да", "ага", "угу", "yes", "y", "ок", "окей", "ok", "okay",
+    "подтверждаю", "верно", "точно", "согласен", "согласна", "+",
+})
+
+
+def _is_confirmation(answer: str) -> bool:
+    """Согласие с уже показанным черновиком, а не новый ответ.
+
+    Ревью, находка 3 (Important). Сравнение — по нормализованной строке
+    (нижний регистр, без хвостовой пунктуации и пробелов по краям): человек
+    с равной вероятностью напишет «Да.», «ОК!» или «да» — буквальное
+    сравнение отсеяло бы часть этих форм как «непонятный» ответ и заставило
+    бы модель толковать очевидное согласие как новый текст.
+    """
+    return answer.strip().lower().strip(" \t.!?,;:") in _CONFIRMATIONS
+
+
+def _announce_draft(issue: IssueInput, body: str, draft: questions.Draft,
+                    interpretation: answer_interpretation.Interpretation) -> str:
+    """Опубликовать комментарий с толкованием и отметить черновик показанным.
+
+    Ревью, находка 1 (Critical). Черновик к моменту вызова уже лежит в теле
+    НЕПОКАЗАННЫМ (`announced=False`) — эта функция публикует комментарий и
+    ТОЛЬКО ПОСЛЕ его успешной отправки переводит признак в `announced=True`.
+    Тот же порядок и то же обоснование, что у `ask_question` (см. её
+    докстринг, пункты 1-3): проставить признак раньше комментария значило бы,
+    что он может соврать про комментарий, которого на самом деле не было, и
+    ретрай активности на неотправленный комментарий отреагировал бы так же,
+    как на подтверждённый человеком черновик, — применил бы толкование,
+    которого никто не видел.
+
+    Остаётся узкое, сознательно допустимое окно: комментарий ушёл, а
+    следующий `update_issue_body` (запись признака) упал. Повторный вызов
+    увидит `announced=False` и опубликует комментарий ВТОРОЙ раз — лишний
+    комментарий в ленте несравнимо дешевле черновика, применённого без
+    показа. Окно покрыто тестом
+    `test_duplicate_comment_if_crash_between_comment_and_announce` в
+    `tests/test_answer_question.py`, по образцу
+    `test_duplicate_comment_if_crash_between_comment_and_flag` из
+    `tests/test_ask_question.py`.
+    """
+    journal = questions.read_journal(body)
+    github_client.post_comment(issue.repo, issue.issue_number,
+        answer_interpretation.render_interpretation(interpretation, journal)
+        + "\n\nЕсли верно — подтвердите:\n\n```\n/harness-answer да\n```\n\n"
+          "Если нет — пришлите поправленный текст той же командой.")
+
+    body = questions.mark_draft_announced(body, draft)
+    github_client.update_issue_body(issue.repo, issue.issue_number, body)
+    return "confirm"
+
+
+def _confirm_free_text(issue: IssueInput, body: str, question: questions.Question,
+                       answer: str) -> str:
+    """Показать толкование ответа и ждать подтверждения (A15, A20, A21).
+
+    Три находки ревью растут из одного корня: черновик писался в тело РАНЬШЕ,
+    чем человек его увидел, а вторым ответом считался ЛЮБОЙ следующий,
+    независимо от вопроса и текста. Починка — три независимых проверки перед
+    тем, как черновик станет решением:
+
+    1. Черновик обязан принадлежать ИМЕННО этому вопросу
+       (`pending.question_id == question.id`, находка 2, Critical). Открытый
+       вопрос в теле всегда один, но человек мог ответить на него номером
+       варианта в обход толкования (`_record_decision` в этом случае чистит
+       черновик — см. её докстринг) или вопрос мог возродиться под новым id
+       (`answer_question`, ветка "reasked") — в обоих случаях висящий
+       черновик принадлежит вопросу, которого больше нет, и не может быть
+       подтверждением текущего.
+    2. Черновик обязан быть ПОКАЗАННЫМ (`pending.announced`, находка 1,
+       Critical). Обрыв между записью черновика и публикацией комментария
+       (сеть, отказ GitHub) роняет активность; Temporal повторяет её теми же
+       аргументами, и без этой проверки повтор нашёл бы записанный, но не
+       показанный черновик и зачёл бы его вторым ответом — решение ушло бы
+       в журнал, а человек толкования ни разу не увидел. При
+       `announced=False` модель заново НЕ зовём — толкование уже посчитано
+       и лежит в черновике, недостающее — публикация, её и доделываем
+       (`_announce_draft`).
+    3. Текст ВТОРОГО ответа обязан быть СОГЛАСИЕМ (`_is_confirmation`,
+       находка 3, Important). Комментарий с толкованием прямо обещает
+       человеку: «если нет — пришлите поправленный текст той же командой».
+       Раньше код это обещание не выполнял — любой второй ответ подтверждал
+       прежнее толкование, даже если это была явная поправка. Теперь
+       несогласие (всё, что не входит в короткий список аффирмативных
+       ответов) трактуется как НОВЫЙ свободный ответ: старый черновик
+       отбрасывается, ответ толкуется заново, а результат ЗАМЕНЯЕТ прежний
+       черновик и снова показывается человеку — падать в ветку ниже с
+       `pending = None` для этого достаточно, других изменений не нужно.
+
+    Провалилась любая из трёх проверок — переходим к обычному пути первого
+    ответа: журнал, толкование моделью (`_interpret_answer`), новый черновик
+    НЕПОКАЗАННЫМ и его показ (`_announce_draft`).
+    """
+    pending = questions.read_draft(body)
+    if pending is not None and pending.question_id == question.id:
+        if pending.announced:
+            if _is_confirmation(answer):
+                _apply_interpretation(issue, body, question, pending.interpretation)
+                return "accepted"
+            # Находка 3: не согласие — новый свободный ответ. Старый
+            # черновик отбрасываем, ниже он будет истолкован и заменён заново.
+            pending = None
+        else:
+            # Находка 1, узкое окно: черновик уже в теле, но человек его ещё
+            # не видел. Модель заново не зовём — толкование в черновике уже
+            # есть, недостающая часть — публикация комментария и признак.
+            interpretation = answer_interpretation.Interpretation(**pending.interpretation)
+            return _announce_draft(issue, body, pending, interpretation)
+    elif pending is not None:
+        # Находка 2: черновик принадлежит другому, уже закрытому или
+        # возрождённому вопросу — подтверждением ТЕКУЩЕГО быть не может.
+        # Молча отбрасываем и разбираем ответ как новый; сам черновик
+        # почистит `_record_decision`/`_apply_interpretation`, когда решение
+        # по вопросу, которому он принадлежал, будет записано.
+        pending = None
+
+    journal = questions.read_journal(body)
+    try:
+        interpretation = _interpret_answer(question, journal, answer)
+    except Exception as err:
+        # Модель отказала или толкование сослалось на несуществующую запись
+        # журнала — вопрос остаётся открытым, человек получает честный текст
+        # вместо утонувшей ошибки (тот же принцип, что у A25: доложить
+        # неудачу, а не молчать о ней).
+        logger.warning("толкование ответа на %s не вышло: %s", question.id, err)
+        github_client.post_comment(issue.repo, issue.issue_number,
+            "Разобрать ответ не смог — попробуйте сформулировать иначе:\n\n"
+            "```\n/harness-answer здесь ваш ответ\n```")
+        return "confirm"
+
+    draft = questions.Draft(question_id=question.id,
+                            interpretation=interpretation.model_dump())
+    body = questions.write_draft(body, draft,
+                                 issue_ref=f"{issue.repo}#{issue.issue_number}")
+    github_client.update_issue_body(issue.repo, issue.issue_number, body)
+    return _announce_draft(issue, body, draft, interpretation)
+
+
+def _apply_interpretation(issue: IssueInput, body: str, question: questions.Question,
+                          payload: dict) -> None:
+    """Записать подтверждённое толкование: решение по текущему вопросу и все правки.
+
+    Черновик и все решения складываются в ОДНО тело в памяти — сеть трогается
+    один раз, `update_issue_body` вызывается ПОСЛЕ всего цикла правок, а не
+    на каждой из них. При обрыве до этого вызова на GitHub ничего не
+    меняется, и повторный ответ безопасно начинает с того же черновика —
+    тот же приём идемпотентности по следствию, что уже применён в
+    `ask_question`.
+    """
+    interpretation = answer_interpretation.Interpretation(**payload)
+    body = questions.clear_draft(body, issue_ref=f"{issue.repo}#{issue.issue_number}")
+    body = questions.append_decision(body, questions.Decision(
+        question_id=question.id, kind=question.kind, question=question.text,
+        answer=interpretation.answer))
+    body = _place_decision(body, question.kind, interpretation.answer)
+    for amendment in interpretation.amendments:
+        journal = questions.read_journal(body)
+        previous = next((d for d in journal
+                         if d.question_id == amendment.question_id), None)
+        if previous is None:
+            # `answer_interpretation.validate` уже проверила это при первом
+            # ответе, до того как черновик лёг в тело. Между двумя ответами
+            # тело Issue мог поправить человек — не доверяем ему повторно и
+            # тихо пропускаем правку в пустоту: завести решение по
+            # несуществующей записи хуже, чем потерять эту избыточную правку.
+            continue
+        body = questions.append_decision(body, questions.Decision(
+            question_id=questions.next_question_id(questions.read_journal(body),
+                                                   previous.kind),
+            kind=previous.kind, question=previous.question,
+            answer=amendment.answer, supersedes=amendment.question_id))
+        # Правка меняет решение по ПРОШЛОМУ вопросу того же вида — например,
+        # человек пересматривает ранее принятый критерий приёмки в том же
+        # ответе, где отвечает на текущий. Назначение по виду не знает о
+        # порядке во времени, только о виде: последняя запись в блоке обязана
+        # быть последней ПО ЖУРНАЛУ, и `append_decision` выше уже это дал.
+        body = _place_decision(body, previous.kind, amendment.answer)
+    github_client.update_issue_body(issue.repo, issue.issue_number,
+                                    questions.clear_open(body))
+    github_client.remove_label(issue.repo, issue.issue_number,
+                               labels.NEEDS_HUMAN_ANSWER)
 
 
 @activity.defn

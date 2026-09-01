@@ -60,6 +60,11 @@ def _all_command_labels() -> frozenset[str]:
     result: set[str] = set()
     # _COMMANDS maps slash-command names to the canonical label suffix.
     for command in commands._COMMANDS.values():
+        # Команды из NO_RUN_LABEL_COMMANDS не запускают дорогую стадию — меток
+        # прогона у них быть не должно, иначе на задачах появится бессмысленная
+        # run:harness-answer.
+        if command in commands.NO_RUN_LABEL_COMMANDS:
+            continue
         result.add(commands.run_label(command))
         result.add(commands.done_label(command))
         result.add(commands.failed_label(command))
@@ -121,6 +126,11 @@ def catalog() -> dict[str, LabelSpec]:
     for level in PRIORITY_LEVELS:
         add(f"priority:{level}", PRIORITY_COLOR, "Расчётный приоритет")
     for command in commands._COMMANDS.values():
+        # Тот же пропуск, что и в _all_command_labels: этот перебор идёт в
+        # bootstrap_labels.py и реально заводит метки в GitHub — без исключения
+        # там завелась бы run:harness-answer, даже если её нет в all_labels().
+        if command in commands.NO_RUN_LABEL_COMMANDS:
+            continue
         add(commands.run_label(command), RUNNING_COLOR,
             f"Команда /{command} выполняется")
         add(commands.done_label(command), DONE_COLOR,

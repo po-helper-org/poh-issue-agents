@@ -381,9 +381,19 @@ def auth_token(repo: str) -> str:
     return _auth_headers(repo)["Authorization"].split(" ", 1)[1]
 
 
-def add_reaction(repo: str, comment_id: int, content: str = "eyes") -> None:
+def add_reaction(repo: str, comment_id: int, content: str = "eyes",
+                 issue_number: int | None = None) -> None:
     """Реакция на комментарий — видимое «команда принята» до тяжёлой работы.
-    GitHub отвечает 200 на уже поставленную реакцию, повторный вызов безвреден."""
+    GitHub отвечает 200 на уже поставленную реакцию, повторный вызов безвреден.
+
+    `issue_number` не используется — у GitHub реакция адресуется одним
+    `comment_id`. Параметр здесь ради ЕДИНОЙ сигнатуры с `gitlab_client.
+    add_reaction` (находка M8 финального ревью): без него код, вызывающий
+    `add_reaction` через диспетчер `forge` (`worker/forge.py`) для ОБОИХ
+    провайдеров, обязан был бы либо не передавать номер задачи вовсе (и тогда
+    падать на GitLab, где он обязателен), либо ветвиться по провайдеру в
+    каждой точке вызова.
+    """
     if _dry_run():
         _log.info("[DRY_RUN] reaction %s comment %s: %s", repo, comment_id, content)
         return

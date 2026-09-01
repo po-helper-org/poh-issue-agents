@@ -191,3 +191,61 @@ def test_strip_raises_on_corrupted_markers():
     body = "текст\n<!-- harness:howtodemo:start -->\nобрезано"
     with pytest.raises(ValueError):
         issue_blocks.strip(body, issue_blocks.HOWTODEMO)
+
+
+def test_question_and_answers_blocks_are_known():
+    """Оба блока в реестре: порча тела даёт громкую ошибку, а не перезапись."""
+    assert issue_blocks.QUESTION in issue_blocks._ALL_BLOCKS
+    assert issue_blocks.ANSWERS in issue_blocks._ALL_BLOCKS
+
+
+def test_draft_block_is_known():
+    """Черновик толкования тоже в реестре — иначе запись в него могла бы
+    молча отравить соседний блок (см. докстринг модуля)."""
+    assert issue_blocks.DRAFT in issue_blocks._ALL_BLOCKS
+
+
+# --- ревью, находка 2 (Minor). `discard_draft` заявлена как снимающая
+# маркеры DRAFT «ЛЮБОЕ число раз, каким бы ни было число вхождений» (см. её
+# докстринг), но до этой правки была на практике проверена ровно одной формой
+# порчи — одиночным осиротевшим стартовым маркером (`_corrupt_draft_markers`
+# в `tests/test_answer_question.py`). Реализация (`.replace(start, "").
+# replace(end, "")`) остальные формы выдерживает уже сейчас, но без прямого
+# теста регрессию (например, переход на `_matched_block`-подобную структурную
+# проверку внутри `discard_draft`, которая для части этих форм подняла бы
+# `ValueError` вместо тихой зачистки) тесты не заметили бы. Тесты — на саму
+# `discard_draft`, а не через `answer_question`/`clear_draft`/`write_draft`:
+# функция чистая (см. докстринг модуля), незачем тянуть весь стек ради формы
+# порчи, которая её вообще не касается.
+
+_DRAFT_START, _DRAFT_END = issue_blocks._markers(issue_blocks.DRAFT)
+
+_CORRUPTED_DRAFT_MARKER_FORMS = [
+    ("одиночный открывающий маркер без закрывающего",
+     f"Текст задачи.\n{_DRAFT_START}\nобрывок черновика"),
+    ("одиночный закрывающий маркер без открывающего",
+     f"Текст задачи.\n{_DRAFT_END}\nобрывок черновика"),
+    ("дубли — два открывающих маркера подряд, один закрывающий",
+     f"{_DRAFT_START}\nA\n{_DRAFT_START}\nB\n{_DRAFT_END}"),
+    ("дубли — две полных пары маркеров одна за другой",
+     f"{_DRAFT_START}\nA\n{_DRAFT_END}\n{_DRAFT_START}\nB\n{_DRAFT_END}"),
+    ("вложенные маркеры: start start end end",
+     f"{_DRAFT_START}\n{_DRAFT_START}\nA\n{_DRAFT_END}\n{_DRAFT_END}"),
+    ("перепутанный порядок — закрывающий раньше открывающего",
+     f"{_DRAFT_END}\nA\n{_DRAFT_START}"),
+    ("маркер внутри забора кода — человек процитировал формат черновика",
+     f"```\n{_DRAFT_START}\nпример\n{_DRAFT_END}\n```\nОстальной текст."),
+]
+
+
+@pytest.mark.parametrize("name, body", _CORRUPTED_DRAFT_MARKER_FORMS,
+                         ids=[form[0] for form in _CORRUPTED_DRAFT_MARKER_FORMS])
+def test_discard_draft_strips_every_declared_corruption_form(name, body):
+    """`discard_draft` снимает ОБА маркера DRAFT при любой из форм порчи —
+    не гадая о структуре и не поднимая `ValueError` ни на одной из них (в
+    отличие от `read()`/`write()`/`strip()`, чей `_matched_block` на большей
+    части этих же тел отказал бы, см. `test_orphaned_start_marker_is_corrupted_body_not_append_signal`
+    и `test_strip_raises_on_corrupted_markers` выше)."""
+    result = issue_blocks.discard_draft(body)
+    assert _DRAFT_START not in result, f"открывающий маркер остался ({name})"
+    assert _DRAFT_END not in result, f"закрывающий маркер остался ({name})"
