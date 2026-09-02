@@ -591,3 +591,145 @@ def test_missing_from_tree_is_a_noop_without_force_include(tmp_path):
     clone_dir = _seed_repo(tmp_path)
     git = gc._git_runner(str(clone_dir), {**os.environ})
     assert gc._missing_from_tree(git, ()) == []
+
+
+# ────────── черновик: выкладка сорванного прогона разработки ──────────
+#
+# Прогон, который сорвался, обязан оставить материал для разбора — но работа
+# в нём заведомо негодная. Обычный PR выглядел бы кандидатом на слияние и
+# получил бы ревью; черновик не получит ни от вебхука, ни от свипера.
+
+
+def test_publish_opens_a_normal_pr_unless_asked_otherwise(monkeypatch, tmp_path):
+    """Штатная выкладка не должна стать черновой — это регрессия видимости."""
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 7}
+
+    sent: dict = {}
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+    monkeypatch.setattr(gc.requests, "post",
+                        lambda *a, **k: sent.update(body=k.get("json")) or _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-20",
+                                 title="t", body="b", message="m")
+
+    assert number == 7
+    assert sent["body"].get("draft") in (False, None), \
+        "обычная выкладка не имеет права уйти черновиком"
+
+
+def test_publish_opens_a_draft_when_asked(monkeypatch, tmp_path):
+    """Сорванный прогон выкладывается черновиком.
+
+    Работа заведомо негодная: прогон не дошёл до конца. Обычный PR обещал бы
+    обратное и ещё и съел бы бюджет ревью.
+    """
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    class _FakeResp:
+        status_code = 201
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"number": 7}
+
+    sent: dict = {}
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+    monkeypatch.setattr(gc.requests, "post",
+                        lambda *a, **k: sent.update(body=k.get("json")) or _FakeResp())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-21",
+                                 title="t", body="b", message="m", draft=True)
+
+    assert number == 7
+    assert sent["body"]["draft"] is True
+
+
+def test_an_empty_worktree_is_still_nothing_to_publish_as_a_draft(monkeypatch, tmp_path):
+    """Пустое дерево остаётся пустым исходом и с черновиком.
+
+    Агент не написал ни строчки — спасать нечего, и черновик тут был бы
+    пустым обещанием материала для разбора.
+    """
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)  # рабочее дерево чистое: агент не трогал файлов
+
+    posts: list = []
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: posts.append((a, k)))
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-22",
+                                 title="t", body="b", message="m", draft=True)
+
+    assert number is None
+    assert posts == [], "открывать нечего — PR запрашивать не должны"
+
+
+def test_a_repeat_run_updates_the_same_draft_instead_of_opening_a_second(
+        monkeypatch, tmp_path):
+    """Повторный прогон обновляет прежний черновик, а не плодит второй.
+
+    Обработка `422 already exists` есть уже сегодня. Тест здесь ради того,
+    чтобы признак черновика её не сломал: сорванные прогоны повторяются
+    часто, и второй PR на ту же ветку — мусор.
+    """
+    import github_client as gc
+
+    clone_dir = _seed_repo(tmp_path)
+    (clone_dir / "a.txt").write_text("тронуто агентом")
+
+    class _Conflict:
+        status_code = 422
+        text = '{"errors":[{"message":"A pull request already exists"}]}'
+
+        def raise_for_status(self):
+            raise AssertionError("до подъёма ошибки дойти не должно")
+
+    class _Existing:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"number": 13}]
+
+    monkeypatch.setattr(gc, "_dry_run", lambda: False)
+    monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
+    monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
+    # `_default_branch` подменена намеренно: `requests.get` ниже занят ответом
+    # про существующий PR и настоящей функции отдал бы не тот payload.
+    monkeypatch.setattr(gc, "_default_branch", lambda repo: "main")
+    monkeypatch.setattr(gc.requests, "post", lambda *a, **k: _Conflict())
+    monkeypatch.setattr(gc.requests, "get", lambda *a, **k: _Existing())
+
+    number = gc.publish_worktree("o/r", str(clone_dir), "agent/issue-23",
+                                 title="t", body="b", message="m", draft=True)
+
+    assert number == 13, "должны вернуть номер уже открытого PR, а не упасть"

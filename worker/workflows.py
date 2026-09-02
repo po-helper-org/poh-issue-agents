@@ -3584,6 +3584,7 @@ class IssueDevelopment:
             return None
 
         number: int | None = None
+        agent_ran = False
         try:
             # Порядок не косметический: сначала клон и постановка — они
             # единственные могут не состояться до того, как что-либо сказано
@@ -3634,6 +3635,16 @@ class IssueDevelopment:
                     if not has_plan:
                         workflow.logger.warning(
                             "план работ пуст или не создан — агент продолжит без него")
+            # Флаг ставится ДО запуска, а не после: агент пишет в рабочее
+            # дерево по ходу работы, и упавший на середине оставляет ровно то,
+            # ради чего всё это и делается. Ставить после успеха значило бы
+            # терять самый интересный для разбора случай.
+            #
+            # Признак ведём ЯВНЫМ флагом, а не выводим из вида исключения: вид
+            # отказа и наличие изменений — разные вещи, и связывать их значит
+            # вернуться к тому же дефекту с другой стороны. Пустое дерево
+            # отсекает сама выкладка (`publish_worktree` вернёт None).
+            agent_ran = True
             await workflow.execute_activity(
                 activities.dev_run_agent, issue,
                 start_to_close_timeout=timedelta(seconds=3600),
@@ -3660,6 +3671,35 @@ class IssueDevelopment:
                 heartbeat_timeout=timedelta(seconds=300),
                 retry_policy=cheap,
             )
+        except Exception as exc:                          # noqa: BLE001
+            # Сорванный прогон обязан оставить материал для разбора.
+            #
+            # Отказ, ради которого написано: на #166 упали три теста из
+            # семидесяти трёх, и тринадцать минут работы агента исчезли без
+            # следа — `dev_publish` идёт после `dev_tests` и не выполнился.
+            #
+            # ПОД МАРКЕРОМ: новая команда в теле воркфлоу роняет
+            # недетерминизмом прогоны, начатые до выкладки, а прогон агента
+            # идёт до 45 минут — реплей убил бы ровно ту работу, которую этот
+            # код спасает.
+            if agent_ran and workflow.patched("issue-development-partial-publish"):
+                try:
+                    await workflow.execute_activity(
+                        activities.dev_publish_partial,
+                        args=[issue, plan.branch, _failure_reason(exc)[:1500]],
+                        start_to_close_timeout=timedelta(seconds=600),
+                        heartbeat_timeout=timedelta(seconds=300),
+                        retry_policy=RetryPolicy(maximum_attempts=2),
+                    )
+                except Exception as save_exc:              # noqa: BLE001
+                    # Спасение НЕ подменяет причину: наружу уходит исходное
+                    # исключение, а неудача самой выкладки только пишется в
+                    # лог. Иначе первопричина исчезает — этот класс подмены в
+                    # контуре уже случался.
+                    workflow.logger.warning(
+                        "частичная выкладка не удалась: %s",
+                        _failure_reason(save_exc))
+            raise
         finally:
             # Запись об итерации — В FINALLY, а не после успешных шагов.
             #
