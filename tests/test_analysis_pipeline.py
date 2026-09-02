@@ -103,6 +103,151 @@ def test_claude_creds_empty_when_nothing_set(monkeypatch):
     assert activities._claude_anthropic_creds() == ("", "")
 
 
+# --- 429 от провайдера: временный отказ, а не сбой стадии ---
+#
+# Живой инцидент (poh-demo-checkout#165, 2026-09-01): 45 минут анализа, пять
+# стадий из шести — и смерть на последней от «Request rejected (429)».
+# Стадия поднимала RuntimeError на любом ненулевом коде выхода, а RuntimeError
+# у неё неповторяем. Лимит проходит сам через минуты — повторять надо его,
+# отказ стадии (нет артефакта, нет входа) — не надо.
+
+class _FakeClock:
+    """time.monotonic/sleep в activities: отступ не ждём по-настоящему."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _patch_clock(monkeypatch, clock):
+    monkeypatch.setattr(activities.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(activities.time, "sleep", clock.sleep)
+
+
+def _claude_env(monkeypatch):
+    monkeypatch.setenv("ZAI_API_KEY", "zkey")
+    monkeypatch.setenv("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
+    for v in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(v, raising=False)
+
+
+_429_DETAIL = ("API Error: Request rejected (429)\n"
+               "[1302][Rate limit reached for requests]")
+
+
+def test_run_claude_retries_rate_limit_and_succeeds(monkeypatch):
+    """Первая попытка ловит 429, отступ, вторая проходит — стадия жива."""
+    _claude_env(monkeypatch)
+    clock = _FakeClock()
+    _patch_clock(monkeypatch, clock)
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=_429_DETAIL)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    activities._run_claude("prompt", "/tmp/cwd")
+
+    assert len(calls) == 2
+    assert clock.sleeps == [activities.RATE_LIMIT_BACKOFF_SEC]
+
+
+def test_run_claude_does_not_retry_other_failures(monkeypatch):
+    """Отказ самой стадии (не лимит) неповторяем, как и было."""
+    _claude_env(monkeypatch)
+    clock = _FakeClock()
+    _patch_clock(monkeypatch, clock)
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="Error: invalid request (400)")
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="claude -p exit 1"):
+        activities._run_claude("prompt", "/tmp/cwd")
+
+    assert len(calls) == 1
+    assert clock.sleeps == []
+
+
+def test_run_claude_gives_up_when_rate_limit_persists(monkeypatch):
+    """Лимит держится все повторы — отдаём прежний отказ с тем же текстом."""
+    _claude_env(monkeypatch)
+    clock = _FakeClock()
+    _patch_clock(monkeypatch, clock)
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=_429_DETAIL)
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="429"):
+        activities._run_claude("prompt", "/tmp/cwd")
+
+    assert len(calls) == 1 + activities.RATE_LIMIT_MAX_RETRIES
+    assert len(clock.sleeps) == activities.RATE_LIMIT_MAX_RETRIES
+
+
+def test_run_claude_retry_runs_on_remaining_timeout_budget(monkeypatch):
+    """Повторная попытка не продлевает стадию: её таймаут — остаток бюджета.
+
+    Раньше одна попытка жила до CLAUDE_STAGE_TIMEOUT_SEC; с отступом бюджет
+    общий, иначе start_to_close воркфлоу отстрелил бы стадию посреди повтора.
+    """
+    _claude_env(monkeypatch)
+    clock = _FakeClock()
+    _patch_clock(monkeypatch, clock)
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            clock.now += 700.0  # первая попытка прожила 700 секунд
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=_429_DETAIL)
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    activities._run_claude("prompt", "/tmp/cwd")
+
+    expected = activities.CLAUDE_STAGE_TIMEOUT_SEC - 700.0 - activities.RATE_LIMIT_BACKOFF_SEC
+    assert calls[1]["timeout"] == pytest.approx(expected)
+
+
+def test_run_claude_skips_retry_when_budget_spent(monkeypatch):
+    """429 в самом конце бюджета — отступ не влезает, отдаём отказ сразу."""
+    _claude_env(monkeypatch)
+    clock = _FakeClock()
+    _patch_clock(monkeypatch, clock)
+    calls: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(kwargs)
+        clock.now += activities.CLAUDE_STAGE_TIMEOUT_SEC - 1.0
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=_429_DETAIL)
+
+    monkeypatch.setattr(activities.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="429"):
+        activities._run_claude("prompt", "/tmp/cwd")
+
+    assert len(calls) == 1
+    assert clock.sleeps == []
+
+
 
 
 def test_fnr_stage_names_are_the_six_stages():

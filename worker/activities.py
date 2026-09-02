@@ -1711,6 +1711,19 @@ REPOMIX_TIMEOUT_SEC = 600
 CLONE_TIMEOUT_SEC = 300
 HEARTBEAT_INTERVAL_SEC = 30.0
 
+# 429 от провайдера (z.ai) — состояние временное: один ключ на все стадии
+# контура, соседняя стадия его отпустит через минуты. Прогон
+# poh-demo-checkout#165 из-за этого умер: RuntimeError от любого ненулевого
+# кода выхода попадал в неповторяемые, и 45 минут работы пяти стадий
+# списывались в частичную выкладку. Повтор — здесь, внутри активности:
+# правка retry_policy в воркфлоу меняла бы его решение и требовала маркера
+# workflow.patched, а тело активности на реплей не влияет.
+RATE_LIMIT_BACKOFF_SEC = 60.0
+RATE_LIMIT_MAX_RETRIES = 3
+# 429 может прийти и числом, и словами — claude-code печатает диагностику по-
+# разному («Request rejected (429)», «Rate limit reached»).
+_RATE_LIMIT_RE = re.compile(r"\b429\b|rate[ _-]?limit", re.IGNORECASE)
+
 # Обогащение контекста /analyze (спека 2026-07-24). Двигаются без правки логики.
 CONTEXT_COMMENT_LIMIT = 20      # свежих комментариев в бриф
 CONTEXT_COMMENT_CHARS = 1500    # обрезка одного комментария
@@ -1930,18 +1943,44 @@ def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None) -> None:
         # молча не состоится.
         command += ["--mcp-config", mcp_config, "--strict-mcp-config",
                     "--allowedTools", f"mcp__{repowise.SERVER_NAME}"]
-    result = subprocess.run(
-        command,
-        cwd=cwd, capture_output=True, text=True,
-        timeout=CLAUDE_STAGE_TIMEOUT_SEC, check=False,
-        # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
-        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_BASE_URL": base},
-    )
-    if result.returncode != 0:
+    # Бюджет стадии общий для всех попыток: раньше одна попытка жила до
+    # CLAUDE_STAGE_TIMEOUT_SEC, и повтор с отступом не должен продлить стадию
+    # сверх неё — иначе start_to_close воркфлоу (claude до 900 + буфер)
+    # отстрелил бы активность посреди отступа.
+    deadline = time.monotonic() + CLAUDE_STAGE_TIMEOUT_SEC
+    remaining = deadline - time.monotonic()
+    for attempt in range(1 + RATE_LIMIT_MAX_RETRIES):
+        result = subprocess.run(
+            command,
+            cwd=cwd, capture_output=True, text=True,
+            timeout=remaining, check=False,
+            # claude-code читает креды из своих ANTHROPIC_*; выводим их из ZAI_*.
+            env={**os.environ, "ANTHROPIC_AUTH_TOKEN": token, "ANTHROPIC_BASE_URL": base},
+        )
+        if result.returncode == 0:
+            return
         # claude-code часто пишет диагностику в stdout, а не stderr — берём оба
         # (stderr приоритетнее), иначе сообщение об ошибке оказывается пустым.
         detail = result.stderr.strip() or result.stdout.strip() or "(пустой вывод)"
-        raise RuntimeError(f"claude -p exit {result.returncode}: {detail[-1500:]}")
+        last_fail = f"claude -p exit {result.returncode}: {detail[-1500:]}"
+        if (attempt >= RATE_LIMIT_MAX_RETRIES
+                or not _RATE_LIMIT_RE.search(detail)):
+            raise RuntimeError(last_fail)
+        # Лимит — не сбой стадии: запрос отвергнут до работы, произведённого нет
+        # (в отличие от повторного прогона после частичной выкладки). Отступ и
+        # повтор живёт внутри активности, поэтому heartbeat из
+        # _run_with_heartbeat не прерывается и воркфлоу ничего не видит.
+        remaining = deadline - time.monotonic()
+        wait = min(RATE_LIMIT_BACKOFF_SEC, remaining)
+        if remaining - wait <= 0:
+            # Отступ съедает бюджет целиком — повторной попытки не будет, не
+            # ждём и отдаём отказ как раньше, с 429 в тексте.
+            raise RuntimeError(last_fail)
+        logger.warning(
+            "claude -p: провайдер отвечает 429 (%s); повтор через %.0f с "
+            "(попытка %d/%d)", detail[:200], wait, attempt + 1, RATE_LIMIT_MAX_RETRIES)
+        time.sleep(wait)
+        remaining -= wait
 
 
 def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
