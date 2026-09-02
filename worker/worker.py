@@ -53,6 +53,7 @@ DEVELOP_ACTIVITIES = [
     activities.dev_followups,
     activities.dev_tests,
     activities.dev_publish,
+    activities.dev_publish_partial,
     activities.capture_episode,
 ]
 
@@ -205,6 +206,7 @@ async def main() -> None:
             activities.dev_empty_run_reason,
             activities.dev_tests,
             activities.dev_publish,
+            activities.dev_publish_partial,
             activities.capture_episode,
             activities.ack_estimate_command,
             activities.collect_estimation_context,

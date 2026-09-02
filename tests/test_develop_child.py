@@ -149,6 +149,10 @@ def test_all_dev_steps_are_registered_activities():
                 activities_module.build_mvp_plan,
                 activities_module.dev_run_agent, activities_module.dev_followups,
                 activities_module.dev_tests, activities_module.dev_publish,
+                # Спасение работы сорвавшегося прогона: зовётся не по порядку,
+                # а из обработчика отказа — но регистрация нужна та же, и без
+                # неё дефект вылезет ровно там, где спасать уже нечем.
+                activities_module.dev_publish_partial,
                 # Запись об итерации слою саморефлексии. Шаг опционален по
                 # действию (без MEMORY_BASE_URL он ничего не делает), но
                 # зарегистрирован всегда: воркфлоу зовёт его под маркером.

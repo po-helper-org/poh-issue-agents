@@ -3515,6 +3515,78 @@ async def dev_tests(issue: IssueInput) -> None:
     await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
 
 
+def _dev_publish_partial(issue: IssueInput, branch: str, reason: str) -> int | None:
+    """Выложить черновиком то, что агент успел написать до срыва.
+
+    Повторяет подготовку дерева из `_dev_publish` — снятие служебных файлов и
+    сохранение `.harness/`: иначе в черновик уедет наша же постановка, а гвард
+    «есть ли дифф» обманется ею и открыл бы черновик по прогону, в котором
+    агент не тронул ни одного файла.
+    """
+    root, clone_dir = _dev_paths(issue)
+    removed = develop.clear_service_files(clone_dir, keep_dir=root)
+    if removed:
+        logger.info("Develop %s#%s: сняты служебные файлы: %s",
+                    issue.repo, issue.issue_number, ", ".join(removed))
+    work = develop.work_branch(issue.issue_number)
+    return github_client.publish_worktree(
+        issue.repo, str(clone_dir), work,
+        title=f"СОРВАЛОСЬ feat(#{issue.issue_number}): {issue.title}",
+        body=("Прогон разработки **сорвался**. Это не готовая работа, а то, "
+              "что агент успел написать до срыва, — материал для разбора.\n\n"
+              f"Задача: #{issue.issue_number}\n\n"
+              f"Причина:\n\n```\n{reason}\n```\n"),
+        message=f"wip(#{issue.issue_number}): прогон сорвался, сохранено как есть",
+        ignore_for_empty_check=(f"{task_context.DIR}/**",),
+        force_include=(task_context.DIR,),
+        # Черновик, а не обычный PR: работа заведомо негодная. Обычный выглядел
+        # бы кандидатом на слияние, а ревью подобрало бы его и потратило бюджет
+        # на то, что контур сам признал негодным.
+        draft=True,
+    )
+
+
+@activity.defn
+async def dev_publish_partial(issue: IssueInput, branch: str,
+                              reason: str) -> int | None:
+    """Спасти работу сорвавшегося прогона черновым PR.
+
+    `None` — сохранять нечего (агент не тронул ни одного файла) либо выложить
+    не удалось. И то, и другое — не повод падать: прогон УЖЕ сорвался, и
+    спасательный шаг не имеет права подменить собой его причину.
+
+    Отказ, ради которого написано: на `poh-demo-checkout#166` тринадцать минут
+    работы агента исчезли из-за трёх красных тестов — `dev_publish` идёт после
+    `dev_tests` и просто не выполнился.
+    """
+    try:
+        number = await _run_with_heartbeat(_dev_publish_partial, issue, branch, reason,
+                                           label="dev:publish-partial")
+    except Exception as exc:  # noqa: BLE001 — см. докстринг: причина уже есть
+        activity.logger.warning("Develop %s#%s: частичная выкладка не удалась: %s",
+                                issue.repo, issue.issue_number, exc)
+        return None
+    if number is None:
+        # Агент не изменил ни одного файла. Комментария нет намеренно: сообщать
+        # человеку не о чем, а лишняя строка в ленте — шум.
+        return None
+    try:
+        await asyncio.to_thread(
+            github_client.post_comment, issue.repo, issue.issue_number,
+            f"## ⏸ Прогон разработки сорвался\n\n"
+            f"Сохранил то, что успел написать агент, — черновым PR #{number}. "
+            f"Это **не готовая работа**, а материал для разбора.\n\n"
+            f"Причина:\n\n```\n{reason}\n```\n\n"
+            f"Ревью на черновик не тратится: снимите статус черновика, когда "
+            f"работа станет годной.")
+    except Exception as exc:  # noqa: BLE001
+        # Черновик уже открыт. Промолчать про номер значит потерять его из
+        # виду вовсе — воркфлоу решит, что спасать было нечего.
+        activity.logger.warning("Develop %s#%s: не удалось сообщить о черновике "
+                                "#%s: %s", issue.repo, issue.issue_number, number, exc)
+    return number
+
+
 @activity.defn
 async def dev_publish(issue: IssueInput, branch: str) -> int | None:
     """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
