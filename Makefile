@@ -1,5 +1,5 @@
 # Layer A operator commands. Run `make setup` once, then up → dry-run → go-live.
-.PHONY: help setup up up-local up-full logs ps dry-run backfill-one go-live dry-again down test consolidate
+.PHONY: help setup up up-local up-full logs ps dry-run backfill-one go-live dry-again down test consolidate deploy-check deploy-check-stack
 
 # Три конфигурации compose:
 #   main (docker-compose.yml)       — только приложение, внешний Temporal из .env
@@ -11,6 +11,16 @@ LOCAL := -f docker-compose.local.yml
 FULL  := -f docker-compose.full.yml
 REPO := $(shell grep -E '^GITHUB_REPOSITORY=' .env 2>/dev/null | cut -d= -f2-)
 PY   := .venv/bin/python
+# Адрес Temporal сторожу выкладки. Makefile не грузит .env целиком (см. REPO
+# выше — там та же ручная выемка), а без адреса сторож ушёл бы на localhost:7233
+# и на внешнем кластере молча докладывал бы «недоступен».
+#
+# Пустое значение НЕ подставляется: `TEMPORAL_ADDRESS=` хуже отсутствия строки —
+# `os.environ.get(..., "localhost:7233")` вернёт пустую строку, а не дефолт, и
+# соединение уйдёт по пустому адресу (та же ловушка, что у MODEL_CLASSIFY,
+# описанная в docs/DEPLOY-DOKPLOY.md).
+TEMPORAL := $(strip $(shell grep -E '^TEMPORAL_ADDRESS=' .env 2>/dev/null | cut -d= -f2-))
+GUARD := $(if $(TEMPORAL),TEMPORAL_ADDRESS=$(TEMPORAL) )$(PY) scripts/deploy_guard.py
 
 help:
 	@echo "make setup        interactive onboarding (preflight, venv, .env)"
@@ -22,22 +32,45 @@ help:
 	@echo "make backfill-one issue=N   triage a single issue (smoke test)"
 	@echo "make go-live      turn DRY_RUN off, restart worker, run for real"
 	@echo "make consolidate  cluster open backlog & open PR (DRY_RUN-guarded)"
+	@echo "make deploy-check how many live workflows a rebuild would hit (ARGS=--replay for details)"
+	@echo "make deploy-check-stack  same check from inside the worker (full stack: 7233 not published)"
 	@echo "make down         stop everything"
 
 setup:
 	bash scripts/setup.sh
 
+# Незакрытые прогоны считаются ПЕРЕД пересборкой: воркфлоу живут неделями, и
+# выкладка, меняющая порядок активностей, их убивает (#263). Гейт, который
+# останавливает, — эта цель: код возврата 1, когда под ударом есть прогоны.
+# Цели сборки ниже зовут тот же сторож с `--warn-only`: цифра печатается,
+# сборка не блокируется — решать выкладывать или нет должен человек.
+deploy-check:
+	$(GUARD) $(ARGS)
+
+# Та же проверка ИЗНУТРИ контейнера. Нужна для конфигурации full: там 7233
+# намеренно не публикуется наружу (`expose`, а не `ports` в
+# docker-compose.full.yml), и с хоста сторожу до Temporal не дотянуться —
+# он честно отвечал бы «недоступен», приучая не читать его вывод.
+# Тот же приём, что у scripts/diag.py: запускать там, где живёт сервис.
+deploy-check-stack:
+	docker compose $(FULL) exec -T worker python scripts/deploy_guard.py $(ARGS)
+
 up:
+	-@$(GUARD) --warn-only
 	docker compose up --build -d $(CORE)
 
 # Локальная разработка: полный стек со встроенным Temporal.
 # .env для Temporal править не нужно — адрес/namespace заданы в файле.
 up-local:
+	-@$(GUARD) --warn-only
 	docker compose $(LOCAL) up --build -d
 	@echo "Temporal UI: http://localhost:8080"
 
 # Полный прод-стек со встроенным Temporal (обычно поднимается через Dokploy;
 # цель нужна для локальной проверки прод-конфига). Требует POSTGRES_PASSWORD.
+# Сторожа выкладки здесь НЕТ намеренно: 7233 в этой конфигурации наружу не
+# публикуется, и проверка с хоста всегда отвечала бы «недоступен». Считать
+# прогоны перед пересборкой этого стека — `make deploy-check-stack`.
 up-full:
 	docker compose $(FULL) up --build -d
 

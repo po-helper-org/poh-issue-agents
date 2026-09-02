@@ -18,7 +18,7 @@ import consolidation_activities as ca
 import delivery_bridge
 import howtodemo_bridge
 from consolidation_workflow import ConsolidationWorkflow
-from shared import sentry_setup
+from shared import nondeterminism, sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import (
     CommentAck,
@@ -124,7 +124,28 @@ def _howtodemo_worker(client) -> Worker | None:
     )
 
 
+def _watch_nondeterminism() -> None:
+    """Наблюдатель за расхождением прогона с записанной историей (#263).
+
+    Зачем: разошедшийся прогон НЕ падает — он бесконечно повторяет workflow
+    task, оставаясь в Running, и снаружи это неотличимо от «задача стоит и ждёт
+    человека». Наблюдатель поднимает единственную запись SDK об этом до строки
+    оператору и события Sentry. Без SENTRY_DSN событие не уходит, строка
+    остаётся.
+
+    Зовётся из `main()`, а НЕ побочным эффектом импорта, в отличие от
+    `sentry_setup.configure` выше: тот без DSN — честный no-op, а этот меняет
+    ГЛОБАЛЬНОЕ состояние `logging` всегда (опускает логгер SDK до DEBUG и вешает
+    фильтр). Делать это фактом импорта значит менять логирование всякому, кто
+    импортировал модуль: `tests/test_develop_child.py` импортирует воркер ради
+    проверки проводки, и наблюдатель оставался бы висеть на весь прогон тестов,
+    перехватывая записи чужих проверок.
+    """
+    nondeterminism.install(sentry_setup.capture_nondeterminism)
+
+
 async def main() -> None:
+    _watch_nondeterminism()
     client = await connect_temporal()
     worker = Worker(
         client,

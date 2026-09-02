@@ -428,3 +428,34 @@ def capture_question_close_failure(issue, exc_type: str, message: str) -> Option
             f"close_answered_by_body_edit failed: {getattr(issue, 'repo', '?')}"
             f"#{getattr(issue, 'issue_number', '?')} ({exc_type})",
             level="error")
+
+
+def capture_nondeterminism(run_id: Optional[str], message: str) -> Optional[str]:
+    """Прогон разошёлся с записанной историей и встал (`shared/nondeterminism.py`).
+
+    Единственный класс сбоя контура, который **нельзя** поймать изнутри: падает
+    не тело активности, а реплей воркфлоу — код, который перехватил бы
+    исключение, до выполнения не доходит. Поэтому событие поднимается снаружи,
+    из наблюдателя за логом Temporal, а не из `except` в `workflows.py`.
+
+    level=error, а не warning: в отличие от аутейджа провайдера (см.
+    `_EXTERNAL_FAILURES` выше) это отказ СВОЕЙ стороны, он не рассосётся сам и
+    чинится только откатом воркера на прежний образ.
+
+    fingerprint без run_id намеренно: одна выкладка ломает разом все прогоны,
+    дошедшие до изменённого места, и в живом случае #263 их было бы до сотни.
+    Группировка по run_id завела бы сотню отдельных issue на одну причину —
+    а причина у них ровно одна, и разбирается она один раз.
+    """
+    if not _configured:
+        return None
+    import sentry_sdk
+
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("stage", "workflow:replay")
+        scope.set_tag("run_id", run_id or "unknown")
+        scope.set_extra("message", message)
+        scope.fingerprint = ["nondeterminism"]
+        return sentry_sdk.capture_message(
+            f"workflow stuck on nondeterminism (run_id={run_id or '?'})",
+            level="error")
