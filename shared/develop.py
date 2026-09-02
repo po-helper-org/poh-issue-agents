@@ -406,12 +406,24 @@ def handoff_comment(issue_number: int, *, repo: str, branch: str, where: str) ->
     )
 
 
-def pr_body(issue_number: int, *, branch: str) -> str:
+def pr_body(issue_number: int, *, branch: str, foreign: list[str]) -> str:
+    note = ""
+    if foreign:
+        # Красный набор без объяснения уходит на ревью загадкой: смотрящий
+        # решит, что сломал агент, и пойдёт разбирать его правку.
+        listed = "\n".join(f"- `{name}`" for name in foreign)
+        note = (
+            "\n## Эти тесты падали и до правки\n\n"
+            f"{listed}\n\n"
+            "Агент их не трогал: они красные на том же коммите и без его "
+            "работы — проверено прогоном на чистом дереве.\n"
+        )
     return (
         f"Closes #{issue_number}\n\n"
         f"Разработку вёл OpenHands по системным требованиям из `{branch or '—'}`.\n"
         "Найденные по дороге edge-кейсы в этой ветке не чинились — они собраны "
-        f"строками в секции GROW тела #{issue_number} и ждут гейта приёмки.\n\n"
+        f"строками в секции GROW тела #{issue_number} и ждут гейта приёмки.\n"
+        f"{note}\n"
         f"<sub>origin: agent · root-issue: #{issue_number}</sub>\n"
     )
 

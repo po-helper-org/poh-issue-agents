@@ -3409,7 +3409,7 @@ async def dev_diagnose(issue: IssueInput,
         return Diagnosis(parsed=False, baseline=[], own=[], foreign=[])
 
 
-def _dev_publish(issue: IssueInput, branch: str) -> int | None:
+def _dev_publish(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     """Коммит, пуш и PR — руками воркера, его токеном.
 
     Агенту токен не давали намеренно; здесь он уже не нужен агенту, а нужен
@@ -3433,7 +3433,7 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
         title=f"feat(#{issue.issue_number}): {issue.title}",
-        body=develop.pr_body(issue.issue_number, branch=branch),
+        body=develop.pr_body(issue.issue_number, branch=branch, foreign=foreign),
         message=f"feat(#{issue.issue_number}): реализация по системным требованиям",
         # `.harness/` — единственный служебный каталог, что НЕ снимается
         # (задача 7: контекст обязан дойти до PR). Он пишется в `_dev_prepare`
@@ -3531,7 +3531,11 @@ async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None =
     # а на следующем круге правок агент прочитает свои прошлые находки как новые.
     await collect_dev_followups(issue)
     await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
-    number = await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+    # Монолитный путь диагноза красного прогона не делает — тесты здесь
+    # либо зелёные, либо шаг уже упал. Чужой красноты, о которой стоило бы
+    # оговориться в теле PR, взяться неоткуда.
+    number = await _run_with_heartbeat(_dev_publish, issue, branch, [],
+                                       label="dev:publish")
 
     if number is None:
         task, _clone = _dev_paths(issue)
@@ -3561,7 +3565,10 @@ async def dev_begin(issue: IssueInput) -> DevelopPlan:
     стадию одной строкой в истории.
     """
     branch = await _dev_resolve_branch(issue)
-    return DevelopPlan(mode=develop.mode(), branch=branch)
+    return DevelopPlan(
+        mode=develop.mode(), branch=branch,
+        repair_rounds=max(0, int(os.environ.get("DEVELOP_REPAIR_ROUNDS", "1") or 1)),
+    )
 
 
 @activity.defn
@@ -3650,6 +3657,30 @@ async def dev_repair(issue: IssueInput, own: list[str]) -> None:
     килобайты текста, им не место в истории воркфлоу.
     """
     await _run_with_heartbeat(_dev_repair, issue, own, label="dev:repair")
+
+
+@activity.defn
+async def dev_announce_repair(issue: IssueInput, own: list[str]) -> None:
+    """Сказать в ленте, что контур чинит своё и что именно.
+
+    Молчащий контур, который внутри себя делает второй дорогой заход
+    (агент идёт до 45 минут), неотличим от зависшего.
+
+    Сообщение не имеет права сорвать починку: отказ гасится здесь.
+    """
+    listed = "\n".join(f"- `{name}`" for name in own)
+    try:
+        await asyncio.to_thread(
+            github_client.post_comment, issue.repo, issue.issue_number,
+            f"## 🔁 Чиню своё\n\n"
+            f"После правки упали тесты, которых до неё не было:\n\n{listed}\n\n"
+            f"Отправляю агента на повторный заход — он правит только эти "
+            f"падения. Остальные красные тесты в наборе, если они есть, "
+            f"падали и без правки.\n\n"
+            f"Заход один: не починит — отдам задачу человеку.")
+    except Exception as exc:  # noqa: BLE001 — см. докстринг
+        activity.logger.warning("Develop %s#%s: о починке не сообщено: %s",
+                                issue.repo, issue.issue_number, exc)
 
 
 @activity.defn
@@ -3759,13 +3790,19 @@ async def dev_publish_partial(issue: IssueInput, branch: str,
 
 
 @activity.defn
-async def dev_publish(issue: IssueInput, branch: str) -> int | None:
+async def dev_publish(issue: IssueInput, branch: str,
+                      foreign: list[str]) -> int | None:
     """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
 
     `None` — агент не изменил ни одного файла. Это не сбой шага, а его
     результат; решение, что делать с пустым прогоном, принимает воркфлоу.
+
+    `foreign` — тесты, красные и без правки агента. Уходят оговоркой в тело
+    PR: красный набор без объяснения смотрящий примет за поломку агента и
+    пойдёт разбирать его правку.
     """
-    return await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+    return await _run_with_heartbeat(_dev_publish, issue, branch, foreign,
+                                     label="dev:publish")
 
 
 @activity.defn

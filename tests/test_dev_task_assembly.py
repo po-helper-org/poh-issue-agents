@@ -777,7 +777,7 @@ def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp
 
     monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: _FakeResp())
 
-    number = a._dev_publish(issue, "research/issue-15")
+    number = a._dev_publish(issue, "research/issue-15", [])
 
     assert number == 77
     show = subprocess.run(["git", "-C", str(clone), "show", "--stat", "HEAD"],
@@ -837,7 +837,7 @@ def test_dev_publish_treats_context_only_changes_as_an_empty_run(monkeypatch, tm
     posts: list = []
     monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: posts.append((args, kw)))
 
-    number = a._dev_publish(issue, "research/issue-16")
+    number = a._dev_publish(issue, "research/issue-16", [])
 
     assert number is None, "агент не тронул ни файла — пустой прогон, PR не открывается"
     assert posts == [], "запрос на создание PR не должен был уйти"
@@ -913,7 +913,7 @@ def test_dev_publish_forces_the_harness_directory_past_the_target_repos_gitignor
 
     monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: _FakeResp())
 
-    number = a._dev_publish(issue, "research/issue-21")
+    number = a._dev_publish(issue, "research/issue-21", [])
 
     assert number == 89
     show = subprocess.run(["git", "-C", str(clone), "show", "--stat", "HEAD"],

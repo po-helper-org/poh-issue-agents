@@ -839,6 +839,9 @@ git commit -m "feat(develop): круг правок — агент чинит с
 
 ### Task 4: Красный путь в воркфлоу
 
+> Правка по итогам реализации: `dev_announce_repair` (Task 5) нужна уже
+> здесь — воркфлоу её зовёт. Заводи её вместе с этой задачей.
+
 Закрывает B1, B10, B14, B25, B26.
 
 **Files:**
@@ -1194,6 +1197,7 @@ Expected: FAIL — диагноз не вызывается, `dev_publish` не 
                 # недетерминизмом прогоны, начатые до выкладки.
                 if not workflow.patched("issue-development-repair-loop"):
                     raise
+                last_exc: BaseException = tests_exc
                 diagnosis = await workflow.execute_activity(
                     activities.dev_diagnose, args=[issue, None],
                     start_to_close_timeout=timedelta(seconds=3900),
@@ -1223,12 +1227,20 @@ Expected: FAIL — диагноз не вызывается, `dev_publish` не 
                         heartbeat_timeout=timedelta(seconds=300),
                         retry_policy=once,
                     )
-                    await workflow.execute_activity(
-                        activities.dev_tests, issue,
-                        start_to_close_timeout=timedelta(seconds=1800),
-                        heartbeat_timeout=timedelta(seconds=300),
-                        retry_policy=once,
-                    )
+                    # Повторный прогон НЕ роняет ветку своим отказом: при
+                    # чужой красноте он красный всегда, и падение наружу
+                    # означало бы, что починку невозможно признать удавшейся
+                    # ни в одном репозитории с чужой краснотой — то есть ровно
+                    # там, ради чего всё это писалось. Решает диагноз ниже.
+                    try:
+                        await workflow.execute_activity(
+                            activities.dev_tests, issue,
+                            start_to_close_timeout=timedelta(seconds=1800),
+                            heartbeat_timeout=timedelta(seconds=300),
+                            retry_policy=once,
+                        )
+                    except Exception as retry_exc:         # noqa: BLE001
+                        last_exc = retry_exc
                     # База та же: базовый коммит не менялся, а лишний прогон
                     # набора стоит времени. Мигание не перепроверяем — эти
                     # тесты уже подтверждены дважды.
@@ -1241,10 +1253,10 @@ Expected: FAIL — диагноз не вызывается, `dev_publish` не 
                     )
                     if not diagnosis.parsed:
                         # Об исходе повторного прогона не известно ничего.
-                        raise
+                        raise last_exc
                 if diagnosis.own:
                     # Заходы кончились, свои падения остались — человек.
-                    raise
+                    raise last_exc
                 foreign = diagnosis.foreign
             number = await workflow.execute_activity(
                 activities.dev_publish, args=[issue, plan.branch, foreign],

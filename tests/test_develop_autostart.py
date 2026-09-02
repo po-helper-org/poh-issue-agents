@@ -192,7 +192,7 @@ async def dev_checks_ok(issue: IssueInput) -> None: ...
 
 
 @activity.defn(name="dev_publish")
-async def dev_publish_ok(issue: IssueInput, branch: str) -> int | None:
+async def dev_publish_ok(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     return 101
 
 
@@ -513,7 +513,7 @@ async def develop_failing(issue: IssueInput, root_issue: int | None = None,
 
 
 @activity.defn(name="dev_publish")
-async def dev_publish_failing(issue: IssueInput, branch: str) -> int | None:
+async def dev_publish_failing(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     """Срыв ПОСЛЕДНЕГО шага — ровно пуш на живом прогоне #39.
 
     Раньше вся разработка была одной активностью, и её ретрай повторял стадию

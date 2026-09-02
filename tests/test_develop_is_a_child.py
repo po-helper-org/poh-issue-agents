@@ -153,7 +153,7 @@ async def checks_ok(issue: IssueInput) -> None: ...
 
 
 @activity.defn(name="dev_publish")
-async def publish_ok(issue: IssueInput, branch: str) -> int | None:
+async def publish_ok(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     _calls.append("publish")
     return 101
 

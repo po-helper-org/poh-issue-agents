@@ -110,18 +110,18 @@ async def test_prepare_returns_a_size_not_the_task_text(gh, monkeypatch):
 
 async def test_publish_returns_the_pr_number(gh, monkeypatch):
     monkeypatch.setattr(activities_module, "_dev_publish",
-                        lambda issue, branch: 101)
+                        lambda issue, branch, foreign: 101)
 
-    assert await activities_module.dev_publish(_issue(39), "b") == 101
+    assert await activities_module.dev_publish(_issue(39), "b", []) == 101
 
 
 async def test_publish_returns_none_when_the_agent_changed_nothing(gh, monkeypatch):
     """`None` — не сбой шага, а его честный результат. Решение «открывать
     нечего» принимает воркфлоу: у него есть контекст стадии, у активности нет."""
     monkeypatch.setattr(activities_module, "_dev_publish",
-                        lambda issue, branch: None)
+                        lambda issue, branch, foreign: None)
 
-    assert await activities_module.dev_publish(_issue(39), "b") is None
+    assert await activities_module.dev_publish(_issue(39), "b", []) is None
 
 
 async def test_run_agent_raises_on_a_failed_run(gh, monkeypatch):
@@ -155,6 +155,9 @@ def test_all_dev_steps_are_registered_activities():
                 # Круг правок: агент чинит своё. Тоже зовётся из обработчика
                 # отказа, а не по порядку шагов.
                 activities_module.dev_repair,
+                # Сообщение о починке: без него второй дорогой заход выглядит
+                # зависанием.
+                activities_module.dev_announce_repair,
                 activities_module.dev_publish,
                 # Спасение работы сорвавшегося прогона: зовётся не по порядку,
                 # а из обработчика отказа — но регистрация нужна та же, и без
