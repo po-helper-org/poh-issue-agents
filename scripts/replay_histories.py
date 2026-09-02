@@ -55,7 +55,8 @@ from temporalio.worker import Replayer                 # noqa: E402
 
 import workflows as wf                                 # noqa: E402
 
-MARKER = "Nondeterminism error: "
+from shared.replay_report import (                     # noqa: E402
+    MARKER, failure_reason, format_failures)
 
 
 def workflow_classes() -> list[type]:
@@ -94,18 +95,15 @@ async def run(directory: str) -> int:
                 WorkflowHistory.from_json(name, raw))
             ok += 1
         except Exception as exc:            # noqa: BLE001 — интересен любой отказ
-            text = str(exc)
-            key = text.split(MARKER)[-1][:160] if MARKER in text else type(exc).__name__
-            failures[key].append(name)
+            failures[failure_reason(exc)].append(name)
 
     total = sum(len(v) for v in failures.values())
     print(f"проиграно: {ok} | падений: {total}")
-    for key, names in sorted(failures.items(), key=lambda kv: -len(kv[1])):
-        print(f"  {len(names):3d}  {key}")
-        for name in names[:5]:
-            print(f"         {name}")
-        if len(names) > 5:
-            print(f"         … и ещё {len(names) - 5}")
+    # Группировка и форма отчёта общие со сторожем выкладки
+    # (`scripts/deploy_guard.py --replay`): одна и та же поломка обязана
+    # выглядеть одинаково, каким бы из двух инструментов её ни нашли.
+    for line in format_failures(failures):
+        print(line)
     return 1 if total else 0
 
 

@@ -115,15 +115,15 @@ class _FakeCount:
 
 
 class _FakeExecution:
-    def __init__(self, wid, started):
+    def __init__(self, wid, started, wtype="IssueLifecycle"):
         self.id = wid
         self.run_id = f"run-{wid}"
-        self.workflow_type = "IssueLifecycle"
+        self.workflow_type = wtype
         self.start_time = started
 
 
 class _FakeClient:
-    def __init__(self, total, executions=None, fail_connect=False):
+    def __init__(self, total, executions=None):
         self._total = total
         self._executions = executions or []
         self.queries = []
@@ -133,6 +133,11 @@ class _FakeClient:
         return _FakeCount(self._total)
 
     async def list_workflows(self, query):
+        # Запрос записывается и здесь: без этого проверка фильтра держала бы
+        # только `count_workflows`, и выборка, уехавшая с пустым или неверным
+        # фильтром, молча набрала бы завершённые прогоны — а реплей объявил бы
+        # их все сломанными.
+        self.queries.append(query)
         for execution in self._executions:
             yield execution
 
@@ -142,7 +147,7 @@ async def test_collect_counts_and_samples():
     total, runs = await deploy_guard.collect(client, limit=200)
     assert total == 120
     assert len(runs) == 5
-    assert client.queries == [deploy_guard.RUNNING_QUERY]
+    assert client.queries == [deploy_guard.RUNNING_QUERY, deploy_guard.RUNNING_QUERY]
 
 
 async def test_collect_respects_limit():
@@ -206,12 +211,12 @@ async def test_unreachable_temporal_still_lets_build_through_in_warn_only(monkey
 
 async def test_clean_replay_of_all_runs_clears_the_risk(monkeypatch):
     client = _FakeClient(2, [_FakeExecution("issue-1", NOW), _FakeExecution("issue-2", NOW)])
-    assert await _main(monkeypatch, client, ["--replay"], replay_result=({}, 2)) == 0
+    assert await _main(monkeypatch, client, ["--replay"], replay_result=({}, 2, {})) == 0
 
 
 async def test_broken_replay_keeps_exit_one(monkeypatch):
     client = _FakeClient(2, [_FakeExecution("issue-1", NOW), _FakeExecution("issue-2", NOW)])
-    result = ({"Activity machine does not handle this event": ["issue-1"]}, 2)
+    result = ({"Activity machine does not handle this event": ["issue-1"]}, 2, {})
     assert await _main(monkeypatch, client, ["--replay"], replay_result=result) == 1
 
 
@@ -220,7 +225,7 @@ async def test_partial_replay_does_not_clear_the_risk(monkeypatch, capsys):
     остатке молчание реплея не значит ничего."""
     client = _FakeClient(500, [_FakeExecution(f"issue-{i}", NOW) for i in range(3)])
     code = await _main(monkeypatch, client, ["--replay", "--limit", "3"],
-                       replay_result=({}, 3))
+                       replay_result=({}, 3, {}))
     assert code == 1
     assert "Проверено 3 из 500" in capsys.readouterr().out
 
@@ -266,15 +271,15 @@ async def test_replay_of_live_history_is_clean():
     и расхождений не даёт. Красный тест здесь означает, что HEAD ломает идущие
     прогоны, — ровно то, ради чего сторож и написан."""
     history = _fixture_history()
-    failures, replayed = await deploy_guard.replay(
+    failures, replayed, skipped = await deploy_guard.replay(
         _ReplayClient(history), [_run(history.workflow_id)])
-    assert (failures, replayed) == ({}, 1)
+    assert (failures, replayed, skipped) == ({}, 1, {})
 
 
 async def test_unreadable_history_is_reported_not_swallowed():
     """Недоступная история — не повод бросить проверку остальных, но и не повод
     посчитать прогон проверенным."""
-    failures, replayed = await deploy_guard.replay(
+    failures, replayed, _ = await deploy_guard.replay(
         _ReplayClient(error=TimeoutError("visibility недоступна")), [_run()])
     assert replayed == 0
     assert list(failures) == ["история не читается: TimeoutError"]
@@ -285,7 +290,7 @@ def test_failure_reason_keeps_the_distinguishing_tail():
     exc = RuntimeError(
         "Replay failed: [TMPRL1100] Nondeterminism error: Activity machine "
         "does not handle this event")
-    assert deploy_guard.failure_reason(exc, "Nondeterminism error: ") == (
+    assert deploy_guard.failure_reason(exc) == (
         "Activity machine does not handle this event")
 
 
@@ -293,13 +298,12 @@ def test_failure_reason_is_bounded():
     """Полный текст несёт идентификаторы прогона: с ними каждая строка
     уникальна, и группировка вырождается в список."""
     exc = RuntimeError("Nondeterminism error: " + "x" * 500)
-    assert len(deploy_guard.failure_reason(exc, "Nondeterminism error: ")) == 160
+    assert len(deploy_guard.failure_reason(exc)) == 160
 
 
 def test_failure_reason_falls_back_to_exception_type():
     """Отказ не про недетерминизм — показывать нечего, группируем по типу."""
-    assert deploy_guard.failure_reason(KeyError("IssueLifecycle"),
-                                       "Nondeterminism error: ") == "KeyError"
+    assert deploy_guard.failure_reason(KeyError("IssueLifecycle")) == "KeyError"
 
 
 async def test_broken_history_lands_in_failures():
@@ -316,8 +320,105 @@ async def test_broken_history_lands_in_failures():
         "ВоркфлоуКоторогоНет"
     broken = WorkflowHistory.from_json("issue-broken", raw)
 
-    failures, replayed = await deploy_guard.replay(
+    failures, replayed, _ = await deploy_guard.replay(
         _ReplayClient(broken), [_run("issue-broken")])
     assert replayed == 1
     assert sum(len(v) for v in failures.values()) == 1
     assert failures[next(iter(failures))] == ["issue-broken"]
+
+
+# --- Что реплей проверить НЕ может ---
+#
+# Находка ревью: `workflow_classes()` сканирует только `workflows.py`, а воркер
+# регистрирует в той же очереди ещё и `ConsolidationWorkflow`. Живой прогон
+# консолидации объявлялся «сломается», и сторож возвращал 1 на безопасной
+# выкладке. Оператор, один раз поверивший ложной тревоге, следующую настоящую
+# уже не прочтёт — поэтому непроверенное обязано быть отдельной категорией.
+
+def test_consolidation_workflow_is_replayable():
+    """`ConsolidationWorkflow` живёт в соседнем модуле, но в ТОЙ ЖЕ очереди —
+    реплей обязан его знать, иначе каждый прогон консолидации ложная тревога."""
+    _, known = deploy_guard.replayable_classes()
+    assert "ConsolidationWorkflow" in known
+    assert "IssueLifecycle" in known
+
+
+async def test_unknown_type_is_skipped_not_broken():
+    """Тип, которого инструмент не знает, — не поломка: его история не читалась
+    и о нём ничего не известно."""
+    failures, replayed, skipped = await deploy_guard.replay(
+        _ReplayClient(), [_run("delivery-x", wtype="DeliveryWorkflowИзСоседа")])
+    assert failures == {}
+    assert replayed == 0
+    assert skipped == {"DeliveryWorkflowИзСоседа": 1}
+
+
+def test_skipped_runs_are_reported_apart_from_failures():
+    lines, ok = deploy_guard.replay_lines({}, 3, {"ЧужойВоркфлоу": 2})
+    text = "\n".join(lines)
+    assert ok is True                       # сам реплей чист
+    assert "Не проверено: 2" in text
+    assert "не поломка" in text
+
+
+async def test_skipped_runs_do_not_clear_the_risk(monkeypatch):
+    """Реплей чист, но охватил не всех — код возврата обязан остаться 1."""
+    client = _FakeClient(2, [_FakeExecution("issue-1", NOW),
+                             _FakeExecution("other-1", NOW, wtype="Чужой")])
+    code = await _main(monkeypatch, client, ["--replay"],
+                       replay_result=({}, 1, {"Чужой": 1}))
+    assert code == 1
+
+
+# --- Честный отказ на любой стадии, а не только на подключении ---
+
+async def test_visibility_failure_is_not_a_traceback(monkeypatch, capsys):
+    """`Client.connect` спрашивает лишь системную информацию и проходит там, где
+    визибилити уже не отвечает. Перехват только вокруг подключения оставлял бы
+    оператора с голым traceback вместо «проверка не выполнена»."""
+    class _NoVisibility(_FakeClient):
+        async def count_workflows(self, query):
+            raise RuntimeError("Unimplemented: CountWorkflowExecutions")
+
+    assert await _main(monkeypatch, _NoVisibility(0), []) == 1
+    out = capsys.readouterr().out
+    assert "проверка не выполнена" in out
+    assert "НЕ значит" in out
+
+
+async def test_visibility_failure_still_lets_build_through_in_warn_only(monkeypatch):
+    class _NoVisibility(_FakeClient):
+        async def count_workflows(self, query):
+            raise RuntimeError("Unimplemented: CountWorkflowExecutions")
+
+    assert await _main(monkeypatch, _NoVisibility(0), ["--warn-only"]) == 0
+
+
+# --- Потолок выборки ---
+
+async def test_limit_zero_collects_nothing():
+    """`--limit 0` — естественный способ попросить счёт без выборки. Проверка
+    потолка после добавления брала бы один прогон и с `--replay` проигрывала
+    бы его историю — ровно ту работу, которую просили не делать."""
+    client = _FakeClient(120, [_FakeExecution(f"issue-{i}", NOW) for i in range(5)])
+    total, runs = await deploy_guard.collect(client, limit=0)
+    assert (total, runs) == (120, [])
+
+
+async def test_partial_coverage_names_the_limit_when_it_is_the_limit(monkeypatch, capsys):
+    client = _FakeClient(500, [_FakeExecution(f"issue-{i}", NOW) for i in range(3)])
+    await _main(monkeypatch, client, ["--replay", "--limit", "3"],
+                replay_result=({}, 3, {}))
+    assert "потолок --limit 3" in capsys.readouterr().out
+
+
+async def test_partial_coverage_does_not_blame_the_limit_on_a_race(monkeypatch, capsys):
+    """Счёт и выборка — два запроса. Прогон, закрывшийся между ними, даёт тот
+    же разрыв при незадетом потолке; обвинить `--limit` значит послать
+    оператора поднимать то, что ни при чём."""
+    client = _FakeClient(4, [_FakeExecution(f"issue-{i}", NOW) for i in range(3)])
+    await _main(monkeypatch, client, ["--replay", "--limit", "200"],
+                replay_result=({}, 3, {}))
+    out = capsys.readouterr().out
+    assert "закрылись между счётом и выборкой" in out
+    assert "потолок --limit" not in out
