@@ -1,5 +1,5 @@
 # Layer A operator commands. Run `make setup` once, then up → dry-run → go-live.
-.PHONY: help setup up up-local up-full logs ps dry-run backfill-one go-live dry-again down test consolidate
+.PHONY: help setup up up-local up-full logs ps dry-run backfill-one go-live dry-again down test consolidate deploy-check
 
 # Три конфигурации compose:
 #   main (docker-compose.yml)       — только приложение, внешний Temporal из .env
@@ -22,12 +22,22 @@ help:
 	@echo "make backfill-one issue=N   triage a single issue (smoke test)"
 	@echo "make go-live      turn DRY_RUN off, restart worker, run for real"
 	@echo "make consolidate  cluster open backlog & open PR (DRY_RUN-guarded)"
+	@echo "make deploy-check how many live workflows a rebuild would hit (--replay for details)"
 	@echo "make down         stop everything"
 
 setup:
 	bash scripts/setup.sh
 
+# Незакрытые прогоны считаются ПЕРЕД пересборкой: воркфлоу живут неделями, и
+# выкладка, меняющая порядок активностей, их убивает (#263). `--warn-only` —
+# цифра печатается, сборка не блокируется: решать выкладывать или нет должен
+# человек, а не `make up`. Гейт, который останавливает, — отдельная цель
+# `deploy-check` без этого флага.
+deploy-check:
+	$(PY) scripts/deploy_guard.py $(ARGS)
+
 up:
+	-@$(PY) scripts/deploy_guard.py --warn-only
 	docker compose up --build -d $(CORE)
 
 # Локальная разработка: полный стек со встроенным Temporal.
@@ -39,6 +49,7 @@ up-local:
 # Полный прод-стек со встроенным Temporal (обычно поднимается через Dokploy;
 # цель нужна для локальной проверки прод-конфига). Требует POSTGRES_PASSWORD.
 up-full:
+	-@$(PY) scripts/deploy_guard.py --warn-only
 	docker compose $(FULL) up --build -d
 
 logs:

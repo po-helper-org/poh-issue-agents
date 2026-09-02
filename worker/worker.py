@@ -18,7 +18,7 @@ import consolidation_activities as ca
 import delivery_bridge
 import howtodemo_bridge
 from consolidation_workflow import ConsolidationWorkflow
-from shared import sentry_setup
+from shared import nondeterminism, sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import (
     CommentAck,
@@ -34,6 +34,14 @@ from workflows import (
 )
 
 sentry_setup.configure("worker")  # no-op без SENTRY_DSN
+
+# Наблюдатель за расхождением с историей. Ставится сразу после Sentry и ДО
+# старта воркера: прогон, разошедшийся с историей после выкладки, не падает, а
+# бесконечно повторяет workflow task, оставаясь в Running — снаружи это
+# неотличимо от «задача стоит и ждёт человека» (#263). Единственным следом была
+# строка в stdout контейнера; наблюдатель поднимает её до события Sentry и
+# отдельной строки оператору. Без SENTRY_DSN событие не уходит, строка остаётся.
+nondeterminism.install(sentry_setup.capture_nondeterminism)
 
 # Список-манифест шести-восьми шагов разработки: test_develop_child.py сверяет
 # его целиком с активностями worker'а, и незарегистрированный шаг обнаружится
