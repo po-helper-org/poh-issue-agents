@@ -1401,13 +1401,45 @@ def pr_body(issue_number: int, *, branch: str, foreign: list[str]) -> str:
 
 - [ ] **Step 4: Протащить `foreign` до выкладки**
 
-В `worker/activities.py`: `_dev_publish(issue, branch, foreign)` передаёт его в
-`develop.pr_body(...)`, активность `dev_publish(issue, branch, foreign)`
-принимает третьим аргументом.
+В `worker/activities.py` — три правки. Сигнатура исполнителя:
+
+```python
+def _dev_publish(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
+```
+
+Внутри него — вызов сборки тела:
+
+```python
+        body=develop.pr_body(issue.issue_number, branch=branch, foreign=foreign),
+```
+
+И сама активность:
+
+```python
+@activity.defn
+async def dev_publish(issue: IssueInput, branch: str,
+                      foreign: list[str]) -> int | None:
+    """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
+
+    `None` — агент не изменил ни одного файла. Это не сбой шага, а его
+    результат; решение, что делать с пустым прогоном, принимает воркфлоу.
+
+    `foreign` — тесты, красные и без правки агента. Уходят оговоркой в тело
+    PR: красный набор без объяснения смотрящий примет за поломку агента и
+    пойдёт разбирать его правку.
+    """
+    return await _run_with_heartbeat(_dev_publish, issue, branch, foreign,
+                                     label="dev:publish")
+```
 
 **Все вызовы `dev_publish` обязаны передать все три аргумента** — Temporal при
 несовпадении числа выбрасывает типы и отдаёт словари вместо объектов. Гвард
-`tests/test_activity_arg_types.py` это ловит; найди и поправь каждый вызов.
+`tests/test_activity_arg_types.py` это ловит; найди каждый вызов и передай
+список — там, где чужая краснота не разбиралась, пустой:
+
+```bash
+grep -rn "dev_publish" worker/ tests/
+```
 
 `_dev_publish_partial` НЕ трогаем: у сорванного прогона чужая краснота не
 разбиралась, и обещать её разбор в черновике было бы неправдой.
