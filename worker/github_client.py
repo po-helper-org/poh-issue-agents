@@ -674,7 +674,8 @@ def _missing_from_tree(git, paths: tuple[str, ...]) -> list[str]:
 def publish_worktree(repo: str, clone_dir: str, branch: str, *,
                      title: str, body: str, message: str,
                      ignore_for_empty_check: tuple[str, ...] = (),
-                     force_include: tuple[str, ...] = ()) -> int | None:
+                     force_include: tuple[str, ...] = (),
+                     draft: bool = False) -> int | None:
     """Коммит рабочего дерева в ветку и PR. None — изменений нет.
 
     Делает это ВОРКЕР, а не агент разработки: агенту токен не давали намеренно,
@@ -705,6 +706,11 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     обойтись, потому что путь может остаться только в индексе, если решение
     «коммитить или нет» приняло его не в расчёт (см. ветку `forced_pending`
     ниже).
+
+    `draft=True` — PR открывается черновым. Так выкладывается работа
+    СОРВАВШЕГОСЯ прогона: она заведомо негодная, а обычный PR выглядел бы
+    кандидатом на слияние. Черновик к тому же не подбирается ревью — ни
+    вебхуком PR-Agent, ни его свипером (правка в `poh-pr-agents`).
     """
     if _dry_run():
         _log.info("[DRY_RUN] publish %s -> %s: %s", clone_dir, branch, title)
@@ -806,7 +812,8 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
     resp = requests.post(
         f"https://api.github.com/repos/{repo}/pulls",
         headers=_auth_headers(repo),
-        json={"title": title, "head": branch, "base": _default_branch(repo), "body": body},
+        json={"title": title, "head": branch, "base": _default_branch(repo),
+              "body": body, "draft": draft},
         timeout=30,
     )
     if resp.status_code == 422 and "already exists" in resp.text:
