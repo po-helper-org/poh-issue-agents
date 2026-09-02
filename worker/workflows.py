@@ -1344,9 +1344,17 @@ class IssueLifecycle:
                     retry_policy=default_retry,
                 )
                 if gate.status == "VAGUE" and not issue.interactive:
+                    # `reason` передан явно вторым аргументом: активность
+                    # принимает `reason: str = ""`, и вызов одним позиционным
+                    # `issue` даёт Temporal несовпадение числа аргументов с
+                    # числом параметров сигнатуры — типы выбрасываются для
+                    # ОБОИХ параметров, включая `issue` (см. докстринг
+                    # tests/test_activity_arg_types.py).
                     await workflow.execute_activity(
                         activities.escalate_to_human,
-                        issue,
+                        args=[issue, "Задача осталась неоднозначной (VAGUE) после "
+                                     "intake gate, а прогон неинтерактивный — "
+                                     "уточнить не у кого. Передаю на ручной разбор."],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
                     return (lifecycle.ESCALATED, "escalated", True)
@@ -1358,7 +1366,9 @@ class IssueLifecycle:
                     if round_count > MAX_CLARIFICATION_ROUNDS:
                         await workflow.execute_activity(
                             activities.escalate_to_human,
-                            issue,
+                            args=[issue, f"Уточнение не сузило запрос за "
+                                         f"{MAX_CLARIFICATION_ROUNDS} раундов — "
+                                         "передаю на ручной разбор."],
                             start_to_close_timeout=timedelta(seconds=30),
                         )
                         return (lifecycle.ESCALATED, "escalated", True)
@@ -1564,10 +1574,21 @@ class IssueLifecycle:
             return await self._analysis_requested(issue)
         if isinstance(decision, UserComment):
             # Разбор намерения из реплики человека
+            #
+            # Все 6 параметров активности переданы явно, включая
+            # `recent_artifacts=None`: у `interpret_user_comment` их шесть, а
+            # Temporal сверяет ЧИСЛО переданных аргументов с числом параметров
+            # сигнатуры (temporalio/worker/_activity.py) и при несовпадении
+            # выбрасывает типы для ВСЕХ параметров разом, а не только для
+            # пропущенного — активность получает сырой JSON вместо `IssueInput`
+            # (живой отказ: `poh-demo-checkout#166`, `AttributeError: 'dict'
+            # object has no attribute 'repo'`). Цикл не ведёт артефактов этапа
+            # ни в одном поле состояния, поэтому `None` здесь — не заглушка,
+            # а честное отсутствие данных.
             intent = await workflow.execute_activity(
                 activities.interpret_user_comment,
                 args=[issue, decision.text, self._phase, self._classification_label,
-                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED)],
+                      awaiting_mod.reason_for_phase(lifecycle.CLASSIFIED), None],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
@@ -1824,43 +1845,121 @@ class IssueLifecycle:
                 if bug:
                     return (lifecycle.READY_FOR_DEV, "bug", True)
             
-            # В других фазах proceed — просто ответ, что продолжаем
-            await workflow.execute_activity(
-                activities.ack_comment_seen,
-                args=[issue, intent.reason],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
-            return (self._phase, self._stage, False)
-        
-        elif intent.intent == "rework":
-            # Проверяем потолок возвратов этапа
-            if self._rework_rounds >= self._rework_max_rounds:
-                # Потолок исчерпан — отвечаем, что больше не переделываем
+            # В других фазах proceed — просто ответ, что продолжаем.
+            #
+            # `workflow.patched` обязателен: замена активности МЕНЯЕТ команду
+            # в истории. `ack_comment_seen` принимает один `CommentAckInput`
+            # и делает ровно одно — ставит реакцию `eyes`; здесь же нужно
+            # ОПУБЛИКОВАТЬ готовый текст («продолжаем», «потолок исчерпан»,
+            # «возврат не поддерживается», «подтверждение принято»). Прежний
+            # вызов передавал `(issue, текст)` — не просто не тот тип, а не та
+            # активность и не та арность: `TypeError`, три попытки, и без
+            # перехвата исключения — падение всего цикла Issue. Эти четыре
+            # ветки сегодня падают ВСЕГДА, поэтому живых прогонов, дошедших до
+            # следующего шага ЗА ними, нет; но истории уже упавших прогонов
+            # есть, и для их реплея прежняя (ошибочная) команда сохранена
+            # веткой `else` — замена везде разом уронила бы такой реплей
+            # недетерминизмом (другой тип активности в той же точке истории).
+            #
+            # Находка R3 (ревью `fix/activity-arg-types`). `post_followup_
+            # reply` публикует комментарий в GitHub — тот же класс отказа,
+            # что и починка Дефекта 2 в целом: устойчивый отказ ЧИСТО
+            # ИНФОРМАЦИОННОГО ответа не имеет права ронять весь
+            # `IssueLifecycle`. Без перехвата — ровно так и было бы: три
+            # попытки исчерпаны, `ActivityError` пробрасывается наружу,
+            # прогон уходит в FAILED из-за того, что не смог ответить на
+            # реплику, хотя сама реплика (`intent.intent == "proceed"`) уже
+            # обработана и фаза не меняется. Соседняя ветка `question` в этой
+            # же функции гасит свой отказ так же (см. ниже), приём общий.
+            if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                try:
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number, intent.reason],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "не ответил на подтверждение продолжения: %s",
+                        _failure_reason(exc))
+            else:
                 await workflow.execute_activity(
                     activities.ack_comment_seen,
-                    args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
-                                 "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                    args=[issue, intent.reason],
                     start_to_close_timeout=timedelta(seconds=30),
                     retry_policy=RetryPolicy(maximum_attempts=3),
                 )
+            return (self._phase, self._stage, False)
+
+        elif intent.intent == "rework":
+            # Проверяем потолок возвратов этапа
+            if self._rework_rounds >= self._rework_max_rounds:
+                # Потолок исчерпан — отвечаем, что больше не переделываем.
+                # `workflow.patched` — та же замена активности, тот же довод,
+                # что и в ветке `proceed` выше.
+                #
+                # Находка R3 — тот же перехват и тот же довод, что у ветки
+                # `proceed` выше по функции: отказ информационного ответа не
+                # должен ронять цикл.
+                if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                    try:
+                        await workflow.execute_activity(
+                            activities.post_followup_reply,
+                            args=[issue.repo, issue.issue_number,
+                                  f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                  "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                            start_to_close_timeout=timedelta(seconds=30),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        )
+                    except Exception as exc:
+                        workflow.logger.warning(
+                            "не ответил про исчерпанный потолок возвратов: %s",
+                            _failure_reason(exc))
+                else:
+                    await workflow.execute_activity(
+                        activities.ack_comment_seen,
+                        args=[issue, f"Потолок возвратов этапа исчерпан ({self._rework_max_rounds}). "
+                                     "Продолжай работу в текущем состоянии или поставь метку для перехода."],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
                 return (self._phase, self._stage, False)
-            
+
             self._rework_rounds += 1
-            
+
             # Возврат в created с репликой в контексте
             if self._phase == lifecycle.CLASSIFIED:
                 # Возвращаемся в created, триаж перезапустится
                 return (lifecycle.CREATED, "rework", True)
-            
-            # В других фазах rework не поддерживаем — отвечаем, что не можем
-            await workflow.execute_activity(
-                activities.ack_comment_seen,
-                args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
-                             "Продолжай работу или поставь метку для перехода."],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+
+            # В других фазах rework не поддерживаем — отвечаем, что не можем.
+            # `workflow.patched` — тот же довод, что и выше по функции.
+            #
+            # Находка R3 — тот же перехват и тот же довод, что у ветки
+            # `proceed` выше по функции.
+            if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                try:
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number,
+                              f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                              "Продолжай работу или поставь метку для перехода."],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "не ответил про неподдержанный возврат этапа: %s",
+                        _failure_reason(exc))
+            else:
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, f"Возврат этапа в фазе {self._phase} не поддерживается. "
+                                 "Продолжай работу или поставь метку для перехода."],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
             return (self._phase, self._stage, False)
         
         elif intent.intent == "question":
@@ -1882,13 +1981,31 @@ class IssueLifecycle:
             return (self._phase, self._stage, False)
         
         elif intent.intent == "ack":
-            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные ходы
-            await workflow.execute_activity(
-                activities.ack_comment_seen,
-                args=[issue, intent.reason],
-                start_to_close_timeout=timedelta(seconds=30),
-                retry_policy=RetryPolicy(maximum_attempts=3),
-            )
+            # Подтверждение — отвечаем, чего ждём, и перечисляем доступные
+            # ходы. `workflow.patched` — тот же довод, что и в ветке `proceed`
+            # выше по функции.
+            #
+            # Находка R3 — тот же перехват и тот же довод, что у ветки
+            # `proceed` выше по функции.
+            if workflow.patched("issue-lifecycle-comment-intent-reply-activity"):
+                try:
+                    await workflow.execute_activity(
+                        activities.post_followup_reply,
+                        args=[issue.repo, issue.issue_number, intent.reason],
+                        start_to_close_timeout=timedelta(seconds=30),
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception as exc:
+                    workflow.logger.warning(
+                        "не ответил на подтверждение (ack): %s",
+                        _failure_reason(exc))
+            else:
+                await workflow.execute_activity(
+                    activities.ack_comment_seen,
+                    args=[issue, intent.reason],
+                    start_to_close_timeout=timedelta(seconds=30),
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
             return (self._phase, self._stage, False)
         
         else:
@@ -3057,11 +3174,14 @@ class IssueLifecycle:
             # хода в анализ нет, поэтому прогон идёт, а фаза остаётся честной.
             return await self._analysis_requested(issue)
         if isinstance(signal, UserComment):
-            # Разбор намерения из реплики человека
+            # Разбор намерения из реплики человека. `recent_artifacts=None`
+            # передан явно шестым аргументом — см. комментарий у такого же
+            # вызова в `_phase_await_decision` про потерю типов при неполном
+            # списке аргументов (poh-demo-checkout#166).
             intent = await workflow.execute_activity(
                 activities.interpret_user_comment,
                 args=[issue, signal.text, self._phase, self._classification_label,
-                      awaiting_mod.reason_for_phase(self._phase)],
+                      awaiting_mod.reason_for_phase(self._phase), None],
                 start_to_close_timeout=timedelta(seconds=30),
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
@@ -3118,14 +3238,29 @@ class IssueLifecycle:
         истории обязан идти по тому же коду, иначе Temporal уронит прогон
         недетерминизмом. Удалять — только когда все прогоны этого поколения
         завершатся (workflow.deprecate_patch).
+
+        Исключение из «без изменений» — достройка списка аргументов там, где
+        Temporal сегодня выбрасывает типы (см. tests/test_activity_arg_types.py).
+        Это не решение workflow: активность, её порядок и число вызовов не
+        меняются, меняется только содержимое ScheduleActivityTask.input —
+        а его определитель недетерминизма при реплее не сверяет (сверяет тип
+        активности и порядок команд). Раз число выброшенных типов не влияет на
+        то, ЧТО куда переходит, маркер patched здесь не нужен — ровно тот же
+        довод, что и в основном фазовом цикле для той же категории дефекта.
         """
         default_retry = RetryPolicy(maximum_attempts=3)
 
         try:
             # --- Zero-cost предфильтры ---
+            # `origin_agent=False` явным вторым аргументом: этот сценарий
+            # старше самого параметра (провенанс агента `_run_linear` не
+            # проверял никогда), и False — не заглушка, а точное повторение
+            # прежнего поведения. Без явного значения Temporal получил бы 1
+            # аргумент на активность с двумя параметрами и выбросил типы
+            # целиком, отдав `issue` активности сырым словарём.
             skip_reason = await workflow.execute_activity(
                 activities.prefilter_bot_and_security,
-                issue,
+                args=[issue, False],
                 start_to_close_timeout=timedelta(seconds=30),
             )
             if skip_reason is not None:
@@ -3186,10 +3321,17 @@ class IssueLifecycle:
 
                 # Batch/backfill mode: no human answers clarifications for 39 issues,
                 # so a VAGUE issue must escalate, not park on _wait_for_signal() forever.
+                #
+                # `reason` вторым аргументом явно — активность принимает
+                # `reason: str = ""`, а одним позиционным `issue` Temporal
+                # получает 1 аргумент на 2 параметра и выбрасывает типы
+                # целиком (см. tests/test_activity_arg_types.py).
                 if gate.status == "VAGUE" and not issue.interactive:
                     await workflow.execute_activity(
                         activities.escalate_to_human,
-                        issue,
+                        args=[issue, "Задача осталась неоднозначной (VAGUE) после "
+                                     "intake gate, а прогон неинтерактивный — "
+                                     "уточнить не у кого. Передаю на ручной разбор."],
                         start_to_close_timeout=timedelta(seconds=30),
                     )
                     self._stage = "escalated"
@@ -3202,7 +3344,9 @@ class IssueLifecycle:
                     if round_count > MAX_CLARIFICATION_ROUNDS:
                         await workflow.execute_activity(
                             activities.escalate_to_human,
-                            issue,
+                            args=[issue, f"Уточнение не сузило запрос за "
+                                         f"{MAX_CLARIFICATION_ROUNDS} раундов — "
+                                         "передаю на ручной разбор."],
                             start_to_close_timeout=timedelta(seconds=30),
                         )
                         self._stage = "escalated"
@@ -3250,10 +3394,14 @@ class IssueLifecycle:
                     return
 
                 # --- Классификация (более сильная модель) ---
+                # `bft_on_triage=False` явно: этот сценарий старше самой БФТ
+                # на триаже (маркер `issue-lifecycle-bft` заведён только для
+                # фазового цикла), и False здесь — точное повторение прежнего
+                # поведения, а не заглушка.
                 self._stage = "classify"
                 classification = await workflow.execute_activity(
                     activities.classify_issue,
-                    issue,
+                    args=[issue, False],
                     start_to_close_timeout=timedelta(seconds=180),
                     retry_policy=default_retry,
                 )
@@ -3372,9 +3520,14 @@ class IssueLifecycle:
         build_decision = await self._wait_for_signal(
             timedelta(hours=deadlines.build_decision_hours))
         if build_decision == "build-me":
+            # `root_issue=None, branch=None` явно: `_run_linear` старше
+            # ISSUE-113 (подзадачи плана и заранее вычисленная ветка) и своей
+            # ветки не считает. С обоими None активность внутри
+            # (`_dev_resolve_branch`) выводит `research/issue-{issue_number}`
+            # — ровно то же имя, что получалось здесь и раньше неявно.
             await workflow.execute_activity(
                 activities.trigger_openhands_resolver,
-                issue,
+                args=[issue, None, None],
                 start_to_close_timeout=timedelta(seconds=90),
                 # Одна попытка — по той же причине, что и на основном пути
                 # (`_start_development`): ретрай прогоняет агента заново.

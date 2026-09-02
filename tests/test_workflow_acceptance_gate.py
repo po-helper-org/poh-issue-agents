@@ -112,22 +112,32 @@ async def trigger_build(issue: IssueInput, root_issue: int | None = None,
 async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
 
 
-# `interpret_user_comment`/`ack_comment_seen` — подстраховка на случай, если в
+# `interpret_user_comment`/`post_followup_reply` — подстраховка на случай, если в
 # конкретном прогоне тестовой среды сигнал `issue_closed` будет применён
 # ПОЗЖЕ, чем прогон дойдёт до парковки `_phase_park` в `in-development` (после
 # того как разработка стартовала): тогда следующий, уже отвеченный или лишний
 # комментарий попадёт в общий путь `_phase_park`, а не в гейт (у гейта
 # указатель `self._open_question` к этому моменту уже пуст). Оба пути этого
 # файла не проверяют — активности здесь только не дают упасть на
-# незарегистрированной активности.
+# незарегистрированной активности либо на несовпадении сигнатуры (шестой
+# параметр `recent_artifacts` — та же история, что чинит
+# tests/test_activity_arg_types.py: воркфлоу обязан передавать его явно).
 @activity.defn(name="interpret_user_comment")
 async def interpret_ack(issue: IssueInput, comment_text: str, current_phase: str,
-                        classification_label, awaiting_reason) -> CommentIntent:
+                        classification_label, awaiting_reason,
+                        recent_artifacts=None) -> CommentIntent:
     return CommentIntent(intent="ack", reason="")
 
 
+# Ответ на intent="ack" публикует активность `post_followup_reply`
+# (Дефект 2 — `ack_comment_seen` для этого не подходит: она ставит только
+# реакцию `eyes` и принимает один `CommentAckInput`, а не текст ответа).
+@activity.defn(name="post_followup_reply")
+async def followup_reply_stub(repo: str, issue_number: int, message: str) -> None: ...
+
+
 @activity.defn(name="ack_comment_seen")
-async def ack_seen_stub(issue: IssueInput, reason: str = "") -> None: ...
+async def ack_seen_stub(ack) -> None: ...
 
 
 # --- заглушки задачи 8 ---
@@ -288,8 +298,8 @@ def _issue() -> IssueInput:
 _COMMON = [awaiting_stub, prefilter_ok, protocol_default, deadlines_stub,
            set_phase_stub, gate_ok, classify_bug, duplicate_none, score_p1,
            post_priority, escalate, trigger_build, dev_dispatch_stub,
-           interpret_ack, ack_seen_stub, options_stub, ask_stub, answer_accepted,
-           stall_reported]
+           interpret_ack, ack_seen_stub, followup_reply_stub, options_stub,
+           ask_stub, answer_accepted, stall_reported]
 
 # Тем же именем активности `report_criterion_gate_stall` в одном Worker'е
 # нельзя зарегистрировать дважды — тестам про отказ УВЕДОМЛЕНИЯ (находка 1)

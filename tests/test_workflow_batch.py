@@ -51,7 +51,12 @@ async def stub_gate_vague(issue, thread):
 
 
 @activity.defn(name="escalate_to_human")
-async def stub_escalate(issue):
+async def stub_escalate(issue, reason: str = ""):
+    # Сигнатура обязана совпадать с реальной активностью (`issue`, `reason`).
+    # Раньше воркфлоу звал её тоже одним аргументом — тем же багом, что чинит
+    # tests/test_activity_arg_types.py, — и заглушка с одним параметром это
+    # молча маскировала. После починки места вызова заглушка с усечённой
+    # сигнатурой падала бы `TypeError`, хотя проверяемое поведение не при чём.
     _state["escalated"] = True
 
 

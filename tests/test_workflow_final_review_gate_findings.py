@@ -102,14 +102,29 @@ async def trigger_build(issue: IssueInput, root_issue: int | None = None,
 async def dev_dispatch_stub(issue: IssueInput, branch: str) -> None: ...
 
 
+# Ревью (R2, `fix/activity-arg-types`): сигнатура отставала от реальной —
+# `interpret_user_comment` принимает ШЕСТЬ параметров (шестой,
+# `recent_artifacts`, чинит tests/test_activity_arg_types.py), а этот стаб
+# объявлял пять. Зеркалит правку из tests/test_workflow_acceptance_gate.py.
 @activity.defn(name="interpret_user_comment")
 async def interpret_ack(issue: IssueInput, comment_text: str, current_phase: str,
-                        classification_label, awaiting_reason) -> CommentIntent:
+                        classification_label, awaiting_reason,
+                        recent_artifacts=None) -> CommentIntent:
     return CommentIntent(intent="ack", reason="")
 
 
+# Ответ на intent="ack" (и прочие ветки `_handle_comment_intent`) публикует
+# активность `post_followup_reply` (Дефект 2) — `ack_comment_seen` для этого
+# не подходит: она лишь ставит реакцию `eyes` и принимает ОДИН датакласс
+# `CommentAckInput`, а не текст ответа. Стаб ниже зарегистрирован на случай,
+# если код всё же пойдёт старым путём (см. `post_followup_reply` ниже и
+# `_LEGACY_ELSE_EXEMPTIONS` в tests/test_activity_arg_types.py).
+@activity.defn(name="post_followup_reply")
+async def followup_reply_stub(repo: str, issue_number: int, message: str) -> None: ...
+
+
 @activity.defn(name="ack_comment_seen")
-async def ack_seen_stub(issue: IssueInput, reason: str = "") -> None: ...
+async def ack_seen_stub(ack) -> None: ...
 
 
 @activity.defn(name="propose_acceptance_options")
@@ -153,7 +168,7 @@ def _issue() -> IssueInput:
 _BASE = [awaiting_stub, prefilter_ok, protocol_default, set_phase_stub, gate_ok,
          classify_bug, duplicate_none, score_p1, post_priority, escalate,
          trigger_build, dev_dispatch_stub, interpret_ack, ack_seen_stub,
-         answer_followup_stub]
+         followup_reply_stub, answer_followup_stub]
 
 
 async def _await_calls(env, predicate, tries: int = 200) -> bool:

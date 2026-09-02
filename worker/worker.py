@@ -158,6 +158,7 @@ async def main() -> None:
             activities.report_question_close_failure,
             activities.post_error_label,
             activities.ack_comment_seen,
+            activities.post_followup_reply,
             activities.mark_analyzing,
             activities.mark_command_running,
             activities.finish_command_labels,
