@@ -3611,6 +3611,47 @@ async def dev_run_agent(issue: IssueInput) -> None:
     await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
 
 
+def _repair_brief(issue: IssueInput, own: list[str]) -> str:
+    """Постановка круга правок. ТОЛЬКО свои падения (B11)."""
+    listed = "\n".join(f"- `{name}`" for name in own)
+    return (
+        f"# Круг правок по Issue #{issue.issue_number}\n\n"
+        f"Твоя правка уже лежит в этом рабочем дереве — начинай с неё, не с нуля.\n\n"
+        f"После неё упали тесты, которых до правки не было:\n\n{listed}\n\n"
+        f"## Что нужно\n\n"
+        f"Почини **только эти** падения, не меняя решения задачи.\n\n"
+        f"Остальные красные тесты в наборе, если они есть, падали и без твоей "
+        f"правки — они не твои и трогать их не нужно.\n"
+    )
+
+
+def _dev_repair(issue: IssueInput, own: list[str]) -> str:
+    """Переписать постановку на починку и прогнать того же агента.
+
+    Постановка подменяется прямо в рабочем дереве: агент читает `.task.md`
+    (см. `_dev_prepare`), и другого входа у него нет. Файл служебный и
+    снимается перед коммитом (`develop.SERVICE_FILES`) — в PR он не уедет.
+    """
+    root, clone_dir = _dev_paths(issue)
+    (clone_dir / ".task.md").write_text(_repair_brief(issue, own), encoding="utf-8")
+    _write_signal(root, "repair_attempts", 1)
+    return _dev_run_agent(issue)
+
+
+@activity.defn
+async def dev_repair(issue: IssueInput, own: list[str]) -> None:
+    """Повторный заход агента: починить своё.
+
+    Отдельная активность, а не флаг у `dev_run_agent` (B12): свой шаг в
+    истории Temporal, свой таймаут и видимый факт, что контур пробовал
+    починить, а не сдался сразу.
+
+    Возврата нет по той же причине, что и у `dev_run_agent`: хвост вывода —
+    килобайты текста, им не место в истории воркфлоу.
+    """
+    await _run_with_heartbeat(_dev_repair, issue, own, label="dev:repair")
+
+
 @activity.defn
 async def dev_empty_run_reason(issue: IssueInput) -> str:
     """Почему прогон агента не дал изменений — по следам самого раннера.
