@@ -293,6 +293,20 @@ class DevelopPlan:
 
 
 @dataclass
+class Diagnosis:
+    """Разбор красного прогона тестов.
+
+    `parsed=False` — исход не разобран (отчёта нет, он битый, тестов ноль,
+    базовый прогон не состоялся). Тогда `own` и `foreign` пусты и смысла не
+    несут: решать по ним нельзя, контур обязан вести себя как прежде.
+    """
+    parsed: bool
+    baseline: list[str]
+    own: list[str]
+    foreign: list[str]
+
+
+@dataclass
 class BftRequest:
     """Вход воркфлоу БФТ. Один тип на оба режима — различает их поле `mode`.
 

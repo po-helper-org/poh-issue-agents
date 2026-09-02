@@ -148,7 +148,11 @@ def test_all_dev_steps_are_registered_activities():
                 # рабочим местом и стартом агента; отказ не роняет прогон.
                 activities_module.build_mvp_plan,
                 activities_module.dev_run_agent, activities_module.dev_followups,
-                activities_module.dev_tests, activities_module.dev_publish,
+                activities_module.dev_tests,
+                # Диагностика красного прогона: зовётся не по порядку, а из
+                # обработчика отказа тестов — регистрация нужна та же.
+                activities_module.dev_diagnose,
+                activities_module.dev_publish,
                 # Спасение работы сорвавшегося прогона: зовётся не по порядку,
                 # а из обработчика отказа — но регистрация нужна та же, и без
                 # неё дефект вылезет ровно там, где спасать уже нечем.
