@@ -3409,6 +3409,36 @@ async def dev_diagnose(issue: IssueInput,
         return Diagnosis(parsed=False, baseline=[], own=[], foreign=[])
 
 
+def _clear_test_reports(clone_dir: Path) -> list[str]:
+    """Снять отчёты о тестах из рабочего дерева перед коммитом.
+
+    Отчёт пишется в дерево самим прогоном тестов, а `publish_worktree`
+    забирает дерево целиком через `git add -A`. Без снятия отчёт уехал бы в PR
+    мусором и — хуже — обманул бы гвард «изменений нет, открывать нечего»:
+    прогон, где агент не тронул ни строки, всё равно открыл бы пул-реквест.
+    Ровно это уже случалось с постановкой `.task.md`.
+
+    Снимаются только НЕОТСЛЕЖИВАЕМЫЕ файлы: отчёт, лежащий в репозитории,
+    принадлежит ему, а не нашему прогону, и его удаление показалось бы в PR
+    правкой, которой никто не просил.
+    """
+    removed: list[str] = []
+    for path in test_report.find_reports(clone_dir, _test_report_patterns()):
+        rel = path.relative_to(clone_dir)
+        tracked = subprocess.run(
+            ["git", "-C", str(clone_dir), "ls-files", "--error-unmatch", str(rel)],
+            capture_output=True, text=True).returncode == 0
+        if tracked:
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("отчёт %s не снят: %s", rel, exc)
+            continue
+        removed.append(str(rel))
+    return removed
+
+
 def _dev_publish(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     """Коммит, пуш и PR — руками воркера, его токеном.
 
@@ -3429,6 +3459,10 @@ def _dev_publish(issue: IssueInput, branch: str, foreign: list[str]) -> int | No
     if removed:
         logger.info("Develop %s#%s: сняты служебные файлы: %s",
                     issue.repo, issue.issue_number, ", ".join(removed))
+    reports = _clear_test_reports(clone_dir)
+    if reports:
+        logger.info("Develop %s#%s: сняты отчёты о тестах: %s",
+                    issue.repo, issue.issue_number, ", ".join(reports))
     work = develop.work_branch(issue.issue_number)
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
@@ -3730,6 +3764,10 @@ def _dev_publish_partial(issue: IssueInput, branch: str, reason: str) -> int | N
     if removed:
         logger.info("Develop %s#%s: сняты служебные файлы: %s",
                     issue.repo, issue.issue_number, ", ".join(removed))
+    reports = _clear_test_reports(clone_dir)
+    if reports:
+        logger.info("Develop %s#%s: сняты отчёты о тестах: %s",
+                    issue.repo, issue.issue_number, ", ".join(reports))
     work = develop.work_branch(issue.issue_number)
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
