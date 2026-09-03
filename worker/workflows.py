@@ -208,8 +208,15 @@ async def _run_staged_analysis(analyze: AnalyzeInput) -> bool:
                 #
                 # Граница по типу: всё, что стадия поднимает сама, — RuntimeError.
                 # Таймауты и потеря воркера в этот тип не попадают.
+                # `RateLimited` (`shared/errors.py`) сюда не попадает: отказ
+                # провайдера по лимиту частоты — не сбой стадии, и повторять
+                # его нужно, но с отступом, а не сразу. Минута, три, девять:
+                # на #165 лимит держался около сорока минут, и повтор без
+                # ожидания просто сжёг бы попытки.
                 retry_policy=RetryPolicy(
-                    maximum_attempts=2,
+                    maximum_attempts=4,
+                    initial_interval=timedelta(seconds=60),
+                    backoff_coefficient=3.0,
                     non_retryable_error_types=["RuntimeError"],
                 ),
             )
@@ -384,6 +391,7 @@ class IssueLifecycle:
         self._phase_driven = False  # True — прогон идёт фазовым циклом
         self._priority_tier = ""
         self._classification_label: str | None = None
+        self._duplicate_of: int | None = None
         self._analysis_done = False
         # Задача — часть чужого плана: подзадача декомпозиции. Ни своей
         # декомпозиции, ни своей разработки у неё нет — и то и другое ведёт
@@ -1447,6 +1455,9 @@ class IssueLifecycle:
                 retry_policy=default_retry,
             )
             if dup.decision == "duplicate":
+                # Номер оригинала нужен позже: если человек подтвердит дубликат,
+                # закрывающий комментарий обязан на него сослаться.
+                self._duplicate_of = dup.best_match_number
                 return (lifecycle.DUPLICATE, "duplicate", True)
 
             self._stage = "priority"
@@ -3218,7 +3229,30 @@ class IssueLifecycle:
                             return (lifecycle.READY_FOR_DEV, "bug", True)
                 return (lifecycle.CLASSIFIED, "awaiting-human-decision", True)
             if signal == "confirm-duplicate":
-                # Подтвердить дубликат (переход в CANCELLED)
+                # Подтвердить дубликат (переход в CANCELLED).
+                #
+                # Фазы мало: она — состояние прогона, а не состояние Issue.
+                # Без закрытия задача остаётся в списке открытых и в очереди к
+                # людям, хотя решение по ней уже принято (#95).
+                #
+                # ПОД МАРКЕРОМ: новая команда в теле воркфлоу роняет
+                # недетерминизмом прогоны, начатые до выкладки, а задачи в
+                # ожидании решения человека живут неделями.
+                if (self._duplicate_of
+                        and workflow.patched("issue-lifecycle-close-confirmed-duplicate")):
+                    try:
+                        await workflow.execute_activity(
+                            activities.close_as_duplicate,
+                            args=[issue, self._duplicate_of],
+                            start_to_close_timeout=timedelta(seconds=60),
+                            retry_policy=RetryPolicy(maximum_attempts=3),
+                        )
+                    except Exception as exc:              # noqa: BLE001
+                        # Не закрыли — не повод ронять прогон: решение принято,
+                        # фаза его отражает, а незакрытый Issue человек закроет
+                        # руками. Обратное — потерянное решение.
+                        workflow.logger.warning(
+                            "дубликат не закрыт: %s", _failure_reason(exc))
                 return (lifecycle.CANCELLED, "cancelled", True)
         
         if signal != "reopen":

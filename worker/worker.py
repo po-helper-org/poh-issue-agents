@@ -169,6 +169,7 @@ async def main() -> None:
             activities.intake_gate,
             activities.post_clarifying_question,
             activities.close_as_spam,
+            activities.close_as_duplicate,
             activities.escalate_to_human,
             activities.ask_question,
             activities.answer_question,

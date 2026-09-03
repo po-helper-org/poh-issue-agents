@@ -31,6 +31,7 @@ import forge
 # другого.
 github_client = forge
 import llm
+from shared.errors import RateLimited
 from shared import (
     acceptance_proposal,
     answer_interpretation,
@@ -203,6 +204,22 @@ def post_clarifying_question(issue: IssueInput, questions: str) -> None:
 def close_as_spam(issue: IssueInput, reason: str) -> None:
     github_client.post_comment(issue.repo, issue.issue_number, f"🚫 Похоже на спам: {reason}")
     github_client.add_label(issue.repo, issue.issue_number, labels.SPAM)
+    github_client.close_issue(issue.repo, issue.issue_number)
+
+
+@activity.defn
+def close_as_duplicate(issue: IssueInput, original: int) -> None:
+    """Закрыть задачу как подтверждённый дубликат.
+
+    Фазы `cancelled` мало: она — состояние прогона, а не состояние Issue.
+    Без закрытия задача остаётся в списке открытых и в очереди к людям,
+    хотя решение по ней уже принято (#95).
+    """
+    github_client.post_comment(
+        issue.repo, issue.issue_number,
+        f"🔁 Закрываю как дубликат #{original} — решение подтверждено человеком.\n\n"
+        f"Обсуждение продолжается в #{original}.")
+    github_client.add_label(issue.repo, issue.issue_number, labels.DUPLICATE)
     github_client.close_issue(issue.repo, issue.issue_number)
 
 
@@ -1611,6 +1628,10 @@ def interpret_user_comment(issue: IssueInput, comment_text: str, current_phase: 
 def duplicate_check(issue: IssueInput) -> DuplicateResult:
     candidates = github_client.search_candidates(issue.repo, issue.title)
     candidates = [c for c in candidates if c["number"] != issue.issue_number]
+    # Дубликат ЗАКРЫТОЙ задачи — не повод отменять новую: закрытая могла быть
+    # отклонена, устареть или быть решена иначе. Отмена по ней молча теряет
+    # запрос, а восстановить его будет некому — задача уже в `cancelled`.
+    candidates = [c for c in candidates if (c.get("state") or "open") == "open"]
     if not candidates:
         return DuplicateResult(decision="none", best_match_number=None, probability=0.0, reason="", context_branch=None)
 
@@ -1919,6 +1940,20 @@ def _claude_anthropic_creds() -> tuple[str, str]:
     return token, base
 
 
+_RATE_LIMIT_MARKERS = ("429", "rate limit", "rate_limit", "too many requests")
+
+
+def _is_rate_limited(detail: str) -> bool:
+    """Отказ провайдера по лимиту частоты, а не сбой стадии.
+
+    Разбор текста, а не кода возврата: `claude -p` отдаёт единицу на всё сразу,
+    а лимит виден только в выводе. Маркеры взяты с живого прогона #165:
+    `API Error: Request rejected (429)` и `[1302][Rate limit reached for requests]`.
+    """
+    low = detail.lower()
+    return any(m in low for m in _RATE_LIMIT_MARKERS)
+
+
 def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None) -> None:
     """Одна стадия FNR — отдельный процесс `claude -p` с чистым контекстом.
 
@@ -1964,6 +1999,14 @@ def _run_claude(prompt: str, cwd: str, mcp_config: str | None = None) -> None:
         # claude-code часто пишет диагностику в stdout, а не stderr — берём оба
         # (stderr приоритетнее), иначе сообщение об ошибке оказывается пустым.
         detail = result.stderr.strip() or result.stdout.strip() or "(пустой вывод)"
+        if _is_rate_limited(detail):
+            # Лимит частоты провайдера — не отказ стадии: к качеству прогона он
+            # отношения не имеет. Тип отдельный, потому что `RuntimeError`
+            # объявлен неретраебельным (прогон недетерминирован и стоит денег),
+            # и на #165 это правило списало сорок пять минут работы и пять
+            # готовых стадий из шести.
+            raise RateLimited(
+                f"провайдер модели отказал по лимиту частоты: {detail[-1500:]}")
         raise RuntimeError(f"claude -p exit {result.returncode}: {detail[-1500:]}")
 
 
