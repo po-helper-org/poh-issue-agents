@@ -63,7 +63,10 @@ async def test_foreign_redness_is_not_charged_to_the_agent(monkeypatch, tmp_path
 
     assert d.parsed is True, "отчёт обязан разобраться на настоящем прогоне"
     assert d.own == [], "агент не трогал красный тест — поломка не его"
-    assert d.foreign == ["tests/a.test.mjs::чужой красный"]
+    # Ключ кончается именем теста; префикс зависит от того, пишет ли раннер
+    # атрибут `file` — старые Node его не пишут, и тогда остаётся `classname`.
+    # Проверяем инвариант «опознан тот самый тест», а не форму ключа.
+    assert [k.split("::")[-1] for k in d.foreign] == ["чужой красный"]
 
 
 async def test_the_agents_work_survives_the_diagnosis(monkeypatch, tmp_path):
@@ -106,5 +109,5 @@ async def test_a_breakage_the_agent_introduced_is_ours(monkeypatch, tmp_path):
 
     d = await a.dev_diagnose(_issue(), None)
 
-    assert d.own == ["tests/a.test.mjs::зелёный"]
-    assert d.foreign == ["tests/a.test.mjs::чужой красный"]
+    assert [k.split("::")[-1] for k in d.own] == ["зелёный"]
+    assert [k.split("::")[-1] for k in d.foreign] == ["чужой красный"]

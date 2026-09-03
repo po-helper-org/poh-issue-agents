@@ -3324,6 +3324,32 @@ def _dev_tests(issue: IssueInput) -> str:
     return out
 
 
+def _dev_git(clone_dir: Path):
+    """git по рабочему дереву задачи, от лица воркера.
+
+    Каталог задачи передан раннеру (uid 10001), а воркер работает от root.
+    Голый `git` отвечает на это `fatal: detected dubious ownership` и
+    отказывается работать — так на живом прогоне #169 упала диагностика
+    красного прогона, и круг правок не состоялся вовсе. `safe.directory`
+    объявляет каталог доверенным для конкретной команды, не трогая глобальный
+    конфиг; тот же приём используется при публикации (`github_client`).
+    """
+    env = {**os.environ,
+           "GIT_CONFIG_COUNT": "1",
+           "GIT_CONFIG_KEY_0": "safe.directory",
+           "GIT_CONFIG_VALUE_0": "*"}
+
+    def git(*args: str, check: bool = True):
+        proc = subprocess.run(["git", "-C", str(clone_dir), *args], env=env,
+                              capture_output=True, text=True, timeout=300)
+        if check and proc.returncode:
+            detail = (proc.stderr or proc.stdout or "").strip()[:500]
+            raise RuntimeError(f"git {' '.join(args)} → код {proc.returncode}: {detail}")
+        return proc
+
+    return git
+
+
 def _test_report_patterns() -> tuple[str, ...]:
     """Где искать отчёт. Пусто в конфиге — обычные места (B5)."""
     raw = os.environ.get("DEVELOP_TEST_REPORT", "").strip()
@@ -3365,11 +3391,9 @@ def _dev_baseline_failures(issue: IssueInput) -> set[str] | None:
     root, clone_dir = _dev_paths(issue)
     base_tree = root / "baseline"
     shutil.rmtree(base_tree, ignore_errors=True)
-    head = subprocess.run(["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
-                          check=True, capture_output=True, text=True).stdout.strip()
-    subprocess.run(["git", "-C", str(clone_dir), "worktree", "add", "--detach",
-                    str(base_tree), head],
-                   check=True, capture_output=True, text=True)
+    git = _dev_git(clone_dir)
+    head = git("rev-parse", "HEAD").stdout.strip()
+    git("worktree", "add", "--detach", str(base_tree), head)
     try:
         _run_test_command(base_tree)
         return test_report.failed_tests(base_tree, _test_report_patterns())
@@ -3377,9 +3401,7 @@ def _dev_baseline_failures(issue: IssueInput) -> set[str] | None:
         # Дерево снимается всегда: оно живёт в общем томе с раннером, а тот
         # ограничен по месту. Осиротевшая регистрация worktree к тому же
         # ломает следующий `worktree add` в тот же путь.
-        subprocess.run(["git", "-C", str(clone_dir), "worktree", "remove",
-                        "--force", str(base_tree)],
-                       capture_output=True, text=True)
+        git("worktree", "remove", "--force", str(base_tree), check=False)
 
 
 def _dev_rerun_failures(issue: IssueInput) -> set[str] | None:
@@ -3468,9 +3490,8 @@ def _clear_test_reports(clone_dir: Path) -> list[str]:
     removed: list[str] = []
     for path in test_report.find_reports(clone_dir, _test_report_patterns()):
         rel = path.relative_to(clone_dir)
-        tracked = subprocess.run(
-            ["git", "-C", str(clone_dir), "ls-files", "--error-unmatch", str(rel)],
-            capture_output=True, text=True).returncode == 0
+        tracked = _dev_git(clone_dir)(
+            "ls-files", "--error-unmatch", str(rel), check=False).returncode == 0
         if tracked:
             continue
         try:
