@@ -3659,14 +3659,115 @@ class IssueDevelopment:
                 start_to_close_timeout=timedelta(seconds=300),
                 retry_policy=cheap,
             )
-            await workflow.execute_activity(
-                activities.dev_tests, issue,
-                start_to_close_timeout=timedelta(seconds=1800),
-                heartbeat_timeout=timedelta(seconds=300),
-                retry_policy=once,
-            )
+            foreign: list[str] = []
+            try:
+                await workflow.execute_activity(
+                    activities.dev_tests, issue,
+                    start_to_close_timeout=timedelta(seconds=1800),
+                    heartbeat_timeout=timedelta(seconds=300),
+                    retry_policy=once,
+                )
+            except Exception as tests_exc:                 # noqa: BLE001
+                # Красный прогон — ещё не приговор: тесты могли падать и без
+                # правки агента. Ровно это случилось на #166 и #167, где `main`
+                # был красный из-за истёкшего промокода, а прогон списали в
+                # отказ вместе с работой агента.
+                #
+                # ПОД МАРКЕРОМ: новые команды в теле воркфлоу роняют
+                # недетерминизмом прогоны, начатые до выкладки.
+                if not workflow.patched("issue-development-repair-loop"):
+                    raise
+                # Причина, которая уйдёт наружу, если разобрать не выйдет.
+                # Обновляется отказом повторного прогона: человеку нужен
+                # свежий список падений, а не доремонтный.
+                last_exc: BaseException = tests_exc
+                try:
+                    diagnosis = await workflow.execute_activity(
+                        activities.dev_diagnose, args=[issue, None],
+                        start_to_close_timeout=timedelta(seconds=3900),
+                        heartbeat_timeout=timedelta(seconds=300),
+                        retry_policy=once,
+                    )
+                except Exception as diag_exc:              # noqa: BLE001
+                    # Диагностика объясняет отказ тестов, а не заменяет его.
+                    # Сама активность свои сбои гасит, но отказ ВЫЗОВА (нет
+                    # активности на воркере, таймаут, срыв воркера) приходит
+                    # уровнем выше — и без этой ветки наружу уходил бы он, а
+                    # исходная причина исчезала. Этот класс подмены в контуре
+                    # уже случался.
+                    workflow.logger.warning(
+                        "диагностика красного прогона не состоялась: %s",
+                        _failure_reason(diag_exc))
+                    raise tests_exc
+                if not diagnosis.parsed:
+                    # Об исходе не известно ничего — решать по нему нельзя.
+                    raise
+                # Заходов ровно `plan.repair_rounds` (умолчание 1). Число
+                # приходит из активности, а не из окружения: решение воркфлоу
+                # обязано быть детерминированным при реплее, и прочитанное
+                # прямо здесь `os.environ` дало бы разное значение до и после
+                # правки переменной — см. докстринг `DevelopPlan`.
+                rounds = 0
+                while diagnosis.own and rounds < plan.repair_rounds:
+                    rounds += 1
+                    await workflow.execute_activity(
+                        activities.dev_announce_repair,
+                        args=[issue, diagnosis.own],
+                        start_to_close_timeout=timedelta(seconds=60),
+                        retry_policy=cheap,
+                    )
+                    await workflow.execute_activity(
+                        activities.dev_repair, args=[issue, diagnosis.own],
+                        start_to_close_timeout=timedelta(seconds=3600),
+                        heartbeat_timeout=timedelta(seconds=300),
+                        retry_policy=once,
+                    )
+                    # Повторный прогон НЕ роняет ветку своим отказом: при
+                    # чужой красноте он красный всегда, и падение наружу
+                    # означало бы, что починку невозможно признать удавшейся
+                    # ни в одном репозитории, где набор красен не по вине
+                    # агента, — то есть ровно там, ради чего всё это писалось.
+                    # Решает диагноз ниже, а не код возврата.
+                    try:
+                        await workflow.execute_activity(
+                            activities.dev_tests, issue,
+                            start_to_close_timeout=timedelta(seconds=1800),
+                            heartbeat_timeout=timedelta(seconds=300),
+                            retry_policy=once,
+                        )
+                    except Exception as retry_exc:         # noqa: BLE001
+                        # Наружу пойдёт СВЕЖИЙ отказ, а не доремонтный:
+                        # прежний перечисляет падения, часть которых уже
+                        # починена, и человек читал бы неправду.
+                        last_exc = retry_exc
+                    # База та же: базовый коммит не менялся, а лишний прогон
+                    # набора стоит времени. Мигание не перепроверяем — эти
+                    # тесты уже подтверждены дважды.
+                    try:
+                        diagnosis = await workflow.execute_activity(
+                            activities.dev_diagnose,
+                            args=[issue, diagnosis.baseline],
+                            start_to_close_timeout=timedelta(seconds=1900),
+                            heartbeat_timeout=timedelta(seconds=300),
+                            retry_policy=once,
+                        )
+                    except Exception as diag_exc:          # noqa: BLE001
+                        workflow.logger.warning(
+                            "диагностика после починки не состоялась: %s",
+                            _failure_reason(diag_exc))
+                        raise last_exc
+                    if not diagnosis.parsed:
+                        # Об исходе повторного прогона не известно ничего.
+                        raise last_exc
+                if diagnosis.own:
+                    # Заходы кончились, свои падения остались — человек.
+                    workflow.logger.warning(
+                        "починка не удалась, осталось своих падений: %s",
+                        len(diagnosis.own))
+                    raise last_exc
+                foreign = diagnosis.foreign
             number = await workflow.execute_activity(
-                activities.dev_publish, args=[issue, plan.branch],
+                activities.dev_publish, args=[issue, plan.branch, foreign],
                 start_to_close_timeout=timedelta(seconds=600),
                 heartbeat_timeout=timedelta(seconds=300),
                 retry_policy=cheap,

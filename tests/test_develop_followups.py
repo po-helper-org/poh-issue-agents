@@ -369,7 +369,7 @@ def test_task_statement_is_not_committed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(activities_module.github_client, "publish_worktree", fake_publish)
 
-    number = activities_module._dev_publish(_issue(19), "research/issue-19")
+    number = activities_module._dev_publish(_issue(19), "research/issue-19", [])
 
     assert number == 28
     assert captured["task_md_exists"] is False, "постановка уехала в коммит"

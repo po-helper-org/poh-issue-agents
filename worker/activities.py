@@ -46,6 +46,7 @@ from shared import (
     questions,
     repowise,
     sentry_setup,
+    test_report,
     task_context,
 )
 from shared.awaiting import Awaiting
@@ -68,6 +69,7 @@ from shared.workflow_types import (
     CommentIntent,
     Deadlines,
     DevelopPlan,
+    Diagnosis,
     DuplicateResult,
     EstimateRequest,
     EstimateResult,
@@ -3279,7 +3281,165 @@ def _dev_tests(issue: IssueInput) -> str:
     return out
 
 
-def _dev_publish(issue: IssueInput, branch: str) -> int | None:
+def _test_report_patterns() -> tuple[str, ...]:
+    """Где искать отчёт. Пусто в конфиге — обычные места (B5)."""
+    raw = os.environ.get("DEVELOP_TEST_REPORT", "").strip()
+    if not raw:
+        return test_report.DEFAULT_PATTERNS
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+def _run_test_command(cwd: Path) -> int:
+    """Прогон проверок в указанном дереве. Возвращает код, не бросает.
+
+    Используется базовой линией и перепроверкой на мигание: там красный код —
+    это ИСХОД, а не отказ шага.
+    """
+    command = os.environ.get("DEVELOP_TEST_COMMAND", "").strip()
+    result = subprocess.run(command, shell=True, cwd=str(cwd),
+                            capture_output=True, text=True,
+                            timeout=DEV_TESTS_TIMEOUT_SEC)
+    return result.returncode
+
+
+def _dev_last_failures(issue: IssueInput) -> set[str] | None:
+    """Что упало в ИТОГОВОМ прогоне — отчёт уже написан `dev_tests`."""
+    _, clone_dir = _dev_paths(issue)
+    return test_report.failed_tests(clone_dir, _test_report_patterns())
+
+
+def _dev_baseline_failures(issue: IssueInput) -> set[str] | None:
+    """Что падало БЕЗ правки агента — на отдельном чистом дереве.
+
+    Отдельное дерево, а НЕ `git stash` (B2): сорванный `stash pop` уничтожает
+    работу агента — ровно то, что контур научился спасать черновиком. Механизм
+    проверки не имеет права уничтожать то, что проверяет.
+
+    Дерево не несёт установленных зависимостей, и там, где тесты без них не
+    идут, прогон закономерно упадёт. Это штатный откат к прежнему поведению
+    (B16), а не дефект: исход просто окажется неразобранным.
+    """
+    root, clone_dir = _dev_paths(issue)
+    base_tree = root / "baseline"
+    shutil.rmtree(base_tree, ignore_errors=True)
+    head = subprocess.run(["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "-C", str(clone_dir), "worktree", "add", "--detach",
+                    str(base_tree), head],
+                   check=True, capture_output=True, text=True)
+    try:
+        _run_test_command(base_tree)
+        return test_report.failed_tests(base_tree, _test_report_patterns())
+    finally:
+        # Дерево снимается всегда: оно живёт в общем томе с раннером, а тот
+        # ограничен по месту. Осиротевшая регистрация worktree к тому же
+        # ломает следующий `worktree add` в тот же путь.
+        subprocess.run(["git", "-C", str(clone_dir), "worktree", "remove",
+                        "--force", str(base_tree)],
+                       capture_output=True, text=True)
+
+
+def _dev_rerun_failures(issue: IssueInput) -> set[str] | None:
+    """Повтор набора на дереве агента — проверка на мигание (B6).
+
+    Перегоняется ВЕСЬ набор, а не подозрительные тесты поимённо (B7): выбор
+    отдельных требует синтаксиса конкретного раннера — той самой привязки, от
+    которой уходит разбор отчёта.
+    """
+    _, clone_dir = _dev_paths(issue)
+    _run_test_command(clone_dir)
+    return test_report.failed_tests(clone_dir, _test_report_patterns())
+
+
+def _diagnose(issue: IssueInput, baseline: list[str] | None) -> Diagnosis:
+    root, _ = _dev_paths(issue)
+    unparsed = Diagnosis(parsed=False, baseline=[], own=[], foreign=[])
+
+    after = _dev_last_failures(issue)
+    if after is None:
+        return unparsed
+
+    if baseline is None:
+        base = _dev_baseline_failures(issue)
+        if base is None:
+            return unparsed
+        # Мигающий тест падает в итоговом прогоне и не падает в повторном.
+        # Своим считаем только устойчивое падение.
+        again = _dev_rerun_failures(issue)
+        if again is None:
+            return unparsed
+        after = after & again
+    else:
+        base = set(baseline)
+
+    own = sorted(after - base)
+    foreign = sorted(after & base)
+
+    # `tests_passed` — про СВОИ поломки (B22): иначе слой саморефлексии считает
+    # неудачей чистую работу в красном репозитории и учится на шуме.
+    _write_signal(root, "tests_passed", not own)
+    _write_signal(root, "tests_red_before", bool(base))
+    # Смысл сигнала сменился — ряд разорван (B23). Без признака версии свёртка
+    # усреднит несравнимое: до выкладки писали «набор зелёный», после —
+    # «агент не сломал своего».
+    _write_signal(root, "tests_signal_version", 2)
+
+    return Diagnosis(parsed=True, baseline=sorted(base), own=own, foreign=foreign)
+
+
+@activity.defn
+async def dev_diagnose(issue: IssueInput,
+                       baseline: list[str] | None) -> Diagnosis:
+    """Чьи это поломки — агента или репозитория.
+
+    `baseline=None` — снять базовую линию и перепроверить на мигание.
+    Непустой список — база уже известна (повтор после починки, B13): её не
+    снимают заново и на мигание не перепроверяют (B8).
+
+    Диагностика НЕ имеет права ронять прогон: она объясняет отказ тестов, а
+    не заменяет его. Любой свой сбой — неразобранный исход, то есть прежнее
+    поведение контура.
+    """
+    try:
+        return await _run_with_heartbeat(_diagnose, issue, baseline,
+                                         label="dev:diagnose")
+    except Exception as exc:  # noqa: BLE001 — см. докстринг
+        activity.logger.warning("Develop %s#%s: диагностика не удалась: %s",
+                                issue.repo, issue.issue_number, exc)
+        return Diagnosis(parsed=False, baseline=[], own=[], foreign=[])
+
+
+def _clear_test_reports(clone_dir: Path) -> list[str]:
+    """Снять отчёты о тестах из рабочего дерева перед коммитом.
+
+    Отчёт пишется в дерево самим прогоном тестов, а `publish_worktree`
+    забирает дерево целиком через `git add -A`. Без снятия отчёт уехал бы в PR
+    мусором и — хуже — обманул бы гвард «изменений нет, открывать нечего»:
+    прогон, где агент не тронул ни строки, всё равно открыл бы пул-реквест.
+    Ровно это уже случалось с постановкой `.task.md`.
+
+    Снимаются только НЕОТСЛЕЖИВАЕМЫЕ файлы: отчёт, лежащий в репозитории,
+    принадлежит ему, а не нашему прогону, и его удаление показалось бы в PR
+    правкой, которой никто не просил.
+    """
+    removed: list[str] = []
+    for path in test_report.find_reports(clone_dir, _test_report_patterns()):
+        rel = path.relative_to(clone_dir)
+        tracked = subprocess.run(
+            ["git", "-C", str(clone_dir), "ls-files", "--error-unmatch", str(rel)],
+            capture_output=True, text=True).returncode == 0
+        if tracked:
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("отчёт %s не снят: %s", rel, exc)
+            continue
+        removed.append(str(rel))
+    return removed
+
+
+def _dev_publish(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     """Коммит, пуш и PR — руками воркера, его токеном.
 
     Агенту токен не давали намеренно; здесь он уже не нужен агенту, а нужен
@@ -3299,11 +3459,15 @@ def _dev_publish(issue: IssueInput, branch: str) -> int | None:
     if removed:
         logger.info("Develop %s#%s: сняты служебные файлы: %s",
                     issue.repo, issue.issue_number, ", ".join(removed))
+    reports = _clear_test_reports(clone_dir)
+    if reports:
+        logger.info("Develop %s#%s: сняты отчёты о тестах: %s",
+                    issue.repo, issue.issue_number, ", ".join(reports))
     work = develop.work_branch(issue.issue_number)
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
         title=f"feat(#{issue.issue_number}): {issue.title}",
-        body=develop.pr_body(issue.issue_number, branch=branch),
+        body=develop.pr_body(issue.issue_number, branch=branch, foreign=foreign),
         message=f"feat(#{issue.issue_number}): реализация по системным требованиям",
         # `.harness/` — единственный служебный каталог, что НЕ снимается
         # (задача 7: контекст обязан дойти до PR). Он пишется в `_dev_prepare`
@@ -3401,7 +3565,11 @@ async def trigger_openhands_resolver(issue: IssueInput, root_issue: int | None =
     # а на следующем круге правок агент прочитает свои прошлые находки как новые.
     await collect_dev_followups(issue)
     await _run_with_heartbeat(_dev_tests, issue, label="dev:tests")
-    number = await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+    # Монолитный путь диагноза красного прогона не делает — тесты здесь
+    # либо зелёные, либо шаг уже упал. Чужой красноты, о которой стоило бы
+    # оговориться в теле PR, взяться неоткуда.
+    number = await _run_with_heartbeat(_dev_publish, issue, branch, [],
+                                       label="dev:publish")
 
     if number is None:
         task, _clone = _dev_paths(issue)
@@ -3431,7 +3599,10 @@ async def dev_begin(issue: IssueInput) -> DevelopPlan:
     стадию одной строкой в истории.
     """
     branch = await _dev_resolve_branch(issue)
-    return DevelopPlan(mode=develop.mode(), branch=branch)
+    return DevelopPlan(
+        mode=develop.mode(), branch=branch,
+        repair_rounds=max(0, int(os.environ.get("DEVELOP_REPAIR_ROUNDS", "1") or 1)),
+    )
 
 
 @activity.defn
@@ -3481,6 +3652,71 @@ async def dev_run_agent(issue: IssueInput) -> None:
     await _run_with_heartbeat(_dev_run_agent, issue, label="dev:agent")
 
 
+def _repair_brief(issue: IssueInput, own: list[str]) -> str:
+    """Постановка круга правок. ТОЛЬКО свои падения (B11)."""
+    listed = "\n".join(f"- `{name}`" for name in own)
+    return (
+        f"# Круг правок по Issue #{issue.issue_number}\n\n"
+        f"Твоя правка уже лежит в этом рабочем дереве — начинай с неё, не с нуля.\n\n"
+        f"После неё упали тесты, которых до правки не было:\n\n{listed}\n\n"
+        f"## Что нужно\n\n"
+        f"Почини **только эти** падения, не меняя решения задачи.\n\n"
+        f"Остальные красные тесты в наборе, если они есть, падали и без твоей "
+        f"правки — они не твои и трогать их не нужно.\n"
+    )
+
+
+def _dev_repair(issue: IssueInput, own: list[str]) -> str:
+    """Переписать постановку на починку и прогнать того же агента.
+
+    Постановка подменяется прямо в рабочем дереве: агент читает `.task.md`
+    (см. `_dev_prepare`), и другого входа у него нет. Файл служебный и
+    снимается перед коммитом (`develop.SERVICE_FILES`) — в PR он не уедет.
+    """
+    root, clone_dir = _dev_paths(issue)
+    (clone_dir / ".task.md").write_text(_repair_brief(issue, own), encoding="utf-8")
+    _write_signal(root, "repair_attempts", 1)
+    return _dev_run_agent(issue)
+
+
+@activity.defn
+async def dev_repair(issue: IssueInput, own: list[str]) -> None:
+    """Повторный заход агента: починить своё.
+
+    Отдельная активность, а не флаг у `dev_run_agent` (B12): свой шаг в
+    истории Temporal, свой таймаут и видимый факт, что контур пробовал
+    починить, а не сдался сразу.
+
+    Возврата нет по той же причине, что и у `dev_run_agent`: хвост вывода —
+    килобайты текста, им не место в истории воркфлоу.
+    """
+    await _run_with_heartbeat(_dev_repair, issue, own, label="dev:repair")
+
+
+@activity.defn
+async def dev_announce_repair(issue: IssueInput, own: list[str]) -> None:
+    """Сказать в ленте, что контур чинит своё и что именно.
+
+    Молчащий контур, который внутри себя делает второй дорогой заход
+    (агент идёт до 45 минут), неотличим от зависшего.
+
+    Сообщение не имеет права сорвать починку: отказ гасится здесь.
+    """
+    listed = "\n".join(f"- `{name}`" for name in own)
+    try:
+        await asyncio.to_thread(
+            github_client.post_comment, issue.repo, issue.issue_number,
+            f"## 🔁 Чиню своё\n\n"
+            f"После правки упали тесты, которых до неё не было:\n\n{listed}\n\n"
+            f"Отправляю агента на повторный заход — он правит только эти "
+            f"падения. Остальные красные тесты в наборе, если они есть, "
+            f"падали и без правки.\n\n"
+            f"Заход один: не починит — отдам задачу человеку.")
+    except Exception as exc:  # noqa: BLE001 — см. докстринг
+        activity.logger.warning("Develop %s#%s: о починке не сообщено: %s",
+                                issue.repo, issue.issue_number, exc)
+
+
 @activity.defn
 async def dev_empty_run_reason(issue: IssueInput) -> str:
     """Почему прогон агента не дал изменений — по следам самого раннера.
@@ -3528,6 +3764,10 @@ def _dev_publish_partial(issue: IssueInput, branch: str, reason: str) -> int | N
     if removed:
         logger.info("Develop %s#%s: сняты служебные файлы: %s",
                     issue.repo, issue.issue_number, ", ".join(removed))
+    reports = _clear_test_reports(clone_dir)
+    if reports:
+        logger.info("Develop %s#%s: сняты отчёты о тестах: %s",
+                    issue.repo, issue.issue_number, ", ".join(reports))
     work = develop.work_branch(issue.issue_number)
     return github_client.publish_worktree(
         issue.repo, str(clone_dir), work,
@@ -3588,13 +3828,19 @@ async def dev_publish_partial(issue: IssueInput, branch: str,
 
 
 @activity.defn
-async def dev_publish(issue: IssueInput, branch: str) -> int | None:
+async def dev_publish(issue: IssueInput, branch: str,
+                      foreign: list[str]) -> int | None:
     """Шаг 6: коммит, пуш и PR — руками воркера, его токеном.
 
     `None` — агент не изменил ни одного файла. Это не сбой шага, а его
     результат; решение, что делать с пустым прогоном, принимает воркфлоу.
+
+    `foreign` — тесты, красные и без правки агента. Уходят оговоркой в тело
+    PR: красный набор без объяснения смотрящий примет за поломку агента и
+    пойдёт разбирать его правку.
     """
-    return await _run_with_heartbeat(_dev_publish, issue, branch, label="dev:publish")
+    return await _run_with_heartbeat(_dev_publish, issue, branch, foreign,
+                                     label="dev:publish")
 
 
 @activity.defn

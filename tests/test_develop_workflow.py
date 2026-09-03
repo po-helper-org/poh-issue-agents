@@ -94,13 +94,13 @@ async def checks_fail_once(issue: IssueInput) -> None:
 
 
 @activity.defn(name="dev_publish")
-async def publish_ok(issue: IssueInput, branch: str) -> int | None:
+async def publish_ok(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     _calls.append("publish")
     return 101
 
 
 @activity.defn(name="dev_publish")
-async def publish_flaky(issue: IssueInput, branch: str) -> int | None:
+async def publish_flaky(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     """Публикация срывается дважды и удаётся с третьей — случай прогона #39."""
     global _fail_publish_times
     _calls.append("publish")
@@ -111,7 +111,7 @@ async def publish_flaky(issue: IssueInput, branch: str) -> int | None:
 
 
 @activity.defn(name="dev_publish")
-async def publish_empty(issue: IssueInput, branch: str) -> int | None:
+async def publish_empty(issue: IssueInput, branch: str, foreign: list[str]) -> int | None:
     _calls.append("publish")
     return None
 
