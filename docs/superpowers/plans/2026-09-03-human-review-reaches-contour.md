@@ -407,13 +407,13 @@ async def _dispatch_agent_event(client, event) -> dict:
         if event is None:
             return {"ok": True}
         number = int(event.ref) if event.ref.isdigit() else 0
-        if not _may_trigger_expensive(payload, event.repo, number, "круг правок"):
+        if not _may_start_expensive(payload, "круг правок", event.repo, number):
             return {"ok": True}
         return await _dispatch_agent_event(client, event)
 ```
 
-Имя проверки allowlist (`_may_trigger_expensive` выше) сверь с тем, как она
-называется в файле, — используй существующую, новой не заводи.
+Проверка allowlist — существующая `_may_start_expensive(payload, what, repo,
+issue_number)` (`webhook/main.py:195`); новой не заводи.
 
 - [ ] **Step 5: Прогнать и убедиться, что прошло**
 
