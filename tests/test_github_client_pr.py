@@ -549,7 +549,12 @@ def test_publish_stops_before_push_when_missing_from_tree_reports_a_gap(monkeypa
 
     monkeypatch.setattr(gc, "_dry_run", lambda: False)
     monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
-    monkeypatch.setattr(gc, "_missing_from_tree", lambda git, paths: [".harness"])
+    # Подменяем там, где проверка ЖИВЁТ: git-механика вынесена в
+    # `worker/worktree.py` и общая с GitLab. Подмена по прежнему адресу
+    # (`gc._missing_from_tree` — реэкспорт) молча не сработала бы, и тест
+    # проверял бы не отказ, а его отсутствие.
+    import worktree
+    monkeypatch.setattr(worktree, "_missing_from_tree", lambda git, paths: [".harness"])
     monkeypatch.setattr(gc.requests, "post", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("PR не должен запрашиваться после отказа")))
 

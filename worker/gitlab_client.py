@@ -28,6 +28,8 @@ import urllib.parse
 
 import requests
 
+import worktree
+
 from shared.agent_comment import is_agent_comment, sign
 
 _log = logging.getLogger("gitlab_client")
@@ -422,6 +424,59 @@ def open_change_request(repo: str, *, source: str, target: str | None = None,
     return _mr(resp.json())
 
 
+def blob_base(repo: str, branch: str) -> str:
+    """Префикс ссылки на файл в ветке — для комментариев в Issue.
+
+    У GitLab между проектом и `blob` стоит `/-/`: без него адрес неотличим от
+    пути к подгруппе и отдаёт 404.
+    """
+    host = BASE.rsplit("/api/v4", 1)[0]
+    return f"{host}/{str(repo).strip('/')}/-/blob/{branch}"
+
+
+def publish_worktree(repo: str, clone_dir: str, branch: str, *,
+                     title: str, body: str, message: str,
+                     ignore_for_empty_check: tuple[str, ...] = (),
+                     force_include: tuple[str, ...] = (),
+                     draft: bool = False) -> int | None:
+    """Коммит рабочего дерева в ветку и MR. None — изменений нет.
+
+    Парная к `github_client.publish_worktree`: git-механика у них общая
+    (`worker/worktree.py`), различаются только имя пользователя для
+    credential-хелпера (`oauth2` против `x-access-token`), почта коммиттера и
+    то, чем открывается запрос на изменения.
+
+    Существует потому, что диспетчер `forge` резолвит метод по репозиторию, и
+    без этой функции стадия разработки на GitLab-репозитории падала
+    `NotImplementedError: gitlab-клиент не умеет «publish_worktree»` — то есть
+    громко и честно, но до MR не доходила вовсе.
+
+    Черновик у GitLab задаётся ПРЕФИКСОМ заголовка, а не полем запроса: поля
+    `draft` у POST /merge_requests нет, и `Draft:` — единственный
+    задокументированный способ. Префикс не дублируется, если заголовок его уже
+    несёт: повторный прогон сорванной разработки иначе накапливал бы
+    `Draft: Draft: …`.
+    """
+    if _dry_run():
+        _log.info("[DRY_RUN] publish %s -> %s: %s", clone_dir, branch, title)
+        return None
+
+    if not worktree.commit_and_push(
+            repo, clone_dir, branch, message=message,
+            credentials=git_credentials(repo),
+            committer_email="openhands-agent@users.noreply.gitlab.com",
+            ignore_for_empty_check=ignore_for_empty_check,
+            force_include=force_include):
+        return None
+
+    if draft and not title.lstrip().lower().startswith("draft:"):
+        title = f"Draft: {title}"
+
+    # Повторный прогон по той же ветке не плодит второй MR: `open_change_request`
+    # сначала ищет существующий и возвращает его (`find_change_request`).
+    return open_change_request(repo, source=branch, title=title, body=body)["number"]
+
+
 def list_linked_prs(repo: str, issue_number: int) -> list[dict]:
     """MR, связанные с задачей.
 
@@ -477,6 +532,15 @@ def auth_token(repo: str = "") -> str:
     return _token()
 
 
+def git_username(repo: str = "") -> str:
+    """Имя пользователя для credential helper. Парная к `github_client`.
+
+    Отдельно от токена: имя — константа провайдера, добывается без обращения
+    к настройкам, а `_token()` без `GITLAB_TOKEN` бросает.
+    """
+    return "oauth2"
+
+
 def git_credentials(repo: str = "") -> tuple[str, str]:
     """Пара для credential helper.
 
@@ -485,7 +549,7 @@ def git_credentials(repo: str = "") -> tuple[str, str]:
     он совместим со всеми перечисленными типами и встречается в примерах самой документации.
     Единственный обязательный литерал — `gitlab-ci-token`, и он нам не нужен.
     """
-    return "oauth2", _token()
+    return git_username(repo), _token()
 
 
 def clone_url(repo: str) -> str:

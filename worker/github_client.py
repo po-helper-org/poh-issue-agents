@@ -17,6 +17,8 @@ from collections.abc import Sequence
 import jwt
 import requests
 
+import worktree
+
 from shared.agent_comment import is_agent_comment, sign
 from shared.labels import ORIGIN_AGENT
 
@@ -617,58 +619,52 @@ def dispatch_workflow(repo: str, workflow_file: str, ref: str, inputs: dict) -> 
             f"({resp.status_code}): {resp.text.strip()[:300]}")
 
 
-class GitCommandError(RuntimeError):
-    """Отказ git с сохранённой причиной.
+# git-механика выкладки — общая с GitLab (`worker/worktree.py`). Имена
+# реэкспортируются: их знают тесты (`gc.GitCommandError`) и круг правок ниже,
+# а расхождение типа отказа между провайдерами означало бы, что `except` в
+# вызывающем коде ловит GitHub и пропускает GitLab.
+GitCommandError = worktree.GitCommandError
+_git_runner = worktree.runner
+_missing_from_tree = worktree._missing_from_tree
 
-    `subprocess.run(check=True)` бросает `CalledProcessError`, чей текст — только
-    команда и код возврата: stderr остаётся в проглоченном `capture_output`. На
-    живом прогоне #39 это дало три одинаковых «returned non-zero exit status 1»
-    в истории Temporal и ни слова о том, ЧТО отверг GitHub.
+
+def git_username(repo: str = "") -> str:
+    """Имя пользователя для credential helper.
+
+    `x-access-token` — литерал GitHub для installation-токена GitHub App и
+    рабочий вариант для PAT. Парная функция есть у `gitlab_client` (там
+    `oauth2`), и обе зовутся через диспетчер `forge`.
+
+    Отдельно от токена намеренно: имя — константа провайдера и добывается без
+    сети, а токен идёт своим путём (`auth_token`), который тесты подменяют.
+    Слитая пара заставляла бы добывать токен там, где нужно только имя.
     """
+    return "x-access-token"
 
 
-def _git_runner(clone_dir: str, env: dict):
-    """git по рабочему дереву задачи, с видимой причиной отказа.
+def git_credentials(repo: str = "") -> tuple[str, str]:
+    """Пара для credential helper — имя и токен вместе, для выкладки."""
+    return git_username(repo), auth_token(repo)
 
-    Токен живёт в окружении (`GH_PUSH_TOKEN`), а не в argv, и в stderr git его
-    не печатает — но текст ошибки уезжает в историю Temporal и в комментарий
-    Issue, поэтому подстраховка стоит дешевле разбирательства.
+
+def clone_url(repo: str) -> str:
+    """HTTPS-адрес репозитория для `git clone`.
+
+    Без токена в URL: argv команды целиком рендерится в текст
+    `CalledProcessError`, и вклеенный токен уехал бы в историю Temporal при
+    первом же сбое. Токен идёт credential-хелпером (см. `git_credentials`).
     """
-    token = env.get("GH_PUSH_TOKEN") or ""
-
-    def git(*args: str, check: bool = True):
-        proc = subprocess.run(["git", "-C", clone_dir, *args], env=env,
-                              capture_output=True, text=True, timeout=300)
-        if check and proc.returncode:
-            detail = (proc.stderr or proc.stdout or "").strip()[:800]
-            if token:
-                detail = detail.replace(token, "[Filtered]")
-            raise GitCommandError(
-                f"git {' '.join(args)} → код {proc.returncode}: {detail}")
-        return proc
-
-    return git
+    return f"https://github.com/{str(repo).strip('/')}.git"
 
 
-def _missing_from_tree(git, paths: tuple[str, ...]) -> list[str]:
-    """Каких путей из `paths` нет в дереве HEAD — проверка ФАКТОМ (M3), а не
-    предположением, что `git add -f` где-то выше сработал. `git add -A`
-    молча пропускает пути, которые `.gitignore` целевого репозитория
-    игнорирует — единственный способ узнать, доехал ли путь до коммита,
-    который вот-вот уйдёт в push, это посмотреть в сам коммит.
+def blob_base(repo: str, branch: str) -> str:
+    """Префикс ссылки на файл в ветке — для комментариев в Issue.
 
-    Пустой `paths` — нулевая стоимость: ни одного вызова git не делается.
+    Парная функция есть у `gitlab_client`: формы путей у провайдеров разные
+    (`/blob/` против `/-/blob/`), и жёсткая github.com-строка давала бы на
+    GitLab-репозитории битые ссылки в каждом комментарии с артефактами.
     """
-    if not paths:
-        return []
-    tree = git("ls-tree", "-r", "--name-only", "HEAD", check=False).stdout
-    names = tree.splitlines()
-    missing = []
-    for path in paths:
-        if any(name == path or name.startswith(f"{path}/") for name in names):
-            continue
-        missing.append(path)
-    return missing
+    return f"https://github.com/{str(repo).strip('/')}/blob/{branch}"
 
 
 def publish_worktree(repo: str, clone_dir: str, branch: str, *,
@@ -716,98 +712,13 @@ def publish_worktree(repo: str, clone_dir: str, branch: str, *,
         _log.info("[DRY_RUN] publish %s -> %s: %s", clone_dir, branch, title)
         return None
 
-    token = auth_token(repo)
-    env = {
-        **os.environ,
-        "GIT_CONFIG_COUNT": "4",
-        "GIT_CONFIG_KEY_0": "credential.helper",
-        "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_PUSH_TOKEN; }; f",
-        "GIT_CONFIG_KEY_1": "user.name",
-        "GIT_CONFIG_VALUE_1": "openhands-agent",
-        "GIT_CONFIG_KEY_2": "user.email",
-        "GIT_CONFIG_VALUE_2": "openhands-agent@users.noreply.github.com",
-        # Каталог задачи передан раннеру (uid 10001), а коммит и пуш делает воркер
-        # от root. Git на такое отвечает `fatal: detected dubious ownership` и
-        # отказывается работать — готовая работа агента не доехала бы до PR.
-        # Объявляем каталог доверенным для этой команды, не трогая общий конфиг.
-        "GIT_CONFIG_KEY_3": "safe.directory",
-        "GIT_CONFIG_VALUE_3": clone_dir,
-        "GH_PUSH_TOKEN": token,
-    }
-
-    git = _git_runner(clone_dir, env)
-
-    # ДО checkout: ветка уже существует ЛОКАЛЬНО только если по этому же
-    # clone_dir сюда уже заходил предыдущий вызов этой функции. `dev_prepare`
-    # клонирует репозиторий заново на каждый прогон СТАДИИ (а не на каждую
-    # попытку публикации), поэтому в пределах ретраев `dev_publish` рабочее
-    # дерево — то же самое: если ветка уже есть, коммит на ней, скорее всего,
-    # уже сделан прошлой попыткой, и упал только пуш (или сам PR). На старом
-    # линейном пути (`trigger_openhands_resolver`, ретраев нет) `dev_prepare`
-    # отрабатывает заново при каждом вызове — там ветки здесь никогда не будет,
-    # и поведение не меняется.
-    branch_existed = git("show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
-                         check=False).returncode == 0
-
-    git("checkout", "-B", branch)
-    git("add", "-A")
-    for path in force_include:
-        # -f обходит .gitignore целевого репозитория: без него `add -A` выше
-        # молча пропускает путь, который репозиторий игнорирует (M3).
-        git("add", "-f", "--", path)
-    # Пустой ИНДЕКС — не то же самое, что «агент ничего не менял»: если ветка
-    # уже существовала до этого вызова, значит, коммит уехал в прошлой попытке,
-    # а сорвался только пуш (или создание PR) — публикацию нужно довести, а не
-    # объявлять «нет диффа». Пустой коммит по-прежнему не делаем: PR без диффа
-    # ревьюить нечего, а фаза задачи от него сдвинулась бы как от настоящей
-    # работы — это по-прежнему верно для ПЕРВОЙ попытки на новой ветке.
-    #
-    # Проверка идёт БЕЗ путей из `ignore_for_empty_check` (git pathspec
-    # `:(exclude)...`) — сам коммит их всё равно заберёт, `git add -A` выше
-    # уже отработал по всему дереву.
-    diff_args = ["diff", "--cached", "--quiet", "--", "."]
-    diff_args += [f":(exclude){pattern}" for pattern in ignore_for_empty_check]
-    visible_diff = git(*diff_args, check=False).returncode != 0
-
-    # M3: `force_include` может внести изменение, которого «видимый» дифф не
-    # видит (он же его специально исключает через `ignore_for_empty_check`) —
-    # например, .harness/ не попал в САМЫЙ ПЕРВЫЙ коммит на этой ветке (был
-    # проигнорирован .gitignore до этой правки или иным путём), а рабочее
-    # дерево на ретрае больше не менялось. Не заметить такое pending-изменение
-    # значило бы никогда его не закоммитить: индекс не хранится между
-    # вызовами дольше жизни рабочего дерева.
-    #
-    # Гейт на `branch_existed` обязателен: на СОВЕРШЕННО НОВОЙ ветке
-    # force_include-путь «новый» ВСЕГДА (только что собран `_dev_prepare`,
-    # разница с базовым коммитом гарантирована) — без гейта пустой прогон
-    # (агент не менял код, есть только `.harness/`) считался бы правкой при
-    # КАЖДОМ вызове, и это ровно тот регресс M1/H1, ради которого
-    # `ignore_for_empty_check` вообще существует. На РЕТРАЕ существующей
-    # ветки предыдущий коммит — это факт, а не свежая сборка, и его нехватку
-    # (гитигнор, старая версия кода) нужно чинить именно здесь.
-    forced_pending = branch_existed and bool(force_include) and git(
-        "diff", "--cached", "--quiet", "--", *force_include, check=False
-    ).returncode != 0
-
-    if visible_diff or forced_pending:
-        git("commit", "-m", message, "-m",
-            "Автор изменений — OpenHands, запущен активностью Develop.")
-    elif not branch_existed:
-        _log.warning("%s: агент не изменил ни одного файла", repo)
+    if not worktree.commit_and_push(
+            repo, clone_dir, branch, message=message,
+            credentials=git_credentials(repo),
+            committer_email="openhands-agent@users.noreply.github.com",
+            ignore_for_empty_check=ignore_for_empty_check,
+            force_include=force_include):
         return None
-
-    # Подтверждаем ФАКТОМ, а не замыслом вызова `add -f` выше (M3): проверяем
-    # дерево HEAD — то, что вот-вот уйдёт в push, — а не полагаемся на то, что
-    # `git add -f` где-то раньше отработал как задумано.
-    missing = _missing_from_tree(git, force_include)
-    if missing:
-        raise RuntimeError(
-            f"{repo}: {', '.join(missing)} не попал(и) в коммит ветки {branch}, "
-            "хотя force_include этого требует — вероятно, .gitignore целевого "
-            "репозитория. Публикация остановлена до пуша."
-        )
-
-    git("push", "--force-with-lease", "-u", "origin", branch)
 
     resp = requests.post(
         f"https://api.github.com/repos/{repo}/pulls",
