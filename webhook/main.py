@@ -338,7 +338,7 @@ async def agent_event(
     бы втащить в них SDK и знание наших workflow id — связность, ради ухода от
     которой задача и ставилась.
     """
-    from shared.agent_events import InvalidAgentEvent, correlate, parse_event
+    from shared.agent_events import InvalidAgentEvent, parse_event
 
     body = await request.body()
     verify_agent_signature(body, x_agent_signature_256)
@@ -354,6 +354,18 @@ async def agent_event(
         return {"ok": True, "correlated": False}
 
     client = await get_temporal_client()
+    return await _dispatch_agent_event(client, event)
+
+
+async def _dispatch_agent_event(client, event) -> dict:
+    """Корреляция факта с задачей и подъём цикла. Общий путь для двух входов.
+
+    Зовут `/agent-event` (внешние агенты) и вебхук событий ревью (человек).
+    Один путь намеренно: корреляция, аудит несопоставленного и подъём цикла
+    обязаны вести себя одинаково независимо от того, кто принёс факт.
+    """
+    from shared.agent_events import correlate
+
     issue_number, how = correlate(event)
     if issue_number is None:
         await _report_orphan(client, event, how)
@@ -666,6 +678,23 @@ async def _handle_delivery(payload: dict, x_github_event: str,
             return {"ok": True}
 
     client = await get_temporal_client()
+
+    if x_github_event in ("pull_request_review", "pull_request_review_comment"):
+        # Замечание человека — такой же повод для круга правок, как доклад
+        # PR-Agent. До 3 сентября этих событий не приходило вовсе, и контур
+        # объявлял «PR готов к слиянию», не увидев возражения (#302).
+        from shared import review_events
+
+        build = (review_events.from_review
+                 if x_github_event == "pull_request_review"
+                 else review_events.from_review_comment)
+        event = build(payload)
+        if event is None:
+            return {"ok": True}
+        number = int(event.ref) if event.ref.isdigit() else 0
+        if not _may_start_expensive(payload, "круг правок", event.repo, number):
+            return {"ok": True}
+        return await _dispatch_agent_event(client, event)
 
     if x_github_event == "issues":
         action = payload["action"]
