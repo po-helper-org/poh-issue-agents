@@ -246,24 +246,47 @@ async def main(argv: list[str] | None = None) -> int:
                         help="всегда возвращать 0 — предупредить, но не блокировать")
     args = parser.parse_args(argv)
 
-    # Один перехват на ВСЮ работу с Temporal, а не только на подключение.
+    # Перехват вокруг работы с Temporal. Шире, чем одно подключение:
     # `Client.connect` спрашивает лишь системную информацию и проходит там, где
-    # визибилити уже не отвечает: namespace без advanced visibility возвращает
-    # Unimplemented на `count_workflows`, и без этого перехвата оператор получал
-    # бы голый traceback вместо честного «проверка не выполнена».
+    # визибилити уже не отвечает (namespace без advanced visibility возвращает
+    # Unimplemented на `count_workflows`), и без этого оператор получал бы голый
+    # traceback вместо честного «проверка не выполнена».
+    #
+    # Но НЕ шире работы с Temporal: `replay()` первым делом импортирует код
+    # воркера, и его отказ — не про кластер. Раньше он попадал сюда же, и
+    # отсутствующий `instructor` докладывался как «Temporal недоступен
+    # (ModuleNotFoundError)» — оператор шёл проверять связь с кластером вместо
+    # своего окружения. У реплея свой перехват ниже.
     try:
         client = await connect_temporal()
         total, runs = await collect(client, args.limit)
-        replayed_result = (await replay(client, runs)
-                           if args.replay and runs else None)
     except Exception as exc:  # noqa: BLE001 — недоступный Temporal не должен ронять сборку
         print(f"Temporal недоступен ({type(exc).__name__}: {exc}) — проверка не выполнена.")
         print("Это НЕ значит, что незакрытых прогонов нет: их просто не у кого спросить.")
         return 0 if args.warn_only else 1
 
+    replayed_result = None
+    replay_failure = None
+    if args.replay and runs:
+        try:
+            replayed_result = await replay(client, runs)
+        except ImportError as exc:
+            # Отдельно от прочего: быстрый режим намеренно работает без
+            # зависимостей воркера (см. докстринг модуля), поэтому `--replay`
+            # с машины оператора — ожидаемый способ на это наткнуться, и
+            # назвать причину надо прямо.
+            replay_failure = (f"нет зависимостей воркера ({type(exc).__name__}: {exc}). "
+                              f"Реплей требует того же окружения, что и воркер; "
+                              f"счёт прогонов выше от него не зависит и выполнен")
+        except Exception as exc:  # noqa: BLE001 — отказ реплея не отменяет уже полученный счёт
+            replay_failure = f"{type(exc).__name__}: {exc}"
+
     lines, ok = report_lines(total, runs, datetime.now(timezone.utc))
 
-    if replayed_result is not None:
+    if replay_failure is not None:
+        lines += ["", f"⚠ Реплей не выполнен: {replay_failure}.",
+                  "Кто именно сломается — неизвестно. Риск не снят."]
+    elif replayed_result is not None:
         failures, replayed, skipped = replayed_result
         extra, clean = replay_lines(failures, replayed, skipped)
         lines += ["", *extra]

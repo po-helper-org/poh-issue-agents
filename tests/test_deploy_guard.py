@@ -422,3 +422,60 @@ async def test_partial_coverage_does_not_blame_the_limit_on_a_race(monkeypatch, 
     out = capsys.readouterr().out
     assert "закрылись между счётом и выборкой" in out
     assert "потолок --limit" not in out
+
+
+# --- Диагноз называет виноватого ---
+#
+# Находка ревью на смерженном коде: перехват вокруг всей работы с Temporal
+# захватывал и `replay()`, который первым делом импортирует код воркера.
+# Отсутствующий `instructor` докладывался как «Temporal недоступен
+# (ModuleNotFoundError)», и оператор шёл проверять связь с кластером вместо
+# своего окружения. Быстрый режим намеренно работает без зависимостей воркера,
+# так что наткнуться на это — штатный сценарий, а не экзотика.
+
+async def _main_with_failing_replay(monkeypatch, exc, argv):
+    client = _FakeClient(5, [_FakeExecution("issue-1", NOW)])
+
+    async def fake_connect():
+        return client
+
+    async def exploding_replay(_client, runs):
+        raise exc
+
+    monkeypatch.setattr(deploy_guard, "connect_temporal", fake_connect)
+    monkeypatch.setattr(deploy_guard, "replay", exploding_replay)
+    return await deploy_guard.main(argv)
+
+
+async def test_missing_worker_deps_are_not_blamed_on_temporal(monkeypatch, capsys):
+    code = await _main_with_failing_replay(
+        monkeypatch, ModuleNotFoundError("No module named 'instructor'"), ["--replay"])
+    out = capsys.readouterr().out
+    assert "Temporal недоступен" not in out
+    assert "нет зависимостей воркера" in out
+    assert "instructor" in out
+    assert code == 1
+
+
+async def test_count_survives_a_failed_replay(monkeypatch, capsys):
+    """Счёт прогонов от зависимостей воркера не зависит и уже получен —
+    отдавать его вместе с отказом реплея честнее, чем терять оба."""
+    await _main_with_failing_replay(
+        monkeypatch, ModuleNotFoundError("No module named 'instructor'"), ["--replay"])
+    out = capsys.readouterr().out
+    assert "Running: 5" in out
+
+
+async def test_failed_replay_does_not_clear_the_risk(monkeypatch, capsys):
+    """Реплей не отработал — кто сломается, неизвестно. Молча вернуть 0 значило
+    бы выдать невыполненную проверку за пройденную."""
+    code = await _main_with_failing_replay(
+        monkeypatch, RuntimeError("реплей развалился"), ["--replay"])
+    assert code == 1
+    assert "Риск не снят" in capsys.readouterr().out
+
+
+async def test_failed_replay_still_lets_build_through_in_warn_only(monkeypatch):
+    code = await _main_with_failing_replay(
+        monkeypatch, RuntimeError("реплей развалился"), ["--replay", "--warn-only"])
+    assert code == 0

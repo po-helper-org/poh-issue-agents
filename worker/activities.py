@@ -1267,7 +1267,7 @@ def mark_ready_for_dev(issue: IssueInput, priority_tier: str, branch: str) -> No
     комментарий отвечает на вопрос «что известно и чего не хватает», чтобы
     задачу можно было взять, не задавая уточняющих вопросов о постановке.
     """
-    base = f"https://github.com/{issue.repo}/blob/{branch}"
+    base = github_client.blob_base(issue.repo, branch)
     questions = _open_questions(issue.repo, branch)
     open_block = (
         "\n".join(f"- {q}" for q in questions)
@@ -1894,12 +1894,18 @@ def _clone_repo(repo: str, dest: str, branch: str | None = None) -> None:
     таймаут) унёс бы живой GitHub-токен прямо в Temporal event history и
     логи воркера — ровно туда, куда человек полезет отлаживать сбой.
     """
-    url = f"https://github.com/{repo}.git"
+    # Адрес и пара для credential-хелпера берутся у КЛИЕНТА ПРОВАЙДЕРА через
+    # диспетчер: до этого и то и другое было прибито к github.com, и клон
+    # GitLab-репозитория уходил бы на чужой хост с чужим именем пользователя.
+    # У GitHub пара — `x-access-token`, у GitLab — `oauth2`.
+    url = github_client.clone_url(repo)
+    username = github_client.git_username(repo)
     env = {
         **os.environ,
         "GIT_CONFIG_COUNT": "1",
         "GIT_CONFIG_KEY_0": "credential.helper",
-        "GIT_CONFIG_VALUE_0": "!f() { echo username=x-access-token; echo password=$GH_CLONE_TOKEN; }; f",
+        "GIT_CONFIG_VALUE_0":
+            f"!f() {{ echo username={username}; echo password=$GH_CLONE_TOKEN; }}; f",
         "GH_CLONE_TOKEN": github_client.auth_token(repo),
     }
     command = ["git", "clone", "--depth", "1"]
@@ -2020,7 +2026,7 @@ def _collect_fnr_artifacts(clone_dir: str) -> dict[str, str]:
 
 
 def _build_summary(analyze: AnalyzeInput, branch: str, files: dict[str, str]) -> str:
-    base = f"https://github.com/{analyze.repo}/blob/{branch}"
+    base = github_client.blob_base(analyze.repo, branch)
     links = "\n".join(f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})" for path in sorted(files))
     # Артефакт диалога называется отдельно: без пояснения он выглядит служебным
     # мусором рядом с документами FNR, а это источник, из которого выведена
@@ -2620,9 +2626,9 @@ async def publish_analysis_partial(analyze: AnalyzeInput, reason: str) -> list[s
     session_id, session_branch = await asyncio.to_thread(_entire_session, str(clone_dir))
     await asyncio.to_thread(_push_entire_branch, analyze.repo, str(clone_dir),
                             session_branch)
+    base = github_client.blob_base(analyze.repo, branch)
     links = "\n".join(
-        f"- [`{path.rsplit('/', 1)[-1]}`]"
-        f"(https://github.com/{analyze.repo}/blob/{branch}/{path})"
+        f"- [`{path.rsplit('/', 1)[-1]}`]({base}/{path})"
         for path in sorted(files))
     await asyncio.to_thread(
         github_client.post_comment, analyze.repo, analyze.issue_number,

@@ -92,6 +92,13 @@ class FakeGitHub:
         self.calls: list[str] = []
 
     # --- мутации ---
+    def blob_base(self, repo, branch):
+        """Двойник обязан повторять поверхность клиента: ссылки на артефакты
+        строятся через диспетчер провайдера (`/blob/` у GitHub, `/-/blob/` у
+        GitLab), и без этого метода сборка комментария падает `AttributeError`
+        уже после того, как анализ отработал."""
+        return f"https://github.com/{repo}/blob/{branch}"
+
     def post_comment(self, repo, issue_number, body):
         self.calls.append("post_comment")
         self.comments.append(body)
