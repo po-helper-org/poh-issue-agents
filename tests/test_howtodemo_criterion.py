@@ -106,3 +106,32 @@ def test_the_list_of_recognised_headings_is_closed_and_named_correctly():
         assert howtodemo.read(f"{heading}\nсценарий") == "сценарий", heading
     for heading in ("## Критерий приёмки", "## Критерии приёмки", "## Приёмки"):
         assert howtodemo.read(f"{heading}\nсценарий") == "", heading
+
+
+def test_handover_of_a_criterion_the_receiver_reads_differently_is_logged(
+        caplog):
+    """Обрезка у приёмщика не должна проходить молча (ревью PR #306).
+
+    `expose` отдаёт критерий, прочитанный `read` целиком — с вложенными
+    подзаголовками. Приёмщик обрывает сценарий на ЛЮБОМ заголовке
+    (`poh_howtodemo.anchor._NEXT`), значит такой критерий он прочтёт лишь
+    частично и, вероятно, зачтёт приёмку по первым шагам. Пока граница
+    поднимается в его разборе, контур обязан хотя бы записать в лог, что
+    выдал текст, который тот прочитает иначе, — иначе частичный прогон
+    неотличим от полного.
+    """
+    body = ("## Как принимаем\n\n1. Открываю корзину\n2. Вижу итог\n\n"
+            "### Шаг 2 подробнее\n\nитог равен нулю")
+    with caplog.at_level("WARNING", logger="howtodemo"):
+        howtodemo.expose(body)
+    assert any("только до этой строки" in r.message for r in caplog.records), \
+        caplog.text
+
+
+def test_handover_of_a_flat_criterion_stays_silent(caplog):
+    """Обычный критерий без вложенных заголовков не засоряет лог."""
+    body = block("1. Открываю корзину\n2. Вижу итог 0")
+    with caplog.at_level("WARNING", logger="howtodemo"):
+        howtodemo.expose(body)
+    assert not any("только до этой строки" in r.message for r in caplog.records), \
+        caplog.text
