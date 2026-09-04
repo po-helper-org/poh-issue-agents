@@ -89,3 +89,20 @@ def test_corrupted_markers_do_not_break_the_handover():
             "## HowToDemo\n\nбыло — А; стало — Б")
     assert howtodemo.read(body) == "было — А; стало — Б"
     assert anchor.extract_block(howtodemo.expose(body)) == "было — А; стало — Б"
+
+
+def test_the_list_of_recognised_headings_is_closed_and_named_correctly():
+    """Формы заголовка перечислены проверкой, а не только регэкспом.
+
+    Ревью PR #306 поймало ровно этот разрыв: `docs/HOWTODEMO.md` называл
+    работающей формой `## Критерий приёмки`, которой шаблон не знает — «приёмка»
+    в нём литерал, и «приёмки» под него не подходит. Пока список нигде не
+    перечислен списком, следующая правка документации разойдётся с кодом так же
+    молча, и эксплуатация будет ждать поддержки, которой нет.
+    """
+    for heading in ("## HowToDemo", "### How to demo", "## Как принимаем",
+                    "## Как проверяем", "## Как демонстрируем", "## Приёмка",
+                    "## Приемка"):
+        assert howtodemo.read(f"{heading}\nсценарий") == "сценарий", heading
+    for heading in ("## Критерий приёмки", "## Критерии приёмки", "## Приёмки"):
+        assert howtodemo.read(f"{heading}\nсценарий") == "", heading
