@@ -1,7 +1,8 @@
 """Мост к HowToDemo-Agent: что именно Harness даёт приёмщику.
 
-Ровно две вещи — installation-токен GitHub App и клиент модели для трансляции
-сценария в план. Вердикт приёмки агент считает сам, кодом.
+Три вещи — installation-токен GitHub App, клиент модели для трансляции сценария
+в план и тело задачи с критерием в форме, которую приёмщик признаёт (#301).
+Вердикт приёмки агент считает сам, кодом.
 """
 
 import sys
@@ -64,3 +65,67 @@ def test_translator_uses_complete_not_extract(bridge, monkeypatch):
     monkeypatch.setattr(bridge.llm, "complete",
                         lambda *a, **kw: '{"steps": []}')
     bridge.PlanTranslator().translate(["шаг"])
+
+
+class _FakePort:
+    """Подделка порта GitHub: помнит вызовы и отдаёт заданное тело."""
+
+    def __init__(self, body: str = ""):
+        self.body = body
+        self.calls: list[tuple] = []
+
+    def issue_body(self, repo, number):
+        self.calls.append(("issue_body", repo, number))
+        return self.body
+
+    def add_label(self, repo, number, label):
+        self.calls.append(("add_label", repo, number, label))
+
+
+def test_issue_body_reaches_the_agent_with_the_criterion_exposed(bridge):
+    """Ради этого мост и трогает порт: приёмщик о размеченном блоке не знает."""
+    from poh_howtodemo import anchor
+
+    from shared import issue_blocks
+
+    raw = issue_blocks.write("## Что происходит\n\nОписание.",
+                             issue_blocks.HOWTODEMO, "было — А; стало — Б")
+    inner = _FakePort(raw)
+    port = bridge._CriterionFirst(inner)
+
+    assert anchor.extract_block(raw) is None
+    assert anchor.extract_block(port.issue_body("o/r", 171)) == "было — А; стало — Б"
+    assert inner.calls == [("issue_body", "o/r", 171)]
+
+
+def test_body_without_a_criterion_passes_through_unchanged(bridge):
+    inner = _FakePort("Обычное тело без сценария.")
+    assert bridge._CriterionFirst(inner).issue_body("o/r", 1) == \
+        "Обычное тело без сценария."
+
+
+def test_other_port_methods_are_delegated(bridge):
+    """Оборачивается ОДИН метод; остальную поверхность порта терять нельзя."""
+    inner = _FakePort()
+    port = bridge._CriterionFirst(inner)
+    port.add_label("o/r", 1, "demo:ok")
+    assert inner.calls == [("add_label", "o/r", 1, "demo:ok")]
+
+
+def test_install_wraps_the_github_port_and_keeps_the_model(bridge, monkeypatch):
+    """`ports.configure` присваивает все три порта разом.
+
+    Вызов с одним лишь `github` обнулил бы модель, и приёмка упала бы не на
+    установке, а много позже — на трансляции сценария, «порт модели не
+    подставлен». Проверяем оба порта после `install`, а не один.
+    """
+    from poh_howtodemo import ports
+
+    saved = (ports._github, ports._llm, ports._shell)
+    monkeypatch.setattr(bridge.github_client, "auth_token", lambda repo: "ghs_x")
+    try:
+        bridge.install()
+        assert isinstance(ports.github(), bridge._CriterionFirst)
+        assert isinstance(ports.llm(), bridge.PlanTranslator)
+    finally:
+        ports.configure(*saved)
