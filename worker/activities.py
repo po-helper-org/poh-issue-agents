@@ -4385,8 +4385,23 @@ async def finish_pr_fixing(repo: str, pr_number: int, rounds: int, settled: bool
                            verdict: str = "") -> None:
     """Итог доведения: либо PR готов, либо он уходит человеку."""
     if settled:
+        # Спрашиваем ФАКТОМ, а не выводим из того, что агент не нашёл предмета
+        # для правок: замечание человека агент мог отклонить, а GitHub всё
+        # равно не даст слить (R7).
+        try:
+            blocked = await asyncio.to_thread(
+                github_client.changes_requested, repo, pr_number)
+        except Exception as exc:  # noqa: BLE001
+            # Проверка не имеет права ронять итог круга (R9).
+            activity.logger.warning("состояние ревью не прочитано: %s", exc)
+            blocked = None
         await asyncio.to_thread(github_client.post_comment, repo, pr_number,
-                                pr_closing.settled_comment(rounds, verdict))
+                                pr_closing.settled_comment(rounds, verdict, blocked))
+        if blocked:
+            # Замечания остались — задача в очереди к людям, как и при
+            # исчерпании кругов (R8).
+            await asyncio.to_thread(github_client.add_label, repo, pr_number,
+                                    pr_closing.NEEDS_HUMAN_PR)
         return
     await asyncio.to_thread(
         github_client.post_comment, repo, pr_number,

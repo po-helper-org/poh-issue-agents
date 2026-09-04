@@ -889,6 +889,33 @@ def list_pull_request_comments(repo: str, pull_number: int, limit: int = 50) -> 
 
 
 
+def changes_requested(repo: str, number: int) -> bool | None:
+    """Блокирует ли ревью слияние. `None` — спросить не удалось.
+
+    Считается ПОСЛЕДНЕЕ ревью каждого автора: человек мог запросить изменения,
+    а потом одобрить, и старая запись в списке остаётся навсегда.
+
+    `None`, а не `False`, намеренно: молчаливое «не заблокировано» вернуло бы
+    обещание готовности ровно тогда, когда мы ничего не знаем.
+    """
+    resp = requests.get(f"https://api.github.com/repos/{repo}/pulls/{number}/reviews",
+                        headers=_auth_headers(repo), params={"per_page": 100},
+                        timeout=30)
+    if not resp.ok:
+        _log.warning("состояние ревью %s#%s не прочитано: %s", repo, number,
+                     getattr(resp, "status_code", "?"))
+        return None
+    last: dict[str, str] = {}
+    for item in resp.json():
+        state = (item.get("state") or "").upper()
+        if state not in ("APPROVED", "CHANGES_REQUESTED"):
+            # `COMMENTED` и `DISMISSED` состояния автора не меняют.
+            continue
+        login = (item.get("user") or {}).get("login") or ""
+        last[login] = state
+    return any(state == "CHANGES_REQUESTED" for state in last.values())
+
+
 def review_text(repo: str, number: int, limit: int = 12000) -> str:
     """Замечания ревью одним текстом: обзорные комментарии + построчные.
 
