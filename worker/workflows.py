@@ -1224,10 +1224,6 @@ class IssueLifecycle:
         трогаем: соврать про состояние хуже, чем не отразить в нём разовый
         прогон.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        recovers_failed = workflow.patched("issue-lifecycle-analyze-recovers-failed")
         if lifecycle.can(self._phase, lifecycle.BUSINESS_ANALYSIS) and (
                 # Ход из `failed` появился позже самого цикла, и он меняет
                 # РЕШЕНИЕ, уже записанное в истории: у прогонов, где `/analyze`
@@ -1236,16 +1232,12 @@ class IssueLifecycle:
                 # активность смены фазы. Без маркера реплей такой истории падает
                 # по недетерминизму — так на стенде встал воркфлоу Issue #11.
                 self._phase != lifecycle.FAILED
-                or recovers_failed):
+                or workflow.patched("issue-lifecycle-analyze-recovers-failed")):
             return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
         await self._run_analysis_child(issue)
         return (self._phase, self._stage, False)
 
     async def _run_phase_loop(self, issue: IssueInput) -> None:
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        subissue_barrier = workflow.patched("issue-lifecycle-step-subissue-barrier")
         deadlines = await workflow.execute_activity(
             activities.read_deadlines,
             start_to_close_timeout=timedelta(seconds=30),
@@ -1274,7 +1266,7 @@ class IssueLifecycle:
         # истории, и реплей без маркера упал бы недетерминизмом.
         if (self._phase != lifecycle.CREATED
                 and not lifecycle.is_terminal(self._phase)
-                and subissue_barrier):
+                and workflow.patched("issue-lifecycle-step-subissue-barrier")):
             state = await workflow.execute_activity(
                 activities.read_protocol_state,
                 args=[issue.repo, issue.issue_number],
@@ -1610,11 +1602,6 @@ class IssueLifecycle:
         понимая, что это; такую задачу ведём в аналитику, потому что описание в
         ней короткое и требований не содержит.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        plan_member_skips_analysis = workflow.patched(
-            "issue-lifecycle-plan-member-skips-analysis")
         if deadlines.research_autostart:
             label = self._classification_label
             if label == "advisor:bug":
@@ -1627,7 +1614,8 @@ class IssueLifecycle:
             # текста, который ничего не добавляет.
             # Под маркером патча: у подзадач, уже уехавших в аналитику, этот
             # выбор записан в историю, и другой на реплее — недетерминизм.
-            if self._plan_member and plan_member_skips_analysis:
+            if self._plan_member and workflow.patched(
+                    "issue-lifecycle-plan-member-skips-analysis"):
                 return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
             if label is None or label == "advisor:feature-request":
                 return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
@@ -2109,19 +2097,6 @@ class IssueLifecycle:
         ставится (`_phase_handoff` отработал раньше) — она сообщает состояние
         задачи, а не то, кто именно её возьмёт.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        autostart_waits_for_answer = workflow.patched(
-            "issue-lifecycle-autostart-waits-for-answer")
-        plan_member_waits_for_parent = workflow.patched(
-            "issue-lifecycle-plan-member-waits-for-parent")
-        criterion_recheck_while_parked = workflow.patched(
-            "issue-lifecycle-criterion-recheck-while-parked")
-        question_answer = workflow.patched("issue-lifecycle-question-answer")
-        answer_command_without_open_question = workflow.patched(
-            "issue-lifecycle-answer-command-without-open-question")
-        followup_answer = workflow.patched("issue-lifecycle-followup-answer")
         # Финальное ревью ветки, находка C1 (Critical). Автостарт звал
         # `_start_development` БЕЗУСЛОВНО — в том числе когда гейт критерия
         # приёмки уже задал вопрос (`self._open_question` непуст) и вернул
@@ -2176,7 +2151,8 @@ class IssueLifecycle:
         # запаркуется на первом же необработанном обороте, не выдумав ни
         # одной лишней команды на уже случившихся событиях.
         autostart_blocked_by_gate_stall = (
-            self._acceptance_gate_stalled and autostart_waits_for_answer
+            self._acceptance_gate_stalled
+            and workflow.patched("issue-lifecycle-autostart-waits-for-answer")
         )
         # Автостарт — только у задачи, которая владеет своим планом. Подзадачи
         # исполняет РОДИТЕЛЬ: один прогон агента на весь объём MVP и один PR на
@@ -2195,7 +2171,8 @@ class IssueLifecycle:
         # перед таймером, а прежняя история идёт к таймеру напрямую. Реплей без
         # маркера падает `Timer machine does not handle ActivityTaskScheduled` —
         # так легли подзадачи #20–#27 на стенде.
-        if self._plan_member and plan_member_waits_for_parent:
+        if self._plan_member and workflow.patched(
+                "issue-lifecycle-plan-member-waits-for-parent"):
             kind = awaiting_mod.EXTERNAL_AGENT
             who = "контур: прогон разработки по родительской задаче"
             reason = (f"исполнение в составе плана задачи #{self._root_issue}"
@@ -2207,7 +2184,8 @@ class IssueLifecycle:
         hours = awaiting_mod.deadline_hours(
             kind, deadlines.build_decision_hours
             if kind in awaiting_mod.BLOCKED_ON_HUMAN else None)
-        if self._open_question and criterion_recheck_while_parked:
+        if self._open_question and workflow.patched(
+                "issue-lifecycle-criterion-recheck-while-parked"):
             # Находка F3 (Important, второй круг финального ревью). Спека
             # A23 обещает: критерий, вписанный в тело РУКАМИ, — рабочая
             # дверь, не хуже команды `/harness-answer`. Но правки тела Issue
@@ -2349,7 +2327,7 @@ class IssueLifecycle:
         if decision == AGENT_ANALYZE:
             return await self._analysis_requested(issue)
         if (isinstance(decision, UserComment) and self._open_question
-                and question_answer):
+                and workflow.patched("issue-lifecycle-question-answer")):
             # Гейт критерия приёмки задал вопрос — маркер обязателен: у
             # прогонов, припаркованных здесь ДО этой задачи, указателя
             # `self._open_question` в истории нет и быть не может, а значит
@@ -2367,7 +2345,8 @@ class IssueLifecycle:
             return (self._phase, self._stage, False)
         if (isinstance(decision, UserComment) and not self._open_question
                 and commands.parse_command(decision.text) == commands.HARNESS_ANSWER
-                and answer_command_without_open_question):
+                and workflow.patched(
+                    "issue-lifecycle-answer-command-without-open-question")):
             # Финальное ревью ветки, находка I3 (Important). Спека A18: команда
             # `/harness-answer`, которой не на что отвечать, обязана получить
             # явный ответ — «вопросов сейчас нет» — а не тонуть молча. Ветка
@@ -2437,7 +2416,8 @@ class IssueLifecycle:
             if nxt is not None:
                 return nxt
             return (self._phase, self._stage, False)
-        if isinstance(decision, UserComment) and followup_answer:
+        if isinstance(decision, UserComment) and workflow.patched(
+                "issue-lifecycle-followup-answer"):
             # Маркер обязателен: у припаркованных прогонов отброшенные реплики
             # УЖЕ лежат в истории, и новый код запланировал бы на их месте
             # активность, которой там нет, — реплей упал бы недетерминизмом.
@@ -2462,11 +2442,6 @@ class IssueLifecycle:
         `self._answered_comment_ids`, тот же, что уже ведёт `_answer_followup`
         для реплик: заводить второй ради того же самого признака незачем.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        reasked_repoints_pointer = workflow.patched(
-            "issue-lifecycle-reasked-question-repoints-pointer")
         if (comment.comment_id is not None
                 and comment.comment_id in self._answered_comment_ids):
             return (self._phase, self._stage, False)
@@ -2544,7 +2519,8 @@ class IssueLifecycle:
             # по-настоящему.
             self._acceptance_gate_stalled = False
             return await self._begin_development(issue)
-        if verdict == "reasked" and reasked_repoints_pointer:
+        if verdict == "reasked" and workflow.patched(
+                "issue-lifecycle-reasked-question-repoints-pointer"):
             # Находка C2 (Critical, финальное ревью). Спека A22: возрождённый
             # вопрос заводит НОВЫЙ идентификатор, указатель переставляется.
             # Контракт `answer_question` этого не позволяет — активность
@@ -2618,11 +2594,6 @@ class IssueLifecycle:
         бы здесь активность, которой там нет, — реплей упал бы недетерминизмом.
         Так легли 29 прогонов из 149 после коммита `ac625e7`.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        criterion_by_hand_closes_question = workflow.patched(
-            "issue-lifecycle-criterion-filled-by-hand-closes-question")
         if workflow.patched("issue-lifecycle-acceptance-gate"):
             # Тело Issue живёт снаружи воркфлоу — активность, не чтение здесь:
             # реплей обязан быть детерминированным, а тело меняется без нас.
@@ -2967,7 +2938,8 @@ class IssueLifecycle:
                 # write_label=False — метка `ready-for-dev` уже стоит, вопрос
                 # не меняет то, что видно как состояние Issue снаружи.
                 return (lifecycle.READY_FOR_DEV, "awaiting-acceptance-criterion", False)
-            if self._open_question and criterion_by_hand_closes_question:
+            if self._open_question and workflow.patched(
+                    "issue-lifecycle-criterion-filled-by-hand-closes-question"):
                 # Находка I4 (Important, финальное ревью). Критерий появился
                 # НЕ через `/harness-answer` (тогда `self._open_question` уже
                 # был бы очищен веткой `accepted` выше) — значит, человек
@@ -3245,14 +3217,6 @@ class IssueLifecycle:
         «вечная сессия». Сигнал `reopen` возвращает Issue в работу по таблице
         переходов — первым допустимым переходом обратно в основной путь.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        plan_member_skips_analysis = workflow.patched(
-            "issue-lifecycle-plan-member-skips-analysis")
-        howtodemo_on_pr_open = workflow.patched("issue-lifecycle-howtodemo-on-pr-open")
-        close_confirmed_duplicate = workflow.patched(
-            "issue-lifecycle-close-confirmed-duplicate")
         # Открылся PR — запускаем приёмку по сценарию из Issue. Фазу не двигаем:
         # `testing` объявлена в модели, но в код не входит ни одним переходом, и
         # оживлять её здесь значило бы править диспетчер фаз ради метки. Приёмка
@@ -3263,7 +3227,7 @@ class IssueLifecycle:
         # уронил бы их недетерминизмом.
         if (self._phase == lifecycle.PR_OPEN and deadlines.howtodemo_autostart
                 and not self._howtodemo_started
-                and howtodemo_on_pr_open):
+                and workflow.patched("issue-lifecycle-howtodemo-on-pr-open")):
             self._howtodemo_started = True
             await self._start_howtodemo(issue)
 
@@ -3319,7 +3283,8 @@ class IssueLifecycle:
                         feature = label is None or label == "advisor:feature-request"
                         if feature:
                             # Подзадача плана аналитику не заказывает (см. _phase_await_decision)
-                            if self._plan_member and plan_member_skips_analysis:
+                            if self._plan_member and workflow.patched(
+                                    "issue-lifecycle-plan-member-skips-analysis"):
                                 return (lifecycle.SYSTEM_REQUIREMENTS, "analysis", True)
                             return (lifecycle.BUSINESS_ANALYSIS, "analysis", True)
                     elif labels.has(current_labels, "bug-me"):
@@ -3338,7 +3303,8 @@ class IssueLifecycle:
                 # ПОД МАРКЕРОМ: новая команда в теле воркфлоу роняет
                 # недетерминизмом прогоны, начатые до выкладки, а задачи в
                 # ожидании решения человека живут неделями.
-                if self._duplicate_of and close_confirmed_duplicate:
+                if (self._duplicate_of
+                        and workflow.patched("issue-lifecycle-close-confirmed-duplicate")):
                     try:
                         await workflow.execute_activity(
                             activities.close_as_duplicate,
@@ -3697,10 +3663,6 @@ class IssueDevelopment:
         `None` родитель читает как «работа идёт на чужой стороне, жди события
         `pr-open`», а не как отказ.
         """
-        # Маркеры вычисляются здесь и безусловно (AGENTS.md, правило 1):
-        # вторым операндом связки они пропускались бы на части прогонов, и
-        # непостоянная запись в историю сама стала бы источником расхождения.
-        partial_publish = workflow.patched("issue-development-partial-publish")
         cheap = RetryPolicy(maximum_attempts=3)
         # Одна попытка там, где шаг недетерминирован, идёт десятками минут и
         # стоит денег. Повтор такого инициирует человек, а не политика ретраев.
@@ -3920,7 +3882,7 @@ class IssueDevelopment:
             # недетерминизмом прогоны, начатые до выкладки, а прогон агента
             # идёт до 45 минут — реплей убил бы ровно ту работу, которую этот
             # код спасает.
-            if agent_ran and partial_publish:
+            if agent_ran and workflow.patched("issue-development-partial-publish"):
                 try:
                     await workflow.execute_activity(
                         activities.dev_publish_partial,
