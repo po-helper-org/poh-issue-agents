@@ -978,8 +978,18 @@ class IssueLifecycle:
         текущей фазы в `merged` хода нет — значит, это отмена, и лишний вызов
         GitHub на каждом закрытии не нужен.
         """
-        if (self._issue is None or not self._pr_number
-                or not lifecycle.can(self._phase, lifecycle.MERGED)):
+        if self._issue is None or not self._pr_number:
+            return (lifecycle.CANCELLED, "cancelled")
+        # Ход `pr-open → merged` объявлен позже остальных (#308). Прогоны,
+        # чья история записана до выкладки, на закрытии из `pr-open` уже выбрали
+        # ветку `cancelled` — без вопроса GitHub. Вопрос на реплее появился бы
+        # в истории, которой не было, и Temporal уронил бы прогон
+        # недетерминизмом (см. #263). Маркер — первым операндом связки
+        # (AGENTS.md, правило 1): у таких прогонов `patched` отвечает «нет».
+        if (not workflow.patched("issue-lifecycle-pr-open-merged-on-close")
+                and self._phase == lifecycle.PR_OPEN):
+            return (lifecycle.CANCELLED, "cancelled")
+        if not lifecycle.can(self._phase, lifecycle.MERGED):
             return (lifecycle.CANCELLED, "cancelled")
         merged = await workflow.execute_activity(
             activities.pr_is_merged,

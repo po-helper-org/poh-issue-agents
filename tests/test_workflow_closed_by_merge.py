@@ -135,10 +135,14 @@ def _event(phase: str, ref: str = "81") -> AgentEvent:
                       status="started", ref=ref)
 
 
-async def _drive_to_pr_review(env, handle) -> None:
-    """Довести цикл до `pr-review` фактами внешнего агента."""
+async def _drive_to(env, handle, path: tuple[str, ...]) -> None:
+    """Довести цикл до заданной фазы фактами внешнего агента.
+
+    Сам цикл из `pr-open` не выходит: единственный ход дальше объявлен как
+    EXTERNAL — его приносит доклад PR-Agent, которого в тесте заменяет сигнал.
+    """
     await _wait_for_park(env, handle)
-    for phase in ("ready-for-dev", "pr-open", "pr-review"):
+    for phase in path:
         await handle.signal(IssueLifecycle.agent_event, _event(phase))
         for _ in range(300):
             if await handle.query(IssueLifecycle.phase) == phase:
@@ -148,7 +152,9 @@ async def _drive_to_pr_review(env, handle) -> None:
             f"цикл не дошёл до {phase}"
 
 
-async def _run(merged: bool) -> tuple[str, list[str]]:
+async def _run(merged: bool,
+               path: tuple[str, ...] = ("ready-for-dev", "pr-open", "pr-review"),
+               ) -> tuple[str, list[str]]:
     _phases.clear()
     _asked.clear()
     _merged["value"] = merged
@@ -159,7 +165,7 @@ async def _run(merged: bool) -> tuple[str, list[str]]:
                           activities=ACTIVITIES):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            await _drive_to_pr_review(env, handle)
+            await _drive_to(env, handle, path)
 
             await handle.signal(IssueLifecycle.issue_closed, "github-actions[bot]")
 
@@ -209,3 +215,24 @@ async def test_no_pr_no_question_to_github():
             await handle.result()
             assert await handle.query(IssueLifecycle.phase) == "cancelled"
     assert _asked == [], "цикл спросил про PR, которого у него нет"
+
+
+@pytest.mark.timeout(180)
+async def test_pr_open_and_merged_pr_closes_as_merged():
+    # Граница #308: в `pr-open` цикл попадает и без доклада PR-Agent (#103).
+    # Прежняя ветка закрытия возвращала `cancelled`, не задавая вопроса GitHub,
+    # — доведённая до `main` задача числилась снятой с обработки.
+    phase, phases = await _run(merged=True, path=("ready-for-dev", "pr-open"))
+    assert phase == "merged", "доведённый до main Issue помечен как снятый с обработки"
+    assert phases[-1] == "merged", f"метка фазы не доехала: {phases}"
+    assert _asked == [("o/r", 81)], "цикл не спросил GitHub про свой PR"
+
+
+@pytest.mark.timeout(180)
+async def test_pr_open_and_unmerged_pr_still_closes_as_cancelled():
+    # Спрашивается сам PR, а не тот, кто закрыл Issue: вопрос из `pr-open` не
+    # отменяет прежнего правила — закрыли без слияния, значит это снятие с
+    # обработки, а не успех.
+    phase, phases = await _run(merged=False, path=("ready-for-dev", "pr-open"))
+    assert phase == "cancelled"
+    assert phases[-1] == "cancelled", f"метка фазы не доехала: {phases}"

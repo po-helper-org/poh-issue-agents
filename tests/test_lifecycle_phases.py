@@ -102,6 +102,9 @@ def test_pr_phases_are_driven_by_external_agents():
     """PR ведут PR-Agent и PR-Closer — Issue-Agent их только слушает."""
     assert lc.initiator(lc.IN_DEVELOPMENT, lc.PR_OPEN) == lc.EXTERNAL
     assert lc.initiator(lc.PR_REVIEW, lc.MERGED) == lc.EXTERNAL
+    # Ход появился в #308: без него закрытие влитым PR из `pr-open` молча
+    # давало `cancelled` — вопрос GitHub даже не задавался.
+    assert lc.initiator(lc.PR_OPEN, lc.MERGED) == lc.EXTERNAL
 
 
 # --- боковые состояния возвращаемы ---

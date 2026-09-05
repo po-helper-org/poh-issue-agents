@@ -156,6 +156,10 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     ),
     PR_OPEN: (
         Transition(PR_REVIEW, EXTERNAL, "PR-Agent начал ревью"),
+        # PR влит, пока доклада PR-Agent не было (#103): единственный путь в
+        # `pr-review` — внешний доклад, и доведённая до `main` задача из
+        # `pr-open` иначе записывалась снятой с обработки.
+        Transition(MERGED, EXTERNAL, "PR влит"),
         Transition(IN_DEVELOPMENT, EXTERNAL, "PR закрыт без слияния"),
         Transition(FAILED, EXTERNAL, "CI красный"),
         Transition(ESCALATED, EXTERNAL, "нужен человек"),
