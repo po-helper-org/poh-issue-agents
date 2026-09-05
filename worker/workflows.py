@@ -1002,12 +1002,30 @@ class IssueLifecycle:
             return (lifecycle.CANCELLED, "cancelled")
         if self._phase == lifecycle.PR_OPEN and not merged_from_pr_open:
             return (lifecycle.CANCELLED, "cancelled")
-        merged = await workflow.execute_activity(
-            activities.pr_is_merged,
-            args=[self._issue.repo, self._pr_number],
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
+        try:
+            merged = await workflow.execute_activity(
+                activities.pr_is_merged,
+                args=[self._issue.repo, self._pr_number],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as exc:  # noqa: BLE001 — исход неизвестен, прогон обязан жить
+            # Исчерпанные ретраи роняли бы весь цикл: непойманный отказ уходит
+            # из `run()` наверх, прогон завершается Failed — ни фазы, ни метки,
+            # ни возможности поднять его сигналом. До правки #308 эта ветка из
+            # `pr-open` в GitHub не ходила вовсе, и расширять её ценой потери
+            # исхода нельзя.
+            #
+            # Исход неизвестен — значит `escalated`, а не `cancelled`: записать
+            # отмену там, где PR мог быть влит, — та же ложь об исходе, ради
+            # устранения которой правка и делается.
+            #
+            # Маркер не нужен: прогон, у которого эта активность исчерпала
+            # ретраи, уже завершился Failed — терминальная история не реплеится.
+            workflow.logger.warning(
+                "не удалось спросить GitHub про PR #%s: %s — исход неизвестен",
+                self._pr_number, exc)
+            return (lifecycle.ESCALATED, "escalated")
         if merged:
             return (lifecycle.MERGED, "merged")
         return (lifecycle.CANCELLED, "cancelled")
@@ -1151,10 +1169,26 @@ class IssueLifecycle:
             except (TypeError, ValueError):
                 workflow.logger.warning("ref события не номер PR: %r", event.ref)
 
+        # Ход `pr-open → merged` открыт правкой #308, и читателей у этой строки
+        # таблицы ДВА: ветка закрытия Issue и вот этот разбор доклада. Прогон,
+        # успевший до правки получить доклад `merged` из `pr-open`, записал в
+        # историю `escalate_to_human` — новый код по той же истории пошёл бы
+        # мимо эскалации и запланировал `set_phase`: `[TMPRL1100] Activity type
+        # of scheduled event 'escalate_to_human' does not match ... 'set_phase'`.
+        # Маркер тот же, что у ветки закрытия: строка таблицы одна, и открыться
+        # она обязана для обоих читателей разом, иначе разъедутся они, а не
+        # версии кода. Вызов безусловный и первым операндом (AGENTS.md, 1).
+        merged_from_pr_open = workflow.patched(
+            "issue-lifecycle-merged-from-pr-open")
         target = agent_events.target_phase(event)
+        allowed = lifecycle.can(self._phase, target)
+        if (allowed and not merged_from_pr_open
+                and self._phase == lifecycle.PR_OPEN
+                and target == lifecycle.MERGED):
+            allowed = False
         if target == self._phase:
             return (self._phase, self._stage, False)  # тот же факт другими словами
-        if not lifecycle.can(self._phase, target):
+        if not allowed:
             await workflow.execute_activity(
                 activities.escalate_to_human,
                 args=[self._issue, f"Агент `{event.agent}` сообщил "

@@ -123,9 +123,15 @@ _history = {"text": ""}
 _asked: list[tuple[str, int]] = []
 
 
+# Отказ GitHub на вопрос о PR: тест переставляет перед прогоном.
+_raises = {"value": False}
+
+
 @activity.defn(name="pr_is_merged")
 async def pr_is_merged_stub(repo: str, pr_number: int) -> bool:
     _asked.append((repo, pr_number))
+    if _raises["value"]:
+        raise RuntimeError("GitHub отвечает 502")
     return _merged["value"]
 
 
@@ -155,9 +161,12 @@ async def _drive_to(env, handle, stop_at: str = "pr-review") -> None:
             f"цикл не дошёл до {phase}"
 
 
-async def _run(merged: bool, stop_at: str = "pr-review") -> tuple[str, list[str]]:
+async def _run(merged: bool, stop_at: str = "pr-review",
+               raises: bool = False) -> tuple[str, list[str]]:
     _phases.clear()
     _asked.clear()
+    _history["text"] = ""
+    _raises["value"] = raises
     _merged["value"] = merged
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
@@ -260,3 +269,20 @@ async def test_patch_marker_is_recorded_on_every_closing_run():
     assert phase == "merged"
     assert "issue-lifecycle-merged-from-pr-open" in _history["text"], \
         "маркер не записан в историю прогона, закрывшегося не из pr-open"
+
+
+@pytest.mark.timeout(180)
+async def test_github_failure_escalates_instead_of_killing_the_cycle():
+    """Исчерпанные ретраи не уносят прогон и не врут об исходе.
+
+    Непойманный отказ активности уходит из `run()` наверх: прогон завершается
+    Failed — ни фазы, ни метки, ни возможности поднять его сигналом. До #308
+    закрытие из `pr-open` в GitHub не ходило вовсе, и расширять эту ветку ценой
+    потери исхода нельзя.
+
+    Записывается `escalated`, а не `cancelled`: PR мог быть влит, и отмена была
+    бы той же ложью об исходе, ради устранения которой правка и делалась.
+    """
+    phase, phases = await _run(merged=True, stop_at="pr-open", raises=True)
+    assert phase == "escalated", "цикл обязан пережить отказ GitHub"
+    assert phases[-1] == "escalated", f"метка фазы не доехала: {phases}"

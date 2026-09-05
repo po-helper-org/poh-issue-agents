@@ -283,6 +283,10 @@ async def _ack_comment_seen(client, repo: str, issue_number: int,
                      repo, issue_number, comment_id, exc)
 
 
+# Отсутствие секрета доложено — повторять на каждую доставку нечего (см. ниже).
+_secret_absence_reported = False
+
+
 def verify_agent_signature(body: bytes, signature_header: str | None) -> None:
     """Подпись входящего события агента — своим секретом, не гитхабовским.
 
@@ -300,8 +304,14 @@ def verify_agent_signature(body: bytes, signature_header: str | None) -> None:
     """
     secret = os.environ.get("AGENT_EVENT_SECRET", "")
     if not secret:
-        _log.warning("доклад агента отвергнут: AGENT_EVENT_SECRET не задан — "
-                     "канал приёма фазовых событий выключен")
+        # Один раз на процесс, а не на доставку: незаданный секрет — состояние
+        # окружения, и оно не меняется от запроса к запросу. Эндпоинт публичный,
+        # и одинаковая строка на каждый чужой POST превратила бы лог в шум.
+        global _secret_absence_reported
+        if not _secret_absence_reported:
+            _secret_absence_reported = True
+            _log.warning("доклад агента отвергнут: AGENT_EVENT_SECRET не задан — "
+                         "канал приёма фазовых событий выключен")
         raise HTTPException(status_code=503, detail="AGENT_EVENT_SECRET не задан")
     if not signature_header or not signature_header.startswith("sha256="):
         _log.warning("доклад агента отвергнут: подписи нет либо она не в формате "

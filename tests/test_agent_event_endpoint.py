@@ -250,8 +250,30 @@ def test_wrong_secret_leaves_a_trace_without_leaking_it(webhook, caplog):
 
 def test_channel_switched_off_leaves_a_trace(webhook, caplog, monkeypatch):
     """Незаданный секрет — не тишина: эндпоинт закрыт, и это видно."""
+    import main
+
     fake, app_client = webhook()
     monkeypatch.delenv("AGENT_EVENT_SECRET", raising=False)
+    monkeypatch.setattr(main, "_secret_absence_reported", False)
     with caplog.at_level("WARNING", logger="webhook"):
         assert _post(app_client, _event()).status_code == 503
     assert any("AGENT_EVENT_SECRET" in r.message for r in caplog.records), caplog.text
+
+
+def test_switched_off_channel_is_reported_once_not_on_every_delivery(
+        webhook, caplog, monkeypatch):
+    """Незаданный секрет — состояние процесса, а не свойство доставки.
+
+    Эндпоинт публичный: одинаковая строка на каждый чужой POST превратила бы
+    лог в шум, и разбирать в нём было бы нечего.
+    """
+    import main
+
+    fake, app_client = webhook()
+    monkeypatch.delenv("AGENT_EVENT_SECRET", raising=False)
+    monkeypatch.setattr(main, "_secret_absence_reported", False)
+    with caplog.at_level("WARNING", logger="webhook"):
+        for _ in range(3):
+            assert _post(app_client, _event()).status_code == 503
+    said = [r for r in caplog.records if "AGENT_EVENT_SECRET" in r.message]
+    assert len(said) == 1, f"строка повторилась {len(said)} раз(а)"
