@@ -20,10 +20,9 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-# Все модули, где живут воркфлоу: маркер, заведённый в любом из них, обязан
-# попасть в реестр. Иначе повторится та же тихая слепота, только по файлам.
-SOURCES = (ROOT / "worker" / "workflows.py",
-           ROOT / "worker" / "consolidation_workflow.py")
+# Весь `worker/`, а не список файлов: маркер, заведённый в новом модуле, обязан
+# попасть в реестр. Рукописный перечень — та же тихая слепота, только по файлам.
+SOURCES = tuple(sorted((ROOT / "worker").glob("*.py")))
 AGENTS = ROOT / "AGENTS.md"
 
 # Реестр размечен, как блоки в теле Issue: разбирается разметка, а не соседство
@@ -63,12 +62,15 @@ def markers_in_code() -> dict[str, set[str]]:
         tree = ast.parse(source.read_text(encoding="utf-8"))
         names = _qualified_names(tree)
         for node in ast.walk(tree):
-            if not (_is_patched(node) and node.args):
+            if not _is_patched(node):
                 continue
-            assert isinstance(node.args[0], ast.Constant) and isinstance(
+            # Разбор аргумента идёт ПОСЛЕ опознания вызова, а не в условии: иначе
+            # `workflow.patched(id="...")` и любая другая форма молча выпадали бы
+            # из реестра, а тест оставался зелёным — реестр обещает обратное.
+            assert node.args and isinstance(node.args[0], ast.Constant) and isinstance(
                 node.args[0].value, str), (
-                f"{source.name}:{node.lineno}: имя маркера обязано быть строкой-"
-                "константой, иначе реестр по нему не собрать")
+                f"{source.name}:{node.lineno}: имя маркера обязано быть первым "
+                "позиционным аргументом-строкой, иначе реестр по нему не собрать")
             inside = [fn for fn, _ in names.items()
                       if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno)]
             assert inside, (
@@ -89,7 +91,9 @@ def registry_block() -> str:
 
 
 def markers_in_registry() -> dict[str, set[str]]:
-    rows = re.findall(r"^\| `([a-z0-9-]+)` \| ([^|]+) \|$",
+    # Пробелы вокруг ячеек терпим: выравнивание столбцов — обычная правка
+    # разметки, и от неё реестр не должен становиться «ненайденным».
+    rows = re.findall(r"^\|\s*`([a-z0-9-]+)`\s*\|([^|]+)\|\s*$",
                       registry_block(), re.MULTILINE)
     return {mid: {f.strip(" `") for f in where.split(",")} for mid, where in rows}
 
