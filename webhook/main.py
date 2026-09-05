@@ -290,14 +290,25 @@ def verify_agent_signature(body: bytes, signature_header: str | None) -> None:
     у соседних сервисов свои права, и утечка одного не должна открывать второй
     канал. Без переменной эндпоинт закрыт (503, а не «пропускаем всех») —
     молчаливо открытый приём фазовых событий хуже, чем выключенный.
+
+    Каждый отказ пишется в лог: соседний сервис видит только код ответа, и его
+    предупреждение остаётся на его стороне. Так канал доклада, тихо переставший
+    работать (#241), становится виден в логах контура. В запись идут причина и
+    отпечаток тела — не тело и не подпись: тело может нести чужое, а подпись
+    позволяет повторить ровно этот запрос.
     """
+    fingerprint = f"len={len(body)} sha256={hashlib.sha256(body).hexdigest()[:12]}"
     secret = os.environ.get("AGENT_EVENT_SECRET", "")
     if not secret:
+        _log.warning("доклад агента отклонён (%s): AGENT_EVENT_SECRET не задан",
+                     fingerprint)
         raise HTTPException(status_code=503, detail="AGENT_EVENT_SECRET не задан")
     if not signature_header or not signature_header.startswith("sha256="):
+        _log.warning("доклад агента отклонён (%s): подпись не передана", fingerprint)
         raise HTTPException(status_code=401, detail="Missing signature")
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature_header):
+        _log.warning("доклад агента отклонён (%s): подпись не совпала", fingerprint)
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 

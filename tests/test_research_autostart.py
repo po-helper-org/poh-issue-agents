@@ -217,22 +217,33 @@ async def _run_until_phase(research_autostart: bool, develop_autostart: bool = F
                             awaiting = await handle.query(IssueLifecycle.awaiting)
                             await handle.terminate()
                             return phase, awaiting, _calls.copy()
-                        else:
-                            # Не парковка — либо идёт дальше, либо ждёт в ready-for-dev
-                            await asyncio.sleep(0.05)  # Даём время на следующий шаг
-                            if "develop" in _calls:
-                                # Ушла в разработку
+                        if "develop" in _calls:
+                            # Ушла в разработку. Фаза ставится ПОСЛЕ запуска
+                            # прогона разработки: он уже дошёл, а запись фазы —
+                            # ещё нет. Одна попытка читала system-requirements и
+                            # падала примерно каждый четвёртый прогон.
+                            for _ in range(60):
                                 phase = await handle.query(IssueLifecycle.phase)
-                                await handle.terminate()
-                                return phase, None, _calls.copy()
-                            # Иначе ждём в ready-for-dev без парковки
-                            phase = await handle.query(IssueLifecycle.phase)
+                                if phase in ("in-development", "pr-open"):
+                                    break
+                                await asyncio.sleep(0.05)
                             await handle.terminate()
                             return phase, None, _calls.copy()
+                        # Разработка ещё не началась: между mark_ready_for_dev и
+                        # запуском прогона — гейт критерия и декомпозиция. Раньше
+                        # здесь был немедленный return, и под нагрузкой он
+                        # возвращал system-requirements как итог полного
+                        # автостарта — падение в большом прогоне при зелёных
+                        # одиночных.
 
                     # Если ушла в разработку (полный автостарт)
-                    if "develop" in _calls:
-                        phase = await handle.query(IssueLifecycle.phase)
+                    elif "develop" in _calls:
+                        # Тот же разъезд «запуск дошёл — фаза ещё нет», что выше.
+                        for _ in range(60):
+                            phase = await handle.query(IssueLifecycle.phase)
+                            if phase in ("in-development", "pr-open"):
+                                break
+                            await asyncio.sleep(0.05)
                         await handle.terminate()
                         return phase, None, _calls.copy()
 

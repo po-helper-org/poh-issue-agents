@@ -105,6 +105,49 @@ def test_endpoint_is_closed_when_the_secret_is_not_configured(webhook, monkeypat
     assert fake.started == []
 
 
+def test_rejection_is_visible_in_the_log(webhook, caplog):
+    """Канал доклада, тихо переставший работать, обязан быть виден в логе
+    контура. Соседний сервис видит лишь код ответа: между 28 августа и
+    4 сентября канал доклада отвалился (#241), и по логам контура этого не
+    было видно вовсе."""
+    fake, app_client = webhook()
+
+    with caplog.at_level("WARNING", logger="webhook"):
+        _post(app_client, _event(), sign=False)
+        _post(app_client, _event(), secret="чужой")
+
+    assert "подпись не передана" in caplog.text
+    assert "подпись не совпала" in caplog.text
+    assert fake.started == []
+
+
+def test_unconfigured_secret_is_visible_in_the_log(webhook, monkeypatch, caplog):
+    """Эндпоинт закрыт целиком — это тоже отказ, а не тишина: иначе outage
+    конфигурации выглядит в логах как отсутствие трафика."""
+    monkeypatch.delenv("AGENT_EVENT_SECRET", raising=False)
+    fake, app_client = webhook()
+
+    with caplog.at_level("WARNING", logger="webhook"):
+        _post(app_client, _event())
+
+    assert "AGENT_EVENT_SECRET" in caplog.text
+    assert fake.started == []
+
+
+def test_rejection_log_carries_no_secret_and_no_body(webhook, caplog):
+    """В запись идут причина и отпечаток тела. Тело может нести чужое, а
+    подпись позволяет повторить ровно этот запрос — обе в лог не попадают."""
+    fake, app_client = webhook()
+    payload = _event(detail="служебное-содержимое-доклада")
+
+    with caplog.at_level("WARNING", logger="webhook"):
+        _post(app_client, payload, secret="чужой")
+
+    assert "служебное-содержимое-доклада" not in caplog.text
+    assert SECRET not in caplog.text
+    assert "чужой" not in caplog.text
+
+
 # --- разбор конверта ---
 
 def test_broken_envelope_is_a_client_error(webhook):
