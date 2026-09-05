@@ -118,6 +118,8 @@ async def _wait_for_park(env, handle) -> None:
 
 # Что ответит GitHub про PR. Тест переставляет перед прогоном.
 _merged = {"value": False}
+# История последнего прогона текстом: по ней проверяется запись маркера.
+_history = {"text": ""}
 _asked: list[tuple[str, int]] = []
 
 
@@ -173,6 +175,7 @@ async def _run(merged: bool, stop_at: str = "pr-review") -> tuple[str, list[str]
             desc = await handle.describe()
             assert desc.status == WorkflowExecutionStatus.COMPLETED, \
                 "закрытый Issue обязан завершить цикл в любом исходе"
+            _history["text"] = str(await handle.fetch_history())
     return phase, list(_phases)
 
 
@@ -237,3 +240,23 @@ async def test_unmerged_pr_from_pr_open_is_still_cancelled():
     phase, phases = await _run(merged=False, stop_at="pr-open")
     assert phase == "cancelled"
     assert phases[-1] == "cancelled", f"метка фазы не доехала: {phases}"
+
+
+@pytest.mark.timeout(180)
+async def test_patch_marker_is_recorded_on_every_closing_run():
+    """Маркер попадает в историю КАЖДОГО закрытия, а не только своей ветки.
+
+    AGENTS.md, правило 1: `workflow.patched(...)` идёт первым операндом связки
+    и зовётся независимо от остальных флагов. Стоя вторым операндом `and`, он
+    пропускался бы на всех закрытиях, кроме `pr-open`, — а непостоянная запись
+    маркера сама становится источником расхождения: следующая правка, читающая
+    его безусловно, уведёт такие прогоны в ветку, не совпадающую с записанной
+    (корпус 149 историй, #263).
+
+    Проверяется прогон, закрывшийся из `pr-review`, — там новый ход не нужен и
+    именно там маркер терялся бы.
+    """
+    phase, _ = await _run(merged=True)
+    assert phase == "merged"
+    assert "issue-lifecycle-merged-from-pr-open" in _history["text"], \
+        "маркер не записан в историю прогона, закрывшегося не из pr-open"

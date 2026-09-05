@@ -986,13 +986,21 @@ class IssueLifecycle:
         активность. Новый код зовёт её первой; на реплее такой истории это
         лишняя команда, то есть `[TMPRL1100]` и прогон, застрявший навсегда
         (#263). Маркер оставляет старым историям старый путь.
+
+        Маркер вычисляется ПЕРВЫМ и безусловно — до всех ранних возвратов и вне
+        связки `and` (AGENTS.md, правило 1). Вторым операндом он пропускался бы
+        на каждом закрытии из другой фазы и попадал бы в историю через раз;
+        непостоянная запись маркера сама становится источником расхождения, и
+        следующая правка, читающая его безусловно, увела бы такие прогоны в
+        ветку, не совпадающую с записанной.
         """
+        merged_from_pr_open = workflow.patched(
+            "issue-lifecycle-merged-from-pr-open")
         if self._issue is None or not self._pr_number:
             return (lifecycle.CANCELLED, "cancelled")
         if not lifecycle.can(self._phase, lifecycle.MERGED):
             return (lifecycle.CANCELLED, "cancelled")
-        if (self._phase == lifecycle.PR_OPEN
-                and not workflow.patched("issue-lifecycle-merged-from-pr-open")):
+        if self._phase == lifecycle.PR_OPEN and not merged_from_pr_open:
             return (lifecycle.CANCELLED, "cancelled")
         merged = await workflow.execute_activity(
             activities.pr_is_merged,
