@@ -977,9 +977,22 @@ class IssueLifecycle:
         Вопрос задаём, только если ответ может что-то изменить: PR нет либо из
         текущей фазы в `merged` хода нет — значит, это отмена, и лишний вызов
         GitHub на каждом закрытии не нужен.
+
+        Из `pr-open` ход в `merged` открылся позже самой ветки закрытия (#308:
+        доклада ревью может не быть вовсе, и тогда влитый PR записывался
+        отменой). Новый ход идёт под своим маркером, и вот почему: прогон,
+        успевший до правки выполнить эту ветку из `pr-open`, записал в историю
+        `cancelled` БЕЗ вызова `pr_is_merged` — короткое замыкание не звало
+        активность. Новый код зовёт её первой; на реплее такой истории это
+        лишняя команда, то есть `[TMPRL1100]` и прогон, застрявший навсегда
+        (#263). Маркер оставляет старым историям старый путь.
         """
-        if (self._issue is None or not self._pr_number
-                or not lifecycle.can(self._phase, lifecycle.MERGED)):
+        if self._issue is None or not self._pr_number:
+            return (lifecycle.CANCELLED, "cancelled")
+        if not lifecycle.can(self._phase, lifecycle.MERGED):
+            return (lifecycle.CANCELLED, "cancelled")
+        if (self._phase == lifecycle.PR_OPEN
+                and not workflow.patched("issue-lifecycle-merged-from-pr-open")):
             return (lifecycle.CANCELLED, "cancelled")
         merged = await workflow.execute_activity(
             activities.pr_is_merged,

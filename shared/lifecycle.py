@@ -156,6 +156,13 @@ TRANSITIONS: dict[str, tuple[Transition, ...]] = {
     ),
     PR_OPEN: (
         Transition(PR_REVIEW, EXTERNAL, "PR-Agent начал ревью"),
+        # PR можно влить, не дождавшись ревью, — руками или потому, что доклад
+        # ревью не пришёл вовсе (#103). Без этого хода закрытие влитым PR
+        # читалось как снятие с обработки: успех и отказ оказывались в одном
+        # состоянии — тот самый дефект, ради которого заводилась ветка закрытия
+        # слиянием (#308). Инициатор внешний: факт слияния приносит GitHub, а
+        # не стадия контура.
+        Transition(MERGED, EXTERNAL, "PR влит"),
         Transition(IN_DEVELOPMENT, EXTERNAL, "PR закрыт без слияния"),
         Transition(FAILED, EXTERNAL, "CI красный"),
         Transition(ESCALATED, EXTERNAL, "нужен человек"),

@@ -290,14 +290,27 @@ def verify_agent_signature(body: bytes, signature_header: str | None) -> None:
     у соседних сервисов свои права, и утечка одного не должна открывать второй
     канал. Без переменной эндпоинт закрыт (503, а не «пропускаем всех») —
     молчаливо открытый приём фазовых событий хуже, чем выключенный.
+
+    Каждый отказ оставляет запись в логе (#308). До этого не оставлял ни один:
+    сосед получал код ответа и писал предупреждение в СВОЙ лог, а на стороне
+    цикла не было ничего. Разошедшийся секрет выглядит как «PR-Agent молчит», и
+    между 28 августа и 4 сентября канал доклада ревью так и отвалился
+    незамеченным. В запись не идут ни секрет, ни подпись, ни тело: она отвечает
+    на вопрос «почему отказано», а не «что прислали».
     """
     secret = os.environ.get("AGENT_EVENT_SECRET", "")
     if not secret:
+        _log.warning("доклад агента отвергнут: AGENT_EVENT_SECRET не задан — "
+                     "канал приёма фазовых событий выключен")
         raise HTTPException(status_code=503, detail="AGENT_EVENT_SECRET не задан")
     if not signature_header or not signature_header.startswith("sha256="):
+        _log.warning("доклад агента отвергнут: подписи нет либо она не в формате "
+                     "sha256=<hex>")
         raise HTTPException(status_code=401, detail="Missing signature")
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature_header):
+        _log.warning("доклад агента отвергнут: подпись не совпала — секрет "
+                     "соседнего сервиса разошёлся с AGENT_EVENT_SECRET контура")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
 
