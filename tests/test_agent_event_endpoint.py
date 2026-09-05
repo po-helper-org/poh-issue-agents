@@ -221,3 +221,59 @@ def test_orphan_record_id_is_stable_for_the_same_fact(webhook):
     _post(app_client, _event(ref="build-881", status=SUCCEEDED))
 
     assert fake.started[0]["id"] == "orphan-acme/widgets-build-881:pr-open:succeeded"
+
+
+# --- видимый след отказа (#308) ---
+
+def test_missing_signature_leaves_a_trace(webhook, caplog):
+    """Отказ подписи обязан быть виден со стороны контура, а не только соседа.
+
+    Сосед получает код ответа и пишет предупреждение в СВОЙ лог; на стороне
+    цикла до этой правки не оставалось ничего. Между 28 августа и 4 сентября
+    канал доклада ревью так и отвалился незамеченным (#103).
+    """
+    fake, app_client = webhook()
+    with caplog.at_level("WARNING", logger="webhook"):
+        assert _post(app_client, _event(), sign=False).status_code == 401
+    assert any("подпис" in r.message.lower() for r in caplog.records), caplog.text
+
+
+def test_wrong_secret_leaves_a_trace_without_leaking_it(webhook, caplog):
+    fake, app_client = webhook()
+    with caplog.at_level("WARNING", logger="webhook"):
+        assert _post(app_client, _event(), secret="чужой").status_code == 401
+    text = caplog.text
+    assert any("подпис" in r.message.lower() for r in caplog.records), text
+    assert SECRET not in text, "секрет контура не должен попадать в лог"
+    assert "acme/widgets" not in text, "тело доклада в лог не пишется"
+
+
+def test_channel_switched_off_leaves_a_trace(webhook, caplog, monkeypatch):
+    """Незаданный секрет — не тишина: эндпоинт закрыт, и это видно."""
+    import main
+
+    fake, app_client = webhook()
+    monkeypatch.delenv("AGENT_EVENT_SECRET", raising=False)
+    monkeypatch.setattr(main, "_secret_absence_reported", False)
+    with caplog.at_level("WARNING", logger="webhook"):
+        assert _post(app_client, _event()).status_code == 503
+    assert any("AGENT_EVENT_SECRET" in r.message for r in caplog.records), caplog.text
+
+
+def test_switched_off_channel_is_reported_once_not_on_every_delivery(
+        webhook, caplog, monkeypatch):
+    """Незаданный секрет — состояние процесса, а не свойство доставки.
+
+    Эндпоинт публичный: одинаковая строка на каждый чужой POST превратила бы
+    лог в шум, и разбирать в нём было бы нечего.
+    """
+    import main
+
+    fake, app_client = webhook()
+    monkeypatch.delenv("AGENT_EVENT_SECRET", raising=False)
+    monkeypatch.setattr(main, "_secret_absence_reported", False)
+    with caplog.at_level("WARNING", logger="webhook"):
+        for _ in range(3):
+            assert _post(app_client, _event()).status_code == 503
+    said = [r for r in caplog.records if "AGENT_EVENT_SECRET" in r.message]
+    assert len(said) == 1, f"строка повторилась {len(said)} раз(а)"

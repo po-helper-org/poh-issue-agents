@@ -258,3 +258,21 @@ def test_failed_can_go_back_to_analysis():
     """
     assert lc.can(lc.FAILED, lc.BUSINESS_ANALYSIS)
     assert lc.initiator(lc.FAILED, lc.BUSINESS_ANALYSIS) == lc.HUMAN
+
+
+def test_merged_is_reachable_without_a_review_report():
+    """PR можно влить, не дождавшись доклада ревью, — модель обязана это знать.
+
+    Единственный ход из `pr-open` в `pr-review` объявлен внешним: его приносит
+    доклад PR-Agent. Пока доклада нет (#103), задача остаётся в `pr-open` — и
+    закрытие влитым PR читалось как снятие с обработки (#308): успех и отказ
+    в одном состоянии, ровно тот дефект, ради которого заводилась ветка
+    закрытия слиянием.
+    """
+    assert lc.can(lc.PR_OPEN, lc.MERGED), \
+        "влитый PR из pr-open некуда записать, кроме как в cancelled"
+    assert lc.can(lc.PR_REVIEW, lc.MERGED), "прежний путь сломан"
+    initiator = next(t.initiator for t in lc.TRANSITIONS[lc.PR_OPEN]
+                     if t.to == lc.MERGED)
+    assert initiator == lc.EXTERNAL, \
+        "факт слияния приносит GitHub, а не стадия контура и не человек"

@@ -118,12 +118,20 @@ async def _wait_for_park(env, handle) -> None:
 
 # Что ответит GitHub про PR. Тест переставляет перед прогоном.
 _merged = {"value": False}
+# История последнего прогона текстом: по ней проверяется запись маркера.
+_history = {"text": ""}
 _asked: list[tuple[str, int]] = []
+
+
+# Отказ GitHub на вопрос о PR: тест переставляет перед прогоном.
+_raises = {"value": False}
 
 
 @activity.defn(name="pr_is_merged")
 async def pr_is_merged_stub(repo: str, pr_number: int) -> bool:
     _asked.append((repo, pr_number))
+    if _raises["value"]:
+        raise RuntimeError("GitHub отвечает 502")
     return _merged["value"]
 
 
@@ -135,10 +143,15 @@ def _event(phase: str, ref: str = "81") -> AgentEvent:
                       status="started", ref=ref)
 
 
-async def _drive_to_pr_review(env, handle) -> None:
-    """Довести цикл до `pr-review` фактами внешнего агента."""
+async def _drive_to(env, handle, stop_at: str = "pr-review") -> None:
+    """Довести цикл до `stop_at` фактами внешнего агента.
+
+    Остановка на `pr-open` — не искусственная: именно там задача и стоит, пока
+    доклад ревью не пришёл, а он приходит не всегда (#103, #308).
+    """
     await _wait_for_park(env, handle)
-    for phase in ("ready-for-dev", "pr-open", "pr-review"):
+    path = ("ready-for-dev", "pr-open", "pr-review")
+    for phase in path[:path.index(stop_at) + 1]:
         await handle.signal(IssueLifecycle.agent_event, _event(phase))
         for _ in range(300):
             if await handle.query(IssueLifecycle.phase) == phase:
@@ -148,9 +161,13 @@ async def _drive_to_pr_review(env, handle) -> None:
             f"цикл не дошёл до {phase}"
 
 
-async def _run(merged: bool) -> tuple[str, list[str]]:
+async def _run(merged: bool, stop_at: str = "pr-review",
+               raises: bool = False,
+               report_merged: bool = False) -> tuple[str, list[str]]:
     _phases.clear()
     _asked.clear()
+    _history["text"] = ""
+    _raises["value"] = raises
     _merged["value"] = merged
     async with await WorkflowEnvironment.start_time_skipping() as env:
         tq = f"tq-{uuid.uuid4()}"
@@ -159,7 +176,16 @@ async def _run(merged: bool) -> tuple[str, list[str]]:
                           activities=ACTIVITIES):
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
-            await _drive_to_pr_review(env, handle)
+            await _drive_to(env, handle, stop_at)
+            if report_merged:
+                # Доклад `merged` внешним агентом ДО закрытия задачи: фаза уже
+                # успешна, и закрытие не должно её переписывать.
+                await handle.signal(IssueLifecycle.agent_event, _event("merged"))
+                for _ in range(300):
+                    if await handle.query(IssueLifecycle.phase) == "merged":
+                        break
+                    await env.sleep(1)
+                assert await handle.query(IssueLifecycle.phase) == "merged"
 
             await handle.signal(IssueLifecycle.issue_closed, "github-actions[bot]")
 
@@ -168,6 +194,7 @@ async def _run(merged: bool) -> tuple[str, list[str]]:
             desc = await handle.describe()
             assert desc.status == WorkflowExecutionStatus.COMPLETED, \
                 "закрытый Issue обязан завершить цикл в любом исходе"
+            _history["text"] = str(await handle.fetch_history())
     return phase, list(_phases)
 
 
@@ -209,3 +236,81 @@ async def test_no_pr_no_question_to_github():
             await handle.result()
             assert await handle.query(IssueLifecycle.phase) == "cancelled"
     assert _asked == [], "цикл спросил про PR, которого у него нет"
+
+
+@pytest.mark.timeout(180)
+async def test_merged_pr_closes_as_merged_even_without_a_review_report():
+    """Задача, влитая из `pr-open`, — успех, а не снятие с обработки (#308).
+
+    Ход `pr-open → pr-review` объявлен внешним: его приносит доклад PR-Agent.
+    Пока доклад не идёт (#103), цикл стоит в `pr-open` — и до этой правки
+    закрытие влитым PR писало `cancelled`, даже не спросив GitHub, влит ли PR.
+    Успех и отказ снова оказывались в одном состоянии.
+    """
+    phase, phases = await _run(merged=True, stop_at="pr-open")
+    assert phase == "merged", "влитый из pr-open Issue помечен как снятый с обработки"
+    assert phases[-1] == "merged", f"метка фазы не доехала: {phases}"
+    assert _asked == [("o/r", 81)], "цикл не спросил GitHub про свой PR"
+
+
+@pytest.mark.timeout(180)
+async def test_unmerged_pr_from_pr_open_is_still_cancelled():
+    """Новый ход не отменяет прежнего правила: не влит — значит снят."""
+    phase, phases = await _run(merged=False, stop_at="pr-open")
+    assert phase == "cancelled"
+    assert phases[-1] == "cancelled", f"метка фазы не доехала: {phases}"
+
+
+@pytest.mark.timeout(180)
+async def test_patch_marker_is_recorded_on_every_closing_run():
+    """Маркер попадает в историю КАЖДОГО закрытия, а не только своей ветки.
+
+    AGENTS.md, правило 1: `workflow.patched(...)` идёт первым операндом связки
+    и зовётся независимо от остальных флагов. Стоя вторым операндом `and`, он
+    пропускался бы на всех закрытиях, кроме `pr-open`, — а непостоянная запись
+    маркера сама становится источником расхождения: следующая правка, читающая
+    его безусловно, уведёт такие прогоны в ветку, не совпадающую с записанной
+    (корпус 149 историй, #263).
+
+    Проверяется прогон, закрывшийся из `pr-review`, — там новый ход не нужен и
+    именно там маркер терялся бы.
+    """
+    phase, _ = await _run(merged=True)
+    assert phase == "merged"
+    assert "issue-lifecycle-merged-from-pr-open" in _history["text"], \
+        "маркер не записан в историю прогона, закрывшегося не из pr-open"
+
+
+@pytest.mark.timeout(180)
+async def test_github_failure_escalates_instead_of_killing_the_cycle():
+    """Исчерпанные ретраи не уносят прогон и не врут об исходе.
+
+    Непойманный отказ активности уходит из `run()` наверх: прогон завершается
+    Failed — ни фазы, ни метки, ни возможности поднять его сигналом. До #308
+    закрытие из `pr-open` в GitHub не ходило вовсе, и расширять эту ветку ценой
+    потери исхода нельзя.
+
+    Записывается `escalated`, а не `cancelled`: PR мог быть влит, и отмена была
+    бы той же ложью об исходе, ради устранения которой правка и делалась.
+    """
+    phase, phases = await _run(merged=True, stop_at="pr-open", raises=True)
+    assert phase == "escalated", "цикл обязан пережить отказ GitHub"
+    assert phases[-1] == "escalated", f"метка фазы не доехала: {phases}"
+
+
+@pytest.mark.timeout(180)
+async def test_close_after_a_merged_report_does_not_overwrite_success():
+    """Успех, уже записанный докладом, закрытие задачи не переписывает отменой.
+
+    Находка ревью PR #310. Доклад `merged` уводит фазу в `merged` ДО того, как
+    GitHub закроет Issue по `Closes #N`. Дальше приходит `issue_closed`, а хода
+    `merged → merged` в таблице нет — и ветка закрытия возвращала `cancelled`,
+    затирая успех отменой. Ровно тот дефект, ради устранения которого правка и
+    делалась, только с другого конца.
+
+    Путь достижим и до правки #308 (из `pr-review` ход в `merged` был всегда),
+    так что проверка не про новый ход, а про стык двух путей в `merged`.
+    """
+    phase, phases = await _run(merged=True, stop_at="pr-open", report_merged=True)
+    assert phase == "merged", "закрытие переписало успех отменой"
+    assert phases[-1] == "merged", f"метка фазы уехала: {phases}"

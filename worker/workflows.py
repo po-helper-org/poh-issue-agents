@@ -977,16 +977,65 @@ class IssueLifecycle:
         Вопрос задаём, только если ответ может что-то изменить: PR нет либо из
         текущей фазы в `merged` хода нет — значит, это отмена, и лишний вызов
         GitHub на каждом закрытии не нужен.
+
+        Из `pr-open` ход в `merged` открылся позже самой ветки закрытия (#308:
+        доклада ревью может не быть вовсе, и тогда влитый PR записывался
+        отменой). Новый ход идёт под своим маркером, и вот почему: прогон,
+        успевший до правки выполнить эту ветку из `pr-open`, записал в историю
+        `cancelled` БЕЗ вызова `pr_is_merged` — короткое замыкание не звало
+        активность. Новый код зовёт её первой; на реплее такой истории это
+        лишняя команда, то есть `[TMPRL1100]` и прогон, застрявший навсегда
+        (#263). Маркер оставляет старым историям старый путь.
+
+        Маркер вычисляется ПЕРВЫМ и безусловно — до всех ранних возвратов и вне
+        связки `and` (AGENTS.md, правило 1). Вторым операндом он пропускался бы
+        на каждом закрытии из другой фазы и попадал бы в историю через раз;
+        непостоянная запись маркера сама становится источником расхождения, и
+        следующая правка, читающая его безусловно, увела бы такие прогоны в
+        ветку, не совпадающую с записанной.
         """
-        if (self._issue is None or not self._pr_number
-                or not lifecycle.can(self._phase, lifecycle.MERGED)):
+        merged_from_pr_open = workflow.patched(
+            "issue-lifecycle-merged-from-pr-open")
+        # Фаза УЖЕ успешна: доклад `merged` мог прийти раньше, чем GitHub закрыл
+        # задачу по `Closes #N`. Хода `merged → merged` в таблице нет, и общий
+        # путь ниже вернул бы `cancelled`, затерев успех отменой — тот же дефект,
+        # ради которого ветка и правится, только с другого конца. Стык достижим
+        # и без правки #308: из `pr-review` ход в `merged` был всегда.
+        #
+        # Маркера не требует: прогон, прошедший это место старым кодом, записал
+        # `cancelled` и на том завершился, а терминальная история не реплеится.
+        if self._phase == lifecycle.MERGED:
+            return (lifecycle.MERGED, "merged")
+        if self._issue is None or not self._pr_number:
             return (lifecycle.CANCELLED, "cancelled")
-        merged = await workflow.execute_activity(
-            activities.pr_is_merged,
-            args=[self._issue.repo, self._pr_number],
-            start_to_close_timeout=timedelta(seconds=30),
-            retry_policy=RetryPolicy(maximum_attempts=3),
-        )
+        if not lifecycle.can(self._phase, lifecycle.MERGED):
+            return (lifecycle.CANCELLED, "cancelled")
+        if self._phase == lifecycle.PR_OPEN and not merged_from_pr_open:
+            return (lifecycle.CANCELLED, "cancelled")
+        try:
+            merged = await workflow.execute_activity(
+                activities.pr_is_merged,
+                args=[self._issue.repo, self._pr_number],
+                start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except Exception as exc:  # noqa: BLE001 — исход неизвестен, прогон обязан жить
+            # Исчерпанные ретраи роняли бы весь цикл: непойманный отказ уходит
+            # из `run()` наверх, прогон завершается Failed — ни фазы, ни метки,
+            # ни возможности поднять его сигналом. До правки #308 эта ветка из
+            # `pr-open` в GitHub не ходила вовсе, и расширять её ценой потери
+            # исхода нельзя.
+            #
+            # Исход неизвестен — значит `escalated`, а не `cancelled`: записать
+            # отмену там, где PR мог быть влит, — та же ложь об исходе, ради
+            # устранения которой правка и делается.
+            #
+            # Маркер не нужен: прогон, у которого эта активность исчерпала
+            # ретраи, уже завершился Failed — терминальная история не реплеится.
+            workflow.logger.warning(
+                "не удалось спросить GitHub про PR #%s: %s — исход неизвестен",
+                self._pr_number, exc)
+            return (lifecycle.ESCALATED, "escalated")
         if merged:
             return (lifecycle.MERGED, "merged")
         return (lifecycle.CANCELLED, "cancelled")
@@ -1130,10 +1179,26 @@ class IssueLifecycle:
             except (TypeError, ValueError):
                 workflow.logger.warning("ref события не номер PR: %r", event.ref)
 
+        # Ход `pr-open → merged` открыт правкой #308, и читателей у этой строки
+        # таблицы ДВА: ветка закрытия Issue и вот этот разбор доклада. Прогон,
+        # успевший до правки получить доклад `merged` из `pr-open`, записал в
+        # историю `escalate_to_human` — новый код по той же истории пошёл бы
+        # мимо эскалации и запланировал `set_phase`: `[TMPRL1100] Activity type
+        # of scheduled event 'escalate_to_human' does not match ... 'set_phase'`.
+        # Маркер тот же, что у ветки закрытия: строка таблицы одна, и открыться
+        # она обязана для обоих читателей разом, иначе разъедутся они, а не
+        # версии кода. Вызов безусловный и первым операндом (AGENTS.md, 1).
+        merged_from_pr_open = workflow.patched(
+            "issue-lifecycle-merged-from-pr-open")
         target = agent_events.target_phase(event)
+        allowed = lifecycle.can(self._phase, target)
+        if (allowed and not merged_from_pr_open
+                and self._phase == lifecycle.PR_OPEN
+                and target == lifecycle.MERGED):
+            allowed = False
         if target == self._phase:
             return (self._phase, self._stage, False)  # тот же факт другими словами
-        if not lifecycle.can(self._phase, target):
+        if not allowed:
             await workflow.execute_activity(
                 activities.escalate_to_human,
                 args=[self._issue, f"Агент `{event.agent}` сообщил "

@@ -55,6 +55,7 @@ Nondeterminism error: Timer machine does not handle this event
 | `issue-lifecycle-plan-member-skips-analysis` | подзадача плана идёт мимо своей аналитики |
 | `issue-lifecycle-plan-member-waits-for-parent` | подзадача ждёт контур, а не человека |
 | `issue-lifecycle-clarify-after-analysis` | круг уточнений после аналитики |
+| `issue-lifecycle-merged-from-pr-open` | закрытие влитым PR из `pr-open` — успех, а не отмена |
 
 **`workflow.patched(...)` — первым операндом связки, всегда.** `and` в Python
 вычисляется слева направо и останавливается на первом ложном значении: в `if
