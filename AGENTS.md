@@ -43,7 +43,9 @@ Nondeterminism error: Timer machine does not handle this event
 активностей. Правка тела активности, её ретраев и меток безопасна: их в истории
 нет.
 
-Действующие маркеры (переименование = отказ по недетерминизму):
+Переименование любого маркера = отказ по недетерминизму на живых прогонах.
+Ниже — те, чью историю важно помнить; **полный** список, проверяемый тестом,
+лежит в реестре следом за ними:
 
 | Маркер | Что разводит |
 |---|---|
@@ -66,6 +68,61 @@ some_flag and workflow.patched(...):` вызов `patched` пропускает�
 его никогда, но актуальный код уже ждёт другую ветку. `workflow.patched(...)`
 обязан идти первым операндом и вызываться на каждом прогоне независимо от
 значений остальных флагов.
+
+### Реестр: все маркеры и где они живут
+
+Таблица выше — те, чью историю важно помнить. Реестр ниже — **все**, и он
+проверяется тестом `tests/test_patch_markers.py`: маркер, добавленный в код и не
+внесённый сюда, роняет прогон тестов. Прозы здесь нет намеренно — место в коде
+проверяемо, а пересказ намерения разъезжается молча, как разъехалась таблица
+выше (девять записей из сорока, #311).
+
+<!-- markers:start -->
+
+| Маркер | Где вызывается |
+|---|---|
+| `issue-development-partial-publish` | `run` |
+| `issue-development-repair-loop` | `run` |
+| `issue-lifecycle-absolute-park-deadline` | `_park_timeout` |
+| `issue-lifecycle-acceptance-gate` | `_start_development` |
+| `issue-lifecycle-acceptance-gate-stall-notice` | `_start_development` |
+| `issue-lifecycle-acceptance-gate-stall-notice-safe` | `_start_development` |
+| `issue-lifecycle-analyze-recovers-failed` | `_analysis_requested` |
+| `issue-lifecycle-answer-command-without-open-question` | `_phase_await_build` |
+| `issue-lifecycle-answer-question-failure-notice` | `_answer_open_question` |
+| `issue-lifecycle-ask-question-failure-message` | `_start_development` |
+| `issue-lifecycle-ask-question-failure-safe` | `_start_development` |
+| `issue-lifecycle-autostart-waits-for-answer` | `_phase_await_build` |
+| `issue-lifecycle-awaiting` | `_publish_awaiting` |
+| `issue-lifecycle-bft` | `_phase_triage` |
+| `issue-lifecycle-capture-episode-always` | `run` |
+| `issue-lifecycle-clarify-after-analysis` | `_clarify_open_questions` |
+| `issue-lifecycle-clear-queue-on-work` | `_enter` |
+| `issue-lifecycle-close-confirmed-duplicate` | `_phase_park` |
+| `issue-lifecycle-comment-intent-reply-activity` | `_handle_comment_intent` |
+| `issue-lifecycle-criterion-filled-by-hand-closes-question` | `_start_development` |
+| `issue-lifecycle-criterion-recheck-stall-notice` | `_phase_await_build` |
+| `issue-lifecycle-criterion-recheck-while-parked` | `_phase_await_build` |
+| `issue-lifecycle-develop-child` | `_begin_development` |
+| `issue-lifecycle-develop-plan-stage` | `run` |
+| `issue-lifecycle-duplicate-exit-checks-existing-labels` | `_phase_park` |
+| `issue-lifecycle-empty-run-diagnosis` | `run` |
+| `issue-lifecycle-followup-answer` | `_phase_await_build` |
+| `issue-lifecycle-howtodemo-on-pr-open` | `_phase_park` |
+| `issue-lifecycle-merged-from-pr-open` | `_agent_event`, `_phase_on_close` |
+| `issue-lifecycle-merged-on-close` | `_run_phase_loop` |
+| `issue-lifecycle-phase-loop` | `agent_event`, `analyze_requested`, `bft_requested`, `estimate_requested`, `run` |
+| `issue-lifecycle-plan-member-skips-analysis` | `_phase_await_decision`, `_phase_park` |
+| `issue-lifecycle-plan-member-waits-for-parent` | `_phase_await_build` |
+| `issue-lifecycle-prfix-child` | `_phase_pr_review` |
+| `issue-lifecycle-question-answer` | `_phase_await_build` |
+| `issue-lifecycle-question-close-failure-notice` | `_start_development` |
+| `issue-lifecycle-question-repoint-failure-notice` | `_answer_open_question`, `_phase_await_build` |
+| `issue-lifecycle-reasked-question-repoints-pointer` | `_answer_open_question` |
+| `issue-lifecycle-repoint-open-question-on-answer` | `_phase_await_build` |
+| `issue-lifecycle-step-subissue-barrier` | `_run_phase_loop` |
+
+<!-- markers:end -->
 
 **Маркер ставится ДО выкладки, задним числом он не лечит.** `workflow.patched`
 на реплее смотрит не на то, что произошло, а на наличие своего маркера в
