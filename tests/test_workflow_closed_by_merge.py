@@ -162,7 +162,8 @@ async def _drive_to(env, handle, stop_at: str = "pr-review") -> None:
 
 
 async def _run(merged: bool, stop_at: str = "pr-review",
-               raises: bool = False) -> tuple[str, list[str]]:
+               raises: bool = False,
+               report_merged: bool = False) -> tuple[str, list[str]]:
     _phases.clear()
     _asked.clear()
     _history["text"] = ""
@@ -176,6 +177,15 @@ async def _run(merged: bool, stop_at: str = "pr-review",
             handle = await env.client.start_workflow(
                 IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
             await _drive_to(env, handle, stop_at)
+            if report_merged:
+                # Доклад `merged` внешним агентом ДО закрытия задачи: фаза уже
+                # успешна, и закрытие не должно её переписывать.
+                await handle.signal(IssueLifecycle.agent_event, _event("merged"))
+                for _ in range(300):
+                    if await handle.query(IssueLifecycle.phase) == "merged":
+                        break
+                    await env.sleep(1)
+                assert await handle.query(IssueLifecycle.phase) == "merged"
 
             await handle.signal(IssueLifecycle.issue_closed, "github-actions[bot]")
 
@@ -286,3 +296,21 @@ async def test_github_failure_escalates_instead_of_killing_the_cycle():
     phase, phases = await _run(merged=True, stop_at="pr-open", raises=True)
     assert phase == "escalated", "цикл обязан пережить отказ GitHub"
     assert phases[-1] == "escalated", f"метка фазы не доехала: {phases}"
+
+
+@pytest.mark.timeout(180)
+async def test_close_after_a_merged_report_does_not_overwrite_success():
+    """Успех, уже записанный докладом, закрытие задачи не переписывает отменой.
+
+    Находка ревью PR #310. Доклад `merged` уводит фазу в `merged` ДО того, как
+    GitHub закроет Issue по `Closes #N`. Дальше приходит `issue_closed`, а хода
+    `merged → merged` в таблице нет — и ветка закрытия возвращала `cancelled`,
+    затирая успех отменой. Ровно тот дефект, ради устранения которого правка и
+    делалась, только с другого конца.
+
+    Путь достижим и до правки #308 (из `pr-review` ход в `merged` был всегда),
+    так что проверка не про новый ход, а про стык двух путей в `merged`.
+    """
+    phase, phases = await _run(merged=True, stop_at="pr-open", report_merged=True)
+    assert phase == "merged", "закрытие переписало успех отменой"
+    assert phases[-1] == "merged", f"метка фазы уехала: {phases}"

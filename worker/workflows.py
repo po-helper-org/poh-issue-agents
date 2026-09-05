@@ -996,6 +996,16 @@ class IssueLifecycle:
         """
         merged_from_pr_open = workflow.patched(
             "issue-lifecycle-merged-from-pr-open")
+        # Фаза УЖЕ успешна: доклад `merged` мог прийти раньше, чем GitHub закрыл
+        # задачу по `Closes #N`. Хода `merged → merged` в таблице нет, и общий
+        # путь ниже вернул бы `cancelled`, затерев успех отменой — тот же дефект,
+        # ради которого ветка и правится, только с другого конца. Стык достижим
+        # и без правки #308: из `pr-review` ход в `merged` был всегда.
+        #
+        # Маркера не требует: прогон, прошедший это место старым кодом, записал
+        # `cancelled` и на том завершился, а терминальная история не реплеится.
+        if self._phase == lifecycle.MERGED:
+            return (lifecycle.MERGED, "merged")
         if self._issue is None or not self._pr_number:
             return (lifecycle.CANCELLED, "cancelled")
         if not lifecycle.can(self._phase, lifecycle.MERGED):
