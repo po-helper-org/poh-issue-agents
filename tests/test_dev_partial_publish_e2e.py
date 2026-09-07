@@ -8,6 +8,7 @@
 комментария в ленте, через настоящий git и настоящую сборку тела PR.
 """
 
+from poh_developer import activities as dev_activities
 import subprocess
 
 import activities as a
@@ -64,7 +65,7 @@ async def test_a_failed_run_leaves_a_draft_and_an_honest_comment(monkeypatch, tm
     clone_dir = _worktree(tmp_path)
     (clone_dir / "cart.py").write_text("# правка агента\n")
 
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, clone_dir))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, clone_dir))
     monkeypatch.setattr(gc, "_dry_run", lambda: False)
     monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
     monkeypatch.setattr(gc, "_auth_headers", lambda repo: {})
@@ -116,7 +117,7 @@ async def test_a_run_that_wrote_nothing_leaves_no_trace(monkeypatch, tmp_path):
     """
     clone_dir = _worktree(tmp_path)  # только постановка, кода агента нет
 
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, clone_dir))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, clone_dir))
     monkeypatch.setattr(gc, "_dry_run", lambda: False)
     monkeypatch.setattr(gc, "auth_token", lambda repo: "t")
 

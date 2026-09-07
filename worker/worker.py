@@ -16,6 +16,7 @@ logging.basicConfig(
 import activities
 import consolidation_activities as ca
 import delivery_bridge
+import developer_bridge
 import howtodemo_bridge
 from consolidation_workflow import ConsolidationWorkflow
 from shared import nondeterminism, sentry_setup
@@ -149,6 +150,12 @@ def _watch_nondeterminism() -> None:
 
 async def main() -> None:
     _watch_nondeterminism()
+    # Порты стадии «Разработка» — ДО поднятия воркера: её шаги исполняет пакет,
+    # и без подставленных реализаций первый же прогон упал бы RuntimeError'ом
+    # «порт не сконфигурирован». Безусловно, а не по наличию пакета: стадия
+    # зарегистрирована в списке активностей ниже, и молчаливо отключить её
+    # значило бы отдать задачу воркеру, который её не выполнит.
+    developer_bridge.install()
     client = await connect_temporal()
     worker = Worker(
         client,

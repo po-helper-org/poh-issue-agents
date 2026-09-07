@@ -4,6 +4,7 @@
 сбой, и у доведения есть предел.
 """
 
+from poh_developer import activities as dev_activities
 import pytest
 
 from poh_developer import pr_closing
@@ -177,9 +178,9 @@ def test_pr_branch_is_cloned_for_the_fix_round(monkeypatch, tmp_path):
 
     monkeypatch.setattr(activities_module.subprocess, "run", fake_run)
     # Передача каталога раннеру требует root — в тесте её проверяет test_develop.
-    monkeypatch.setattr(activities_module, "_handover_to_runner", lambda path: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda path: None)
 
-    activities_module._prfix_prepare("o/r", 28, "feature/19-openhands", "постановка")
+    dev_activities._prfix_prepare("o/r", 28, "feature/19-openhands", "постановка")
 
     clone = next(c for c in commands if "clone" in c)
     assert "--branch" in clone, f"клонируется не ветка PR: {clone}"
@@ -235,10 +236,10 @@ def test_round_does_not_commit_its_own_task_statement(monkeypatch, tmp_path):
     monkeypatch.setattr(activities_module.github_client, "review_text",
                         lambda repo, n: "PR Reviewer Guide")
     monkeypatch.setattr(activities_module.github_client, "push_fixes", fake_push)
-    monkeypatch.setattr(activities_module, "_prfix_prepare",
+    monkeypatch.setattr(dev_activities, "_prfix_prepare",
                         lambda repo, n, branch, task:
                             (clone / ".task.md").write_text(task, encoding="utf-8"))
-    monkeypatch.setattr(activities_module, "_reap_runner", lambda slug: None)
+    monkeypatch.setattr(dev_activities, "_reap_runner", lambda slug: None)
     monkeypatch.setattr(activities_module.subprocess, "run",
                         lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "",
                                                          "stderr": ""})())
@@ -278,10 +279,10 @@ def test_round_asks_the_layer_for_developer_rules(monkeypatch, tmp_path):
                         lambda repo, n: "PR Reviewer Guide")
     monkeypatch.setattr(activities_module.github_client, "push_fixes",
                         lambda repo, clone_dir, branch, message: False)
-    monkeypatch.setattr(activities_module, "_prfix_prepare",
+    monkeypatch.setattr(dev_activities, "_prfix_prepare",
                         lambda repo, n, branch, task:
                             (clone / ".task.md").write_text(task, encoding="utf-8"))
-    monkeypatch.setattr(activities_module, "_reap_runner", lambda slug: None)
+    monkeypatch.setattr(dev_activities, "_reap_runner", lambda slug: None)
     monkeypatch.setattr(activities_module.subprocess, "run",
                         lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": "",
                                                          "stderr": ""})())

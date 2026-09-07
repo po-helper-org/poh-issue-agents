@@ -7,6 +7,7 @@
 задачу в незаметную.
 """
 
+from poh_developer import activities as dev_activities
 import asyncio
 import pathlib
 import re
@@ -291,7 +292,7 @@ def test_leftover_run_is_reaped_before_a_new_attempt(monkeypatch):
     monkeypatch.setattr(activities_module.subprocess, "run",
                         lambda cmd, **kw: commands.append(cmd) or _Done())
 
-    activities_module._dev_run_agent(_issue(7))
+    dev_activities._dev_run_agent(_issue(7))
 
     slug = develop.task_slug("o/r", 7)
     assert commands[0] == ["docker", "rm", "-f", slug], (
@@ -305,7 +306,7 @@ def test_workspace_is_handed_over_to_the_runner(tmp_path, monkeypatch):
     monkeypatch.setattr(activities_module.os, "chown",
                         lambda path, uid, gid: chowned.append((str(path), uid)))
 
-    activities_module._handover_to_runner(tmp_path)
+    dev_activities._handover_to_runner(tmp_path)
 
     assert (str(tmp_path), develop.RUNNER_UID) in chowned
 
@@ -322,4 +323,4 @@ def test_failed_handover_is_loud(tmp_path, monkeypatch):
     monkeypatch.setattr(activities_module.os, "chown", boom)
 
     with pytest.raises(RuntimeError, match="раннер"):
-        activities_module._handover_to_runner(tmp_path)
+        dev_activities._handover_to_runner(tmp_path)

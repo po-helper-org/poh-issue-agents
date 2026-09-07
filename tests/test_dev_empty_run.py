@@ -7,6 +7,7 @@
 инфраструктуры.
 """
 
+from shared import repowise
 import sys
 from pathlib import Path
 
@@ -89,9 +90,14 @@ def test_broken_threshold_falls_back_to_the_default(monkeypatch):
 
 @pytest.fixture
 def acts(monkeypatch):
-    import activities
+    """Модуль стадии — из пакета: шаги живут там, и подменять их внутренности
+    нужно тоже там. Индекс кода включается через МОДУЛЬ контура: порт стадии
+    делегирует ему в момент вызова, поэтому подмена доходит."""
+    from shared import repowise
 
-    monkeypatch.setattr(activities.repowise, "enabled", lambda: True)
+    from poh_developer import activities
+
+    monkeypatch.setattr(repowise, "enabled", lambda: True)
     return activities
 
 
@@ -104,21 +110,21 @@ def _issue():
 
 def test_dead_proxy_means_no_mcp_config_at_all(acts, monkeypatch, tmp_path):
     """Конфиг по мёртвому адресу убивает раннер на инициализации."""
-    monkeypatch.setattr(acts.repowise, "available", lambda timeout=0: False)
+    monkeypatch.setattr(repowise, "available", lambda timeout=0: False)
     acts._write_runner_mcp_config(_issue(), tmp_path)
     assert not (tmp_path / develop.MCP_CONFIG_DIR / develop.MCP_CONFIG_NAME).exists()
 
 
 def test_live_proxy_still_gets_its_config(acts, monkeypatch, tmp_path):
-    monkeypatch.setattr(acts.repowise, "available", lambda timeout=0: True)
+    monkeypatch.setattr(repowise, "available", lambda timeout=0: True)
     acts._write_runner_mcp_config(_issue(), tmp_path)
     config = tmp_path / develop.MCP_CONFIG_DIR / develop.MCP_CONFIG_NAME
     assert config.exists() and "mcpServers" in config.read_text(encoding="utf-8")
 
 
 def test_disabled_integration_writes_nothing_as_before(acts, monkeypatch, tmp_path):
-    monkeypatch.setattr(acts.repowise, "enabled", lambda: False)
-    monkeypatch.setattr(acts.repowise, "available",
+    monkeypatch.setattr(repowise, "enabled", lambda: False)
+    monkeypatch.setattr(repowise, "available",
                         lambda timeout=0: pytest.fail("живость не спрашивают"))
     acts._write_runner_mcp_config(_issue(), tmp_path)
     assert not (tmp_path / develop.MCP_CONFIG_DIR).exists()

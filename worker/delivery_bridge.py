@@ -27,7 +27,7 @@ from temporalio import activity
 
 import github_client
 from shared import agent_comment
-from poh_developer import develop, pr_closing
+from poh_developer import activities as dev_activities, develop, pr_closing
 
 _log = logging.getLogger(__name__)
 
@@ -221,11 +221,11 @@ async def fix_conflicts(repo: str, pr_number: int) -> str:
     activities._handover_to_runner(root)
 
     slug = _slug(repo, pr_number)
-    await asyncio.to_thread(activities._reap_runner, slug)
+    await asyncio.to_thread(dev_activities._reap_runner, slug)
     command = develop.runner_command(
         slug, image=develop.runner_image(), volume=develop.workspace_volume(),
         mount=develop.workspace_mount(), network=develop.proxy_network(),
-        home=activities._runner_home(slug))
+        home=dev_activities._runner_home(slug))
     env = {**os.environ, **develop.runner_env(
         os.environ.get("ZAI_API_KEY", ""), os.environ.get("ZAI_BASE_URL", ""),
         os.environ.get("DEVELOP_MODEL", "").strip() or "openai/glm-4.6")}

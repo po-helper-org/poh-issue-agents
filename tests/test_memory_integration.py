@@ -3,6 +3,7 @@
 Главное свойство, которое здесь закреплено: **слой опционален**. Выключенный он
 не меняет ни постановку, ни поведение шагов — побайтово.
 """
+from poh_developer import activities as dev_activities
 import asyncio
 import json
 from pathlib import Path
@@ -37,15 +38,15 @@ def layer_on(monkeypatch):
 def test_disabled_layer_leaves_the_task_byte_identical(monkeypatch):
     """Постановка без слоя обязана совпадать с постановкой при выключенном слое."""
     parts = ["# Задача: реализовать Issue #42", "## Кнопка", "тело задачи",
-             a._DEV_FALLBACK_RULES]
-    baseline = a._join_sections(a._split_sections(list(parts)))
+             dev_activities._DEV_FALLBACK_RULES]
+    baseline = dev_activities._join_sections(dev_activities._split_sections(list(parts)))
 
     with_layer = list(parts)
     rules = memory.rules(memory.DEVELOP, repo="o/r", query="кнопка")
     if rules.text:
         with_layer.append(rules.text)
 
-    assert a._join_sections(a._split_sections(with_layer)) == baseline
+    assert dev_activities._join_sections(dev_activities._split_sections(with_layer)) == baseline
 
 
 def test_disabled_layer_makes_capture_a_noop():
@@ -59,17 +60,17 @@ def test_disabled_layer_returns_no_rule_ids():
 # ───────────────────── включённый слой ─────────────────────
 
 def test_enabled_layer_block_reaches_the_task(layer_on):
-    parts = ["# Задача: реализовать Issue #42", "тело", a._DEV_FALLBACK_RULES]
+    parts = ["# Задача: реализовать Issue #42", "тело", dev_activities._DEV_FALLBACK_RULES]
     rules = memory.rules(memory.DEVELOP, repo="o/r")
     parts.append(rules.text)
-    task = a._join_sections(a._split_sections(parts))
+    task = dev_activities._join_sections(dev_activities._split_sections(parts))
     assert "красные тесты не публикуем" in task
 
 
 def test_block_survives_section_parsing(layer_on):
     """Блок с решётки стал бы именем секции и исчез — этого быть не должно."""
     parts = ["# Задача: реализовать Issue #1", "тело", layer_on]
-    assert "красные тесты не публикуем" in a._join_sections(a._split_sections(parts))
+    assert "красные тесты не публикуем" in dev_activities._join_sections(dev_activities._split_sections(parts))
 
 
 def test_rule_ids_are_returned_for_the_episode(layer_on):
@@ -80,28 +81,28 @@ def test_rule_ids_are_returned_for_the_episode(layer_on):
 
 def test_injected_rules_are_written_outside_the_clone(tmp_path):
     """Файл лежит в корне задачи, а не в клоне: `git add -A` его не видит."""
-    a._write_injected_rules(tmp_path, ["C-001", "D-001"])
-    assert (tmp_path / a.INJECTED_RULES_FILE).exists()
-    assert a._read_injected_rules(tmp_path) == ["C-001", "D-001"]
+    dev_activities._write_injected_rules(tmp_path, ["C-001", "D-001"])
+    assert (tmp_path / dev_activities.INJECTED_RULES_FILE).exists()
+    assert dev_activities._read_injected_rules(tmp_path) == ["C-001", "D-001"]
 
 
 def test_missing_injected_rules_file_is_not_an_error(tmp_path):
-    assert a._read_injected_rules(tmp_path) == []
+    assert dev_activities._read_injected_rules(tmp_path) == []
 
 
 def test_broken_injected_rules_file_is_not_an_error(tmp_path):
-    (tmp_path / a.INJECTED_RULES_FILE).write_text("не json", encoding="utf-8")
-    assert a._read_injected_rules(tmp_path) == []
+    (tmp_path / dev_activities.INJECTED_RULES_FILE).write_text("не json", encoding="utf-8")
+    assert dev_activities._read_injected_rules(tmp_path) == []
 
 
 # ───────────────────── файл намерений ─────────────────────
 
 def test_reflect_note_is_parsed(tmp_path):
-    (tmp_path / a.REFLECT_NOTE_FILE).write_text(
+    (tmp_path / dev_activities.REFLECT_NOTE_FILE).write_text(
         "## Намерение\nпочинить обработчик клика\n\n"
         "## Допущения\n- поле всегда приходит\n- порядок не важен\n\n"
         "## Сомнения\n- не проверил на пустом списке\n", encoding="utf-8")
-    got = a._read_reflect_note(tmp_path)
+    got = dev_activities._read_reflect_note(tmp_path)
     assert got["intent"] == "починить обработчик клика"
     assert got["assumptions"] == ["поле всегда приходит", "порядок не важен"]
     assert got["uncertainty"] == ["не проверил на пустом списке"]
@@ -109,13 +110,13 @@ def test_reflect_note_is_parsed(tmp_path):
 
 def test_missing_reflect_note_is_not_an_error(tmp_path):
     """Агент не написал файл — запись уходит без намерения, стадия не срывается."""
-    assert a._read_reflect_note(tmp_path) == {}
+    assert dev_activities._read_reflect_note(tmp_path) == {}
 
 
 def test_partial_reflect_note_yields_what_there_is(tmp_path):
-    (tmp_path / a.REFLECT_NOTE_FILE).write_text("## Намерение\nтолько это\n",
+    (tmp_path / dev_activities.REFLECT_NOTE_FILE).write_text("## Намерение\nтолько это\n",
                                                 encoding="utf-8")
-    got = a._read_reflect_note(tmp_path)
+    got = dev_activities._read_reflect_note(tmp_path)
     assert got["intent"] == "только это"
     assert got["assumptions"] == [] and got["uncertainty"] == []
 
@@ -128,8 +129,8 @@ def test_reflect_note_instruction_is_its_own_block():
     прогоном: демо-репозиторий имеет свои правила, и файл намерений не
     появился ни разу.
     """
-    assert a.REFLECT_NOTE_FILE in a._DEV_REFLECT_NOTE_RULE
-    assert a.REFLECT_NOTE_FILE not in a._DEV_FALLBACK_RULES
+    assert dev_activities.REFLECT_NOTE_FILE in dev_activities._DEV_REFLECT_NOTE_RULE
+    assert dev_activities.REFLECT_NOTE_FILE not in dev_activities._DEV_FALLBACK_RULES
 
 
 def test_reflect_note_block_is_its_own_contour_section():
@@ -137,20 +138,20 @@ def test_reflect_note_block_is_its_own_contour_section():
 
     Приклеенный блок был бы неотличим при разборе от продолжения соседней
     секции и терял бы собственный заголовок."""
-    secs = a._split_sections([a._DEV_REFLECT_NOTE_RULE])
+    secs = dev_activities._split_sections([dev_activities._DEV_REFLECT_NOTE_RULE])
     assert len(secs) == 1
     assert secs[0][0] == "## След решения"
-    assert a.REFLECT_NOTE_FILE in a._join_sections(secs)
+    assert dev_activities.REFLECT_NOTE_FILE in dev_activities._join_sections(secs)
 
 
 def test_reflect_note_instruction_survives_repo_own_rules():
     """Свои правила репозитория не должны вытеснять требование контура."""
     parts = ["# Задача: реализовать Issue #1", "тело",
              "## Свои правила репозитория\nделай по-нашему",
-             a._DEV_REFLECT_NOTE_RULE]
-    task = a._join_sections(a._split_sections(parts))
+             dev_activities._DEV_REFLECT_NOTE_RULE]
+    task = dev_activities._join_sections(dev_activities._split_sections(parts))
     assert "делай по-нашему" in task
-    assert a.REFLECT_NOTE_FILE in task
+    assert dev_activities.REFLECT_NOTE_FILE in task
 
 
 # ───────────────── перечень служебных файлов ─────────────────
@@ -166,7 +167,7 @@ def test_followups_file_constant_is_in_the_list():
 
 
 def test_reflect_note_is_in_the_list():
-    assert a.REFLECT_NOTE_FILE in develop.SERVICE_FILES
+    assert dev_activities.REFLECT_NOTE_FILE in develop.SERVICE_FILES
 
 
 def test_clear_service_files_removes_all_and_reports(tmp_path):
@@ -189,26 +190,26 @@ def test_clear_service_files_is_idempotent(tmp_path):
 
 def test_signals_file_lives_outside_the_clone(tmp_path):
     """`git add -A` его не видит: корень задачи лежит вне рабочего дерева."""
-    a._write_signal(tmp_path, "tests_passed", True)
-    assert (tmp_path / a.SIGNALS_FILE).exists()
-    assert a._read_signals(tmp_path) == {"tests_passed": True}
+    dev_activities._write_signal(tmp_path, "tests_passed", True)
+    assert (tmp_path / dev_activities.SIGNALS_FILE).exists()
+    assert dev_activities._read_signals(tmp_path) == {"tests_passed": True}
 
 
 def test_signals_accumulate_not_overwrite(tmp_path):
-    a._write_signal(tmp_path, "tests_passed", False)
-    a._write_signal(tmp_path, "fix_rounds", 2)
-    assert a._read_signals(tmp_path) == {"tests_passed": False, "fix_rounds": 2}
+    dev_activities._write_signal(tmp_path, "tests_passed", False)
+    dev_activities._write_signal(tmp_path, "fix_rounds", 2)
+    assert dev_activities._read_signals(tmp_path) == {"tests_passed": False, "fix_rounds": 2}
 
 
 def test_missing_signals_file_is_not_an_error(tmp_path):
-    assert a._read_signals(tmp_path) == {}
+    assert dev_activities._read_signals(tmp_path) == {}
 
 
 def test_broken_signals_file_is_not_an_error(tmp_path):
-    (tmp_path / a.SIGNALS_FILE).write_text("не json", encoding="utf-8")
-    assert a._read_signals(tmp_path) == {}
-    a._write_signal(tmp_path, "tests_passed", True)
-    assert a._read_signals(tmp_path) == {"tests_passed": True}
+    (tmp_path / dev_activities.SIGNALS_FILE).write_text("не json", encoding="utf-8")
+    assert dev_activities._read_signals(tmp_path) == {}
+    dev_activities._write_signal(tmp_path, "tests_passed", True)
+    assert dev_activities._read_signals(tmp_path) == {"tests_passed": True}
 
 
 def test_skipped_tests_are_unknown_not_passed(tmp_path, monkeypatch):
@@ -218,13 +219,13 @@ def test_skipped_tests_are_unknown_not_passed(tmp_path, monkeypatch):
     вовсе: пустой `DEVELOP_TEST_COMMAND` засчитался бы как зелёный прогон.
     """
     monkeypatch.delenv("DEVELOP_TEST_COMMAND", raising=False)
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
 
     class _I:
         repo, issue_number, title = "o/r", 1, "T"
 
-    a._dev_tests(_I())
-    assert a._read_signals(tmp_path) == {"tests_passed": None}
+    dev_activities._dev_tests(_I())
+    assert dev_activities._read_signals(tmp_path) == {"tests_passed": None}
 
 
 def test_red_tests_record_the_outcome_before_raising(tmp_path, monkeypatch):
@@ -233,7 +234,7 @@ def test_red_tests_record_the_outcome_before_raising(tmp_path, monkeypatch):
     import subprocess as sp
 
     monkeypatch.setenv("DEVELOP_TEST_COMMAND", "какая-то команда")
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
     monkeypatch.setattr(a.subprocess, "run",
                         lambda *x, **k: sp.CompletedProcess(x, 1, "провал", ""))
 
@@ -241,29 +242,29 @@ def test_red_tests_record_the_outcome_before_raising(tmp_path, monkeypatch):
         repo, issue_number, title = "o/r", 1, "T"
 
     with pytest.raises(RuntimeError, match="проверки не прошли"):
-        a._dev_tests(_I())
-    assert a._read_signals(tmp_path) == {"tests_passed": False}
+        dev_activities._dev_tests(_I())
+    assert dev_activities._read_signals(tmp_path) == {"tests_passed": False}
 
 
 def test_green_tests_record_success(tmp_path, monkeypatch):
     import subprocess as sp
 
     monkeypatch.setenv("DEVELOP_TEST_COMMAND", "какая-то команда")
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
     monkeypatch.setattr(a.subprocess, "run",
                         lambda *x, **k: sp.CompletedProcess(x, 0, "всё зелено", ""))
 
     class _I:
         repo, issue_number, title = "o/r", 1, "T"
 
-    a._dev_tests(_I())
-    assert a._read_signals(tmp_path) == {"tests_passed": True}
+    dev_activities._dev_tests(_I())
+    assert dev_activities._read_signals(tmp_path) == {"tests_passed": True}
 
 
 def test_signals_file_is_not_committed():
     """Лежит в корне задачи, вне клона — но проверим и перечень служебных."""
-    assert a.SIGNALS_FILE.startswith(".")
-    assert a.INJECTED_RULES_FILE.startswith(".")
+    assert dev_activities.SIGNALS_FILE.startswith(".")
+    assert dev_activities.INJECTED_RULES_FILE.startswith(".")
 
 
 def test_capture_runs_even_when_a_step_fails():
@@ -303,7 +304,7 @@ def test_reflect_note_is_preserved_not_destroyed(tmp_path):
     assert sorted(removed) == [".reflect.md", ".task.md"]
     assert not (clone / ".reflect.md").exists(), "из дерева обязан исчезнуть"
     assert (root / ".reflect.md").exists(), "содержимое обязано пережить снятие"
-    assert a._read_reflect_note(root)["intent"] == "починил обработчик"
+    assert dev_activities._read_reflect_note(root)["intent"] == "починил обработчик"
 
 
 def test_task_statement_is_destroyed_not_preserved(tmp_path):
@@ -339,7 +340,7 @@ def _capture(monkeypatch, tmp_path, issue):
     """Прогнать шаг записи, вернув отданную слою запись."""
     sent = {}
     monkeypatch.setenv("MEMORY_BASE_URL", "http://memory-api:8090")
-    monkeypatch.setattr(a, "_dev_paths", lambda i: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda i: (tmp_path, tmp_path / "repo"))
     monkeypatch.setattr(memory, "put_episode",
                         lambda ep: sent.update(ep) or True)
 
@@ -371,11 +372,11 @@ def test_episode_carries_the_task_text(monkeypatch, tmp_path):
 def test_huge_statement_is_cut_before_it_goes_over_the_wire(monkeypatch, tmp_path):
     """Постановка бывает на десятки килобайт. Память организации — не её копия."""
     issue = IssueInput(repo="o/r", issue_number=77, title="t",
-                       body="я" * (a.TASK_BODY_LIMIT * 3),
+                       body="я" * (dev_activities.TASK_BODY_LIMIT * 3),
                        author_login="u", author_type="User")
     sent = _capture(monkeypatch, tmp_path, issue)
 
-    assert len(sent["task_body"]) == a.TASK_BODY_LIMIT
+    assert len(sent["task_body"]) == dev_activities.TASK_BODY_LIMIT
 
 
 def test_empty_statement_travels_as_absent_not_as_blank(monkeypatch, tmp_path):
@@ -450,7 +451,7 @@ def test_control_iteration_never_asks_the_layer_for_rules(monkeypatch, tmp_path)
     monkeypatch.setenv("MEMORY_CONTROL_MOD", "2")
     monkeypatch.setattr(memory, "rules",
                         lambda *a, **k: asked.append(a) or memory.Rules(text="X", ids=["C-1"]))
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a, "_clone_repo",
                         lambda repo, dest, branch=None: os.makedirs(dest, exist_ok=True))
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
@@ -463,8 +464,8 @@ def test_control_iteration_never_asks_the_layer_for_rules(monkeypatch, tmp_path)
 
     issue = IssueInput(repo="o/r", issue_number=94, title="t", body="b",
                        author_login="u", author_type="User")
-    task, ids = a._dev_prepare(issue, "research/issue-94")
+    task, ids = dev_activities._dev_prepare(issue, "research/issue-94")
 
     assert asked == [], "у слоя спросили правила в контрольной итерации"
     assert ids == []
-    assert a.ORG_RULES_HEADING not in task
+    assert dev_activities.ORG_RULES_HEADING not in task

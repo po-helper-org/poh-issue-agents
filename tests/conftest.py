@@ -80,3 +80,14 @@ def make_fake_set_labels(add_label, remove_label):
         if add_error is not None:
             raise add_error
     return set_labels
+
+
+# Порты стадии «Разработка» на весь прогон тестов: её шаги живут в пакете и без
+# подставленных реализаций отказывают RuntimeError'ом. Адаптеры делегируют
+# МОДУЛЯМ контура, поэтому привычная подмена `github_client.post_comment` в
+# тесте доходит до стадии ровно как раньше.
+@pytest.fixture(autouse=True, scope="session")
+def _developer_ports():
+    import developer_bridge
+
+    developer_bridge.install()

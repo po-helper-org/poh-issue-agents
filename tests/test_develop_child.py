@@ -6,6 +6,7 @@
 передаче задачи. Здесь проверяются границы, по которым стадия разрезана.
 """
 
+from poh_developer import activities as dev_activities
 import pytest
 
 import activities as activities_module
@@ -99,7 +100,7 @@ async def test_prepare_returns_a_size_not_the_task_text(gh, monkeypatch):
     payload Temporal незачем: на большой задаче требования дают сотни килобайт,
     а история воркфлоу — не хранилище документов. НФТ-01: потолок 4 КБ.
     """
-    monkeypatch.setattr(activities_module, "_dev_prepare",
+    monkeypatch.setattr(dev_activities, "_dev_prepare",
                         lambda issue, branch: ("x" * 5000, ["R-1", "R-2"]))
 
     size = await activities_module.dev_prepare(_issue(39), "research/issue-39")
@@ -109,7 +110,7 @@ async def test_prepare_returns_a_size_not_the_task_text(gh, monkeypatch):
 
 
 async def test_publish_returns_the_pr_number(gh, monkeypatch):
-    monkeypatch.setattr(activities_module, "_dev_publish",
+    monkeypatch.setattr(dev_activities, "_dev_publish",
                         lambda issue, branch, foreign: 101)
 
     assert await activities_module.dev_publish(_issue(39), "b", []) == 101
@@ -118,7 +119,7 @@ async def test_publish_returns_the_pr_number(gh, monkeypatch):
 async def test_publish_returns_none_when_the_agent_changed_nothing(gh, monkeypatch):
     """`None` — не сбой шага, а его честный результат. Решение «открывать
     нечего» принимает воркфлоу: у него есть контекст стадии, у активности нет."""
-    monkeypatch.setattr(activities_module, "_dev_publish",
+    monkeypatch.setattr(dev_activities, "_dev_publish",
                         lambda issue, branch, foreign: None)
 
     assert await activities_module.dev_publish(_issue(39), "b", []) is None
@@ -130,7 +131,7 @@ async def test_run_agent_raises_on_a_failed_run(gh, monkeypatch):
     def boom(issue):
         raise RuntimeError("прогон агента разработки завершился с кодом 137")
 
-    monkeypatch.setattr(activities_module, "_dev_run_agent", boom)
+    monkeypatch.setattr(dev_activities, "_dev_run_agent", boom)
 
     with pytest.raises(RuntimeError, match="137"):
         await activities_module.dev_run_agent(_issue(39))

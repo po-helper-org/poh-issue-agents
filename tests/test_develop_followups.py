@@ -8,6 +8,7 @@
 руками: Issue по отмеченной находке заведёт человек сам, после гейта приёмки.
 """
 
+from poh_developer import activities as dev_activities
 from poh_developer import develop
 
 
@@ -105,7 +106,7 @@ def test_followups_go_to_grow_section_not_issues(monkeypatch, tmp_path):
     monkeypatch.setattr(a.github_client, "post_comment", lambda *a_, **k_: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
 
-    root, clone = a._dev_paths(issue_stub := a.IssueInput(
+    root, clone = dev_activities._dev_paths(issue_stub := a.IssueInput(
         repo="o/r", issue_number=42, title="t", body="b",
         author_login="u", author_type="User"))
     clone.mkdir(parents=True, exist_ok=True)
@@ -369,7 +370,7 @@ def test_task_statement_is_not_committed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(activities_module.github_client, "publish_worktree", fake_publish)
 
-    number = activities_module._dev_publish(_issue(19), "research/issue-19", [])
+    number = dev_activities._dev_publish(_issue(19), "research/issue-19", [])
 
     assert number == 28
     assert captured["task_md_exists"] is False, "постановка уехала в коммит"
@@ -393,7 +394,7 @@ def test_agent_output_reaches_the_log(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(activities_module.subprocess, "run", lambda cmd, **kw: _Done())
 
     with caplog.at_level("INFO", logger="activities"):
-        activities_module._dev_run_agent(_issue(19))
+        dev_activities._dev_run_agent(_issue(19))
 
     assert "AGENT-SAID-THIS" in caplog.text
 

@@ -24,10 +24,8 @@ L5 (ревью задачи 7): `_fetch_decomposition_plan`, `_fetch_subtasks` �
 обсуждения, если понадобится, естественнее лёг бы файлом `.harness/`
 (по образцу M4), а не инлайном в постановку, как раньше.
 """
-from activities import (
-    _truncate,
-    _refresh_issue_body,
-)
+from activities import _truncate
+from poh_developer.activities import _refresh_issue_body
 
 
 def test_truncate_short_text():
