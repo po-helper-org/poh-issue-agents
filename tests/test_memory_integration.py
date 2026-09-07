@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 import activities as a
-from shared import develop, memory
+from shared import memory
+from poh_developer import develop
 from shared.workflow_types import IssueInput
 
 

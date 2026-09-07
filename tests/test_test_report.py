@@ -6,7 +6,7 @@
 
 from pathlib import Path
 
-from shared import test_report
+from poh_developer import test_report
 
 _PYTEST = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites><testsuite name="pytest" tests="3">

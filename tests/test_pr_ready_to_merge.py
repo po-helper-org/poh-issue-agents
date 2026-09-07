@@ -5,7 +5,7 @@
 заблокировано.
 """
 
-from shared import pr_closing
+from poh_developer import pr_closing
 
 
 def test_a_blocked_pr_is_not_called_ready():

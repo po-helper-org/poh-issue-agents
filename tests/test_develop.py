@@ -14,7 +14,7 @@ import re
 import pytest
 
 import activities as activities_module
-from shared import develop
+from poh_developer import develop, runner
 from shared.workflow_types import IssueInput
 from tests.conftest import make_fake_set_labels
 
@@ -42,53 +42,6 @@ def gh(monkeypatch):
 
 
 # --- чистый контракт границы ---
-
-def test_inputs_are_all_strings():
-    """`workflow_dispatch` принимает только строки — число молча уронит прогон
-    на стороне GitHub, где мы его уже не увидим."""
-    inputs = develop.dispatch_inputs(12, branch="research/issue-12", priority="P1")
-
-    assert all(isinstance(v, str) for v in inputs.values())
-    assert inputs["issue_number"] == "12"
-
-
-def test_missing_branch_is_an_explicit_empty_string():
-    """Пустая строка — это «аналитики не было», и агент обязан отличать её от
-    несуществующей ветки. Отсутствие ключа означало бы «не передали»."""
-    inputs = develop.dispatch_inputs(12, branch="")
-
-    assert inputs["research_branch"] == ""
-
-
-def test_comment_says_where_the_run_happens():
-    body = develop.handoff_comment(12, repo="o/r", branch="research/issue-12",
-                                   where="запустил OpenHands на своём сервере")
-
-    assert "research/issue-12" in body
-    assert "на своём сервере" in body    # где именно идёт работа
-    assert "Closes #12" in body          # чем прогон должен закончиться
-    assert "GROW" in body                # и что он делает с edge-кейсами
-
-
-def test_comment_without_analysis_says_so_instead_of_naming_a_branch():
-    body = develop.handoff_comment(12, repo="o/r", branch="", where="запустил агента")
-
-    assert "аналитики по задаче не было" in body
-    assert "research/issue-12" not in body
-
-
-def test_develop_is_on_by_default(monkeypatch):
-    """Забытая переменная не должна тихо обрывать контур на самом дорогом шаге."""
-    monkeypatch.delenv("DEVELOP_ENABLED", raising=False)
-
-    assert develop.enabled() is True
-
-
-@pytest.mark.parametrize("raw", ["0", "false", "off", "NO"])
-def test_develop_switches_off_only_explicitly(monkeypatch, raw):
-    monkeypatch.setenv("DEVELOP_ENABLED", raw)
-
-    assert develop.enabled() is False
 
 
 # --- сама активность ---
@@ -276,46 +229,6 @@ def test_priority_is_scored_for_an_agent_issue_without_classification(monkeypatc
 
 # --- Локальный режим: прогон на своём сервере ---
 
-def test_local_is_the_default(monkeypatch):
-    """Стенд самодостаточен, пока явно не сказано иначе: репозиторий
-    обслуживается целиком внутри контура, без чужих раннеров."""
-    monkeypatch.delenv("DEVELOP_MODE", raising=False)
-
-    assert develop.mode() == develop.LOCAL
-
-
-def test_runner_gets_no_github_token():
-    """Агент исполняет код чужого репозитория. Токен ему не нужен: пушит и
-    открывает PR воркер — своим токеном и после прогона."""
-    command = develop.runner_command("dev-o__r-7", image="img",
-                                     volume="vol", mount="/workspaces")
-
-    passed = {command[i + 1] for i, part in enumerate(command) if part == "-e"}
-    assert passed == {"LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"}
-    assert not any("GH" in part or "TOKEN" in part for part in command)
-
-
-def test_runner_is_disposable_and_sees_only_its_task():
-    command = develop.runner_command("dev-o__r-7", image="img",
-                                     volume="vol", mount="/workspaces")
-
-    assert "--rm" in command                                  # не копим мусор с ключом
-    assert "vol:/workspaces" in command                       # общий том с воркером
-    assert command[command.index("-w") + 1] == "/workspaces/dev-o__r-7/repo"
-
-
-def test_task_slug_is_a_directory_name_not_a_path():
-    """Слэш репозитория в имени каталога создал бы вложенность вместо задачи."""
-    assert "/" not in develop.task_slug("po-helper-org/poh-demo-checkout", 7)
-
-
-def test_run_timeout_falls_back_on_garbage(monkeypatch):
-    """Битое значение не должно означать «без потолка»: зависший агент держал
-    бы задачу в неопределённости молча."""
-    monkeypatch.setenv("DEVELOP_TIMEOUT_SEC", "скоро")
-
-    assert develop.run_timeout() == develop.DEFAULT_RUN_TIMEOUT_SEC
-
 
 def test_worker_image_carries_the_binary_the_runner_is_launched_with():
     """Одноразовый контейнер поднимает сам воркер — значит клиент Docker обязан
@@ -337,41 +250,27 @@ def test_worker_image_carries_the_binary_the_runner_is_launched_with():
         "воркер запускает раннер через docker, но клиента в его образе нет")
 
 
-def test_worker_and_runner_agree_on_the_node_version():
-    """Проверки проекта гоняет воркер, код проекта исполняет раннер — Node у них
-    обязан быть один.
+def test_worker_node_major_matches_the_developer_stage():
+    """Образ воркера сверяется с мажором Node, объявленным стадией разработки.
 
-    Воркер прогоняет `DEVELOP_TEST_COMMAND` до пуша, ту же строку, что и CI. На
-    живом прогоне #13 это дало `Could not find 'tests/*.test.mjs'`: команда
-    репозитория — `node --test "tests/*.test.mjs"`, glob раскрывает сам Node
-    (с 22), а в образе воркера стоял 20. Красный шаг разработки на зелёном коде.
+    Проверки проекта гоняет ВОРКЕР — ту же строку, что и CI, — а код проекта
+    исполняет раннер. Разъехались мажоры: на живом прогоне #13 команда
+    репозитория `node --test "tests/*.test.mjs"` дала
+    `Could not find 'tests/*.test.mjs'` — glob раскрывает сам Node начиная с 22,
+    а в образе воркера стоял 20. Красный шаг разработки на зелёном коде.
+
+    Тест сменил СМЫСЛ, а не только форму, поэтому и переименован. Раньше он
+    сверял два Dockerfile внутри этого репозитория; образ раннера переехал в
+    `poh-developer-agents`, и сверять здесь стало нечего. Теперь сверяется свой
+    образ с ЧУЖИМ ОБЪЯВЛЕНИЕМ — константой пакета, которую тот же пакет
+    проверяет против своего Dockerfile запуском собранного образа в CI.
     """
-    root = pathlib.Path(__file__).resolve().parents[1]
+    text = (pathlib.Path(__file__).resolve().parents[1]
+            / "worker" / "Dockerfile").read_text(encoding="utf-8")
+    found = re.search(r"deb\.nodesource\.com/setup_(\d+)\.x", text)
 
-    def node_major(dockerfile: str) -> str:
-        text = (root / dockerfile).read_text(encoding="utf-8")
-        found = re.search(r"deb\.nodesource\.com/setup_(\d+)\.x", text)
-        assert found, f"{dockerfile}: не нашёл установку Node"
-        return found.group(1)
-
-    assert node_major("worker/Dockerfile") == node_major("openhands/Dockerfile")
-
-
-def test_runner_container_has_a_deterministic_name():
-    """У прогона должно быть имя, по которому его можно найти и снять.
-
-    Контейнер живёт своей жизнью: воркер запускает его и ждёт, но если воркер
-    умер (выкладка, рестарт, terminate воркфлоу), клиент исчезает, а контейнер
-    остаётся работать — с ключом модели, минутами CPU и памятью. На стенде так
-    и вышло: прогон сняли, а раннер жил ещё полчаса и доедал память, из-за
-    которой следующая задача еле ползла. Без имени найти его нечем: `--rm`
-    убирает контейнер только после нормального выхода.
-    """
-    slug = develop.task_slug("o/r", 7)
-    command = develop.runner_command(slug, image="i", volume="v", mount="/m")
-
-    assert "--name" in command
-    assert command[command.index("--name") + 1] == slug
+    assert found, "worker/Dockerfile: не нашёл установку Node"
+    assert int(found.group(1)) == runner.RUNNER_NODE_MAJOR
 
 
 def test_leftover_run_is_reaped_before_a_new_attempt(monkeypatch):
@@ -398,23 +297,6 @@ def test_leftover_run_is_reaped_before_a_new_attempt(monkeypatch):
     assert commands[0] == ["docker", "rm", "-f", slug], (
         f"перед прогоном не сняли остаток: {commands[0]}")
     assert commands[1][:2] == ["docker", "run"]
-
-
-def test_runner_uid_matches_the_image():
-    """Uid раннера объявлен в одном месте и совпадает с образом.
-
-    Воркер готовит каталог задачи от root, а раннер работает непривилегированным
-    пользователем. Разъехались числа — каталог остаётся недоступным на запись, и
-    это САМЫЙ дорогой из возможных отказов: агент не падает, а молча уходит
-    писать в /tmp и докладывает об успехе. На живом прогоне #19 так потерялись
-    21 минута работы, а PR открылся пустым.
-    """
-    dockerfile = (pathlib.Path(__file__).resolve().parents[1]
-                  / "openhands" / "Dockerfile").read_text(encoding="utf-8")
-
-    found = re.search(r"useradd\s+-m\s+-u\s+(\d+)", dockerfile)
-    assert found, "не нашёл создание пользователя в образе раннера"
-    assert int(found.group(1)) == develop.RUNNER_UID
 
 
 def test_workspace_is_handed_over_to_the_runner(tmp_path, monkeypatch):

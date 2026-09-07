@@ -6,7 +6,7 @@
 
 import pytest
 
-from shared import pr_closing
+from poh_developer import pr_closing
 
 
 def test_empty_result_is_a_legal_outcome():

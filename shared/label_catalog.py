@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import commands, develop, lifecycle, pr_closing
+from . import commands, lifecycle
+# Стадия «Разработка» переехала пакетом (po-helper-org/poh-developer-agents).
+from poh_developer import develop, pr_closing
 from . import labels as L
 
 PHASE_COLOR = "#1F75CB"

@@ -21,7 +21,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-# Логгер по правилам shared/ (см. shared/task_context.py): модуль остаётся
+# Логгер по правилам shared/ (см. poh_developer/task_context.py): модуль остаётся
 # чистым — логирование не сеть и не GitHub, а без него порча тела тонет без
 # следа (ревью, находка 2).
 logger = logging.getLogger(__name__)

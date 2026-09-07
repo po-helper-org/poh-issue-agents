@@ -26,7 +26,8 @@ from pathlib import Path
 from temporalio import activity
 
 import github_client
-from shared import agent_comment, develop, pr_closing
+from shared import agent_comment
+from poh_developer import develop, pr_closing
 
 _log = logging.getLogger(__name__)
 

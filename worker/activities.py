@@ -37,19 +37,18 @@ from shared import (
     answer_interpretation,
     bft,
     decomposition,
-    develop,
     howtodemo,
     issue_blocks,
     labels,
     lifecycle,
     memory,
-    pr_closing,
     questions,
     repowise,
     sentry_setup,
-    test_report,
-    task_context,
 )
+# Стадия «Разработка» — из пакета, а не из shared/: источник правды переехал в
+# po-helper-org/poh-developer-agents, копии здесь удалены.
+from poh_developer import develop, pr_closing, task_context, test_report
 from shared.awaiting import Awaiting
 from shared.commands import (
     ANALYZE,

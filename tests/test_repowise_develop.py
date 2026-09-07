@@ -14,7 +14,8 @@ import json
 
 import pytest
 
-from shared import develop, repowise
+from shared import repowise
+from poh_developer import develop
 
 
 @pytest.fixture(autouse=True)

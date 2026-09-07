@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import activities as a
-from shared import task_context
+from poh_developer import task_context
 
 
 def test_plan_stage_fails_when_file_not_created(monkeypatch, tmp_path):
