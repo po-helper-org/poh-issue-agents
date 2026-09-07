@@ -6,6 +6,7 @@
 stderr, и в истории оставалось только «returned non-zero exit status 1».
 """
 
+from poh_developer import activities as dev_activities
 import asyncio
 
 import pytest
@@ -31,7 +32,7 @@ def test_announce_is_skipped_when_already_in_development(monkeypatch):
                         lambda *a: posted.append(a))
     monkeypatch.setattr(activities.github_client, "add_label", lambda *a: None)
 
-    asyncio.run(activities._dev_announce(_issue(), "", where="на своём сервере"))
+    asyncio.run(dev_activities._dev_announce(_issue(), "", where="на своём сервере"))
 
     assert posted == [], "повторная передача не должна давать второго комментария"
 
@@ -44,7 +45,7 @@ def test_announce_posts_on_the_first_handoff(monkeypatch):
                         lambda *a: posted.append(a))
     monkeypatch.setattr(activities.github_client, "add_label", lambda *a: None)
 
-    asyncio.run(activities._dev_announce(_issue(), "", where="на своём сервере"))
+    asyncio.run(dev_activities._dev_announce(_issue(), "", where="на своём сервере"))
 
     assert len(posted) == 1
 
@@ -61,7 +62,7 @@ def test_announce_speaks_up_when_labels_are_unreadable(monkeypatch):
                         lambda *a: posted.append(a))
     monkeypatch.setattr(activities.github_client, "add_label", lambda *a: None)
 
-    asyncio.run(activities._dev_announce(_issue(), "", where="на своём сервере"))
+    asyncio.run(dev_activities._dev_announce(_issue(), "", where="на своём сервере"))
 
     assert len(posted) == 1
 

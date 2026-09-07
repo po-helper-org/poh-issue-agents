@@ -4,6 +4,7 @@
 нечего, и вердикт пишет сама модель. Здесь так нельзя: план — вход исполнителя.
 """
 
+from poh_developer import activities as dev_activities
 import asyncio
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from poh_developer import task_context
 
 def test_plan_stage_fails_when_file_not_created(monkeypatch, tmp_path):
     monkeypatch.setattr(a, "_run_claude", lambda prompt, cwd, mcp=None: None)
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
     (tmp_path / "repo" / task_context.DIR).mkdir(parents=True)
 
     issue = a.IssueInput(repo="o/r", issue_number=3, title="t", body="b",
@@ -32,7 +33,7 @@ def test_plan_stage_succeeds_when_file_written(monkeypatch, tmp_path):
         (harness / task_context.PLAN).write_text("# План\n\n### Task 1\n", encoding="utf-8")
 
     monkeypatch.setattr(a, "_run_claude", fake_claude)
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
 
     issue = a.IssueInput(repo="o/r", issue_number=3, title="t", body="b",
                          author_login="u", author_type="User")
@@ -46,7 +47,7 @@ def test_empty_plan_file_counts_as_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(a, "_run_claude",
                         lambda prompt, cwd, mcp=None:
                             (harness / task_context.PLAN).write_text("  \n", encoding="utf-8"))
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
 
     issue = a.IssueInput(repo="o/r", issue_number=3, title="t", body="b",
                          author_login="u", author_type="User")
@@ -64,7 +65,7 @@ def test_plan_file_with_only_invisible_chars_counts_as_failure(monkeypatch, tmp_
         a, "_run_claude",
         lambda prompt, cwd, mcp=None:
             (harness / task_context.PLAN).write_text("﻿​", encoding="utf-8"))
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
 
     issue = a.IssueInput(repo="o/r", issue_number=3, title="t", body="b",
                          author_login="u", author_type="User")
@@ -82,7 +83,7 @@ def test_plan_stage_raises_when_claude_call_fails(monkeypatch, tmp_path):
         raise RuntimeError("claude -p exit 1: rate limited")
 
     monkeypatch.setattr(a, "_run_claude", failing_claude)
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
 
     issue = a.IssueInput(repo="o/r", issue_number=3, title="t", body="b",
                          author_login="u", author_type="User")
@@ -108,7 +109,7 @@ def test_plan_stage_heartbeats_during_long_claude(monkeypatch, tmp_path):
         (harness / task_context.PLAN).write_text("# План\n\n### Task 1\n", encoding="utf-8")
 
     monkeypatch.setattr(a, "_run_claude", slow_claude)
-    monkeypatch.setattr(a, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
+    monkeypatch.setattr(dev_activities, "_dev_paths", lambda issue: (tmp_path, tmp_path / "repo"))
 
     issue = a.IssueInput(repo="o/r", issue_number=3, title="t", body="b",
                          author_login="u", author_type="User")

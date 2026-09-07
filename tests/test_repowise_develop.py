@@ -10,6 +10,7 @@
 общем томе — образ при этом не трогается и обёртка над ENTRYPOINT не нужна.
 """
 
+from poh_developer import activities as dev_activities
 import json
 
 import pytest
@@ -103,14 +104,14 @@ def test_transcript_fetched_by_session_of_develop_agent(monkeypatch):
         return "# Диалог\n\nход 1\n"
 
     monkeypatch.setattr(activities.repowise, "transcript", fake_transcript)
-    text = activities._collect_dev_dialog("o/r", 42, run_failed=True)
+    text = dev_activities._collect_dev_dialog("o/r", 42, run_failed=True)
     assert fetched == [repowise.session_id("o/r", 42, repowise.DEVELOP)]
     assert "ход 1" in text
 
 
 def test_empty_session_yields_marked_artifact(monkeypatch):
     monkeypatch.setattr(activities.repowise, "transcript", lambda session: None)
-    text = activities._collect_dev_dialog("o/r", 42, run_failed=False)
+    text = dev_activities._collect_dev_dialog("o/r", 42, run_failed=False)
     assert "обращений к индексу не было" in text
     assert "o/r#42" in text
 
@@ -119,7 +120,7 @@ def test_failed_run_is_named_in_empty_artifact(monkeypatch):
     # Разбирающему прогон важно отличить «агент не спросил» от «агент упал
     # раньше, чем успел спросить».
     monkeypatch.setattr(activities.repowise, "transcript", lambda session: None)
-    text = activities._collect_dev_dialog("o/r", 42, run_failed=True)
+    text = dev_activities._collect_dev_dialog("o/r", 42, run_failed=True)
     assert "аварийно" in text
 
 
@@ -139,7 +140,7 @@ def test_publication_never_masks_agent_failure(monkeypatch):
     monkeypatch.setattr(activities.github_client, "push_artifacts_to_branch", boom)
 
     # Не поднимает — значит исход прогона агента останется тем, чем был.
-    activities._publish_dev_dialog_sync(_issue(), "research/issue-42")
+    dev_activities._publish_dev_dialog_sync(_issue(), "research/issue-42")
 
 
 def test_publication_skipped_when_integration_disabled(monkeypatch):
@@ -147,14 +148,14 @@ def test_publication_skipped_when_integration_disabled(monkeypatch):
     called = []
     monkeypatch.setattr(activities.github_client, "post_comment",
                         lambda *a, **k: called.append("comment"))
-    activities._publish_dev_dialog_sync(_issue(), "")
+    dev_activities._publish_dev_dialog_sync(_issue(), "")
     assert called == []
 
 
 # --- Правила обращения к индексу в постановке (FR-19) ---
 
 def test_rules_tell_agent_to_ask_before_and_when_stuck():
-    text = activities._DEV_REPOWISE_RULES
+    text = dev_activities._DEV_REPOWISE_RULES
     assert "До начала работы" in text
     assert "При затруднении" in text
     # Недоступный индекс не должен читаться агентом как повод остановиться.
@@ -168,7 +169,7 @@ def test_rules_leave_no_room_to_skip_the_index():
     # маленькой задаче с подробными требованиями совет проигрывает желанию
     # сразу писать код. Требование обязано быть безусловным и называть
     # инструменты — иначе шаг конвейера существует только на бумаге.
-    text = activities._DEV_REPOWISE_RULES
+    text = dev_activities._DEV_REPOWISE_RULES
     assert "ПЕРВЫМ ДЕЙСТВИЕМ" in text
     assert "не меньше одного вопроса" in text
     assert "search_codebase" in text, "правило не называет инструмент поиска"
@@ -178,7 +179,7 @@ def test_rules_leave_no_room_to_skip_the_index():
 def test_rules_do_not_ask_agent_to_retell_the_dialog():
     # Транскрипт ведёт прокси. Просьба пересказать его вернула бы ровно тот
     # класс отказов, ради которого журнал и вынесен наружу.
-    assert "пересказывать" in activities._DEV_REPOWISE_RULES
+    assert "пересказывать" in dev_activities._DEV_REPOWISE_RULES
 
 
 # --- Права на HOME -----------------------------------------------------------
@@ -197,7 +198,7 @@ def test_home_directory_is_handed_over_to_runner(tmp_path, monkeypatch):
     # убивал раннер на инициализации (poh-demo-checkout#151). Тест про передачу
     # HOME, поэтому живость просто подделываем.
     monkeypatch.setattr(activities.repowise, "available", lambda timeout=0: True)
-    monkeypatch.setattr(activities, "_handover_to_runner", handed.append)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", handed.append)
     monkeypatch.setattr(activities, "_clone_repo",
                         lambda repo, dest, branch=None: __import__("os").makedirs(dest, exist_ok=True))
     monkeypatch.setattr(activities.develop, "workspace_mount", lambda: str(tmp_path))
@@ -209,9 +210,9 @@ def test_home_directory_is_handed_over_to_runner(tmp_path, monkeypatch):
                             "требования" if path.endswith("system_requirements.md") else "")
 
     issue = _issue(56)
-    activities._dev_prepare(issue, "research/issue-56")
+    dev_activities._dev_prepare(issue, "research/issue-56")
 
-    root, _clone = activities._dev_paths(issue)
+    root, _clone = dev_activities._dev_paths(issue)
     assert handed == [root], "раннеру передан не весь каталог задачи, а только клон"
     assert (root / develop.MCP_CONFIG_DIR / develop.MCP_CONFIG_NAME).exists()
 
@@ -219,6 +220,6 @@ def test_home_directory_is_handed_over_to_runner(tmp_path, monkeypatch):
 def test_handover_covers_the_directory_used_as_home(tmp_path, monkeypatch):
     monkeypatch.setattr(activities.develop, "workspace_mount", lambda: str(tmp_path))
     issue = _issue(56)
-    root, _clone = activities._dev_paths(issue)
+    root, _clone = dev_activities._dev_paths(issue)
     slug = develop.task_slug(issue.repo, issue.issue_number)
-    assert activities._runner_home(slug) == str(root)
+    assert dev_activities._runner_home(slug) == str(root)

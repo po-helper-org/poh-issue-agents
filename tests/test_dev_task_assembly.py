@@ -13,6 +13,7 @@
 он больше не служит вытеснению, но по-прежнему нужен, чтобы заголовки при
 сборке не терялись, а блоки не приклеивались к чужим соседям.
 """
+from poh_developer import activities as dev_activities
 from pathlib import Path
 
 import pytest
@@ -31,20 +32,20 @@ MAIN = f"# Задача: реализовать Issue #{ISSUE_N}"
 
 def test_heading_is_the_first_line_not_the_whole_block():
     """Раньше весь кусок становился именем секции, и содержимое исчезало."""
-    secs = a._split_sections(["## Как работать\nнаходки пиши в .followups.md"])
+    secs = dev_activities._split_sections(["## Как работать\nнаходки пиши в .followups.md"])
     assert secs == [("## Как работать", "находки пиши в .followups.md")]
 
 
 def test_rules_block_reaches_the_agent():
     """Блок правил репозитория терялся целиком вместе с этой инструкцией."""
-    parts = [MAIN, f"## {TITLE}", "тело", a._DEV_FALLBACK_RULES]
-    task = a._join_sections(a._split_sections(parts))
+    parts = [MAIN, f"## {TITLE}", "тело", dev_activities._DEV_FALLBACK_RULES]
+    task = dev_activities._join_sections(dev_activities._split_sections(parts))
     assert ".followups.md" in task
 
 
 def test_joined_task_keeps_section_headings():
     parts = [MAIN, f"## {TITLE}", "тело", "## Системные требования", "требования"]
-    task = a._join_sections(a._split_sections(parts))
+    task = dev_activities._join_sections(dev_activities._split_sections(parts))
     assert MAIN in task
     assert "## Системные требования" in task
 
@@ -52,11 +53,11 @@ def test_joined_task_keeps_section_headings():
 def test_block_starting_with_newline_survives():
     """Единственный блок, переживавший прежний разбор, обязан пережить и новый."""
     parts = [MAIN, "тело", "\nПравила организации:\n- пункт"]
-    assert "- пункт" in a._join_sections(a._split_sections(parts))
+    assert "- пункт" in dev_activities._join_sections(dev_activities._split_sections(parts))
 
 
 def test_empty_sections_do_not_produce_blank_blocks():
-    task = a._join_sections([("", ""), ("## Пусто", "")])
+    task = dev_activities._join_sections([("", ""), ("## Пусто", "")])
     assert task.strip() == "## Пусто"
 
 
@@ -78,14 +79,14 @@ def test_context_goes_to_files_without_truncation(monkeypatch, tmp_path):
                         lambda repo, path, ref=None:
                             long_requirements if path.endswith("system_requirements.md") else "")
     monkeypatch.setattr(a, "_clone_repo", lambda repo, dest, branch=None: None)
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
 
     issue = a.IssueInput(repo="o/r", issue_number=7, title="t", body="b",
                          author_login="u", author_type="User")
-    task, _ = a._dev_prepare(issue, "research/issue-7")
+    task, _ = dev_activities._dev_prepare(issue, "research/issue-7")
 
-    root, clone = a._dev_paths(issue)
+    root, clone = dev_activities._dev_paths(issue)
     harness = Path(clone) / task_context.DIR
 
     assert (harness / task_context.CONTEXT_MAP).exists(), "карты контекста нет"
@@ -101,7 +102,7 @@ def test_context_goes_to_files_without_truncation(monkeypatch, tmp_path):
 def _prepare_kwargs(monkeypatch, tmp_path, get_file):
     monkeypatch.setattr(a.github_client, "get_file", get_file)
     monkeypatch.setattr(a, "_clone_repo", lambda repo, dest, branch=None: None)
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
 
 
@@ -119,7 +120,7 @@ def test_missing_requirements_with_analysis_branch_fails_the_stage(monkeypatch, 
                          author_login="u", author_type="User")
 
     with pytest.raises(RuntimeError, match="requirements.md"):
-        a._dev_prepare(issue, "research/issue-9")
+        dev_activities._dev_prepare(issue, "research/issue-9")
 
 
 def test_truncation_marker_in_fetched_content_fails_the_stage(monkeypatch, tmp_path):
@@ -141,7 +142,7 @@ def test_truncation_marker_in_fetched_content_fails_the_stage(monkeypatch, tmp_p
                          author_login="u", author_type="User")
 
     with pytest.raises(RuntimeError, match="след усечения") as excinfo:
-        a._dev_prepare(issue, "research/issue-14")
+        dev_activities._dev_prepare(issue, "research/issue-14")
     message = str(excinfo.value)
     assert task_context.REQUIREMENTS in message, "сообщение не называет файл с находкой"
     assert any(word in message for word in ("branch", "ветк", "исправ", "перепиш", "убер")), \
@@ -155,7 +156,7 @@ def test_no_analysis_branch_does_not_require_a_requirements_file(monkeypatch, tm
     issue = a.IssueInput(repo="o/r", issue_number=10, title="t", body="b",
                          author_login="u", author_type="User")
 
-    task, _ = a._dev_prepare(issue, "")  # ветки аналитики нет
+    task, _ = dev_activities._dev_prepare(issue, "")  # ветки аналитики нет
     assert "Аналитики по задаче нет" in task
 
 
@@ -189,9 +190,9 @@ def test_decisions_come_from_the_analysis_branch_concept_md(monkeypatch, tmp_pat
 
     issue = a.IssueInput(repo="o/r", issue_number=11, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-11")
+    dev_activities._dev_prepare(issue, "research/issue-11")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     harness = clone / task_context.DIR
     assert (harness / task_context.DECISIONS).read_text(encoding="utf-8") == \
         "## Решение\nделаем через адаптер, не патчим ядро"
@@ -205,9 +206,9 @@ def test_no_concept_on_the_analysis_branch_is_not_an_error(monkeypatch, tmp_path
 
     issue = a.IssueInput(repo="o/r", issue_number=12, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-12")
+    dev_activities._dev_prepare(issue, "research/issue-12")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     assert not (clone / task_context.DIR / task_context.DECISIONS).exists()
 
 
@@ -222,14 +223,14 @@ def test_reflect_note_no_longer_reaches_decisions(monkeypatch, tmp_path):
 
     issue = a.IssueInput(repo="o/r", issue_number=13, title="t", body="b",
                          author_login="u", author_type="User")
-    root, _clone = a._dev_paths(issue)
+    root, _clone = dev_activities._dev_paths(issue)
     root.mkdir(parents=True, exist_ok=True)
-    (root / a.REFLECT_NOTE_FILE).write_text(
+    (root / dev_activities.REFLECT_NOTE_FILE).write_text(
         "## Намерение\nэто НЕ должно попасть в PR\n", encoding="utf-8")
 
-    a._dev_prepare(issue, "research/issue-13")
+    dev_activities._dev_prepare(issue, "research/issue-13")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     decisions = (clone / task_context.DIR / task_context.DECISIONS).read_text(encoding="utf-8")
     assert "НЕ должно попасть" not in decisions
     assert decisions == "## Решение\nвердикт дебатов"
@@ -251,12 +252,12 @@ def test_decisions_are_retry_safe_since_they_now_come_from_git_not_local_disk(
     issue = a.IssueInput(repo="o/r", issue_number=14, title="t", body="b",
                          author_login="u", author_type="User")
 
-    a._dev_prepare(issue, "research/issue-14")  # «первая попытка»
-    _root, clone = a._dev_paths(issue)
+    dev_activities._dev_prepare(issue, "research/issue-14")  # «первая попытка»
+    _root, clone = dev_activities._dev_paths(issue)
     first = (clone / task_context.DIR / task_context.DECISIONS).read_text(encoding="utf-8")
 
-    a._dev_prepare(issue, "research/issue-14")  # «повторная попытка» — тот же каталог
-    _root, clone = a._dev_paths(issue)
+    dev_activities._dev_prepare(issue, "research/issue-14")  # «повторная попытка» — тот же каталог
+    _root, clone = dev_activities._dev_paths(issue)
     second = (clone / task_context.DIR / task_context.DECISIONS).read_text(encoding="utf-8")
 
     assert first == second == "## Решение\nделаем через адаптер"
@@ -286,9 +287,9 @@ def test_optional_analysis_artifacts_reach_the_harness_directory(monkeypatch, tm
 
     issue = a.IssueInput(repo="o/r", issue_number=17, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-17")
+    dev_activities._dev_prepare(issue, "research/issue-17")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     harness = clone / task_context.DIR
     assert (harness / task_context.TASK).read_text(encoding="utf-8") == "постановка FNR"
     assert (harness / task_context.REPOWISE_DIALOG).read_text(encoding="utf-8") == \
@@ -315,9 +316,9 @@ def test_concept_md_is_not_written_as_a_separate_file_from_decisions(monkeypatch
 
     issue = a.IssueInput(repo="o/r", issue_number=20, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-20")
+    dev_activities._dev_prepare(issue, "research/issue-20")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     harness = clone / task_context.DIR
     assert (harness / task_context.DECISIONS).read_text(encoding="utf-8") == \
         "вердикт дебатов: делаем через адаптер"
@@ -341,9 +342,9 @@ def test_missing_optional_artifact_is_absent_from_the_map_not_an_error(monkeypat
 
     issue = a.IssueInput(repo="o/r", issue_number=18, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-18")
+    dev_activities._dev_prepare(issue, "research/issue-18")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     harness = clone / task_context.DIR
     assert not (harness / task_context.TASK).exists()
     assert not (harness / task_context.VALIDATION).exists()
@@ -367,9 +368,9 @@ def test_optional_artifact_fetch_failure_degrades_instead_of_failing_the_stage(
 
     issue = a.IssueInput(repo="o/r", issue_number=19, title="t", body="b",
                          author_login="u", author_type="User")
-    task, _ = a._dev_prepare(issue, "research/issue-19")  # не должно бросить исключение
+    task, _ = dev_activities._dev_prepare(issue, "research/issue-19")  # не должно бросить исключение
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     assert not (clone / task_context.DIR / task_context.VALIDATION).exists()
 
 
@@ -410,14 +411,14 @@ def test_stale_harness_from_a_previous_issue_does_not_survive_a_fresh_run(monkey
         task_context.REQUIREMENTS: "требования ЧУЖОЙ задачи из предыдущего прогона",
         task_context.HOWTODEMO: "сценарий ЧУЖОЙ задачи",
     }))
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
 
     issue = a.IssueInput(repo="o/r", issue_number=20, title="t", body="b",
                          author_login="u", author_type="User")
 
     with pytest.raises(RuntimeError, match="requirements.md"):
-        a._dev_prepare(issue, "research/issue-20")
+        dev_activities._dev_prepare(issue, "research/issue-20")
 
 
 def test_harness_directory_is_rebuilt_from_scratch_every_run(monkeypatch, tmp_path):
@@ -428,15 +429,15 @@ def test_harness_directory_is_rebuilt_from_scratch_every_run(monkeypatch, tmp_pa
     monkeypatch.setattr(a, "_clone_repo", _clone_with_stale_harness({
         "leftover-from-another-issue.md": "чужой файл",
     }))
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
 
     issue = a.IssueInput(repo="o/r", issue_number=21, title="t", body="b",
                          author_login="u", author_type="User")
 
-    a._dev_prepare(issue, "")  # без ветки — не наткнёмся на обязательный набор
+    dev_activities._dev_prepare(issue, "")  # без ветки — не наткнёмся на обязательный набор
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     assert not (clone / task_context.DIR / "leftover-from-another-issue.md").exists(), \
         "унаследованный файл пережил пересборку каталога"
 
@@ -457,7 +458,7 @@ def test_empty_context_fails_even_if_required_set_is_patched_to_demand_nothing(
                          author_login="u", author_type="User")
 
     with pytest.raises(RuntimeError, match="контекст не собран"):
-        a._dev_prepare(issue, "research/issue-22")
+        dev_activities._dev_prepare(issue, "research/issue-22")
 
 
 # ───────────────── вырезка блока HowToDemo из тела Issue (задача 7) ─────────────────
@@ -497,14 +498,14 @@ def test_howtodemo_scenario_reaches_the_harness_file(monkeypatch, tmp_path):
     """Сквозная проверка: сценарий из тела Issue доезжает до
     `.harness/howtodemo.md`, а не остаётся только в регэкспе."""
     _prepare_kwargs(monkeypatch, tmp_path, lambda repo, path, ref=None: "")
-    monkeypatch.setattr(a, "_refresh_issue_body",
+    monkeypatch.setattr(dev_activities, "_refresh_issue_body",
                         lambda issue: "## HowToDemo\n\nОткрываю страницу и вижу цену")
 
     issue = a.IssueInput(repo="o/r", issue_number=13, title="t", body="b",
                          author_login="u", author_type="User")
-    task, _ = a._dev_prepare(issue, "")
+    task, _ = dev_activities._dev_prepare(issue, "")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     harness = clone / task_context.DIR
     assert (harness / task_context.HOWTODEMO).read_text(encoding="utf-8") == \
         "Открываю страницу и вижу цену"
@@ -745,7 +746,7 @@ def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp
                        check=True, capture_output=True)
 
     monkeypatch.setattr(a, "_clone_repo", fake_clone)
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
     monkeypatch.setattr(a.github_client, "get_file",
                         lambda repo, path, ref=None:
@@ -753,9 +754,9 @@ def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp
 
     issue = a.IssueInput(repo="o/r", issue_number=15, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-15")
+    dev_activities._dev_prepare(issue, "research/issue-15")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     assert (clone / task_context.DIR / task_context.CONTEXT_MAP).exists(), \
         "готовка не положила каталог контекста — дальше проверять нечего"
     # «Агент» дописывает код уже ПОСЛЕ подготовки контекста, как в реальном прогоне.
@@ -778,7 +779,7 @@ def test_harness_directory_reaches_the_actual_commit_end_to_end(monkeypatch, tmp
 
     monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: _FakeResp())
 
-    number = a._dev_publish(issue, "research/issue-15", [])
+    number = dev_activities._dev_publish(issue, "research/issue-15", [])
 
     assert number == 77
     show = subprocess.run(["git", "-C", str(clone), "show", "--stat", "HEAD"],
@@ -819,7 +820,7 @@ def test_dev_publish_treats_context_only_changes_as_an_empty_run(monkeypatch, tm
                        check=True, capture_output=True)
 
     monkeypatch.setattr(a, "_clone_repo", fake_clone)
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
     monkeypatch.setattr(a.github_client, "get_file",
                         lambda repo, path, ref=None:
@@ -827,7 +828,7 @@ def test_dev_publish_treats_context_only_changes_as_an_empty_run(monkeypatch, tm
 
     issue = a.IssueInput(repo="o/r", issue_number=16, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-16")
+    dev_activities._dev_prepare(issue, "research/issue-16")
     # «Агент» не трогает рабочее дерево вовсе — единственная правка внутри
     # него это `.harness/`, положенный подготовкой ДО прогона агента.
 
@@ -838,7 +839,7 @@ def test_dev_publish_treats_context_only_changes_as_an_empty_run(monkeypatch, tm
     posts: list = []
     monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: posts.append((args, kw)))
 
-    number = a._dev_publish(issue, "research/issue-16", [])
+    number = dev_activities._dev_publish(issue, "research/issue-16", [])
 
     assert number is None, "агент не тронул ни файла — пустой прогон, PR не открывается"
     assert posts == [], "запрос на создание PR не должен был уйти"
@@ -881,7 +882,7 @@ def test_dev_publish_forces_the_harness_directory_past_the_target_repos_gitignor
                        check=True, capture_output=True)
 
     monkeypatch.setattr(a, "_clone_repo", fake_clone)
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
     monkeypatch.setattr(a.github_client, "get_file",
                         lambda repo, path, ref=None:
@@ -889,9 +890,9 @@ def test_dev_publish_forces_the_harness_directory_past_the_target_repos_gitignor
 
     issue = a.IssueInput(repo="o/r", issue_number=21, title="t", body="b",
                          author_login="u", author_type="User")
-    a._dev_prepare(issue, "research/issue-21")
+    dev_activities._dev_prepare(issue, "research/issue-21")
 
-    _root, clone = a._dev_paths(issue)
+    _root, clone = dev_activities._dev_paths(issue)
     assert (clone / task_context.DIR / task_context.CONTEXT_MAP).exists(), \
         "готовка не положила каталог контекста — дальше проверять нечего"
     # «Агент» дописывает код уже ПОСЛЕ подготовки контекста, как в реальном прогоне.
@@ -914,7 +915,7 @@ def test_dev_publish_forces_the_harness_directory_past_the_target_repos_gitignor
 
     monkeypatch.setattr(gc.requests, "post", lambda *args, **kw: _FakeResp())
 
-    number = a._dev_publish(issue, "research/issue-21", [])
+    number = dev_activities._dev_publish(issue, "research/issue-21", [])
 
     assert number == 89
     show = subprocess.run(["git", "-C", str(clone), "show", "--stat", "HEAD"],
@@ -956,12 +957,12 @@ def test_focus_rule_survives_repository_own_rules(monkeypatch, tmp_path):
             "## Свои правила репозитория", encoding="utf-8")
 
     monkeypatch.setattr(a, "_clone_repo", _fake_clone)
-    monkeypatch.setattr(a, "_handover_to_runner", lambda root: None)
+    monkeypatch.setattr(dev_activities, "_handover_to_runner", lambda root: None)
     monkeypatch.setattr(a.develop, "workspace_mount", lambda: str(tmp_path))
 
     issue = a.IssueInput(repo="o/r", issue_number=1, title="t", body="b",
                          author_login="u", author_type="User")
-    task, _ = a._dev_prepare(issue, "research/issue-1")
+    task, _ = dev_activities._dev_prepare(issue, "research/issue-1")
 
     assert "Свои правила репозитория" in task, "правила репозитория потерялись"
     assert "пройдёт ли сценарий без этого" in task, "правило фокуса не доехало"
