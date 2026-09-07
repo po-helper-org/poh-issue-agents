@@ -1,16 +1,19 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
-
-@dataclass
-class IssueInput:
-    repo: str
-    issue_number: int
-    title: str
-    body: str
-    author_login: str
-    author_type: str  # "Bot" | "User" | ...
-    interactive: bool = True  # False in batch backfill: VAGUE escalates, no wait
+# Типы стадии «Разработка» объявлены в пакете и переэкспортируются сюда, чтобы все
+# импортёры контура (на сегодня 62 файла) продолжали писать привычный
+# `from shared.workflow_types import IssueInput`.
+#
+# Объявление ровно одно, на стороне пакета — так требует Temporal: при расхождении
+# полей он молча отдаёт воркфлоу словари вместо объектов, и отказ проявляется далеко
+# от причины. Разбор — в шапке `poh_developer/workflow_types.py`
+# (po-helper-org/poh-developer-agents, main).
+from poh_developer.workflow_types import (  # noqa: F401
+    Diagnosis,
+    DevelopPlan,
+    IssueInput,
+)
 
 
 @dataclass
@@ -277,37 +280,6 @@ class AnalyzeInput:
     # либо метку `run:analyze`; цикл ставит сюда `research-me`, чтобы ack не
     # называл человеку метку, которую тот не ставил.
     trigger: str | None = None
-
-
-@dataclass
-class DevelopPlan:
-    """Решения, принятые на входе в разработку, — один раз на стадию.
-
-    Режим и ветка аналитики определяются активностью, а не воркфлоу: и то и
-    другое читается из окружения и из GitHub, а решение воркфлоу обязано быть
-    детерминированным при реплее. Результат активности лежит в истории, поэтому
-    повтор возьмёт то же значение, что и первый прогон.
-    """
-    mode: str    # "local" | "dispatch" (`poh_developer/develop.py`)
-    branch: str  # ветка артефактов аналитики; "" — аналитики не было
-    # Сколько раз агент пробует починить своё. Умолчание 1: второй заход
-    # удваивает худший случай прогона (агент идёт до 45 минут). Поднимать
-    # стоит, когда наберётся статистика, сколько починок удаётся.
-    repair_rounds: int = 1
-
-
-@dataclass
-class Diagnosis:
-    """Разбор красного прогона тестов.
-
-    `parsed=False` — исход не разобран (отчёта нет, он битый, тестов ноль,
-    базовый прогон не состоялся). Тогда `own` и `foreign` пусты и смысла не
-    несут: решать по ним нельзя, контур обязан вести себя как прежде.
-    """
-    parsed: bool
-    baseline: list[str]
-    own: list[str]
-    foreign: list[str]
 
 
 @dataclass
