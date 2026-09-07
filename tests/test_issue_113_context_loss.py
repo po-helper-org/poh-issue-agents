@@ -39,7 +39,7 @@ def test_truncate_short_text():
 
 def test_truncate_long_text():
     """Обрезка длинного текста должна добавлять маркер."""
-    from shared import task_context
+    from poh_developer import task_context
 
     text = "A" * 100
     result = _truncate(text, 50)

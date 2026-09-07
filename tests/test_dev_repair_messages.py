@@ -5,7 +5,7 @@
 """
 
 import activities as a
-from shared import develop
+from poh_developer import develop
 from shared.workflow_types import IssueInput
 
 

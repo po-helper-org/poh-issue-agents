@@ -17,7 +17,7 @@ from collections.abc import Sequence
 import jwt
 import requests
 
-import worktree
+from poh_developer import worktree
 
 from shared.agent_comment import is_agent_comment, sign
 from shared.labels import ORIGIN_AGENT

@@ -6,7 +6,7 @@
 заложенным поведением.
 """
 
-from shared import task_context
+from poh_developer import task_context
 
 
 def test_map_lists_every_entry():

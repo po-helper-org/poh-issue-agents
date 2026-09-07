@@ -8,7 +8,7 @@
 руками: Issue по отмеченной находке заведёт человек сам, после гейта приёмки.
 """
 
-from shared import develop
+from poh_developer import develop
 
 
 def test_findings_file_is_parsed_into_titles_and_bodies():

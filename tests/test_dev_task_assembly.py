@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 import activities as a
-from shared import issue_blocks, task_context
+from shared import issue_blocks
+from poh_developer import task_context
 
 
 TITLE = "Починить кнопку"
@@ -69,7 +70,7 @@ def test_context_goes_to_files_without_truncation(monkeypatch, tmp_path):
     «Переполнение достижимо штатно».
     """
     import activities as a
-    from shared import task_context
+    from poh_developer import task_context
 
     long_requirements = "требование\n" * 5000   # заведомо больше прежнего потолка
 
