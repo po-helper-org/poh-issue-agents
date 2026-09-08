@@ -17,7 +17,12 @@ import instructor
 from openai import OpenAI
 
 MODEL_GATE = os.environ.get("MODEL_GATE", "glm-4.5-air")
-MODEL_CLASSIFY = os.environ.get("MODEL_CLASSIFY", "glm-5.2")
+# Умолчание совпадает с тем, что стоит в `.env.example` и в compose харнесса.
+# Расходились: здесь было `glm-5.2`, там `glm-4.6` — на стенде побеждал compose,
+# а всякий прогон мимо него (скрипты, локальный воркер, тесты с настоящим
+# ключом) молча уходил на модель дороже и жёстче по лимитам. Расхождение
+# умолчаний не видно ниоткуда: обе стороны выглядят настроенными.
+MODEL_CLASSIFY = os.environ.get("MODEL_CLASSIFY", "glm-4.6")
 
 _client: instructor.Instructor | None = None
 
