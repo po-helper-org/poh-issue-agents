@@ -29,6 +29,7 @@ GLM отвергает, `worker/llm.py:28-30`). Модель, которая д�
 """
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -100,6 +101,47 @@ def _usage(obj) -> tuple[int, int]:
             getattr(usage, "completion_tokens", 0) or 0)
 
 
+@contextlib.contextmanager
+def _counting_raw_calls():
+    """Токены вызовов, ответ которых до замера не доходит.
+
+    Заведено по находке прогона на поддельном эндпоинте: сервер получил пять
+    запросов, а в счёт попали четыре. Пятый — свободный ответ: `llm.complete`
+    отдаёт строку, и usage из неё не достать. Это путь прямых стадий БФТ, самый
+    крупный по объёму, и он молча не учитывался — то есть замер занижал расход
+    ровно там, где расход больше всего.
+
+    Обёртка ловит ТОЛЬКО его. Instructor держит собственную ссылку на `create`,
+    взятую при сборке клиента, и мимо обёртки идёт — поэтому источника два, и
+    они не пересекаются. Проверено тем же поддельным эндпоинтом: обёртка
+    насчитала один вызов из пяти, остальные четыре пришли объектами.
+    """
+    total = [0, 0]
+    try:
+        completions = llm.get_client().client.chat.completions
+    except Exception:                                         # noqa: BLE001
+        # Клиента нет (нет кредов, подменены вызовы) — считать нечего, но и
+        # мешать незачем: это учётная обвязка, а не само измерение. Если креды
+        # действительно нужны, об этом скажет первый же `llm.extract` — своим
+        # отказом, а не отказом счётчика.
+        yield total
+        return
+    original = completions.create
+
+    def counting(*args, **kwargs):
+        resp = original(*args, **kwargs)
+        tin, tout = _usage(resp)
+        total[0] += tin
+        total[1] += tout
+        return resp
+
+    completions.create = counting
+    try:
+        yield total
+    finally:
+        completions.create = original
+
+
 def probe(model: str) -> dict:
     """Один кандидат: три ворот, классификация, свободный ответ."""
     out = {"model": model, "gate": [], "classify": None, "complete": None,
@@ -108,24 +150,29 @@ def probe(model: str) -> dict:
     gate_prompt = _prompt("system_intake_gate.md")
 
     try:
-        for name, message, expected in GATE_CASES:
-            got = llm.extract(gate_prompt, message, GateExtraction, model=model)
-            tin, tout = _usage(got)
-            out["tokens_in"] += tin
-            out["tokens_out"] += tout
-            out["gate"].append((name, got.status, got.status == expected))
+        with _counting_raw_calls() as raw:
+            try:
+                for name, message, expected in GATE_CASES:
+                    got = llm.extract(gate_prompt, message, GateExtraction, model=model)
+                    tin, tout = _usage(got)
+                    out["tokens_in"] += tin
+                    out["tokens_out"] += tout
+                    out["gate"].append((name, got.status, got.status == expected))
 
-        got = llm.extract(_prompt("system_advisor.md"), CLASSIFY_CASE,
-                          ClassificationExtraction, model=model)
-        tin, tout = _usage(got)
-        out["tokens_in"] += tin
-        out["tokens_out"] += tout
-        out["classify"] = got.category
+                got = llm.extract(_prompt("system_advisor.md"), CLASSIFY_CASE,
+                                  ClassificationExtraction, model=model)
+                tin, tout = _usage(got)
+                out["tokens_in"] += tin
+                out["tokens_out"] += tout
+                out["classify"] = got.category
 
-        text = llm.complete("Отвечай одной короткой строкой по-русски.",
-                            "Назови три признака хорошего баг-репорта.",
-                            model=model, max_tokens=200)
-        out["complete"] = (text or "").strip()[:60]
+                text = llm.complete("Отвечай одной короткой строкой по-русски.",
+                                    "Назови три признака хорошего баг-репорта.",
+                                    model=model, max_tokens=200)
+                out["complete"] = (text or "").strip()[:60]
+            finally:
+                out["tokens_in"] += raw[0]
+                out["tokens_out"] += raw[1]
     except Exception as exc:                                  # noqa: BLE001
         # Любой отказ — исход замера, а не сбой скрипта: недоступная на тарифе
         # модель, отвергнутая схема и таймаут одинаково означают «не годится».
@@ -216,19 +263,23 @@ def main() -> int:
         rows.append(row)
 
     print()
-    header = f"{'модель':<14} {'ворота':<22} {'классиф.':<12} {'ответ':<7} {'токены':<14} {'сек':>5}"
+    # Ширина ворот рассчитана на худший случай — три спутанных исхода
+    # (`✗SUFFICIENT` × 3): именно его и надо читать без разъезжающихся колонок.
+    header = (f"{'модель':<16} {'ворота':<36} {'классиф.':<12} {'ответ':<6} "
+              f"{'токены':<13} {'сек':>5}")
     print(header)
     print("-" * len(header))
     for r in rows:
         if r["error"]:
-            print(f"{r['model']:<14} ОТКАЗ: {r['error'][:70]}")
+            print(f"{r['model']:<16} ОТКАЗ: {r['error'][:70]}")
             continue
         gates = " ".join(("✓" if ok else f"✗{got}") for _, got, ok in r["gate"])
         ok_all = all(ok for _, _, ok in r["gate"]) and bool(r["complete"])
-        print(f"{r['model']:<14} {gates:<22} {str(r['classify']):<12} "
-              f"{'есть' if r['complete'] else 'нет':<7} "
-              f"{r['tokens_in']}/{r['tokens_out']:<8} {r['seconds']:>5}"
-              f"{'' if ok_all else '   ← не держит схему или ветвление'}")
+        tokens = f"{r['tokens_in']}/{r['tokens_out']}"
+        answer = "есть" if r["complete"] else "нет"
+        note = "" if ok_all else "   ← не держит схему или ветвление"
+        print(f"{r['model']:<16} {gates:<36} {str(r['classify']):<12} "
+              f"{answer:<6} {tokens:<13} {r['seconds']:>5}{note}")
         if "claude" in r:
             print(f"{'':<14} claude -p: {r['claude']}")
 

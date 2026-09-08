@@ -11,6 +11,11 @@
     docker compose exec webhook python scripts/diag.py --repo owner/name
     docker compose exec webhook python scripts/diag.py --no-temporal
 
+Секцию «Модели» полностью видно только в контейнере ВОРКЕРА — `llm.py` лежит
+там, и только оттуда видно фактическое умолчание, а не одно значение из .env:
+
+    docker compose exec issue-worker python scripts/diag.py --no-temporal
+
 Значения секретов не печатаются ни при каких условиях — только «задан/не задан».
 Вывод уходит в stdout и может попасть в тикет или чат, а конфиг сервиса
 (список репозиториев, адрес кластера) — уже разведданные для постороннего.
@@ -143,6 +148,63 @@ def secrets_lines() -> list[str]:
     return [f"  {var}: {_yes_no(_is_set(var))}" for var in SECRET_VARS]
 
 
+def _effective(var: str, where: str) -> str:
+    """Значение переменной либо честное «не задана».
+
+    Умолчание кода СЮДА НЕ КОПИРУЕТСЯ: скопированное, оно разошлось бы с
+    оригиналом ровно так, как разошлись `worker/llm.py` и compose по
+    `MODEL_CLASSIFY`. Вместо значения печатается адрес, где его смотреть.
+    """
+    value = os.environ.get(var, "").strip()
+    return value if value else f"НЕ задана → сработает умолчание кода ({where})"
+
+
+def model_lines() -> list[str]:
+    """Какая модель отработает на каждом пути.
+
+    Имена моделей не секретны — секретен ключ, и он остаётся в списке выше.
+    Печатать их нужно затем, что расхождение конфига с кодом снаружи не видно:
+    обе стороны выглядят настроенными, а работают на разном.
+
+    Пустая переменная — не то же самое для разных путей. Стадии на Instructor
+    называют модель в коде, и незаданная переменная там означает умолчание.
+    А `claude -p` вызывается БЕЗ `--model`: там пусто означает «выберет
+    провайдер», и он берёт самую свежую — на самом долгом пути контура, где
+    стадия идёт до 900 секунд. Поэтому у него отдельное предупреждение.
+
+    Запускать в контейнере ВОРКЕРА: `llm.py` лежит только там, и только там
+    видно фактическое умолчание. В контейнере вебхука секция честно скажет,
+    чего не знает.
+    """
+    lines = [
+        f"  триаж         (MODEL_GATE)        = {_effective('MODEL_GATE', 'worker/llm.py')}",
+        f"  классификация (MODEL_CLASSIFY)    = {_effective('MODEL_CLASSIFY', 'worker/llm.py')}",
+        f"  стадии БФТ    (BFT_DIRECT_MODEL)  = {_effective('BFT_DIRECT_MODEL', 'worker/activities.py')}",
+        f"  разработка    (DEVELOP_MODEL)     = {_effective('DEVELOP_MODEL', 'poh_developer')}",
+    ]
+
+    try:
+        import llm
+    except ImportError:
+        lines.append("  (фактические умолчания не видны: llm.py есть только "
+                     "в контейнере воркера)")
+    else:
+        lines.append(f"  фактически у Instructor: gate={llm.MODEL_GATE}, "
+                     f"classify={llm.MODEL_CLASSIFY}")
+
+    claude = os.environ.get("ANTHROPIC_MODEL", "").strip()
+    if claude:
+        lines.append(f"  анализ `claude -p` (ANTHROPIC_MODEL) = {claude}")
+    else:
+        lines += [
+            "  анализ `claude -p` (ANTHROPIC_MODEL) = НЕ ЗАДАНА",
+            "  ⚠ здесь пусто НЕ означает умолчание: модель выберет провайдер,",
+            "    а он берёт самую свежую — на самом долгом пути контура.",
+            "    Задай ANTHROPIC_MODEL в .env (см. docs/harness/configuration.md).",
+        ]
+    return lines
+
+
 def build_report(repo: str | None) -> tuple[list[str], bool]:
     """Статическая часть отчёта (без сети). Второй элемент — всё ли в порядке."""
     specs = allowed_specs()
@@ -161,6 +223,9 @@ def build_report(repo: str | None) -> tuple[list[str], bool]:
     lines.append("=== Секреты (только факт наличия) ===")
     lines += secrets_lines()
     lines.append(f"  DRY_RUN: {'включён — мутаций в GitHub не будет' if _is_set('DRY_RUN') else 'выключен (боевой режим)'}")
+    lines.append("")
+    lines.append("=== Модели ===")
+    lines += model_lines()
     lines.append("")
     lines.append("=== Temporal ===")
     lines += temporal_config_lines()
