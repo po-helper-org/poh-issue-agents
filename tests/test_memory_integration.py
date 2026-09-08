@@ -274,7 +274,13 @@ def test_capture_runs_even_when_a_step_fails():
     слой видел только удачные прогоны.
     """
     import pathlib
-    src = pathlib.Path("worker/workflows.py").read_text(encoding="utf-8")
+
+    from poh_developer import workflows as stage
+
+    # Читается ИСХОДНИК ПАКЕТА: воркфлоу стадии живёт там, и путь берётся у
+    # модуля, а не собирается строкой от рабочего каталога — прогон тестов
+    # стартует не только из корня репозитория.
+    src = pathlib.Path(stage.__file__).read_text(encoding="utf-8")
     block = src[src.index("class IssueDevelopment"):src.index('name="IssuePrFix"')]
     assert "finally:" in block
     assert block.index("finally:") < block.index("capture_episode")

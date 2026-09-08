@@ -19,6 +19,7 @@ import delivery_bridge
 import developer_bridge
 import howtodemo_bridge
 from consolidation_workflow import ConsolidationWorkflow
+from poh_developer import integration as developer
 from shared import nondeterminism, sentry_setup
 from shared.temporal_client import connect_temporal
 from workflows import (
@@ -124,6 +125,34 @@ def _howtodemo_worker(client) -> Worker | None:
         workflow_runner=UnsandboxedWorkflowRunner(),
         activity_executor=ThreadPoolExecutor(max_workers=1),
         max_concurrent_activities=1,
+        debug_mode=True,
+    )
+
+
+def _developer_worker(client) -> Worker:
+    """Воркер стадии «Разработка» — своя очередь в том же процессе.
+
+    Отдельная очередь по той же причине, что у релиза и приёмки: один прогон
+    агента держит активность до сорока пяти минут, и на общем пуле из трёх
+    слотов он вытеснял бы триаж Issue.
+
+    Пакет обязателен, в отличие от соседей: стадия зарегистрирована и на
+    основной очереди, её воркфлоу импортированы в `workflows.py`, и без пакета
+    процесс не поднимется ещё на импорте. Прятать это за `try/except ImportError`
+    значило бы обещать работу без стадии, которой на самом деле нет.
+
+    `build_mvp_plan` регистрируется ЗДЕСЬ вместе с шагами стадии: воркфлоу зовёт
+    его по имени (`developer.PLAN_ACTIVITY`) и ищет там, где исполняется само.
+    Отсутствие проявилось бы не отказом старта, а зависшим прогоном разработки.
+    """
+    return Worker(
+        client,
+        task_queue=developer.TASK_QUEUE,
+        workflows=developer.WORKFLOWS,
+        activities=[*developer.ACTIVITIES, activities.build_mvp_plan],
+        workflow_runner=UnsandboxedWorkflowRunner(),
+        activity_executor=ThreadPoolExecutor(max_workers=3),
+        max_concurrent_activities=3,
         debug_mode=True,
     )
 
@@ -285,7 +314,8 @@ async def main() -> None:
     # Модули-соседи необязательны поштучно: несобравшийся сосед не должен
     # останавливать обработку Issue, поэтому каждый отсутствующий просто не
     # попадает в список очередей.
-    side = [w for w in (_delivery_worker(client), _howtodemo_worker(client))
+    side = [w for w in (_developer_worker(client), _delivery_worker(client),
+                        _howtodemo_worker(client))
             if w is not None]
     queues = ", ".join(f"'{w.task_queue}'" for w in [worker, *side])
     print(f"Worker started, listening on task queues {queues}")

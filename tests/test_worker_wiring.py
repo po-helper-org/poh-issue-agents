@@ -46,18 +46,27 @@ def _referenced(module_file: str, alias: str, module) -> set[str]:
 
 
 def _registered() -> set[str]:
-    """Имена из списка `activities=[...]` в вызове Worker(...) внутри worker.py."""
+    """Имена из списков `activities=[...]` во ВСЕХ вызовах Worker(...) worker.py.
+
+    Со всех, а не с первого встреченного: воркеров в процессе несколько —
+    основной цикл и очередь стадии «Разработка», а за ними релиз и приёмка.
+    Возврат по первому совпадению отдавал бы список того воркера, чьё
+    определение оказалось выше в файле, и проверка молча превращалась бы в
+    проверку одного из них.
+    """
     tree = ast.parse((WORKER_DIR / "worker.py").read_text(encoding="utf-8"))
+    found: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         for kw in node.keywords:
             if kw.arg != "activities" or not isinstance(kw.value, ast.List):
                 continue
-            return {
+            found |= {
                 item.attr for item in kw.value.elts
                 if isinstance(item, ast.Attribute) and isinstance(item.value, ast.Name)
             }
+    return found
     raise AssertionError("в worker.py не найден вызов Worker(activities=[...])")
 
 

@@ -91,3 +91,26 @@ def _developer_ports():
     import developer_bridge
 
     developer_bridge.install()
+
+
+# Очередь стадии «Разработка» в тестах воркфлоу.
+#
+# Тесты цикла поднимают ОДИН воркер на случайной очереди и проверяют поведение
+# цикла, а не раскладку очередей. Отправляя дочерний прогон на `developer`, они
+# все до единого повисали бы на несуществующем воркере — 44 блока плумбинга без
+# единого нового утверждения.
+#
+# `None` — не магия, а ровно то, что делал родитель до переезда: дочерний прогон
+# наследует очередь родителя. Ветка `else` в `IssueLifecycle` под маркером
+# отдаёт то же самое, так что тесты идут тем же путём, каким пойдут прогоны,
+# начатые до выкладки.
+#
+# Саму раскладку — родитель на одной очереди, стадия на своей — проверяет
+# `tests/test_developer_queue.py`, и он от этой подмены освобождён меткой.
+@pytest.fixture(autouse=True)
+def _stage_queue(request, monkeypatch):
+    if request.node.get_closest_marker("developer_queue"):
+        return
+    from poh_developer import integration as developer
+
+    monkeypatch.setattr(developer, "TASK_QUEUE", None)

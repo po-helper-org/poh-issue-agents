@@ -21,11 +21,11 @@ poh-delivery-agent @ git+https://github.com/po-helper-org/poh-delivery-agent@2ad
 # требовал тега, но пуш тегов из среды, где ведётся перенос, отклоняется
 # шлюзом с 403 — SHA выбран осознанно как замена, а не по забывчивости.
 #
-# Из пакета контур берёт стадию целиком: её чистые модули, шаги
-# (`worker/activities.py` переэкспортирует их имена) и типы, которые едут через
-# границу репозиториев (`shared/workflow_types.py`). Разговор со стадией идёт
-# через порты, реализации — в `worker/developer_bridge.py`.
-poh-developer @ git+https://github.com/po-helper-org/poh-developer-agents@d44a1b0e72d6f767d264efe3c5f70030c17b0983
+# Из пакета контур берёт стадию целиком: чистые модули, шаги, воркфлоу и типы,
+# которые едут через границу репозиториев. Разговор со стадией идёт через порты,
+# реализации — в `worker/developer_bridge.py`; исполняется она на своей очереди
+# (`developer`), которую поднимает `worker/worker.py`.
+poh-developer @ git+https://github.com/po-helper-org/poh-developer-agents@ba44e277556604641166c32cbcc9b1f500ddef83
 
 # HowToDemo-Agent — модуль приёмки из соседнего репозитория. Пин на ПОЛНЫЙ
 # SHA по той же причине, что и у Delivery-Agent выше.
