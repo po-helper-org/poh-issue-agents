@@ -21,6 +21,8 @@ _spec.loader.exec_module(probe_mod)
 
 import llm  # noqa: E402
 
+_real_complete = llm.complete
+
 
 def _answers(monkeypatch, statuses, category="FEATURE", text="ответ"):
     """Модель отвечает заданным исходом на каждые ворота по очереди."""
@@ -151,3 +153,34 @@ def test_without_credentials_the_report_says_what_is_missing(monkeypatch, capsys
 
     assert probe_mod.main() == 2
     assert "ZAI_BASE_URL" in capsys.readouterr().out
+
+
+def test_the_free_form_answer_is_counted_too(monkeypatch):
+    """Токены свободного ответа попадают в счёт.
+
+    Дефект, найденный прогоном на поддельном эндпоинте: сервер получил пять
+    запросов, а в отчёт попали токены четырёх. Пятый — `llm.complete`: он
+    отдаёт строку, и usage из неё не достать. Это путь прямых стадий БФТ, самый
+    крупный по объёму, и он молча не учитывался — то есть замер занижал расход
+    ровно там, где расход больше всего.
+
+    Здесь подменяется СЫРОЙ клиент, а `llm.complete` работает настоящий: иначе
+    тест проверял бы заглушку вместо пути, на котором дефект и жил.
+    """
+    _answers(monkeypatch, ["SPAM", "VAGUE", "SUFFICIENT"])
+
+    raw_usage = types.SimpleNamespace(prompt_tokens=7, completion_tokens=3)
+    raw_response = types.SimpleNamespace(
+        usage=raw_usage,
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content="ответ"))])
+    completions = types.SimpleNamespace(create=lambda **kw: raw_response)
+    fake_client = types.SimpleNamespace(
+        client=types.SimpleNamespace(chat=types.SimpleNamespace(completions=completions)))
+    monkeypatch.setattr(llm, "get_client", lambda: fake_client)
+    monkeypatch.setattr(llm, "complete", _real_complete)   # вернуть настоящий поверх заглушки
+
+    row = probe_mod.probe("модель")
+
+    assert row["complete"] == "ответ"
+    assert row["tokens_in"] == 40 + 7      # четыре структурных вызова плюс свободный
+    assert row["tokens_out"] == 20 + 3
