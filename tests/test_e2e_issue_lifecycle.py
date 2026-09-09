@@ -162,10 +162,14 @@ class FakeLLM:
 
     def __init__(self) -> None:
         self.models: list[str] = []
+        # Пара «схема → модель»: по индексу в `models` этого не видно, а
+        # проверять надо именно соответствие шага своей переменной.
+        self.by_schema: dict[str, str] = {}
 
     def extract(self, system_prompt, user_message, response_model, model=None):
         self.models.append(model)
         name = response_model.__name__
+        self.by_schema.setdefault(name, model)
         if name == "GateExtraction":
             return response_model(status="SUFFICIENT", content="ок")
         if name == "ClassificationExtraction":
@@ -209,6 +213,14 @@ def e2e(monkeypatch, tmp_path):
     # Границы: GitHub и LLM.
     monkeypatch.setattr(activities_module, "github_client", gh)
     monkeypatch.setattr(activities_module.llm, "extract", fake_llm.extract)
+
+    # Метки вместо боевых имён моделей. Проверяется ПРОВОДКА — что каждый шаг
+    # читает свою переменную, — а не то, какие модели выбраны сегодня. Прежняя
+    # проверка сравнивала два боевых значения на неравенство и развалилась в тот
+    # день, когда замер свёл ворота и классификацию на одну модель: проводка
+    # осталась исправной, а тест покраснел.
+    monkeypatch.setattr(activities_module.llm, "MODEL_GATE", "метка-ворота")
+    monkeypatch.setattr(activities_module.llm, "MODEL_CLASSIFY", "метка-классификация")
 
     # Тяжёлые внешние процессы прогона /analyze — тоже граница (git, repomix, claude).
     def fake_clone(repo, dest):
@@ -377,8 +389,11 @@ async def test_new_issue_goes_through_the_whole_triage(e2e, monkeypatch):
     assert "advisor:feature-request" in gh.labels
     assert any(label.startswith("priority:") for label in gh.labels)
     assert any("Приоритет" in c for c in gh.comments)
-    # Дешёвая модель на gate, сильная на классификации — разделение сохранилось.
-    assert fake_llm.models[0] != fake_llm.models[1]
+    # Каждый шаг взял СВОЮ переменную. Свести их на одну модель — решение
+    # эксплуатации, а вот перепутать местами или прибить одну на оба шага —
+    # отказ, который иначе виден только счётом за лимиты.
+    assert fake_llm.by_schema["GateExtraction"] == "метка-ворота"
+    assert fake_llm.by_schema["ClassificationExtraction"] == "метка-классификация"
 
 
 @pytest.mark.timeout(120)
