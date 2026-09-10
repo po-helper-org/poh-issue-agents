@@ -1,5 +1,10 @@
 FROM python:3.12-slim
 
+# git нужен pip: poh-developer ставится из git+https, и без него установка
+# падает на `RUN pip install` с невнятным `Cannot find command 'git'`.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY webhook/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
