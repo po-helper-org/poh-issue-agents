@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "worker"))
 import github_client  # noqa: E402
 from poh_developer import develop  # noqa: E402
 from poh_developer.integration import TASK_QUEUE as DEVELOPER_QUEUE  # noqa: E402
+from temporalio.exceptions import WorkflowAlreadyStartedError  # noqa: E402
 from shared.commands import ESTIMATE, done_label, failed_label, run_label  # noqa: E402
 from shared.temporal_client import connect_temporal  # noqa: E402
 from shared.workflow_ids import (  # noqa: E402
@@ -259,22 +260,32 @@ def wait_for(repo: str, number: int, scenario: Scenario, timeout_sec: int,
     return False, labels
 
 
-async def start_development(repo: str, number: int, scenario: Scenario):
+async def start_development(repo: str, number: int, scenario: Scenario, log):
     """Запуск стадии напрямую на её очереди — минуя триаж и аналитику.
 
     Прогонять ради проверки разработки весь цикл значило бы платить за триаж и
     аналитику и получать красный результат от любого их отказа. Стадия работает
     и без аналитики: `dev_begin` вернёт пустую ветку артефактов.
+
+    Гонка с самим контуром разрешается в его пользу. Заведение Issue поднимает
+    вебхук, а тот — цикл задачи, и цикл может дойти до разработки первым: у
+    прогона фиксированный id (`develop-<repo>-<n>`), поэтому второй старт
+    упирается в `WorkflowAlreadyStarted`. Падать на этом значило бы потратить
+    живой прогон на собственную ошибку — цепляемся к идущему и смотрим за ним.
     """
     client = await connect_temporal()
-    handle = await client.start_workflow(
-        "IssueDevelopment",
-        IssueInput(repo=repo, issue_number=number, title=scenario.title,
-                   body=scenario.body, author_login="e2e", author_type="User",
-                   interactive=False),
-        id=development_workflow_id(repo, number), task_queue=DEVELOPER_QUEUE,
-    )
-    return handle
+    wf_id = development_workflow_id(repo, number)
+    try:
+        return await client.start_workflow(
+            "IssueDevelopment",
+            IssueInput(repo=repo, issue_number=number, title=scenario.title,
+                       body=scenario.body, author_login="e2e", author_type="User",
+                       interactive=False),
+            id=wf_id, task_queue=DEVELOPER_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        log("  ✓ стадию уже поднял сам контур — смотрим за его прогоном")
+        return client.get_workflow_handle(wf_id)
 
 
 async def run_fix_round(repo: str, pr: int) -> str:
@@ -314,7 +325,7 @@ async def run_develop_scenario(repo: str, args, log) -> int:
     pr: int | None = None
     code = 1
     try:
-        handle = await start_development(repo, number, scenario)
+        handle = await start_development(repo, number, scenario, log)
         log(f"  ✓ стадия запущена на очереди «{DEVELOPER_QUEUE}»: {handle.id}")
         log(f"  … ждём PR (до {args.timeout} с; прогон агента идёт десятками минут)")
         try:

@@ -263,7 +263,7 @@ def _develop_env(monkeypatch, *, handle=None, files=None):
     async def temporal_ok():
         return "temporal:7233/default"
 
-    async def start(repo, number, scenario):
+    async def start(repo, number, scenario, log):
         return handle if handle is not None else _Handle(7)
 
     monkeypatch.setattr(e2e_live, "check_temporal", temporal_ok)
@@ -370,6 +370,38 @@ def test_develop_fails_when_the_fix_round_breaks(monkeypatch):
 
     assert asyncio.run(e2e_live.main(["develop", "--fix-round"])) == 1
     assert closed == [7, 42]
+
+
+@pytest.mark.timeout(30)
+def test_develop_attaches_to_a_run_the_contour_started_itself(monkeypatch):
+    """Гонка с вебхуком не должна стоить живого прогона.
+
+    Заведение Issue поднимает цикл задачи, и тот может дойти до разработки
+    первым. Id прогона фиксирован, поэтому наш старт упрётся в
+    WorkflowAlreadyStarted — цепляемся к идущему вместо падения.
+    """
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    attached = _Handle(7)
+
+    class _Client:
+        async def start_workflow(self, *a, **k):
+            raise WorkflowAlreadyStartedError(k["id"], "IssueDevelopment")
+
+        def get_workflow_handle(self, wf_id):
+            attached.id = wf_id
+            return attached
+
+    async def connect():
+        return _Client()
+
+    monkeypatch.setattr(e2e_live, "connect_temporal", connect)
+
+    handle = asyncio.run(e2e_live.start_development(
+        "acme/widgets", 42, e2e_live.develop_scenario(), log=lambda _: None))
+
+    assert handle is attached
+    assert handle.id == "develop-acme/widgets-42"
 
 
 def test_develop_gets_its_own_timeout():
