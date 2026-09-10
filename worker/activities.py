@@ -3275,7 +3275,11 @@ def _bft_direct_draft(req: BftRequest, clone_dir: str) -> str:
     из них документ. Между ними — программная проверка полноты и якорей: ради
     неё разбиение и сделано, одним ответом проверять нечего.
     """
-    model = os.environ.get("BFT_DIRECT_MODEL", "glm-4.6")
+    # `glm-5.2` — по тому же замеру, что и остальные модели контура
+    # (`scripts/model_probe.py`): при одинаковом входе она отдаёт меньше
+    # выходных токенов и вдвое быстрее прежней `glm-4.6`. Умолчание обязано
+    # совпадать с `.env.example` — за этим следит `tests/test_model_config.py`.
+    model = os.environ.get("BFT_DIRECT_MODEL", "glm-5.2")
     sources = _bft_sources(clone_dir)
     line_counts = {rel: len(body.splitlines()) for rel, body in sources.items()}
     inputs = _bft_stage_inputs(clone_dir, req.issue_number, sources)
