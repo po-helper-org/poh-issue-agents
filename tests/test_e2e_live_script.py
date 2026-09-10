@@ -404,6 +404,71 @@ def test_develop_attaches_to_a_run_the_contour_started_itself(monkeypatch):
     assert handle.id == "develop-acme/widgets-42"
 
 
+# --- запись об исходе прогона ---
+
+def test_record_line_is_key_value():
+    """Позиционные поля сломались бы от первого же добавленного столбца."""
+    line = e2e_live.record_line(repo="acme/widgets", issue=42, pr=7,
+                                outcome="ok", seconds=1843.4, files=5)
+
+    assert line.startswith(e2e_live.RECORD_PREFIX)
+    fields = dict(part.split("=", 1) for part in line.split("\t") if "=" in part)
+    assert fields["pr"] == "7"
+    assert fields["исход"] == "ok"
+    assert fields["секунд"] == "1843"
+    assert fields["файлов"] == "5"
+
+
+def test_record_line_survives_a_run_without_a_pull_request():
+    line = e2e_live.record_line(repo="acme/widgets", issue=42, pr=None,
+                                outcome="таймаут", seconds=3600, files=0)
+
+    assert "pr=—" in line and "исход=таймаут" in line
+
+
+@pytest.mark.timeout(30)
+def test_record_is_written_on_success(monkeypatch, tmp_path):
+    _develop_env(monkeypatch)
+    path = tmp_path / "runs.tsv"
+
+    assert asyncio.run(e2e_live.main(["develop", "--record", str(path)])) == 0
+
+    line = path.read_text(encoding="utf-8").strip()
+    assert "исход=ok" in line and "pr=7" in line
+
+
+@pytest.mark.timeout(30)
+def test_record_is_written_on_failure_too(monkeypatch, tmp_path):
+    """Отказ — самая интересная строка: без неё сравнивать будет нечего."""
+    _develop_env(monkeypatch, files=[".harness/task.md"])
+    path = tmp_path / "runs.tsv"
+
+    assert asyncio.run(e2e_live.main(["develop", "--record", str(path)])) == 1
+
+    assert "не изменил кода" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.timeout(30)
+def test_record_appends_instead_of_replacing(monkeypatch, tmp_path):
+    _develop_env(monkeypatch)
+    path = tmp_path / "runs.tsv"
+    path.write_text("прежняя строка\n", encoding="utf-8")
+
+    asyncio.run(e2e_live.main(["develop", "--record", str(path)]))
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "прежняя строка" and len(lines) == 2
+
+
+@pytest.mark.timeout(30)
+def test_unwritable_record_does_not_sink_the_run(monkeypatch, tmp_path):
+    """Прогон стоил токенов и минут: потерять его из-за пути к файлу нельзя."""
+    _develop_env(monkeypatch)
+
+    assert asyncio.run(e2e_live.main(
+        ["develop", "--record", str(tmp_path / "нет-такого-каталога" / "runs.tsv")])) == 0
+
+
 def test_develop_gets_its_own_timeout():
     """Общее умолчание в 600 с дало бы стадии гарантированный ложный отказ."""
     assert e2e_live.DEFAULT_TIMEOUT["develop"] > e2e_live.FALLBACK_TIMEOUT

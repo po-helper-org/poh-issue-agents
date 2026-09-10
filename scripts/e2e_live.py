@@ -11,6 +11,7 @@
     docker compose exec worker python scripts/e2e_live.py triage
     docker compose exec worker python scripts/e2e_live.py label-command
     docker compose exec worker python scripts/e2e_live.py develop --fix-round
+    docker compose exec worker python scripts/e2e_live.py develop --record runs.tsv
     docker compose exec worker python scripts/e2e_live.py triage --repo owner/name --keep
 
 Репозиторий берётся из --repo, иначе из E2E_REPO, иначе из GITHUB_REPOSITORY.
@@ -22,6 +23,10 @@
 состоявшаяся правка — разные вещи. Прогон #19 открыл PR, доложил об успехе и не
 изменил ни одного файла кода: воркер работает от root, раннер от uid 10001, и
 агент ушёл писать в `/tmp`. Метки в тот прогон выглядели исправными.
+
+`develop` пишет об исходе одну строку `E2E-RECORD` — в вывод всегда, в файл по
+`--record`. Она и есть мера: «стало ли лучше» считается разницей двух таких
+строк, а не памятью о прошлом прогоне.
 
 Коды возврата: 0 — контур отработал, 1 — ожидания не выполнены за отведённое
 время, 2 — ошибка конфигурации (репозиторий не задан, нет доступа).
@@ -159,6 +164,39 @@ SCENARIOS = {
 # отказ по таймауту.
 DEFAULT_TIMEOUT = {"develop": 3600}
 FALLBACK_TIMEOUT = 600
+
+
+# Префикс строки записи. По нему её выхватывают из лога контейнера, когда файл
+# записи не подставлен: `docker compose logs | grep E2E-RECORD`.
+RECORD_PREFIX = "E2E-RECORD"
+
+
+def record_line(*, repo: str, issue: int, pr: int | None, outcome: str,
+                seconds: float, files: int, fix_round: str = "") -> str:
+    """Одна строка об исходе прогона: сравнимая с такой же строкой прошлого раза.
+
+    «Стало ли лучше» без записи считается по памяти и ощущению — за неделю
+    переноса стадии именно так и вышло. Строка делает вопрос арифметическим.
+
+    Поля идут как `ключ=значение`, а не по позициям: добавленное позже поле не
+    сломает чтение прежних строк.
+    """
+    from datetime import datetime, timezone
+
+    parts = [
+        RECORD_PREFIX,
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "сценарий=develop",
+        f"репозиторий={repo}",
+        f"задача={issue}",
+        f"pr={pr if pr is not None else '—'}",
+        f"секунд={seconds:.0f}",
+        f"файлов={files}",
+        f"исход={outcome}",
+    ]
+    if fix_round:
+        parts.append(f"круг={fix_round}")
+    return "\t".join(parts)
 
 
 def develop_problems(filenames: list[str]) -> list[str]:
@@ -324,6 +362,10 @@ async def run_develop_scenario(repo: str, args, log) -> int:
 
     pr: int | None = None
     code = 1
+    started = time.monotonic()
+    outcome = "сорвался"
+    files: list[str] = []
+    fix_round = ""
     try:
         handle = await start_development(repo, number, scenario, log)
         log(f"  ✓ стадия запущена на очереди «{DEVELOPER_QUEUE}»: {handle.id}")
@@ -333,10 +375,12 @@ async def run_develop_scenario(repo: str, args, log) -> int:
         except asyncio.TimeoutError:
             log(f"✗ стадия не завершилась за {args.timeout} с. Прогон ЖИВ: "
                 f"смотреть {handle.id} в Temporal UI, там же видно, на каком шаге")
+            outcome = "таймаут"
             return 1
 
         if pr is None:
             log("✗ стадия вернула None — это режим dispatch, а не local")
+            outcome = "dispatch"
             return 2
         log(f"  ✓ пул-реквест #{pr} открыт")
 
@@ -346,18 +390,33 @@ async def run_develop_scenario(repo: str, args, log) -> int:
             log(f"  ✗ {problem}")
         if problems:
             log(f"  файлы PR: {files or '—'}")
+            outcome = "; ".join(problems)
             return 1
         log(f"  ✓ правка настоящая: {len(files)} файл(ов), среди них код")
 
         code = 0
+        outcome = "ok"
         if args.fix_round:
             log("  … круг правок")
             try:
-                log(f"  ✓ круг правок: {await run_fix_round(repo, pr)}")
+                fix_round = await run_fix_round(repo, pr)
+                log(f"  ✓ круг правок: {fix_round}")
             except Exception as exc:
+                fix_round = f"сорвался: {type(exc).__name__}"
                 log(f"  ✗ круг правок сорвался: {type(exc).__name__}: {exc}")
                 code = 1
+                outcome = "круг правок сорвался"
     finally:
+        record = record_line(repo=repo, issue=number, pr=pr, outcome=outcome,
+                            seconds=time.monotonic() - started, files=len(files),
+                            fix_round=fix_round)
+        log(record)
+        if args.record:
+            try:
+                with open(args.record, "a", encoding="utf-8") as fh:
+                    fh.write(record + "\n")
+            except OSError as exc:
+                log(f"  ⚠ запись в {args.record} не удалась: {exc}")
         if not args.keep:
             # PR закрывается тем же вызовом, что и Issue: у GitHub пул-реквест
             # доступен по /issues/<номер>, и отдельной функции для этого в
@@ -386,6 +445,8 @@ async def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep", action="store_true", help="не закрывать служебный Issue")
     parser.add_argument("--fix-round", action="store_true",
                         help="develop: прогнать по открытому PR ещё и круг правок")
+    parser.add_argument("--record", metavar="ФАЙЛ",
+                        help="develop: дописать строку об исходе прогона в файл")
     args = parser.parse_args(argv)
     if args.timeout is None:
         args.timeout = DEFAULT_TIMEOUT.get(args.scenario, FALLBACK_TIMEOUT)
