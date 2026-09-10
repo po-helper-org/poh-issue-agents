@@ -758,6 +758,31 @@ def get_pull(repo: str, number: int) -> dict:
     return resp.json()
 
 
+def list_pull_files(repo: str, number: int, limit: int = 300) -> list[str]:
+    """Имена файлов, изменённых пул-реквестом.
+
+    Постранично, а не первой сотней: перечень нужен для ответа «уехал ли в PR
+    служебный файл», и пропущенная страница превращает этот ответ в ложное
+    «нет». GitHub отдаёт до 100 записей на страницу и не обещает порядка, при
+    котором корневые файлы окажутся на первой.
+    """
+    names: list[str] = []
+    page = 1
+    while len(names) < limit:
+        resp = requests.get(
+            f"https://api.github.com/repos/{repo}/pulls/{number}/files",
+            headers=_auth_headers(repo),
+            params={"per_page": 100, "page": page}, timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        names.extend(item["filename"] for item in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return names[:limit]
+
+
 def get_commit_timestamp(repo: str, commit_sha: str) -> str:
     """Время создания коммита в формате ISO 8601.
 

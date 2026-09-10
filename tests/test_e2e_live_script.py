@@ -197,6 +197,186 @@ def test_service_issue_is_closed_even_when_run_fails(monkeypatch):
     assert closed == [42]
 
 
+# --- сценарий develop: что считать состоявшейся правкой ---
+
+def test_empty_pull_request_is_a_failure():
+    """Прогон #19: PR открыт, доклад об успехе, кода в нём нет."""
+    assert e2e_live.develop_problems([])
+
+
+def test_context_directory_alone_is_not_a_change():
+    """`.harness/` коммитится намеренно — но PR из одного его не несёт правки.
+
+    Это и есть форма отказа #19: постановка уехала в PR и заслонила собой то,
+    что агент не тронул ни одного файла кода.
+    """
+    problems = e2e_live.develop_problems([".harness/task.md", ".harness/rules.md"])
+
+    assert problems == ["в PR нет ни одного файла правки — агент не изменил кода"]
+
+
+def test_service_file_in_the_pull_request_is_a_failure():
+    """Прогон #35: круг правок закоммитил свою же постановку."""
+    problems = e2e_live.develop_problems([".task.md", "src/server.mjs"])
+
+    assert len(problems) == 1
+    assert ".task.md" in problems[0]
+
+
+def test_real_change_passes():
+    assert e2e_live.develop_problems(
+        ["src/server.mjs", "tests/version.test.mjs", ".harness/task.md"]) == []
+
+
+def test_service_file_list_is_not_a_copy(monkeypatch):
+    """Перечень берётся из пакета стадии: вторая копия рассохлась бы молча."""
+    monkeypatch.setattr(e2e_live.develop, "SERVICE_FILES", (".task.md", ".newborn.md"))
+
+    problems = e2e_live.develop_problems([".newborn.md", "src/server.mjs"])
+
+    assert problems and ".newborn.md" in problems[0]
+
+
+# --- сценарий develop: ход прогона ---
+
+class _Handle:
+    """Подделка ручки воркфлоу: у неё есть id и результат."""
+
+    def __init__(self, result, *, hang=False):
+        self.id = "develop-acme/widgets-42"
+        self._result = result
+        self._hang = hang
+
+    async def result(self):
+        if self._hang:
+            await asyncio.sleep(3600)
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+def _develop_env(monkeypatch, *, handle=None, files=None):
+    """Общая обвязка: контур доступен, стадия включена, Issue заводится."""
+    monkeypatch.setenv("E2E_REPO", "acme/widgets")
+    monkeypatch.delenv("DRY_RUN", raising=False)
+
+    async def temporal_ok():
+        return "temporal:7233/default"
+
+    async def start(repo, number, scenario):
+        return handle if handle is not None else _Handle(7)
+
+    monkeypatch.setattr(e2e_live, "check_temporal", temporal_ok)
+    monkeypatch.setattr(e2e_live, "start_development", start)
+    monkeypatch.setattr(e2e_live.develop, "enabled", lambda: True)
+    monkeypatch.setattr(e2e_live.develop, "mode", lambda: "local")
+    monkeypatch.setattr(e2e_live.github_client, "create_issue", lambda *a, **k: 42)
+    monkeypatch.setattr(e2e_live.github_client, "list_pull_files",
+                        lambda repo, pr, **k: files if files is not None
+                        else ["src/server.mjs", "tests/version.test.mjs"])
+    closed: list[int] = []
+    monkeypatch.setattr(e2e_live.github_client, "close_issue",
+                        lambda repo, n: closed.append(n))
+    return closed
+
+
+@pytest.mark.timeout(30)
+def test_develop_refuses_when_the_stage_is_switched_off(monkeypatch):
+    """Выключенная стадия оставит Issue в очереди — платить за прогон незачем."""
+    _develop_env(monkeypatch)
+    monkeypatch.setattr(e2e_live.develop, "enabled", lambda: False)
+
+    def no_issue(*a, **k):
+        raise AssertionError("Issue не должен заводиться при выключенной стадии")
+
+    monkeypatch.setattr(e2e_live.github_client, "create_issue", no_issue)
+
+    assert asyncio.run(e2e_live.main(["develop"])) == 2
+
+
+@pytest.mark.timeout(30)
+def test_develop_refuses_in_dispatch_mode(monkeypatch):
+    """В dispatch PR открывает чужая сторона: проверять этим сценарием нечего."""
+    _develop_env(monkeypatch)
+    monkeypatch.setattr(e2e_live.develop, "mode", lambda: "dispatch")
+
+    assert asyncio.run(e2e_live.main(["develop"])) == 2
+
+
+@pytest.mark.timeout(30)
+def test_develop_passes_on_a_real_change(monkeypatch):
+    closed = _develop_env(monkeypatch)
+
+    assert asyncio.run(e2e_live.main(["develop"])) == 0
+    assert closed == [7, 42], "закрываются и PR, и служебная задача"
+
+
+@pytest.mark.timeout(30)
+def test_develop_fails_when_the_pull_request_carries_no_code(monkeypatch):
+    closed = _develop_env(monkeypatch, files=[".harness/task.md"])
+
+    assert asyncio.run(e2e_live.main(["develop"])) == 1
+    assert closed == [7, 42], "после отказа мусор тоже убирается"
+
+
+@pytest.mark.timeout(30)
+def test_develop_reports_a_live_run_on_timeout(monkeypatch, capsys):
+    """Таймаут скрипта не убивает прогон: он идёт, и об этом надо сказать."""
+    _develop_env(monkeypatch, handle=_Handle(None, hang=True))
+
+    assert asyncio.run(e2e_live.main(["develop", "--timeout", "0"])) == 1
+    assert "Прогон ЖИВ" in capsys.readouterr().out
+
+
+@pytest.mark.timeout(30)
+def test_develop_keeps_everything_open_with_keep(monkeypatch):
+    _develop_env(monkeypatch)
+
+    def no_close(*a, **k):
+        raise AssertionError("с --keep ни PR, ни задача не закрываются")
+
+    monkeypatch.setattr(e2e_live.github_client, "close_issue", no_close)
+
+    assert asyncio.run(e2e_live.main(["develop", "--keep"])) == 0
+
+
+@pytest.mark.timeout(30)
+def test_develop_runs_the_fix_round_only_when_asked(monkeypatch):
+    _develop_env(monkeypatch)
+    rounds: list[int] = []
+
+    async def fake_round(repo, pr):
+        rounds.append(pr)
+        return "правки внесены"
+
+    monkeypatch.setattr(e2e_live, "run_fix_round", fake_round)
+
+    assert asyncio.run(e2e_live.main(["develop"])) == 0
+    assert rounds == [], "без --fix-round круг не запускается"
+
+    assert asyncio.run(e2e_live.main(["develop", "--fix-round"])) == 0
+    assert rounds == [7]
+
+
+@pytest.mark.timeout(30)
+def test_develop_fails_when_the_fix_round_breaks(monkeypatch):
+    """PR уже проверен, но сорванный круг — тоже отрицательный ответ."""
+    closed = _develop_env(monkeypatch)
+
+    async def boom(repo, pr):
+        raise RuntimeError("активность упала")
+
+    monkeypatch.setattr(e2e_live, "run_fix_round", boom)
+
+    assert asyncio.run(e2e_live.main(["develop", "--fix-round"])) == 1
+    assert closed == [7, 42]
+
+
+def test_develop_gets_its_own_timeout():
+    """Общее умолчание в 600 с дало бы стадии гарантированный ложный отказ."""
+    assert e2e_live.DEFAULT_TIMEOUT["develop"] > e2e_live.FALLBACK_TIMEOUT
+
+
 @pytest.mark.timeout(30)
 def test_keep_flag_leaves_the_issue_open(monkeypatch):
     monkeypatch.setenv("E2E_REPO", "acme/widgets")

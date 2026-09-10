@@ -738,3 +738,63 @@ def test_a_repeat_run_updates_the_same_draft_instead_of_opening_a_second(
                                  title="t", body="b", message="m", draft=True)
 
     assert number == 13, "должны вернуть номер уже открытого PR, а не упасть"
+
+
+class _FilesResp:
+    def __init__(self, names):
+        self._names = names
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return [{"filename": name} for name in self._names]
+
+
+def _paged_files(monkeypatch, pages):
+    """Отдаёт страницы по номеру из params: как это делает GitHub."""
+    seen = []
+
+    def fake_get(url, **kwargs):
+        page = kwargs["params"]["page"]
+        seen.append(page)
+        return _FilesResp(pages[page - 1] if page <= len(pages) else [])
+
+    monkeypatch.setattr(github_client.requests, "get", fake_get)
+    monkeypatch.setattr(github_client, "_auth_headers", lambda repo: {})
+    return seen
+
+
+def test_list_pull_files_returns_names(monkeypatch):
+    _paged_files(monkeypatch, [["src/server.mjs", "tests/a.test.mjs"]])
+
+    assert github_client.list_pull_files("o/r", 7) == ["src/server.mjs", "tests/a.test.mjs"]
+
+
+def test_list_pull_files_walks_every_page(monkeypatch):
+    """Служебный файл может лежать на второй странице.
+
+    Проверка «уехал ли в PR служебный файл» читает весь перечень, и остановка
+    на первой сотне превратила бы её в ложное «нет».
+    """
+    seen = _paged_files(monkeypatch, [[f"f{i}.py" for i in range(100)], [".task.md"]])
+
+    names = github_client.list_pull_files("o/r", 7)
+
+    assert seen == [1, 2], "вторая страница обязана быть запрошена"
+    assert ".task.md" in names
+
+
+def test_list_pull_files_stops_on_a_short_page(monkeypatch):
+    seen = _paged_files(monkeypatch, [["a.py"], ["b.py"]])
+
+    github_client.list_pull_files("o/r", 7)
+
+    assert seen == [1], "неполная страница — последняя, ходить дальше незачем"
+
+
+def test_list_pull_files_honours_the_limit(monkeypatch):
+    _paged_files(monkeypatch, [[f"f{i}.py" for i in range(100)],
+                               [f"g{i}.py" for i in range(100)]])
+
+    assert len(github_client.list_pull_files("o/r", 7, limit=150)) == 150
