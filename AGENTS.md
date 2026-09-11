@@ -43,7 +43,9 @@ Nondeterminism error: Timer machine does not handle this event
 активностей. Правка тела активности, её ретраев и меток безопасна: их в истории
 нет.
 
-Действующие маркеры (переименование = отказ по недетерминизму):
+Переименование любого маркера = отказ по недетерминизму на живых прогонах.
+Ниже — те, чью историю важно помнить; **полный** список, проверяемый тестом,
+лежит в реестре следом за ними:
 
 | Маркер | Что разводит |
 |---|---|
@@ -57,15 +59,135 @@ Nondeterminism error: Timer machine does not handle this event
 | `issue-lifecycle-clarify-after-analysis` | круг уточнений после аналитики |
 | `issue-lifecycle-merged-from-pr-open` | закрытие влитым PR из `pr-open` — успех, а не отмена |
 
-**`workflow.patched(...)` — первым операндом связки, всегда.** `and` в Python
-вычисляется слева направо и останавливается на первом ложном значении: в `if
-some_flag and workflow.patched(...):` вызов `patched` пропускается всякий раз,
-когда `some_flag` ложен, и маркер попадает в историю через раз вместо каждого
-прогона. Такая непостоянная запись сама становится источником расхождения —
-реплей прогона, где вызова не случилось, не находит маркер там, где не находил
-его никогда, но актуальный код уже ждёт другую ветку. `workflow.patched(...)`
-обязан идти первым операндом и вызываться на каждом прогоне независимо от
-значений остальных флагов.
+**`workflow.patched(...)` зовётся ТАМ, где ветвление, и никуда не переносится.**
+Правка 5 сентября (#311, PR #313): прежняя формулировка требовала обратного —
+«первым операндом связки, всегда» — и, исполненная буквально, приводила ровно к
+тому отказу, от которого правило защищает. Проверено разбором SDK и живым
+воспроизведением, а не рассуждением.
+
+Что делает `workflow.patched` (`temporalio/worker/_workflow_instance.py:1067`):
+
+```python
+use_patch = self._patches_memoized.get(id)
+if use_patch is not None:
+    return use_patch                       # решение первого вызова — на весь прогон
+use_patch = not self._is_replaying or id in self._patches_notified
+self._patches_memoized[id] = use_patch
+if use_patch:
+    command = self._add_command()          # маркер уходит в историю ЗДЕСЬ
+```
+
+Отсюда два следствия, и оба ломают живые прогоны.
+
+**Перенос вызова через `await` убивает прогон.** О маркерах, лежащих в истории,
+ядро сообщает экземпляру по ходу реплея — заданием активации
+(`_apply_notify_has_patch`, строка 696), и до соответствующей активации в
+`_patches_notified` их нет. Сам набор не сбрасывается, он копится; важен момент
+вызова. Вызов, поднятый выше `await`, случается на более ранней активации: о
+маркере, записанном дальше по истории, экземпляру ещё не сообщили, `patched`
+возвращает False, запоминает это на весь прогон и команду не выдаёт — а в
+истории маркер лежит. Реплей падает:
+
+    [TMPRL1100] Nondeterminism error: Non-deprecated patch marker encountered
+    for change p, but there is no corresponding change command!
+
+Воспроизведено на игрушечном воркфлоу против установленного SDK: v1 пишет
+маркер во второй задаче, v2 поднимает вызов в первую, реплей истории v1 против
+v2 падает этим текстом; контроль v1 против v1 проходит.
+
+**Вызов раньше прежнего замораживает старые прогоны на старой ветке.** Решение
+первого вызова запоминается на весь прогон. Прогон, припаркованный до выкладки,
+маркера в истории не имеет: вызов, случившийся на реплее, вернёт False, запишет
+False — и до конца жизни прогона новая ветка ему недоступна, хотя прежний код
+дошёл бы до вызова живьём и получил True.
+
+**Что делать.** Оставлять вызов на месте ветвления: `if some_flag and
+workflow.patched(...)` — нормальная форма. При ОДНОМ читателе маркера она
+реплеится верно: история с маркером находит его в своей задаче, история без
+маркера просто не звала вызов, а на живом краю получает True.
+
+Опасность не в порядке операндов, а во ВТОРОМ читателе того же идентификатора.
+Решение первого вызова запоминается на весь прогон (`_patches_memoized` выше), и
+второй читатель получает уже принятое — даже если сам добрался бы до живого края
+и получил True. Практически это значит: ранний читатель, срабатывающий на
+реплее старой истории, ЗАКРЫВАЕТ ветку позднему до конца жизни прогона.
+
+Опасен не сам факт двух читателей, а РАЗНЫЕ решения за одним идентификатором.
+Читатели, открывающие одну и ту же ветку, безопасны: запомненное значение — то
+самое, которого ждёт и второй (так живут `issue-lifecycle-phase-loop`,
+`issue-lifecycle-plan-member-skips-analysis` и другие маркеры реестра с двумя и
+более местами вызова). Дробить их на отдельные идентификаторы не нужно: каждый
+новый идентификатор — свой риск порядка выкладки.
+
+`issue-lifecycle-merged-from-pr-open` — обратный случай и заведён по ошибке:
+одна строка таблицы переходов, но читатели решают РАЗНОЕ (записать исход
+закрытия и принять ли доклад `merged`). Цена: прогон, начатый до выкладки и
+успевший обработать доклад внешнего агента, к моменту закрытия задачи получит
+уже запомненное False и запишет `cancelled`, хотя правка #308 делалась ровно
+против этого. Затронуты прогоны, у которых `_agent_event` звался: ход
+`in-development → pr-open` объявлен внешним, то есть приходит докладом; ходы из
+`ready-for-dev` и `system-requirements` цикл делает сам. Заведено задачей #315.
+
+Отсюда правило для нового кода: **один идентификатор — одно решение**. Второму
+читателю с другим решением — свой маркер.
+
+### Реестр: все маркеры и где они живут
+
+Таблица выше — те, чью историю важно помнить. Реестр ниже — **все**, и он
+проверяется тестом `tests/test_patch_markers.py`: маркер, добавленный в код и не
+внесённый сюда, роняет прогон тестов; строка про несуществующий маркер и
+неверное место — тоже.
+
+Прозы здесь нет намеренно. Место в коде проверяемо, а пересказ намерения для
+сорока маркеров разъезжается молча — так и разъехалась таблица выше, знавшая
+девять из сорока (#311).
+
+<!-- markers:start -->
+
+| Маркер | Где вызывается |
+|---|---|
+| `issue-development-partial-publish` | `IssueDevelopment.run` |
+| `issue-development-repair-loop` | `IssueDevelopment.run` |
+| `issue-lifecycle-absolute-park-deadline` | `IssueLifecycle._park_timeout` |
+| `issue-lifecycle-acceptance-gate` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-acceptance-gate-stall-notice` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-acceptance-gate-stall-notice-safe` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-analyze-recovers-failed` | `IssueLifecycle._analysis_requested` |
+| `issue-lifecycle-answer-command-without-open-question` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-answer-question-failure-notice` | `IssueLifecycle._answer_open_question` |
+| `issue-lifecycle-ask-question-failure-message` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-ask-question-failure-safe` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-autostart-waits-for-answer` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-awaiting` | `IssueLifecycle._publish_awaiting` |
+| `issue-lifecycle-bft` | `IssueLifecycle._phase_triage` |
+| `issue-lifecycle-capture-episode-always` | `IssueDevelopment.run` |
+| `issue-lifecycle-clarify-after-analysis` | `IssueLifecycle._clarify_open_questions` |
+| `issue-lifecycle-clear-queue-on-work` | `IssueLifecycle._enter` |
+| `issue-lifecycle-close-confirmed-duplicate` | `IssueLifecycle._phase_park` |
+| `issue-lifecycle-comment-intent-reply-activity` | `IssueLifecycle._handle_comment_intent` |
+| `issue-lifecycle-criterion-filled-by-hand-closes-question` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-criterion-recheck-stall-notice` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-criterion-recheck-while-parked` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-develop-child` | `IssueLifecycle._begin_development` |
+| `issue-lifecycle-develop-plan-stage` | `IssueDevelopment.run` |
+| `issue-lifecycle-duplicate-exit-checks-existing-labels` | `IssueLifecycle._phase_park` |
+| `issue-lifecycle-empty-run-diagnosis` | `IssueDevelopment.run` |
+| `issue-lifecycle-followup-answer` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-howtodemo-on-pr-open` | `IssueLifecycle._phase_park` |
+| `issue-lifecycle-merged-from-pr-open` | `IssueLifecycle._agent_event`, `IssueLifecycle._phase_on_close` |
+| `issue-lifecycle-merged-on-close` | `IssueLifecycle._run_phase_loop` |
+| `issue-lifecycle-phase-loop` | `IssueLifecycle.agent_event`, `IssueLifecycle.analyze_requested`, `IssueLifecycle.bft_requested`, `IssueLifecycle.estimate_requested`, `IssueLifecycle.run` |
+| `issue-lifecycle-plan-member-skips-analysis` | `IssueLifecycle._phase_await_decision`, `IssueLifecycle._phase_park` |
+| `issue-lifecycle-plan-member-waits-for-parent` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-prfix-child` | `IssueLifecycle._phase_pr_review` |
+| `issue-lifecycle-question-answer` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-question-close-failure-notice` | `IssueLifecycle._start_development` |
+| `issue-lifecycle-question-repoint-failure-notice` | `IssueLifecycle._answer_open_question`, `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-reasked-question-repoints-pointer` | `IssueLifecycle._answer_open_question` |
+| `issue-lifecycle-repoint-open-question-on-answer` | `IssueLifecycle._phase_await_build` |
+| `issue-lifecycle-step-subissue-barrier` | `IssueLifecycle._run_phase_loop` |
+
+<!-- markers:end -->
 
 **Маркер ставится ДО выкладки, задним числом он не лечит.** `workflow.patched`
 на реплее смотрит не на то, что произошло, а на наличие своего маркера в
