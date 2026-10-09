@@ -11,6 +11,7 @@ ExecStart=@REPO@/.venv/bin/python @REPO@/worker/worker.py
 Restart=always
 RestartSec=10
 MemoryMax=768M
+# к Z.AI и Gitea — только напрямую: прокси из окружения сессии aleks увёл бы запросы с данными требований
 UnsetEnvironment=http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 
 [Install]

@@ -13,14 +13,13 @@
 
 import tomllib
 from dataclasses import dataclass
-import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-# Корень данных: `/app` в образе (`COPY worker/ .`), рабочая копия репозитория на стенде харнесса БФТ
-# (юнит задаёт APP_ROOT). Прошитый `/app` ронял intake_gate на smoke T1 (#329).
-RULES_PATH = Path(os.environ.get("APP_ROOT", "/app")) / "config" / "estimation-rules.toml"
+from shared.app_root import APP_ROOT  # noqa: E402
+
+RULES_PATH = APP_ROOT / "config" / "estimation-rules.toml"
 
 _CONFIDENCE_LADDER = ("low", "medium", "high")
 _SUFFICIENCY_CONFIDENCE = {

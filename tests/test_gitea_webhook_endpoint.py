@@ -23,7 +23,7 @@ SECRET = "gitea-s3cret"
 
 
 @pytest.fixture
-def gitea_client_app(monkeypatch):
+def webhook_app(monkeypatch):
     monkeypatch.setenv("GITEA_WEBHOOK_SECRET", SECRET)
     monkeypatch.setenv("GITEA_BOT_LOGIN", "bft-bot")
     monkeypatch.setenv("ISSUE_AGENT_REPOS", "bft/requests")
@@ -71,30 +71,40 @@ def post(client, name, secret=SECRET, body=None):
     return client.post("/gitea/webhook", content=raw, headers=headers)
 
 
-def test_чужая_подпись_отвергается_401(gitea_client_app):
-    assert post(gitea_client_app, "issues_opened", secret="wrong").status_code == 401
-    assert not gitea_client_app.started
+def test_чужая_подпись_отвергается_401(webhook_app):
+    assert post(webhook_app, "issues_opened", secret="wrong").status_code == 401
+    assert not webhook_app.started
 
 
-def test_без_секрета_503_а_не_200(gitea_client_app, monkeypatch):
+def test_без_секрета_503_а_не_200(webhook_app, monkeypatch):
     """Не настроены — не принимаем: молчаливые 200 пропускали бы неподписанные доставки."""
     import main
     monkeypatch.setattr(main, "GITEA_WEBHOOK_SECRET", "")
-    assert post(gitea_client_app, "issues_opened").status_code == 503
+    assert post(webhook_app, "issues_opened").status_code == 503
 
 
-def test_новая_задача_стартует_воркфлоу(gitea_client_app):
-    r = post(gitea_client_app, "issues_opened")
+def test_новая_задача_стартует_воркфлоу(webhook_app):
+    r = post(webhook_app, "issues_opened")
     assert r.status_code == 200
-    names = [a[0] for a, _ in gitea_client_app.started if a and isinstance(a[0], str)]
-    assert "IssueLifecycle" in names, gitea_client_app.started
+    names = [a[0] for a, _ in webhook_app.started if a and isinstance(a[0], str)]
+    assert "IssueLifecycle" in names, webhook_app.started
 
 
-def test_смена_меток_подтверждается_без_запуска(gitea_client_app):
-    r = post(gitea_client_app, "issue_label_updated")
+def test_смена_меток_подтверждается_без_запуска(webhook_app):
+    r = post(webhook_app, "issue_label_updated")
     assert r.status_code == 200
-    assert not gitea_client_app.started
+    assert not webhook_app.started
 
 
-def test_мусор_вместо_payload_не_роняет(gitea_client_app):
-    assert post(gitea_client_app, "issues_opened", body=b"{not json").status_code == 200
+def test_мусор_вместо_payload_не_роняет(webhook_app):
+    assert post(webhook_app, "issues_opened", body=b"{not json").status_code == 200
+
+
+def test_нераспознанная_доставка_оставляет_след_аудита(webhook_app):
+    """Разобранный JSON, который нормализатор не понял, — не тишина: след в Temporal, как у GitLab."""
+    d = json.loads((FIX / "issues_opened.json").read_text())
+    d["body"]["issue"] = "не объект"
+    raw = json.dumps(d["body"]).encode()
+    r = post(webhook_app, "issues_opened", body=raw)
+    assert r.status_code == 200
+    assert webhook_app.started, "отказ разбора должен оставлять след аудита"

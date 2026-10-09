@@ -1,6 +1,5 @@
 """Consolidation activities: profile extraction, taxonomy/increments, synthesis, PR."""
 import re
-import os
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -16,9 +15,9 @@ from shared.workflow_types import (
     Taxonomy, UnifyingIssueDraft, ZoneAssignment,
 )
 
-# Корень данных: `/app` в образе (`COPY worker/ .`), рабочая копия репозитория на стенде харнесса БФТ
-# (юнит задаёт APP_ROOT). Прошитый `/app` ронял intake_gate на smoke T1 (#329).
-PROMPTS_DIR = Path(os.environ.get("APP_ROOT", "/app")) / "prompts"
+from shared.app_root import APP_ROOT  # noqa: E402
+
+PROMPTS_DIR = APP_ROOT / "prompts"
 
 
 def _load_prompt(name: str) -> str:

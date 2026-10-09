@@ -115,9 +115,8 @@ from shared.workflow_types import (
 
 logger = logging.getLogger(__name__)
 
-# Корень данных: `/app` в образе (`COPY worker/ .`), рабочая копия репозитория на стенде харнесса БФТ
-# (юнит задаёт APP_ROOT). Прошитый `/app` ронял intake_gate на smoke T1 (#329).
-APP_ROOT = Path(os.environ.get("APP_ROOT", "/app"))
+from shared.app_root import APP_ROOT  # noqa: E402 — см. shared/app_root.py
+
 PROMPTS_DIR = APP_ROOT / "prompts"
 CONFIG_DIR = APP_ROOT / "config"
 WORKSPACE_DIR = APP_ROOT / "workspace"

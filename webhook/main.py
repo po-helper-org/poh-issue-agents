@@ -565,8 +565,9 @@ async def gitea_webhook(request: Request):
 
     Подпись — hex HMAC-SHA256 тела в `X-Gitea-Signature`: родной заголовок
     Gitea, а не `X-Hub-Signature-256`, который она шлёт для совместимости и
-    который может пропасть в следующей версии. Отказать может только подпись:
-    остальное уходит в аудит с 200, как у GitLab.
+    который может пропасть в следующей версии. Отказать может только подпись.
+    Тело не JSON — журнал и 200: аудиту нечего показать. JSON, который
+    нормализатор не понял, — след аудита в Temporal, как у GitLab.
     """
     body = await request.body()
     if not GITEA_WEBHOOK_SECRET:
@@ -581,23 +582,31 @@ async def gitea_webhook(request: Request):
     delivery_id = request.headers.get("x-gitea-delivery") or None
     try:
         payload = json.loads(body)
-        normalized = gitea_events.normalize(event, payload, bot_login=GITEA_BOT_LOGIN)
+    except ValueError:
+        _log.warning("доставка Gitea %s (%s): тело не JSON — принимаю", delivery_id or "без id", event)
+        return {"ok": True}
+    try:
+        internal = gitea_events.internal_event(event)
     except gitea_events.UnsupportedEvent as exc:
         _log.info("доставка Gitea пропущена: %s", exc)
         return {"ok": True}
+    repo = (payload.get("repository") or {}).get("full_name") if isinstance(payload, dict) else None
+    try:
+        normalized = gitea_events.normalize(event, payload, bot_login=GITEA_BOT_LOGIN)
     except Exception:
-        _log.exception("не разобрал доставку Gitea %s (%s) — принимаю", delivery_id or "без id", event)
+        _log.exception("не разобрал доставку Gitea %s (%s) — принимаю и ухожу в аудит",
+                       delivery_id or "без id", event)
+        await _audit_dropped_delivery(payload if isinstance(payload, dict) else {}, internal,
+                                      delivery_id, repo, ["(ошибка разбора)"])
         return {"ok": True}
     try:
-        return await _handle_delivery(normalized, gitea_events.internal_event(event), delivery_id)
+        return await _handle_delivery(normalized, internal, delivery_id)
     except HTTPException:
         raise
     except Exception:
         _log.exception("не обработал доставку Gitea %s (%s) — принимаю и ухожу в аудит",
                        delivery_id or "без id", event)
-        await _audit_dropped_delivery(normalized, gitea_events.internal_event(event), delivery_id,
-                                      (normalized.get("repository") or {}).get("full_name"),
-                                      ["(ошибка обработки)"])
+        await _audit_dropped_delivery(normalized, internal, delivery_id, repo, ["(ошибка обработки)"])
         return {"ok": True}
 
 

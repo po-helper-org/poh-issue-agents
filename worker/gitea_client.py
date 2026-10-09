@@ -106,10 +106,15 @@ def _label_ids(repo: str) -> dict:
     return {item["name"]: item["id"] for item in resp.json()}
 
 
+def _create_label(repo: str, name: str, color: str = "cccccc", description: str = ""):
+    """Единственное место заведения метки: Gitea ждёт цвет с «#», спеки контура — без."""
+    return _request("POST", _url(repo, "/labels"),
+                    json={"name": name, "color": "#" + str(color).lstrip("#"), "description": description})
+
+
 def _ensure_label(repo: str, ids: dict, name: str) -> int:
     if name not in ids:
-        resp = _ok(_request("POST", _url(repo, "/labels"), json={"name": name, "color": "#cccccc"}))
-        ids[name] = resp.json()["id"]
+        ids[name] = _ok(_create_label(repo, name)).json()["id"]
     return ids[name]
 
 
@@ -147,8 +152,7 @@ def ensure_labels_exist(repo: str, specs) -> int:
     for spec in specs:
         if spec.name in ids:
             continue
-        resp = _request("POST", _url(repo, "/labels"), json={
-            "name": spec.name, "color": "#" + str(spec.color).lstrip("#"), "description": spec.description})
+        resp = _create_label(repo, spec.name, spec.color, spec.description)
         if resp.status_code == 409:
             continue  # завелась параллельно
         _ok(resp)

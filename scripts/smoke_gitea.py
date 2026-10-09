@@ -40,9 +40,8 @@ def workflows(number: int) -> list[str]:
     out = subprocess.run([TEMPORAL, "workflow", "list", "--address", "127.0.0.1:7233", "-o", "json",
                           "--query", "WorkflowType = 'IssueLifecycle'"], capture_output=True, text=True)
     rows = json.loads(out.stdout or "[]") if out.returncode == 0 else []
-    return [f"{w['execution']['workflowId']} {w.get('status')}" for w in rows
-            if w["execution"]["workflowId"].endswith(f"-{number}") or f"#{number}" in w["execution"]["workflowId"]
-            or w["execution"]["workflowId"].endswith(str(number))]
+    want = f"issue-bft/requests-{number}"   # точный id: endswith("1") принял бы и карточку 11
+    return [f"{w['execution']['workflowId']} {w.get('status')}" for w in rows if w["execution"]["workflowId"] == want]
 
 
 def stages(number: int) -> tuple[list[str], list[str]]:
@@ -86,9 +85,9 @@ def worker_claude() -> list[str]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--timeout", type=int, default=120)  # #329: «за 120 с»
     ap.add_argument("--keep", action="store_true")
-    a = ap.parse_args()
+    args = ap.parse_args()
 
     issue = api("POST", "/issues", {
         "title": "Smoke T1: выгрузка заказов в CSV для бухгалтерии",
@@ -100,7 +99,7 @@ def main():
     print(f"задача bft/requests#{n} создана")
     t0, wf, comment = time.time(), [], None
     done, failed = [], []
-    while time.time() - t0 < a.timeout:
+    while time.time() - t0 < args.timeout:
         time.sleep(5)
         wf = wf or workflows(n)
         done, failed = stages(n)
@@ -113,7 +112,7 @@ def main():
           f"({time.time() - t0:.0f} с)")
     print("стадии:", done, "| упали:", failed or "нет")
     print("claude в bft-worker:", "НЕТ" if not claude else f"ЕСТЬ {claude}")
-    if not a.keep:
+    if not args.keep:
         api("PATCH", f"/issues/{n}", {"state": "closed"})
     # Стадия на GLM (intake_gate) отработала, ни одна активность не упала, ошибку контур не ставил.
     ok = (bool(wf) and "intake_gate" in done and comment is not None
