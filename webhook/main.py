@@ -33,6 +33,7 @@ Webhook receiver: вход контура. Проверяет подпись, т
 """
 
 import hashlib
+import json
 import hmac
 import logging
 import os
@@ -42,7 +43,7 @@ from starlette.requests import ClientDisconnect
 from temporalio.client import Client
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from shared import gitlab_events, gitlab_signature, labels
+from shared import gitea_events, gitlab_events, gitlab_signature, labels
 
 from shared import sentry_setup
 from shared.commands import (
@@ -547,6 +548,56 @@ async def gitlab_webhook(request: Request):
             normalized, internal, delivery_id,
             (normalized.get("repository") or {}).get("full_name"),
             ["(ошибка обработки)"])
+        return {"ok": True}
+
+
+# --- Gitea (харнесс БФТ, ADR-21) ---
+
+GITEA_WEBHOOK_SECRET = os.environ.get("GITEA_WEBHOOK_SECRET", "")
+# Логин сервисного аккаунта: `user.type` у Gitea всегда «User», и без логина
+# контур принял бы свой комментарий за реплику человека (как у GitLab).
+GITEA_BOT_LOGIN = os.environ.get("GITEA_BOT_LOGIN") or None
+
+
+@app.post("/gitea/webhook")
+async def gitea_webhook(request: Request):
+    """Приём доставки Gitea.
+
+    Подпись — hex HMAC-SHA256 тела в `X-Gitea-Signature`: родной заголовок
+    Gitea, а не `X-Hub-Signature-256`, который она шлёт для совместимости и
+    который может пропасть в следующей версии. Отказать может только подпись:
+    остальное уходит в аудит с 200, как у GitLab.
+    """
+    body = await request.body()
+    if not GITEA_WEBHOOK_SECRET:
+        _log.error("GITEA_WEBHOOK_SECRET не задан — доставки Gitea отвергаются")
+        raise HTTPException(status_code=503, detail="Gitea webhook not configured")
+    got = request.headers.get("x-gitea-signature") or ""
+    want = hmac.new(GITEA_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(got, want):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    event = request.headers.get("x-gitea-event-type") or request.headers.get("x-gitea-event") or ""
+    delivery_id = request.headers.get("x-gitea-delivery") or None
+    try:
+        payload = json.loads(body)
+        normalized = gitea_events.normalize(event, payload, bot_login=GITEA_BOT_LOGIN)
+    except gitea_events.UnsupportedEvent as exc:
+        _log.info("доставка Gitea пропущена: %s", exc)
+        return {"ok": True}
+    except Exception:
+        _log.exception("не разобрал доставку Gitea %s (%s) — принимаю", delivery_id or "без id", event)
+        return {"ok": True}
+    try:
+        return await _handle_delivery(normalized, gitea_events.internal_event(event), delivery_id)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("не обработал доставку Gitea %s (%s) — принимаю и ухожу в аудит",
+                       delivery_id or "без id", event)
+        await _audit_dropped_delivery(normalized, gitea_events.internal_event(event), delivery_id,
+                                      (normalized.get("repository") or {}).get("full_name"),
+                                      ["(ошибка обработки)"])
         return {"ok": True}
 
 

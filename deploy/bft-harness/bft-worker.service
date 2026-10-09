@@ -1,0 +1,17 @@
+[Unit]
+Description=Worker харнесса БФТ: процессы Temporal, стадии на GLM (без claude -p)
+After=bft-temporal.service bft-gitea.service
+
+[Service]
+WorkingDirectory=@REPO@
+Environment=PYTHONPATH=@REPO@/worker:@REPO@
+Environment=APP_ROOT=@REPO@
+EnvironmentFile=%h/.config/bft-harness/harness.env
+ExecStart=@REPO@/.venv/bin/python @REPO@/worker/worker.py
+Restart=always
+RestartSec=10
+MemoryMax=768M
+UnsetEnvironment=http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+
+[Install]
+WantedBy=default.target

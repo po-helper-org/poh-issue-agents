@@ -1,0 +1,15 @@
+[Unit]
+Description=Webhook харнесса БФТ (127.0.0.1:8651): доставки Gitea → Temporal
+After=bft-temporal.service bft-gitea.service
+
+[Service]
+WorkingDirectory=@REPO@
+Environment=PYTHONPATH=@REPO@/webhook:@REPO@
+EnvironmentFile=%h/.config/bft-harness/harness.env
+ExecStart=@REPO@/.venv/bin/uvicorn main:app --app-dir @REPO@/webhook --host 127.0.0.1 --port 8651 --log-level warning
+Restart=always
+RestartSec=5
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

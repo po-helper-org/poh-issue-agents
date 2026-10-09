@@ -115,9 +115,12 @@ from shared.workflow_types import (
 
 logger = logging.getLogger(__name__)
 
-PROMPTS_DIR = Path("/app/prompts")
-CONFIG_DIR = Path("/app/config")
-WORKSPACE_DIR = Path("/app/workspace")
+# Корень данных: `/app` в образе (`COPY worker/ .`), рабочая копия репозитория на стенде харнесса БФТ
+# (юнит задаёт APP_ROOT). Прошитый `/app` ронял intake_gate на smoke T1 (#329).
+APP_ROOT = Path(os.environ.get("APP_ROOT", "/app"))
+PROMPTS_DIR = APP_ROOT / "prompts"
+CONFIG_DIR = APP_ROOT / "config"
+WORKSPACE_DIR = APP_ROOT / "workspace"
 
 
 def _load_prompt(name: str) -> str:
