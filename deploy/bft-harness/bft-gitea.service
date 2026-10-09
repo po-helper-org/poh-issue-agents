@@ -1,0 +1,14 @@
+[Unit]
+Description=Gitea харнесса БФТ (127.0.0.1:8650, SQLite)
+After=network-online.target
+
+[Service]
+ExecStart=@BASE@/bin/gitea web --config @BASE@/gitea/app.ini --work-path @BASE@/gitea
+WorkingDirectory=@BASE@/gitea
+Environment=GITEA_WORK_DIR=@BASE@/gitea
+Restart=always
+RestartSec=5
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

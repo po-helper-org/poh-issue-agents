@@ -80,3 +80,14 @@ def test_dispatch_workflow_бросает_ошибку_самого_клиент
     g = importlib.reload(f)
     with pytest.raises(NotImplementedError, match="локальным раннером"):
         g.dispatch_workflow("gl/project", "wf.yml")
+
+
+def test_репозиторий_из_списка_gitea_уходит_в_gitea(forge, monkeypatch):
+    """Харнесс БФТ держит карточки в self-hosted Gitea (ADR-21), рядом живут GitHub и GitLab."""
+    monkeypatch.setenv("GITEA_REPOS", "bft/*")
+    monkeypatch.setenv("GITLAB_REPOS", "poh-harness/*")
+    import forge as f
+    g = importlib.reload(f)
+    assert g.provider_for("bft/requests") == "gitea"
+    assert g.provider_for("poh-harness/threads-harness") == "gitlab"
+    assert g.provider_for("po-helper-org/poh-demo-checkout") == "github"

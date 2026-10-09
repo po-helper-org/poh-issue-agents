@@ -17,7 +17,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-RULES_PATH = Path("/app/config/estimation-rules.toml")
+from shared.app_root import APP_ROOT  # noqa: E402
+
+RULES_PATH = APP_ROOT / "config" / "estimation-rules.toml"
 
 _CONFIDENCE_LADDER = ("low", "medium", "high")
 _SUFFICIENCY_CONFIDENCE = {

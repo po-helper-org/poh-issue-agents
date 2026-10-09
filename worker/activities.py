@@ -115,9 +115,11 @@ from shared.workflow_types import (
 
 logger = logging.getLogger(__name__)
 
-PROMPTS_DIR = Path("/app/prompts")
-CONFIG_DIR = Path("/app/config")
-WORKSPACE_DIR = Path("/app/workspace")
+from shared.app_root import APP_ROOT  # noqa: E402 — см. shared/app_root.py
+
+PROMPTS_DIR = APP_ROOT / "prompts"
+CONFIG_DIR = APP_ROOT / "config"
+WORKSPACE_DIR = APP_ROOT / "workspace"
 
 
 def _load_prompt(name: str) -> str:
