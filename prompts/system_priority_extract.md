@@ -21,7 +21,7 @@
       "okr_alignment": "unrelated | supports_okr | direct_top_priority",
       "okr_key_result": "строка с названием KR, если applicable, иначе null",
       "bug_severity": "none | high | critical",
-      "affected_domains": ["GDS", "UMC", "Live", "BI", "Ticketland"],
+      "affected_domains": ["Product-A", "Product-B", "Live", "BI", "Acme Tickets"],
       "consequences": {
         "who": "какая команда/роль должна исполнять",
         "risks": ["риск 1", "риск 2"],
