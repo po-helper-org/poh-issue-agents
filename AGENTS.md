@@ -142,12 +142,14 @@ workflow.patched(...)` — нормальная форма. При ОДНОМ ч
 сорока маркеров разъезжается молча — так и разъехалась таблица выше, знавшая
 девять из сорока (#311).
 
+Маркеры `IssueDevelopment` (стадия «Разработка») переехали вместе с кодом в пакет
+`poh-developer` (`poh-developer-agents`) и здесь не перечисляются: реестр и тест
+смотрят только в `worker/*.py`.
+
 <!-- markers:start -->
 
 | Маркер | Где вызывается |
 |---|---|
-| `issue-development-partial-publish` | `IssueDevelopment.run` |
-| `issue-development-repair-loop` | `IssueDevelopment.run` |
 | `issue-lifecycle-absolute-park-deadline` | `IssueLifecycle._park_timeout` |
 | `issue-lifecycle-acceptance-gate` | `IssueLifecycle._start_development` |
 | `issue-lifecycle-acceptance-gate-stall-notice` | `IssueLifecycle._start_development` |
@@ -160,7 +162,6 @@ workflow.patched(...)` — нормальная форма. При ОДНОМ ч
 | `issue-lifecycle-autostart-waits-for-answer` | `IssueLifecycle._phase_await_build` |
 | `issue-lifecycle-awaiting` | `IssueLifecycle._publish_awaiting` |
 | `issue-lifecycle-bft` | `IssueLifecycle._phase_triage` |
-| `issue-lifecycle-capture-episode-always` | `IssueDevelopment.run` |
 | `issue-lifecycle-clarify-after-analysis` | `IssueLifecycle._clarify_open_questions` |
 | `issue-lifecycle-clear-queue-on-work` | `IssueLifecycle._enter` |
 | `issue-lifecycle-close-confirmed-duplicate` | `IssueLifecycle._phase_park` |
@@ -169,9 +170,8 @@ workflow.patched(...)` — нормальная форма. При ОДНОМ ч
 | `issue-lifecycle-criterion-recheck-stall-notice` | `IssueLifecycle._phase_await_build` |
 | `issue-lifecycle-criterion-recheck-while-parked` | `IssueLifecycle._phase_await_build` |
 | `issue-lifecycle-develop-child` | `IssueLifecycle._begin_development` |
-| `issue-lifecycle-develop-plan-stage` | `IssueDevelopment.run` |
+| `issue-lifecycle-developer-queue` | `IssueLifecycle._begin_development` |
 | `issue-lifecycle-duplicate-exit-checks-existing-labels` | `IssueLifecycle._phase_park` |
-| `issue-lifecycle-empty-run-diagnosis` | `IssueDevelopment.run` |
 | `issue-lifecycle-followup-answer` | `IssueLifecycle._phase_await_build` |
 | `issue-lifecycle-howtodemo-on-pr-open` | `IssueLifecycle._phase_park` |
 | `issue-lifecycle-merged-from-pr-open` | `IssueLifecycle._agent_event`, `IssueLifecycle._phase_on_close` |
@@ -180,6 +180,7 @@ workflow.patched(...)` — нормальная форма. При ОДНОМ ч
 | `issue-lifecycle-plan-member-skips-analysis` | `IssueLifecycle._phase_await_decision`, `IssueLifecycle._phase_park` |
 | `issue-lifecycle-plan-member-waits-for-parent` | `IssueLifecycle._phase_await_build` |
 | `issue-lifecycle-prfix-child` | `IssueLifecycle._phase_pr_review` |
+| `issue-lifecycle-prfix-developer-queue` | `IssueLifecycle._phase_pr_review` |
 | `issue-lifecycle-question-answer` | `IssueLifecycle._phase_await_build` |
 | `issue-lifecycle-question-close-failure-notice` | `IssueLifecycle._start_development` |
 | `issue-lifecycle-question-repoint-failure-notice` | `IssueLifecycle._answer_open_question`, `IssueLifecycle._phase_await_build` |
