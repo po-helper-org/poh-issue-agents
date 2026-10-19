@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Прогон тестов: `.venv/bin/python -m pytest` из корня воркта b6c73c (`make test` и `.venv/bin/pytest` сломаны — память проекта).
-- Все правки — в воркте `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.claude/worktrees/issue-agents-solution-generation-b6c73c`. Пути в задачах — репо-относительные от этого корня.
+- Все правки — в воркте `/path/to/poh-issue-agents/.claude/worktrees/issue-agents-solution-generation-b6c73c`. Пути в задачах — репо-относительные от этого корня.
 - DRY_RUN не трогаем: мутации GitHub гейтятся внутри `github_client` (`push_artifacts_to_branch`/`post_comment`).
 - Токен клонирования никогда не в argv: `_clone_repo` переиспользуется как есть (credential.helper через env).
 - Heartbeat идёт ВНУТРИ каждого долгого вызова через существующий `_run_with_heartbeat(fn, *args, label=...)`.

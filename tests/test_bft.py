@@ -93,7 +93,7 @@ def _letter(**overrides):
         how_to_demo=["Открываю карточку", "Вижу цену в KZT"],
         open_questions=["Откуда берём курс? (Аня)", "Округляем ли до целых?"],
         scope="карточка товара (корзина — не входит в зону БФТ)",
-        documentation=["[Эпик GDSLV-1374](https://example.test/1374)"],
+        documentation=["[Эпик ACME-1374](https://example.test/1374)"],
         requirements=[{"id": "БТ-1", "as_is": "[ASIS не озвучен]", "to_be": "цена в KZT",
                        "related": "", "source": "«хочу видеть цену в тенге»"}],
         personas=[{"name": "Аня", "role": "PO", "unit": "[не указано]"}],
