@@ -1,0 +1,140 @@
+<title>BluePrint инициативы: варианты</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Прототип (выбросить после решения): три формы BluePrint-карты на одном кейсе + готовая матрица исполнения. Переключатель — нижняя панель, ссылки #a #b #c #m. */
+:root{
+  --bg:#f6f7f9; --paper:#ffffff; --ink:#1b2430; --mut:#5d6878; --line:#d9dee6;
+  --accent:#c4122f; --accent-soft:#fbe7ea; --change:#fff4d1; --change-ink:#7a5a00; --ok:#1f7a4d;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",sans-serif; --f-body:"IBM Plex Sans",system-ui,sans-serif; --f-mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#12161c; --paper:#1a2029; --ink:#e6e9ee; --mut:#9aa4b2; --line:#2c3440;
+  --accent:#ff5a6e; --accent-soft:#3a1e24; --change:#3a3110; --change-ink:#f2d47a; --ok:#5cc792; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#12161c; --paper:#1a2029; --ink:#e6e9ee; --mut:#9aa4b2; --line:#2c3440;
+  --accent:#ff5a6e; --accent-soft:#3a1e24; --change:#3a3110; --change-ink:#f2d47a; --ok:#5cc792; color-scheme:dark}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--f-body)}
+.wrap{max-width:1100px;margin:0 auto;padding-inline:16px;padding-block:20px 120px;display:grid;gap:18px}
+h1,h2,h3{font-family:var(--f-display);font-weight:600;text-wrap:balance;margin:0}
+h1{font-size:28px} h2{font-size:21px} h3{font-size:16px}
+.mut{color:var(--mut)} .eyebrow{font:500 12px var(--f-mono);letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+.box{background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:16px;display:grid;gap:10px;min-width:0}
+.rec{border-left:3px solid var(--accent)}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;font-size:14px;width:100%}
+th,td{border:1px solid var(--line);padding:8px;vertical-align:top;text-align:left}
+th{font-family:var(--f-display);font-weight:600;background:var(--bg)}
+.bp th.row{width:150px;font-size:13px}
+.bp td{min-width:150px}
+.line td{border:none;padding:2px 8px;font:500 11px var(--f-mono);color:var(--accent);letter-spacing:.05em;text-transform:uppercase;background:var(--accent-soft)}
+.chg{background:var(--change)} .chg::after{content:"меняем";display:block;margin-top:4px;font:500 11px var(--f-mono);color:var(--change-ink)}
+.ref{font:500 12px var(--f-mono);color:var(--accent);white-space:nowrap}
+.note{font-size:13px;color:var(--mut)}
+.tree{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.tree .col{display:grid;gap:8px;align-content:start;min-width:0}
+.node{border:1px solid var(--line);border-radius:6px;padding:8px;background:var(--paper)}
+.node b{display:block;font-family:var(--f-display);font-weight:600}
+.steps{display:grid;gap:10px}
+.step{display:grid;grid-template-columns:110px 1fr 1fr;gap:10px;border:1px solid var(--line);border-radius:8px;padding:12px;background:var(--paper)}
+.step .k{font-family:var(--f-display);font-weight:600}
+.step .meta{grid-column:2/4;display:flex;flex-wrap:wrap;gap:6px}
+.chip{font:500 12px var(--f-mono);border:1px solid var(--line);border-radius:999px;padding:2px 8px}
+.chip.r{border-color:var(--accent);color:var(--accent)}
+.st{font:500 13px var(--f-mono)}
+.bar{position:fixed;left:0;right:0;bottom:0;padding:10px 16px calc(10px + env(safe-area-inset-bottom,0px));background:var(--paper);border-top:1px solid var(--line);display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.bar a{font:600 14px var(--f-display);text-decoration:none;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px 12px}
+.bar a[aria-current="true"]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.bar a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (max-width:720px){.tree{grid-template-columns:1fr}.step{grid-template-columns:1fr}.step .meta{grid-column:auto}}
+</style>
+
+<div class="wrap">
+  <header class="box">
+    <div class="eyebrow">Прототип · карта «Коробка БФТ v1» · тикет #346</div>
+    <h1>BluePrint-карта инициативы: три формы</h1>
+    <p>Кейс обезличенный: «Выгрузка заказов в CSV для бухгалтерии». В каждом варианте одни и те же данные, разная только форма страницы. Выберите форму — или возьмите куски из нескольких.</p>
+  </header>
+
+  <section class="box rec">
+    <h2>Рекомендация</h2>
+    <p><b>Матрицу ответственности не придумывать.</b> Готовая «матрица исполнения» уже есть в навыке <code>/bft-matrix</code> (poh-bft-writer): строки EX-NN, у каждой строки поставщик и проверяющий из другой команды, критерий «да/нет» с доказательством, покрытие ФТ, гейт 23. Формат вы утвердили 2026-10-15. Коробке остаётся собирать её как документ пакета <code>kind: raci</code> и проверять гейтом 23. Вкладка «Матрица» внизу показывает её форму.</p>
+    <p><b>Для BluePrint рекомендую вариант C</b> («Было → стало по шагам»). Он читается с телефона, каждый шаг сразу ведёт к ФТ и к строке матрицы, а Confluence рисует его обычной таблицей. Вариант A точнее следует методологии, но он широкий и полезен только при большом числе слоёв; B хорош на старте, когда ещё нет ФТ.</p>
+  </section>
+
+  <section id="v-a" class="box" data-v="a">
+    <div class="eyebrow">Вариант A</div>
+    <h2>Слои service blueprint</h2>
+    <p class="note">По методологии GDS: колонки — шаги пути клиента, строки — слои, между ними линии взаимодействия и видимости. Изменённые клетки подсвечены. В Confluence — одна широкая таблица.</p>
+    <div class="scroll"><table class="bp">
+      <tr><th class="row">Шаг пути</th><th>1. Выбрать период</th><th>2. Нажать «Экспорт»</th><th>3. Получить файл</th><th>4. Открыть в Excel</th><th>5. Сверить с банком</th></tr>
+      <tr><th class="row">Путь клиента (бухгалтер)</th><td>Раз в месяц готовит сверку</td><td class="chg">Одна кнопка вместо копирования 3 ч <span class="ref">ФТ-1</span></td><td class="chg">Файл скачан за секунды <span class="ref">НФТ-1</span></td><td>Колонки читаются без правки</td><td>Расхождения видны сразу</td></tr>
+      <tr><th class="row">Свидетельства</th><td>Поле «Период», по умолчанию — прошлый месяц</td><td class="chg">Кнопка «Экспорт в CSV» в списке заказов</td><td class="chg">orders_2026-09.csv, UTF-8 с BOM <span class="ref">ФТ-3</span></td><td>Кириллица без «кракозябр»</td><td>—</td></tr>
+      <tr class="line"><td colspan="6">линия взаимодействия</td></tr>
+      <tr><th class="row">Фронт (админка)</th><td>Фильтр периода</td><td class="chg">Запуск выгрузки, индикатор <span class="ref">ФТ-2</span></td><td>Ссылка на файл</td><td>—</td><td>—</td></tr>
+      <tr class="line"><td colspan="6">линия видимости</td></tr>
+      <tr><th class="row">Бэкстейдж</th><td>—</td><td class="chg">Сбор заказов за период: номер, дата, сумма, статус оплаты <span class="ref">ФТ-1</span></td><td class="chg">Формирование CSV до 50 тыс. строк <span class="ref">НФТ-1</span></td><td>—</td><td>—</td></tr>
+      <tr><th class="row">Поддерживающие процессы</th><td>Справочник статусов оплаты</td><td>—</td><td>Журнал выгрузок (кто, когда)</td><td>—</td><td>Сверка банковской выписки — вне системы</td></tr>
+      <tr><th class="row">Метрики · регуляторика</th><td colspan="2">Время подготовки сверки: 3 ч → 5 мин</td><td colspan="3">Персональных данных в файле нет; доступ — роль «Бухгалтер»</td></tr>
+    </table></div>
+  </section>
+
+  <section id="v-b" class="box" data-v="b" hidden>
+    <div class="eyebrow">Вариант B</div>
+    <h2>Карта влияния и короткий blueprint изменений</h2>
+    <p class="note">Сверху — дерево «цель → кто → какое влияние → что поставляем» (Impact Map, практика 3 методологии). Ниже — blueprint только для изменённых шагов. В Confluence — четыре колонки списков и маленькая таблица.</p>
+    <div class="tree">
+      <div class="col"><div class="eyebrow">Цель</div><div class="node"><b>Сверка за 5 минут</b>вместо 3 часов ручного копирования</div></div>
+      <div class="col"><div class="eyebrow">Кто</div><div class="node"><b>Бухгалтер</b>готовит сверку</div><div class="node"><b>Руководитель расчётов</b>принимает сверку</div></div>
+      <div class="col"><div class="eyebrow">Влияние</div><div class="node"><b>Не копирует руками</b>выгружает файлом</div><div class="node"><b>Не ищет ошибки копирования</b>данные из системы</div></div>
+      <div class="col"><div class="eyebrow">Поставляем</div><div class="node"><b>Кнопка «Экспорт в CSV»</b><span class="ref">ФТ-1 · ФТ-2</span></div><div class="node"><b>Файл, который открывает Excel</b><span class="ref">ФТ-3 · НФТ-1</span></div></div>
+    </div>
+    <div class="scroll"><table>
+      <tr><th>Изменённый шаг</th><th>Было</th><th>Стало</th><th>Слой</th></tr>
+      <tr><td>Получить данные</td><td>Копирует заказы из админки в таблицу</td><td>Нажимает «Экспорт в CSV»</td><td>Фронт · Бэкстейдж</td></tr>
+      <tr><td>Открыть файл</td><td>Чинит кодировку вручную</td><td>Файл открывается сразу</td><td>Свидетельства</td></tr>
+    </table></div>
+  </section>
+
+  <section id="v-c" class="box" data-v="c" hidden>
+    <div class="eyebrow">Вариант C · рекомендуемый</div>
+    <h2>Было → стало по шагам</h2>
+    <p class="note">Один шаг — одна строка: как сейчас, как будет, какое требование это закрывает и какая строка матрицы исполнения за него отвечает. Неизменённые шаги свёрнуты в одну строку. В Confluence — таблица из пяти колонок, читается и с телефона.</p>
+    <div class="steps">
+      <div class="step"><div class="k">1. Выбрать период</div><div><span class="eyebrow">Было</span><br>Бухгалтер помнит, за какой месяц сверка</div><div><span class="eyebrow">Стало</span><br>Поле «Период», по умолчанию — прошлый месяц</div><div class="meta"><span class="chip">без изменений в процессе</span></div></div>
+      <div class="step"><div class="k">2. Получить данные</div><div><span class="eyebrow">Было</span><br>3 часа копирует заказы в таблицу, бывают ошибки</div><div class="chg"><span class="eyebrow">Стало</span><br>Кнопка «Экспорт в CSV» в списке заказов</div><div class="meta"><span class="chip r">ФТ-1</span><span class="chip r">ФТ-2</span><span class="chip">EX-01 витрина · проверяет бэкенд</span><span class="chip">слой: фронт + бэкстейдж</span></div></div>
+      <div class="step"><div class="k">3. Открыть файл</div><div><span class="eyebrow">Было</span><br>Чинит кодировку руками</div><div class="chg"><span class="eyebrow">Стало</span><br>UTF-8 с BOM, Excel открывает сразу; до 50 тыс. строк за 10 с</div><div class="meta"><span class="chip r">ФТ-3</span><span class="chip r">НФТ-1</span><span class="chip">EX-02 бэкенд · проверяет аналитика</span><span class="chip">риск: большой период</span></div></div>
+      <div class="step"><div class="k">4–5. Сверить</div><div><span class="eyebrow">Было</span><br>Сверяет с выпиской банка</div><div><span class="eyebrow">Стало</span><br>То же, вне системы</div><div class="meta"><span class="chip">вне границ</span></div></div>
+    </div>
+  </section>
+
+  <section id="v-m" class="box" data-v="m" hidden>
+    <div class="eyebrow">Готово · poh-bft-writer /bft-matrix</div>
+    <h2>Матрица исполнения (вместо «матрицы ответственности»)</h2>
+    <p class="note">Форма уже утверждена: у строки один поставщик и проверяющий из другой команды, критерий «да/нет» с доказательством, покрытие каждого ФТ/НФТ, статусы ✓ ◐ ↩ ⊘ ◔ ○, журнал возвратов, чеклисты точек паузы. Проверка — гейт 23. Ниже — две строки на том же кейсе.</p>
+    <div class="scroll"><table>
+      <tr><th>Строка</th><th>Что</th><th>Поставщик</th><th>Проверяющий</th><th>Критерий приёмки · доказательство</th><th>Требования</th><th>Статус</th></tr>
+      <tr><td class="ref">EX-01</td><td>Кнопка «Экспорт в CSV» и выбор периода</td><td>Витрина · ведущий разработчик</td><td>Бэкенд · техлид</td><td>Выгрузка за прошлый месяц стартует одной кнопкой — запись демо</td><td class="ref">ФТ-1 ФТ-2</td><td class="st">◔ в работе</td></tr>
+      <tr><td class="ref">EX-02</td><td>Файл CSV для Excel</td><td>Бэкенд · техлид</td><td>Аналитика · аналитик данных</td><td>50 тыс. строк за ≤10 с, открывается в Excel без правки — протокол прогона</td><td class="ref">ФТ-3 НФТ-1</td><td class="st">○ не начато</td></tr>
+    </table></div>
+  </section>
+</div>
+
+<nav class="bar" aria-label="Варианты">
+  <a href="#a" data-v="a">A · слои</a>
+  <a href="#b" data-v="b">B · карта влияния</a>
+  <a href="#c" data-v="c">C · было → стало</a>
+  <a href="#m" data-v="m">Матрица</a>
+</nav>
+
+<script>
+(function(){
+  const show = v => {
+    if(!["a","b","c","m"].includes(v)) v = "a";
+    document.querySelectorAll("section[data-v]").forEach(s => s.hidden = s.dataset.v !== v);
+    document.querySelectorAll(".bar a").forEach(a => a.setAttribute("aria-current", a.dataset.v === v ? "true" : "false"));
+  };
+  document.querySelectorAll(".bar a").forEach(a => a.addEventListener("click", e => { e.preventDefault(); history.replaceState(null, "", "#" + a.dataset.v); show(a.dataset.v); }));
+  show((location.hash || "#a").slice(1));
+})();
+</script>
