@@ -21,7 +21,7 @@
         "temporal-mcp"
       ],
       "env": {
-        "TEMPORAL_MCP_CONFIG": "/Users/aleksishmanov/projects/po-helper-issues/temporal-mcp.config.json"
+        "TEMPORAL_MCP_CONFIG": "/path/to/po-helper-issues/temporal-mcp.config.json"
       }
     }
   }

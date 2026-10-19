@@ -9,15 +9,18 @@
 файле, который правят параллельно. Диспетчер держит решение в одном месте, и
 его видно целиком.
 
-Принадлежность репозитория задаётся переменной `GITLAB_REPOS` в том же
-формате, что и `ISSUE_AGENT_REPOS`. Молчание переменной означает GitHub:
-контур работал с ним всегда, и умолчание не должно менять поведение.
+Принадлежность репозитория задаётся переменными `GITLAB_REPOS` и `GITEA_REPOS`
+в том же формате, что и `ISSUE_AGENT_REPOS`. Молчание переменных означает GitHub:
+контур работал с ним всегда, и умолчание не должно менять поведение. Gitea —
+self-hosted хранилище карточек харнесса БФТ (ADR-21): корпоративные требования
+не уходят на github.com.
 """
 from __future__ import annotations
 
 import logging
 import os
 
+import gitea_client
 import github_client
 import gitlab_client
 
@@ -27,12 +30,17 @@ _log = logging.getLogger("forge")
 
 GITHUB = "github"
 GITLAB = "gitlab"
+GITEA = "gitea"
 
-_CLIENTS = {GITHUB: github_client, GITLAB: gitlab_client}
+_CLIENTS = {GITHUB: github_client, GITLAB: gitlab_client, GITEA: gitea_client}
 
 
 def gitlab_specs() -> list[str]:
     return os.environ.get("GITLAB_REPOS", "").split(",")
+
+
+def gitea_specs() -> list[str]:
+    return os.environ.get("GITEA_REPOS", "").split(",")
 
 
 def provider_for(repo: str) -> str:
@@ -42,10 +50,11 @@ def provider_for(repo: str) -> str:
     `is_allowed` на пустом списке разрешает всё, и без этой проверки включение
     переменной было бы не нужно — весь трафик уехал бы в GitLab молча.
     """
-    specs = [s for s in gitlab_specs() if s.strip()]
-    if not specs:
-        return GITHUB
-    return GITLAB if is_allowed(str(repo), specs) else GITHUB
+    for provider, specs in ((GITEA, gitea_specs()), (GITLAB, gitlab_specs())):
+        specs = [s for s in specs if s.strip()]
+        if specs and is_allowed(str(repo), specs):
+            return provider
+    return GITHUB
 
 
 def client_for(repo: str):

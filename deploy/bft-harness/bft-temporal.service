@@ -1,0 +1,12 @@
+[Unit]
+Description=Temporal start-dev харнесса БФТ (127.0.0.1:7233, UI 127.0.0.1:8233, SQLite)
+After=network-online.target
+
+[Service]
+ExecStart=@BASE@/bin/temporal server start-dev --ip 127.0.0.1 --port 7233 --ui-ip 127.0.0.1 --ui-port 8233 --db-filename @BASE@/temporal/harness.db --log-level warn
+Restart=always
+RestartSec=5
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

@@ -53,7 +53,7 @@ def development_workflow_id(repo_full_name: str, issue_number: int) -> str:
     # один момент времени в одном экземпляре, и повторный запуск при идущем
     # прогоне обязан упереться в WorkflowAlreadyStarted. Иначе на репозитории
     # окажется два агента в одном рабочем каталоге — имя контейнера раннера
-    # тоже выводится из номера Issue (`shared/develop.py:131`).
+    # тоже выводится из номера Issue (`poh_developer/develop.py`).
     return f"develop-{repo_full_name}-{issue_number}"
 
 

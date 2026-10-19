@@ -54,7 +54,7 @@ status: Черновик 0.1
 | Название проекта | <Проект> |
 | Ответственный за продукт | <ФИО> |
 | Ответственный за документ | <ФИО> |
-| Задача/Epic Jira | [<PROJECTKEY-XXX>](https://jira.mts.ru/browse/<PROJECTKEY-XXX>) — <статус в трекере> |
+| Задача/Epic Jira | [<PROJECTKEY-XXX>](https://jira.example.com/browse/<PROJECTKEY-XXX>) — <статус в трекере> |
 | Статус | <АНАЛИЗ / Ревью / Утверждён / пусто> |
 | Системные требования | <ссылка на СА / FNR или пусто> |
 
@@ -81,8 +81,8 @@ status: Черновик 0.1
 
 | Артефакт/Файл/Ссылка | Описание |
 | --- | --- |
-| [<Человеко-подпись> (Confluence <pageId>)](https://confluence.mts.ru/pages/viewpage.action?pageId=<pageId>) | <что это> |
-| [<PROJECTKEY-XXX>](https://jira.mts.ru/browse/<PROJECTKEY-XXX>) | <Связанный БФТ / инициатива / US> |
+| [<Человеко-подпись> (Confluence <pageId>)](https://confluence.example.com/pages/viewpage.action?pageId=<pageId>) | <что это> |
+| [<PROJECTKEY-XXX>](https://jira.example.com/browse/<PROJECTKEY-XXX>) | <Связанный БФТ / инициатива / US> |
 
 Проблема которую решаем
 =======================
@@ -94,7 +94,7 @@ status: Черновик 0.1
 | --- | --- |
 | **ДЛЯ КОГО** | <актор-бенефициар> |
 | **ЧТО ДЕЛАЕМ** | <одно предложение сути доработки> |
-| **ASIS** | <текущее поведение одной строкой> ([JIRA KEY](https://jira.mts.ru/browse/KEY)) |
+| **ASIS** | <текущее поведение одной строкой> ([JIRA KEY](https://jira.example.com/browse/KEY)) |
 | **ПРОБЛЕМА** | <ul><li><в чём боль для бизнеса/пользователя></li><li><разрыв></li></ul> |
 | **TOBE** | <ul><li><целевое поведение></li><li><целевое поведение></li></ul> |
 
@@ -154,7 +154,7 @@ deactivate fe
 
 | Идентификатор | Наименование требования | Ценность разрабатываемого функционала для бизнес-заказчиков | Краткое описание доработки из данного БФТ | Связанные требования |
 | --- | --- | --- | --- | --- |
-| БТ-1 | <Название> | <Безопасность / Устранение SPOF / Сокращение TTM / Рост SEO / …> | <Что реализуется> | ПТ-1, ФТ-1, [<PROJECTKEY-XXX>](https://jira.mts.ru/browse/<PROJECTKEY-XXX>) |
+| БТ-1 | <Название> | <Безопасность / Устранение SPOF / Сокращение TTM / Рост SEO / …> | <Что реализуется> | ПТ-1, ФТ-1, [<PROJECTKEY-XXX>](https://jira.example.com/browse/<PROJECTKEY-XXX>) |
 
 Пользовательские требования*
 ============================
@@ -227,6 +227,6 @@ deactivate fe
 
 | Факт в БФТ | Источник (якорь) | Ранг | Тип |
 | --- | --- | --- | --- |
-| <факт> | [<PROJECTKEY-XXX>](https://jira.mts.ru/browse/<PROJECTKEY-XXX>) / решение PO от {дата} / ТЗ § | R1/R2/R3 | JIRA / Confluence / BR / Решение PO |
+| <факт> | [<PROJECTKEY-XXX>](https://jira.example.com/browse/<PROJECTKEY-XXX>) / решение PO от {дата} / ТЗ § | R1/R2/R3 | JIRA / Confluence / BR / Решение PO |
 
 <!-- ## Adversarial Review — заполняется на Стадии 6 команды /bft-gen -->

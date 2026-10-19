@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Интерпретатор тестов:** `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest` (venv в основном чекауте, worktree его переиспользует; `make test` и `.venv/bin/pytest` сломаны — не использовать).
+- **Интерпретатор тестов:** `/path/to/poh-issue-agents/.venv/bin/python -m pytest` (venv в основном чекауте, worktree его переиспользует; `make test` и `.venv/bin/pytest` сломаны — не использовать).
 - **Спека:** `docs/superpowers/specs/2026-07-24-analyze-context-enrichment-design.md` — источник истины.
 - **Scope:** только комментарии + связанные PR. Без стиринга из команды, без лейблов, без явных указателей на доки, без отдельной activity.
 - **Деградация обязательна:** ни один fetch-сбой не роняет прогон; пол = `title + body`.
@@ -109,7 +109,7 @@ def test_uses_timeline_endpoint_with_preview_header(monkeypatch):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_linked_prs.py -v`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_linked_prs.py -v`
 Expected: FAIL — `AttributeError: module 'github_client' has no attribute 'list_linked_prs'`.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -158,7 +158,7 @@ def list_linked_prs(repo: str, issue_number: int, limit: int = 20) -> list[dict]
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_linked_prs.py -v`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_linked_prs.py -v`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Commit**
@@ -295,7 +295,7 @@ def test_degrades_when_prs_fetch_fails(monkeypatch):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_build_task_context.py -v`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_build_task_context.py -v`
 Expected: FAIL — `AttributeError: module 'activities' has no attribute '_build_task_context'` (или `CONTEXT_TOTAL_CHARS`).
 
 - [ ] **Step 3: Write minimal implementation**
@@ -408,7 +408,7 @@ def _build_task_context(analyze: AnalyzeInput) -> str:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_build_task_context.py -v`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_build_task_context.py -v`
 Expected: PASS (6 passed).
 
 - [ ] **Step 5: Commit**
@@ -489,7 +489,7 @@ def test_enriched_context_reaches_task_stage(monkeypatch, wired):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py::test_enriched_context_reaches_task_stage -v`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py::test_enriched_context_reaches_task_stage -v`
 Expected: FAIL — `KeyError: '/fnr-new-task'` в `prompts` не будет содержать текст коммента (или `AssertionError`), т.к. `run_analysis_pipeline` ещё шлёт статичный `title+body`.
 
 - [ ] **Step 3: Wire the helper**
@@ -510,12 +510,12 @@ Expected: FAIL — `KeyError: '/fnr-new-task'` в `prompts` не будет со
 
 - [ ] **Step 4: Run the new test + full pipeline suite**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py -v`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py -v`
 Expected: PASS (все прежние тесты + `test_enriched_context_reaches_task_stage`).
 
 - [ ] **Step 5: Run full suite (regression)**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS — 164 прежних + 10 новых (3 Task 1 + 6 Task 2 + 1 Task 3) = 174 passed.
 
 - [ ] **Step 6: Commit**

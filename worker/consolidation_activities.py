@@ -15,7 +15,9 @@ from shared.workflow_types import (
     Taxonomy, UnifyingIssueDraft, ZoneAssignment,
 )
 
-PROMPTS_DIR = Path("/app/prompts")
+from shared.app_root import APP_ROOT  # noqa: E402
+
+PROMPTS_DIR = APP_ROOT / "prompts"
 
 
 def _load_prompt(name: str) -> str:

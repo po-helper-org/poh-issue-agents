@@ -28,7 +28,7 @@ import urllib.parse
 
 import requests
 
-import worktree
+from poh_developer import worktree
 
 from shared.agent_comment import is_agent_comment, sign
 

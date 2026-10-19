@@ -2,3 +2,15 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 temporalio==1.9.0
 sentry-sdk[fastapi]==2.20.0
+
+# Вебхук импортирует `shared.commands` -> `shared.workflow_types`, а тот с
+# PR #319 переэкспортирует типы стадии «Разработка» из пакета. Пакета здесь не
+# было, и вебхук перестал стартовать вовсе: `ModuleNotFoundError: No module
+# named 'poh_developer'` на импорте main.py, контейнер в вечном рестарте,
+# события GitHub в контур не доходят. Снаружи это выглядит как «webhook не
+# отвечает», без единого намёка на причину.
+#
+# Пин ОБЯЗАН совпадать с worker/requirements.txt: при расхождении полей
+# Temporal молча отдаёт воркфлоу словари вместо объектов (см. шапку
+# shared/workflow_types.py), и отказ проявится далеко от причины.
+poh-developer @ git+https://github.com/po-helper-org/poh-developer-agents@ba44e277556604641166c32cbcc9b1f500ddef83

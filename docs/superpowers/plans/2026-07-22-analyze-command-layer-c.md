@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Команда тестов (единственная рабочая в этом worktree):** `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`. `make test` и `.venv/bin/pytest` здесь НЕ работают: worktree не имеет своего `.venv`, а console-скрипты основного venv имеют сломанный shebang (`/Users/aleksishmanov/projects/po-helper-issues/.venv/bin/python`). Запускать только через `python -m pytest`.
+- **Команда тестов (единственная рабочая в этом worktree):** `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`. `make test` и `.venv/bin/pytest` здесь НЕ работают: worktree не имеет своего `.venv`, а console-скрипты основного venv имеют сломанный shebang (`/path/to/po-helper-issues/.venv/bin/python`). Запускать только через `python -m pytest`.
 - **Базовый прогон:** 12 тестов проходят до начала работ. Любая задача обязана оставлять suite зелёным.
 - `fastapi` в venv **отсутствует** → `webhook/main.py` не импортируется в тестах. Вся тестируемая логика команд живёт в `shared/commands.py` (без зависимостей от FastAPI/temporalio).
 - Все мутации GitHub обязаны соблюдать `DRY_RUN` (`worker/github_client.py:19`).
@@ -268,7 +268,7 @@ def test_build_analyze_input_tolerates_null_body():
 
 - [ ] **Step 2: Прогнать тест — убедиться, что падает**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_commands.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_commands.py -q`
 Expected: FAIL — `ModuleNotFoundError: No module named 'shared.commands'`
 
 - [ ] **Step 3: Добавить `AnalyzeInput`**
@@ -336,12 +336,12 @@ def build_analyze_input(payload: dict) -> AnalyzeInput:
 
 - [ ] **Step 5: Прогнать тесты — убедиться, что проходят**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_commands.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_commands.py -q`
 Expected: PASS (9 passed)
 
 - [ ] **Step 6: Прогнать весь suite**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS (21 passed)
 
 - [ ] **Step 7: Commit**
@@ -536,7 +536,7 @@ def test_put_file_includes_sha_when_file_already_exists(monkeypatch):
 
 - [ ] **Step 2: Прогнать тест — убедиться, что падает**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_analyze.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_analyze.py -q`
 Expected: FAIL — `AttributeError: module 'github_client' has no attribute 'auth_token'`
 
 - [ ] **Step 3: Добавить `import base64` в шапку `worker/github_client.py`**
@@ -642,12 +642,12 @@ def push_artifacts_to_branch(repo: str, branch: str, files: dict[str, str], mess
 
 - [ ] **Step 6: Прогнать тесты**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_analyze.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_github_client_analyze.py -q`
 Expected: PASS (9 passed)
 
 - [ ] **Step 7: Прогнать весь suite (регресс существующих github_client-тестов)**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS (30 passed)
 
 - [ ] **Step 8: Commit**
@@ -734,7 +734,7 @@ def test_error_comment_mentions_reason_and_retry(monkeypatch):
 
 - [ ] **Step 2: Прогнать тест — убедиться, что падает**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_activities_analyze.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_activities_analyze.py -q`
 Expected: FAIL — `AttributeError: module 'activities' has no attribute 'ack_command'`
 
 - [ ] **Step 3: Расширить импорт типов**
@@ -791,12 +791,12 @@ async def publish_analysis_error(analyze: AnalyzeInput, reason: str) -> None:
 
 - [ ] **Step 5: Прогнать тесты**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_activities_analyze.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_activities_analyze.py -q`
 Expected: PASS (3 passed)
 
 - [ ] **Step 6: Прогнать весь suite**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS (33 passed)
 
 - [ ] **Step 7: Commit**
@@ -943,7 +943,7 @@ def test_workspace_is_removed_even_on_failure(monkeypatch, wired):
 
 - [ ] **Step 2: Прогнать тест — убедиться, что падает**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py -q`
 Expected: FAIL — `AttributeError: module 'activities' has no attribute 'FNR_DIR'`
 
 - [ ] **Step 3: Расширить шапку импортов `worker/activities.py`**
@@ -1125,12 +1125,12 @@ async def run_analysis_pipeline(analyze: AnalyzeInput) -> str:
 
 - [ ] **Step 5: Прогнать тесты**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_analysis_pipeline.py -q`
 Expected: PASS (6 passed)
 
 - [ ] **Step 6: Прогнать весь suite**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS (42 passed)
 
 > `run_research_pipeline` удалён — он ещё числится и в регистрации воркера (`worker/worker.py:38`), и в ветке `research-me` воркфлоу (`worker/workflows.py:178`). Импорт `worker.py` не ломается на уровне тестов, но обе ссылки обязан снять Task 7 (он идёт сразу следом).
@@ -1253,7 +1253,7 @@ async def test_pipeline_failure_publishes_error_and_does_not_retry():
 
 - [ ] **Step 2: Прогнать тест — убедиться, что падает**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_workflow_analysis.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_workflow_analysis.py -q`
 Expected: FAIL — `ImportError: cannot import name 'IssueAnalysis' from 'workflows'`
 
 - [ ] **Step 3: Расширить импорт типов в `worker/workflows.py`**
@@ -1406,14 +1406,14 @@ from workflows import IssueAnalysis, IssueLifecycle
 
 - [ ] **Step 7: Прогнать тесты**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest tests/test_workflow_analysis.py -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest tests/test_workflow_analysis.py -q`
 Expected: PASS (2 passed)
 
 - [ ] **Step 8: Проверить, что регистрация воркера импортируется**
 
 Run:
 ```bash
-cd worker && /Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -c "
+cd worker && /path/to/poh-issue-agents/.venv/bin/python -c "
 import sys; sys.path.insert(0, '..')
 import worker
 print('worker module imports OK')
@@ -1423,7 +1423,7 @@ Expected: печатает `worker module imports OK` (ошибки `AttributeEr
 
 - [ ] **Step 9: Прогнать весь suite**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS (44 passed)
 
 - [ ] **Step 10: Commit**
@@ -1563,7 +1563,7 @@ _log = logging.getLogger("webhook")
 
 - [ ] **Step 4: Прогнать весь suite (регресса быть не должно)**
 
-Run: `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q`
+Run: `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q`
 Expected: PASS (44 passed)
 
 - [ ] **Step 5: Поднять стек в DRY_RUN и проверить сквозной путь**

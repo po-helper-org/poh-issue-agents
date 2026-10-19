@@ -12,7 +12,8 @@
 
 import pytest
 
-from shared import label_catalog, labels, lifecycle, commands, develop, pr_closing
+from shared import label_catalog, labels, lifecycle, commands
+from poh_developer import develop, pr_closing
 
 
 # --- advisor:* метки ---
@@ -350,7 +351,8 @@ def test_catalog_grows_with_flat_labels():
 # --- Rich catalog checks from main ---
 """Каталог меток собирается из кода, а не переписывается руками."""
 
-from shared import commands, develop, lifecycle, pr_closing
+from shared import commands, lifecycle
+from poh_developer import develop, pr_closing
 from shared import labels as L
 from shared.label_catalog import TRIGGERS, catalog
 

@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "worker"))
 
 import gitlab_client as gl  # noqa: E402
-import worktree  # noqa: E402
+from poh_developer import worktree  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

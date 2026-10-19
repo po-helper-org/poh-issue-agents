@@ -26,6 +26,7 @@ _FORGE_ENV = (
     "GITHUB_PRIVATE_KEY_PATH", "GITHUB_INSTALLATION_ID", "GITHUB_REPOSITORY",
     "GITHUB_WEBHOOK_SECRET", "GH_PUSH_TOKEN", "GH_CLONE_TOKEN",
     "ISSUE_AGENT_REPOS", "DRY_RUN",
+    "GITLAB_REPOS", "GITEA_REPOS",
 )
 
 
@@ -80,3 +81,37 @@ def make_fake_set_labels(add_label, remove_label):
         if add_error is not None:
             raise add_error
     return set_labels
+
+
+# Порты стадии «Разработка» на весь прогон тестов: её шаги живут в пакете и без
+# подставленных реализаций отказывают RuntimeError'ом. Адаптеры делегируют
+# МОДУЛЯМ контура, поэтому привычная подмена `github_client.post_comment` в
+# тесте доходит до стадии ровно как раньше.
+@pytest.fixture(autouse=True, scope="session")
+def _developer_ports():
+    import developer_bridge
+
+    developer_bridge.install()
+
+
+# Очередь стадии «Разработка» в тестах воркфлоу.
+#
+# Тесты цикла поднимают ОДИН воркер на случайной очереди и проверяют поведение
+# цикла, а не раскладку очередей. Отправляя дочерний прогон на `developer`, они
+# все до единого повисали бы на несуществующем воркере — 44 блока плумбинга без
+# единого нового утверждения.
+#
+# `None` — не магия, а ровно то, что делал родитель до переезда: дочерний прогон
+# наследует очередь родителя. Ветка `else` в `IssueLifecycle` под маркером
+# отдаёт то же самое, так что тесты идут тем же путём, каким пойдут прогоны,
+# начатые до выкладки.
+#
+# Саму раскладку — родитель на одной очереди, стадия на своей — проверяет
+# `tests/test_developer_queue.py`, и он от этой подмены освобождён меткой.
+@pytest.fixture(autouse=True)
+def _stage_queue(request, monkeypatch):
+    if request.node.get_closest_marker("developer_queue"):
+        return
+    from poh_developer import integration as developer
+
+    monkeypatch.setattr(developer, "TASK_QUEUE", None)

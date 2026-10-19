@@ -18,7 +18,7 @@
 - **Taxonomy determinism (M1):** `derive_taxonomy` accepts an optional `prior` taxonomy; zone `name` is the canonical id (not a member-number slug). Call with `temperature ≤ 0.2` if the client exposes it; otherwise low temperature is a prompt+model concern (leave a NFR note, do not block).
 - **Replay (M2):** `fetch_open_issues` returns `IssueInput` WITHOUT body; `extract_solution_profile` fetches its own body via `github_client.get_issue_body`.
 - **assign `other` (M3):** `assign_zone` may return `primary_zone == "other"`.
-- Test interpreter (repo-root venv): `/Users/aleksishmanov/projects/poh-org/poh-issue-agents/.venv/bin/python -m pytest -q` from the repo root. Tests monkeypatch `ca.llm.extract` and `ca._load_prompt`.
+- Test interpreter (repo-root venv): `/path/to/poh-issue-agents/.venv/bin/python -m pytest -q` from the repo root. Tests monkeypatch `ca.llm.extract` and `ca._load_prompt`.
 - Reuse the existing test patterns in `tests/test_consolidation_*.py`.
 
 ---

@@ -27,6 +27,7 @@ from shared.workflow_types import (
     PriorityResult,
     ProtocolState,
 )
+from poh_developer import integration as developer
 from workflows import IssueAnalysis, IssueDevelopment, IssueEstimation, IssueLifecycle
 
 REPO = "o/r"
@@ -301,3 +302,41 @@ async def test_a_collision_with_an_orphaned_run_parks_instead_of_spinning():
     )
     assert "publish" not in _calls, (
         "второй прогон не должен был запустить СВОЙ прогон разработки")
+
+
+@pytest.mark.developer_queue
+@pytest.mark.timeout(120)
+async def test_the_stage_runs_on_its_own_queue():
+    """Дочерний прогон уходит НА ОЧЕРЕДЬ СТАДИИ, а не на очередь цикла.
+
+    Ради этого стадия и стала отдельной очередью: один прогон агента держит
+    активность до сорока пяти минут, и на общем пуле из трёх слотов он вытеснял
+    бы триаж Issue. Раскладка проверяется здесь, а не в каждом тесте цикла:
+    остальным она безразлична, и подмена в `conftest.py` возвращает им прежнее
+    наследование очереди родителя.
+
+    Утверждение — по СОБЫТИЮ старта в истории родителя, а не по тому, что
+    прогон куда-то доехал: доехать он мог бы и по наследству, если бы адрес
+    потерялся.
+    """
+    _calls.clear()
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        tq = f"tq-{uuid.uuid4()}"
+        async with _worker(env, tq), Worker(
+                env.client, task_queue=developer.TASK_QUEUE,
+                workflows=[IssueDevelopment], activities=ALL_ACTIVITIES):
+            handle = await env.client.start_workflow(
+                IssueLifecycle.run, _issue(), id=f"wf-{uuid.uuid4()}", task_queue=tq)
+            await _await_phase(env, handle, lifecycle.CLASSIFIED)
+            await handle.signal(IssueLifecycle.human_decision, "bug-me")
+            phase = await _await_phase(env, handle, lifecycle.PR_OPEN)
+            children = await _child_starts(handle)
+
+    queues = {c.task_queue.name for c in children
+              if c.workflow_id == development_workflow_id(REPO, ISSUE)}
+
+    assert queues == {developer.TASK_QUEUE}, (
+        f"разработка стартовала не на своей очереди: {queues or 'старта нет'}"
+    )
+    assert phase == lifecycle.PR_OPEN, "цикл не дождался результата с чужой очереди"
+    assert "publish" in _calls
