@@ -21,7 +21,7 @@
       "okr_alignment": "unrelated | supports_okr | direct_top_priority",
       "okr_key_result": "строка с названием KR, если applicable, иначе null",
       "bug_severity": "none | high | critical",
-      "affected_domains": ["GDS", "UMC", "Live", "BI", "Ticketland"],
+      "affected_domains": ["Product-A", "Product-B", "Live", "BI", "Acme Tickets"],
       "consequences": {
         "who": "какая команда/роль должна исполнять",
         "risks": ["риск 1", "риск 2"],
@@ -33,8 +33,8 @@
 
 - 1 — затрагивает единичных пользователей/крайний edge case.
 - 2 — затрагивает узкий сегмент (одна команда/один тип клиента).
-- 3 — затрагивает заметную долю пользователей одного продукта (GDS или Live
-  или UMC, не всё сразу).
+- 3 — затрагивает заметную долю пользователей одного продукта (Product-A или Live
+  или Product-B, не всё сразу).
 - 4 — затрагивает несколько продуктов/большинство пользователей одного
   продукта.
 - 5 — затрагивает всю экосистему или критический revenue-путь (продажа

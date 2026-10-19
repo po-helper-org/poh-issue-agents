@@ -6,7 +6,7 @@
 
 | Ранг | Тип якоря | Когда валиден | Пример |
 |---|---|---|---|
-| **R1** 🥇 | **Код** `file:line` (через sa-helper graph/repomix или прямой код) | **ТОЛЬКО As-Is** (текущее поведение системы) | `extapi/order.go:142` |
+| **R1** 🥇 | **Код** `file:line` (через sa-helper graph/repomix или прямой код) | **ТОЛЬКО As-Is** (текущее поведение системы) | `orders/order.go:142` |
 | **R2** 🥈 | Задача трекера (`KEY-123`), страница wiki (`pageId`), бизнес-правило (`BR-*`), ADR (`ADR-ID`) | As-Is и To-Be | `[SHOP-16189](https://jira.example.com/browse/SHOP-16189)`, `[Confluence 1000000001](https://confluence.example.com/pages/viewpage.action?pageId=1000000001)`, `BR-DATA-002` |
 | **R3** 🥉 | Решение PO/заказчика: **кто ответил + дата + источник** (встреча/почта/ТЗ) | To-Be (forward-looking) | `PO (Иванов, 21.06, встреча)` |
 | **R4** ❌ | «Обычно так», «лучшая практика», общие знания | **НЕ валиден** | — |
