@@ -57,7 +57,7 @@
       "type": "object",
       "required": ["kind", "title", "content"],
       "properties": {
-        "kind": {"enum": ["bft", "raci", "blueprint", "epic"]},
+        "kind": {"description": "bft — документ БФТ по шаблону команды; raci — матрица исполнения в формате /bft-matrix (poh-bft-writer, проверка — гейт 23); blueprint — BluePrint-карта «было → стало по шагам»; epic — эпик Jira со связью с БФТ.", "enum": ["bft", "raci", "blueprint", "epic"]},
         "title": {"type": "string"},
         "format": {"const": "markdown", "default": "markdown"},
         "content": {"type": "string"}
