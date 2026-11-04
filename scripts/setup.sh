@@ -97,7 +97,9 @@ fi
 [ -n "$ZAI_KEY" ] || die "ZAI_API_KEY is required (all LLM stages use it)."
 
 # defaults (kept from existing .env when present)
-ZAI_BASE_URL="$(cur ZAI_BASE_URL)";   ZAI_BASE_URL="${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
+# ADR 0016: на сервере dede умолчание — профиль Hermes (issue-agents);
+# прямой z.ai — только явным выбором при локальной установке.
+ZAI_BASE_URL="$(cur ZAI_BASE_URL)";   ZAI_BASE_URL="${ZAI_BASE_URL:-http://127.0.0.1:8642/p/issue-agents/v1}"
 ANTHROPIC_BASE_URL="$(cur ANTHROPIC_BASE_URL)"; ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-https://api.z.ai/api/anthropic}"
 MODEL_GATE="$(cur MODEL_GATE)";       MODEL_GATE="${MODEL_GATE:-glm-4.5-air}"
 MODEL_CLASSIFY="$(cur MODEL_CLASSIFY)"; MODEL_CLASSIFY="${MODEL_CLASSIFY:-glm-4.6}"
