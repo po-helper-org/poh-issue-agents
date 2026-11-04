@@ -37,6 +37,22 @@ MODEL_CLASSIFY = os.environ.get("MODEL_CLASSIFY", "glm-5.2")
 
 _client: instructor.Instructor | None = None
 
+# ADR 0016: если ZAI_BASE_URL указывает на профиль Hermes (…/p/issue-agents/v1),
+# каждый запрос несёт метку фичи; usage пишется строкой llm-usage в stdout (journald).
+FEATURE = "poh-issue-agents/extract"
+
+
+def _is_hermes_gateway(base_url: str) -> bool:
+    return "/p/" in (base_url or "")
+
+
+def _log_usage(model: str, usage) -> None:
+    if usage is None or getattr(usage, "prompt_tokens", None) is None:
+        return
+    print(f"llm-usage service=poh-issue-agents feature={FEATURE} model={model}"
+          f" input_tokens={usage.prompt_tokens or 0} output_tokens={usage.completion_tokens or 0}"
+          f" cache_read_tokens=0", flush=True)
+
 
 def get_client() -> instructor.Instructor:
     global _client
@@ -44,10 +60,13 @@ def get_client() -> instructor.Instructor:
         # z.ai GLM rejects OpenAI tool-calling (400 "Invalid API parameter" —
         # instructor's default Mode.TOOLS). JSON mode works: the model returns
         # a JSON object matching the Pydantic schema.
+        base_url = os.environ["ZAI_BASE_URL"]
+        extra = {"X-Hermes-Feature": FEATURE} if _is_hermes_gateway(base_url) else None
         _client = instructor.from_openai(
             OpenAI(
-                base_url=os.environ["ZAI_BASE_URL"],
+                base_url=base_url,
                 api_key=os.environ["ZAI_API_KEY"],
+                default_headers=extra,
             ),
             mode=instructor.Mode.JSON,
         )
@@ -87,4 +106,5 @@ def complete(system_prompt: str, user_message: str, *, model: str,
         max_tokens=max_tokens,
         temperature=temperature,
     )
+    _log_usage(model, getattr(resp, "usage", None))   # ADR 0016: учёт по фиче
     return resp.choices[0].message.content or ""
