@@ -1,0 +1,9 @@
+# llm-direct-allow — осознанные исключения из ADR 0016 (причина обязательна)
+# `claude -p` ходит по Anthropic-совместимому эндпоинту того же z.ai — легаси
+# стадии FNR (activities), миграция — отдельная задача; в контуре Dokploy env
+# уже переведён на профиль issue-agents (ZAI_BASE_URL=…8642/p/issue-agents/v1).
+.env.example                      # пример env: ANTHROPIC_BASE_URL для claude -p (легаси, см. выше) и комментарии
+deploy/bft-harness/setup-services.sh  # генерит harness.env для bft-харнесса: прямой Z.AI, контур БФТ — отдельная задача миграции
+scripts/setup.sh                  # ANTHROPIC_BASE_URL для claude -p (легаси стадии FNR)
+tests/test_analysis_pipeline.py   # фикстуры тестов: URL в monkeypatch.setenv
+worker/llm.py                     # import openai: SDK направлен на профиль Hermes (ZAI_BASE_URL=…/p/issue-agents/v1), не на провайдера

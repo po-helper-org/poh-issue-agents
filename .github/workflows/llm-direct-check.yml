@@ -1,0 +1,15 @@
+# Прямой вызов LLM-провайдера вне профиля Hermes запрещён (ADR 0016).
+# Стандарт: po-helper-org/.github → LLM-VIA-HERMES.md; канон скрипта там же.
+# push (любая ветка, включая main) + каждый PR — security-чек должен ловить и прямые пуши.
+name: llm-direct-check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-llm-direct.sh
